@@ -81,6 +81,22 @@ type UISnapshot struct {
 	TotalCacheReadTokens  int
 	TotalCacheWriteTokens int
 	TotalCostUSD          float64
+	TotalSavedUSD         float64 // 因 CacheRead 命中省下的美元（相对全按非缓存输入价计费）
+
+	// 缓存诊断
+	OverallCacheCapable    bool // 至少一个 role 跑过支持 prompt cache 的模型（区分"未启用"和"0% 命中"）
+	OverallRecentCacheRead int  // 滑动窗最近 N 次的 cacheRead 总和
+	OverallRecentInput     int  // 滑动窗最近 N 次的 input 总和
+	OverallRecentSamples   int  // 滑动窗内的样本数（≤ recentSampleCap）
+
+	// MissingAssistantUsage > 0 通常意味着上游 streaming 没按 OpenAI
+	// stream_options.include_usage 协议发 final usage chunk（自建 proxy 常见），
+	// 导致 UsageTracker 收不到任何累计数据。UI 据此明示用户排查 backend，
+	// 不要让用户误以为是缓存模块本身坏了。
+	MissingAssistantUsage int
+
+	// 缓存 per-role 维度，按 CacheRead 降序，已过滤未消费 token 的 role
+	CachePerAgent []AgentCacheStat
 
 	// 基础设定
 	Premise          string
@@ -134,6 +150,28 @@ type AgentSnapshot struct {
 	Context          AgentContextSnapshot
 	RecentProjection AgentContextSnapshot
 	UpdatedAt        time.Time
+}
+
+// AgentCacheStat 是单个 agent 的缓存命中累计（投影到左栏）。
+// HitRate = CacheRead / Input；Input 在 litellm 层已统一为"含 CacheRead"语义。
+//
+// CacheCapable 用来区分两种 0% 命中：
+//   - true  → 模型支持 prompt cache，0% 是 prompt 设计差或前缀不稳定，需要优化
+//   - false → 模型/provider 不支持 prompt cache，0% 是预期，不必排查
+//
+// Recent* 是滑动窗（最近 N 次调用）的命中数据，对比累计可识别"前期拖累"vs"稳态低命中"。
+type AgentCacheStat struct {
+	Role            string
+	Input           int
+	Output          int
+	CacheRead       int
+	CacheWrite      int
+	Cost            float64
+	Saved           float64
+	CacheCapable    bool
+	RecentCacheRead int
+	RecentInput     int
+	RecentSamples   int
 }
 
 // AgentContextSnapshot 是 Agent 上下文使用情况。

@@ -390,6 +390,26 @@ func (h *Host) Snapshot() UISnapshot {
 	// 动态解析当前模型的上下文窗口，/model 切换后下一次 Snapshot 自动反映
 	modelWindow, _ := h.cfg.ResolveContextWindow(model)
 	cost, tokIn, tokOut, cacheRead, cacheWrite := h.usage.Totals()
+	saved := h.usage.SavedUSD()
+	overallCapable := h.usage.OverallCacheCapable()
+	recentRead, recentInput, recentSamples := h.usage.OverallRecent()
+	perAgent := h.usage.PerAgent()
+	cacheStats := make([]AgentCacheStat, 0, len(perAgent))
+	for _, a := range perAgent {
+		cacheStats = append(cacheStats, AgentCacheStat{
+			Role:            a.Role,
+			Input:           a.Input,
+			Output:          a.Output,
+			CacheRead:       a.CacheRead,
+			CacheWrite:      a.CacheWrite,
+			Cost:            a.Cost,
+			Saved:           a.Saved,
+			CacheCapable:    a.CacheCapable,
+			RecentCacheRead: a.RecentCacheRead,
+			RecentInput:     a.RecentInput,
+			RecentSamples:   a.RecentSamples,
+		})
+	}
 
 	snap := UISnapshot{
 		Provider:              provider,
@@ -402,7 +422,14 @@ func (h *Host) Snapshot() UISnapshot {
 		TotalOutputTokens:     tokOut,
 		TotalCacheReadTokens:  cacheRead,
 		TotalCacheWriteTokens: cacheWrite,
-		TotalCostUSD:          cost,
+		TotalCostUSD:           cost,
+		TotalSavedUSD:          saved,
+		OverallCacheCapable:    overallCapable,
+		OverallRecentCacheRead: recentRead,
+		OverallRecentInput:     recentInput,
+		OverallRecentSamples:   recentSamples,
+		CachePerAgent:          cacheStats,
+		MissingAssistantUsage:  h.usage.MissingAssistantUsage(),
 	}
 
 	progress, _ := h.store.Progress.Load()

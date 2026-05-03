@@ -119,8 +119,11 @@ func renderStatePanel(snap host.UISnapshot, width, height int) string {
 	overview.WriteString(renderField("流程", snapshotFlowLabel(snap.Flow)))
 	if snap.Layered {
 		overview.WriteString(renderField("已完成", fmt.Sprintf("%d 章", snap.CompletedCount)))
-		if snap.TotalChapters > 0 {
-			overview.WriteString(renderField("已规划", fmt.Sprintf("%d 章", snap.TotalChapters)))
+		// 分层动态规划：右栏只展示当前弧已展开的章节，"已规划"也用同一个口径，
+		// 否则会把骨架弧 EstimatedChapters 的粗估算（如 92）混进来，与可见大纲对不上。
+		// progress.TotalChapters 那个值仅用于内部 ContextProfile 决策，不要泄漏到 UI。
+		if planned := len(snap.Outline); planned > 0 {
+			overview.WriteString(renderField("已规划", fmt.Sprintf("%d 章", planned)))
 		}
 	} else {
 		switch {
@@ -137,11 +140,10 @@ func renderStatePanel(snap host.UISnapshot, width, height int) string {
 	if snap.TotalInputTokens > 0 || snap.TotalOutputTokens > 0 {
 		tokens := fmt.Sprintf("in %s · out %s",
 			formatNumber(snap.TotalInputTokens), formatNumber(snap.TotalOutputTokens))
-		if snap.TotalCacheReadTokens > 0 || snap.TotalCacheWriteTokens > 0 {
-			tokens += fmt.Sprintf(" · cache %s",
-				formatNumber(snap.TotalCacheReadTokens+snap.TotalCacheWriteTokens))
-		}
 		overview.WriteString(renderField("用量", tokens))
+		if cost := formatCostUSD(snap.TotalCostUSD); cost != "" {
+			overview.WriteString(renderField("成本", cost))
+		}
 	}
 	if headline := snapshotHeadline(tasks, snap); headline != "" {
 		label := "当前"
@@ -151,6 +153,10 @@ func renderStatePanel(snap host.UISnapshot, width, height int) string {
 		overview.WriteString(renderHighlightField(label, truncate(headline, contentW-10)))
 	}
 	sections = append(sections, renderSidebarSection("概览", overview.String(), contentW))
+
+	if body := renderCacheSidebar(snap, contentW); body != "" {
+		sections = append(sections, renderSidebarSection("缓存", body, contentW))
+	}
 
 	if len(snap.PendingRewrites) > 0 {
 		var rewrite strings.Builder
@@ -451,6 +457,166 @@ func snapshotFlowLabel(flow string) string {
 	default:
 		return flow
 	}
+}
+
+// renderCacheSidebar 渲染左栏"缓存"区块。
+//
+// 三种态：
+//  1. 完全没消费 token：返回空，section 不渲染
+//  2. 当前会话所有 role 都跑的是不支持 prompt cache 的模型：仅渲染一行"未启用"提示
+//  3. 已启用：顶部"命中率累计/近10 · 节省 · 读/写"+ 分隔 + per-role 行
+//
+// per-role 行 capable 时显示"累计/近10%"双数字；不 capable 时显示"未启用"。
+// 通过累计 vs 近 N 次的对比可以识别"前期拖累"vs"稳态低命中"。
+func renderCacheSidebar(snap host.UISnapshot, width int) string {
+	// 上游 streaming 没发 OpenAI 的 final usage chunk —— 累计数据全为 0，
+	// 但这不是"没启用 cache"也不是"用量太低被门控藏起来"，必须显式提示，
+	// 否则用户会一直以为左栏写了缓存代码却显示不出来。优先级最高。
+	if snap.MissingAssistantUsage > 0 && snap.TotalInputTokens <= 0 {
+		warn := lipgloss.NewStyle().Foreground(colorError).Bold(true).
+			Render(fmt.Sprintf("⚠ 上游未返 usage（%d 次）", snap.MissingAssistantUsage))
+		hint := lipgloss.NewStyle().Foreground(colorDim).Italic(true).
+			Render(truncate("检查 provider stream_options.include_usage", max(8, width-2)))
+		return warn + "\n" + hint + "\n"
+	}
+
+	if snap.TotalInputTokens <= 0 && snap.TotalCacheWriteTokens <= 0 {
+		return ""
+	}
+
+	// 全程未启用 → 显示一行解释，避免用户误判为"0% 命中需要排查"
+	if !snap.OverallCacheCapable && snap.TotalCacheReadTokens == 0 && snap.TotalCacheWriteTokens == 0 {
+		return lipgloss.NewStyle().Foreground(colorDim).Italic(true).
+			Render(truncate("当前模型未启用 prompt cache", max(8, width-2))) + "\n"
+	}
+
+	var b strings.Builder
+
+	// 顶部综合指标：累计 + 近 N 各占一行，标签明示，避免 "X% · 近N Y%" 这种
+	// 三种分隔符（百分号 / 中点 / 文字）混杂导致语义不清。
+	overallHit := cacheHitRate(snap.TotalCacheReadTokens, snap.TotalInputTokens)
+	b.WriteString(renderField("累计命中", colorPercent(overallHit)))
+	if snap.OverallRecentSamples > 0 && snap.OverallRecentInput > 0 {
+		recent := cacheHitRate(snap.OverallRecentCacheRead, snap.OverallRecentInput)
+		b.WriteString(renderField(fmt.Sprintf("近%d命中", snap.OverallRecentSamples), colorPercent(recent)))
+	}
+
+	if savedStr := formatCostUSD(snap.TotalSavedUSD); savedStr != "" {
+		b.WriteString(renderField("节省", savedStr))
+	}
+
+	// 读/写量分两行；写量为 0 在很多自建 OpenAI 兼容后端是"未上报 cache_creation_tokens"
+	// 而非"真无写入"，加一个轻提示，避免被误读成 prefix 极度稳定。
+	b.WriteString(renderField("缓存读量", formatTokensCompact(snap.TotalCacheReadTokens)))
+	if snap.TotalCacheWriteTokens > 0 {
+		b.WriteString(renderField("缓存写量", formatTokensCompact(snap.TotalCacheWriteTokens)))
+	} else if snap.TotalCacheReadTokens > 0 {
+		// 既然有命中就一定写过，写量却是 0 → 上游没返字段
+		hint := lipgloss.NewStyle().Foreground(colorDim).Italic(true).Render("(上游未上报)")
+		b.WriteString(renderField("缓存写量", "0 "+hint))
+	}
+
+	if len(snap.CachePerAgent) > 0 {
+		b.WriteString(lipgloss.NewStyle().Foreground(colorDim).
+			Render(strings.Repeat("·", max(8, width-12))))
+		b.WriteString("\n")
+		for _, a := range snap.CachePerAgent {
+			b.WriteString(renderCacheAgentLine(a, width))
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// colorPercent 把百分比按命中率分档着色后转字符串，仅用于值列。
+func colorPercent(p float64) string {
+	return lipgloss.NewStyle().Foreground(cacheHitColor(p)).Bold(true).
+		Render(formatPercent(p))
+}
+
+// renderCacheAgentLine 渲染单个 role 行：role 名 + 一个百分比 + 缓存读量。
+// 百分比优先用滑动窗（稳态命中率）— 这是优化时唯一关心的信号；累计值的对比
+// 由顶部综合指标承担，per-role 不再混塞双值，避免 "82%/85%" 这种无标签歧义。
+//
+// 三种态：
+//
+//	未启用     "WRITER        未启用"
+//	已启用     "WRITER        85%  · 323.3k"   稳态值（窗已积累）
+//	刚启用     "WRITER        82%  · 1.2k"     累计值兜底（窗未填满或样本=0）
+//
+// 后接 cache 读量帮助判断"高命中率是真规模还是小样本侥幸"。
+func renderCacheAgentLine(a host.AgentCacheStat, width int) string {
+	// role 名与"运行角色"区保持完全一致；Width 取 12 让最长的 COORDINATOR
+	// 仍能保留 1 列尾随空格做分隔，其它 role 自动右侧填充。
+	roleStyle := lipgloss.NewStyle().Foreground(eventAgentColor(a.Role)).Width(12)
+	role := roleStyle.Render(agentDisplayName(a.Role))
+
+	if !a.CacheCapable {
+		dim := lipgloss.NewStyle().Foreground(colorDim).Italic(true)
+		_ = width
+		return role + dim.Render("未启用")
+	}
+
+	// 稳态命中率优先；窗内无样本时回落到累计。
+	hit := cacheHitRate(a.RecentCacheRead, a.RecentInput)
+	if a.RecentSamples == 0 || a.RecentInput == 0 {
+		hit = cacheHitRate(a.CacheRead, a.Input)
+	}
+	// 百分比固定 4 列宽（"100%"），避免读量列在 "5%" 与 "85%" 之间左右跳。
+	pctCell := lipgloss.NewStyle().Width(4).
+		Render(colorPercent(hit))
+
+	read := lipgloss.NewStyle().Foreground(colorDim).
+		Render(" · " + formatTokensCompact(a.CacheRead))
+	_ = width
+	return role + pctCell + read
+}
+
+// cacheHitRate 在 input 已含 cacheRead 的语义下直接除得百分比。
+// input == 0 时返回 0，避免出现假命中。
+func cacheHitRate(cacheRead, input int) float64 {
+	if input <= 0 {
+		return 0
+	}
+	return float64(cacheRead) / float64(input) * 100
+}
+
+// cacheHitColor 命中率染色：≥50% 绿 / 20–50% 黄 / <20% 红。
+// 用与上下文使用率相反的方向：缓存命中率越高越健康。
+func cacheHitColor(percent float64) lipgloss.AdaptiveColor {
+	switch {
+	case percent >= 50:
+		return colorSuccess
+	case percent >= 20:
+		return colorReview
+	default:
+		return colorError
+	}
+}
+
+func formatPercent(p float64) string {
+	if p <= 0 {
+		return "0%"
+	}
+	if p < 10 {
+		return fmt.Sprintf("%.1f%%", p)
+	}
+	return fmt.Sprintf("%.0f%%", p)
+}
+
+// formatTokensCompact 把 token 数渲染成 "8.2k" / "1.4M" 这种紧凑形式。
+// 用于狭窄的 per-role 行，避免和 formatNumber 的逗号风格挤出去。
+func formatTokensCompact(n int) string {
+	if n <= 0 {
+		return "0"
+	}
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+	if n >= 1000 {
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	}
+	return fmt.Sprintf("%d", n)
 }
 
 func renderContextSidebar(snap host.UISnapshot, width int) string {
