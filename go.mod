@@ -9,6 +9,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/voocel/agentcore v1.6.8
 	github.com/voocel/litellm v1.6.10
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

@@ -13,6 +13,7 @@ import (
 	"github.com/voocel/ainovel-cli/internal/agents/ctxpack"
 	"github.com/voocel/ainovel-cli/internal/bootstrap"
 	"github.com/voocel/ainovel-cli/internal/host/reminder"
+	"github.com/voocel/ainovel-cli/internal/rules"
 	"github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/tools"
 )
@@ -42,7 +43,8 @@ func BuildCoordinator(
 	recordUsage UsageRecorder,
 ) (*agentcore.Agent, *tools.AskUserTool, *ctxpack.WriterRestorePack, *corecontext.ContextEngine) {
 	// 共享工具
-	contextTool := tools.NewContextTool(store, bundle.References, cfg.Style)
+	rulesOpts := rules.DefaultOptions(bundle.RulesFS, cfg.OutputDir)
+	contextTool := tools.NewContextTool(store, bundle.References, cfg.Style, rulesOpts)
 	readChapter := tools.NewReadChapterTool(store)
 	askUser := tools.NewAskUserTool()
 
@@ -57,7 +59,7 @@ func BuildCoordinator(
 		tools.NewDraftChapterTool(store),
 		tools.NewEditChapterTool(store),
 		tools.NewCheckConsistencyTool(store),
-		tools.NewCommitChapterTool(store),
+		tools.NewCommitChapterTool(store).WithRules(rulesOpts),
 	}
 	editorTools := []agentcore.Tool{
 		contextTool,

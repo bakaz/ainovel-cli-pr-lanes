@@ -20,6 +20,7 @@ import (
 	"github.com/voocel/ainovel-cli/internal/host/flow"
 	"github.com/voocel/ainovel-cli/internal/host/imp"
 	modelreg "github.com/voocel/ainovel-cli/internal/models"
+	"github.com/voocel/ainovel-cli/internal/rules"
 	storepkg "github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/tools"
 )
@@ -750,9 +751,10 @@ func (h *Host) ImportFrom(ctx context.Context, opts imp.Options) (<-chan imp.Eve
 	}
 	h.mu.Unlock()
 
+	rulesOpts := rules.DefaultOptions(h.bundle.RulesFS, h.cfg.OutputDir)
 	deps := imp.Deps{
 		Store:      h.store,
-		CommitTool: tools.NewCommitChapterTool(h.store),
+		CommitTool: tools.NewCommitChapterTool(h.store).WithRules(rulesOpts),
 		LLM:        h.models.ForRole("architect"),
 		Prompts: imp.Prompts{
 			Foundation: h.bundle.Prompts.ImportFoundation,

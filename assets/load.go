@@ -3,6 +3,7 @@ package assets
 import (
 	"embed"
 	"fmt"
+	"io/fs"
 	"strings"
 
 	"github.com/voocel/ainovel-cli/internal/tools"
@@ -16,6 +17,9 @@ var referencesFS embed.FS
 
 //go:embed styles/*.md
 var stylesFS embed.FS
+
+//go:embed rules
+var rulesFS embed.FS
 
 // Prompts 表示嵌入的提示词集合。
 type Prompts struct {
@@ -33,6 +37,9 @@ type Bundle struct {
 	References tools.References
 	Prompts    Prompts
 	Styles     map[string]string
+	// RulesFS 是 assets/rules 子树（包含 default.md 与 genres/）。
+	// 调用方传给 rules.Load 作为内置规则来源。
+	RulesFS fs.FS
 }
 
 // Load 返回指定风格对应的资源集合。
@@ -41,7 +48,18 @@ func Load(style string) Bundle {
 		References: loadReferences(style),
 		Prompts:    loadPrompts(),
 		Styles:     loadStyles(),
+		RulesFS:    loadRulesFS(),
 	}
+}
+
+// loadRulesFS 返回 assets/rules 的子文件系统；根目录直接包含 default.md 与 genres/。
+// fs.Sub 失败时（理论不应发生）返回 nil，rules.Load 据此跳过内置来源。
+func loadRulesFS() fs.FS {
+	sub, err := fs.Sub(rulesFS, "rules")
+	if err != nil {
+		return nil
+	}
+	return sub
 }
 
 func loadReferences(style string) tools.References {

@@ -11,16 +11,32 @@ import (
 	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/ainovel-cli/internal/apperr"
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/rules"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
 // CommitChapterTool 提交章节：加载正文 → 保存终稿 → 生成摘要 → 更新状态 → 更新进度。
 type CommitChapterTool struct {
-	store *store.Store
+	store     *store.Store
+	rulesOpts rules.LoadOptions // 可选；空 LoadOptions 时不产生 rule_violations
 }
 
 func NewCommitChapterTool(store *store.Store) *CommitChapterTool {
 	return &CommitChapterTool{store: store}
+}
+
+// WithRules 注入规则加载选项，使 commit_chapter 在返回 JSON 中附带 rule_violations。
+// 不调用此方法时 commit_chapter 行为不变（向后兼容，便于测试）。
+func (t *CommitChapterTool) WithRules(opts rules.LoadOptions) *CommitChapterTool {
+	t.rulesOpts = opts
+	return t
+}
+
+// commitOutput 在 domain.CommitResult 之上嵌入扩展字段，保持 domain 包不依赖 rules。
+// 由于嵌入字段会被 JSON marshaler 提升（promoted），序列化结果等同于扁平结构。
+type commitOutput struct {
+	domain.CommitResult
+	RuleViolations []rules.Violation `json:"rule_violations,omitempty"`
 }
 
 func (t *CommitChapterTool) Name() string { return "commit_chapter" }
@@ -320,7 +336,16 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 		return nil, apperr.Wrap(err, apperr.CodeStoreWriteFailed, "tools.commit_chapter.checkpoint", "checkpoint commit")
 	}
 
-	return json.Marshal(result)
+	// 11. 机械规则检查（仅返事实，不阻断；rulesOpts 未配置时返 nil）
+	violations := t.checkRules(content, wordCount)
+	return json.Marshal(commitOutput{CommitResult: result, RuleViolations: violations})
+}
+
+// checkRules 加载用户规则并对给定章节正文做机械检查。
+// rulesOpts 全空时 loader 返回空 layers，checker 返 nil，整体零开销。
+func (t *CommitChapterTool) checkRules(text string, wordCount int) []rules.Violation {
+	bundle := rules.Merge(rules.Load(t.rulesOpts))
+	return rules.Check(text, wordCount, bundle.Structured)
 }
 
 // executeRewriteCommit 处理打磨/重写章节的提交：覆盖终稿与摘要、更新字数、drain 队列。
@@ -411,6 +436,8 @@ func (t *CommitChapterTool) executeRewriteCommit(
 	}
 	drained := len(remaining) == 0
 
+	// 同主路径：rewrite/polish 也做机械检查并附 rule_violations
+	violations := t.checkRules(content, wordCount)
 	return json.Marshal(map[string]any{
 		"chapter":         chapter,
 		"rewritten":       true,
@@ -420,6 +447,7 @@ func (t *CommitChapterTool) executeRewriteCommit(
 		"queue_drained":   drained,
 		"next_chapter":    nextChapter,
 		"flow":            flow,
+		"rule_violations": violations,
 	})
 }
 

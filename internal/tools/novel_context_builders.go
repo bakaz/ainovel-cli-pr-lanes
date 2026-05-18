@@ -1,6 +1,9 @@
 package tools
 
-import "github.com/voocel/ainovel-cli/internal/domain"
+import (
+	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/rules"
+)
 
 type contextBuildState struct {
 	chapter         int
@@ -104,6 +107,29 @@ func (t *ContextTool) buildProgressStatus(result map[string]any) {
 		status["finished"] = true
 	}
 	result["progress_status"] = status
+}
+
+// buildUserRules 把合并后的 Bundle 注入 working_memory.user_rules（canonical 路径）。
+//
+// 单点注入：writer / editor / architect / coordinator 任一路径调用 novel_context
+// 都能在 working_memory.user_rules 拿到一致的偏好。architect 路径原本没有 working_memory，
+// 由本函数按需新建（仅装 user_rules）；chapter > 0 路径下 working_memory 已存在，直接嵌入。
+//
+// 即便 Bundle 为空也注入，保持字段稳定，避免 LLM 看到 user_rules=null 而走异常分支。
+func (t *ContextTool) buildUserRules(result map[string]any) {
+	bundle := rules.Merge(rules.Load(t.rulesOpts))
+	payload := map[string]any{
+		"structured":  bundle.Structured,
+		"preferences": bundle.Preferences,
+		"sources":     bundle.Sources,
+		"conflicts":   bundle.Conflicts,
+	}
+	working, ok := result["working_memory"].(map[string]any)
+	if !ok {
+		working = map[string]any{}
+		result["working_memory"] = working
+	}
+	working["user_rules"] = payload
 }
 
 func (t *ContextTool) buildBaseContext(result map[string]any, warn func(string, error)) {

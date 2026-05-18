@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/rules"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -26,7 +27,7 @@ func TestContextToolReportsWarningsForCorruptedState(t *testing.T) {
 		t.Fatalf("write progress.json: %v", err)
 	}
 
-	tool := NewContextTool(store, References{}, "default")
+	tool := NewContextTool(store, References{}, "default", rules.LoadOptions{})
 	args, err := json.Marshal(map[string]any{"chapter": 2})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
@@ -166,7 +167,7 @@ func TestContextToolChapterModeIncludesWorkingAndReferenceFields(t *testing.T) {
 		Consistency:      "一致性检查",
 		HookTechniques:   "钩子技巧",
 		QualityChecklist: "质量清单",
-	}, "default")
+	}, "default", rules.LoadOptions{})
 	args, err := json.Marshal(map[string]any{"chapter": 2})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
@@ -304,7 +305,7 @@ func TestContextToolArchitectModeIncludesPlanningAndFoundation(t *testing.T) {
 		OutlineTemplate:   "大纲模板",
 		CharacterTemplate: "角色模板",
 		LongformPlanning:  "长篇规划",
-	}, "default")
+	}, "default", rules.LoadOptions{})
 	args, err := json.Marshal(map[string]any{})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
@@ -422,7 +423,7 @@ func TestContextToolSelectedMemoryRecallsStoryThreadsAndReviewLessons(t *testing
 		t.Fatalf("SaveReview: %v", err)
 	}
 
-	tool := NewContextTool(s, References{}, "default")
+	tool := NewContextTool(s, References{}, "default", rules.LoadOptions{})
 	args, err := json.Marshal(map[string]any{"chapter": 2})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
@@ -496,7 +497,7 @@ func TestContextToolSelectedMemoryIncludesGlobalReviewLessons(t *testing.T) {
 		t.Fatalf("SaveReview(global): %v", err)
 	}
 
-	tool := NewContextTool(s, References{}, "default")
+	tool := NewContextTool(s, References{}, "default", rules.LoadOptions{})
 	args, err := json.Marshal(map[string]any{"chapter": 2})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
@@ -541,7 +542,7 @@ func TestContextToolKeepsFullForeshadowWhenRecallNotTriggered(t *testing.T) {
 		t.Fatalf("SaveForeshadowLedger: %v", err)
 	}
 
-	tool := NewContextTool(s, References{}, "default")
+	tool := NewContextTool(s, References{}, "default", rules.LoadOptions{})
 	args, err := json.Marshal(map[string]any{"chapter": 2})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
@@ -589,7 +590,7 @@ func TestContextToolFallsBackToFullForeshadowWhenSelectionIsTooSparse(t *testing
 		t.Fatalf("SaveForeshadowLedger: %v", err)
 	}
 
-	tool := NewContextTool(s, References{}, "default")
+	tool := NewContextTool(s, References{}, "default", rules.LoadOptions{})
 	args, err := json.Marshal(map[string]any{"chapter": 2})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)

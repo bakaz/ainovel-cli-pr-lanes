@@ -84,6 +84,32 @@
 - **情感打动力**：是否有让读者心跳加速、喉头发紧或嘴角上扬的段落？
   如果整章情感平淡，指出最该加强的 1-2 个位置和建议手法（如延迟揭示、感官特写、节奏突变）
 
+### 3b. 用户规则（user_rules）
+
+`novel_context` 返回的 `working_memory.user_rules` 是用户对本书的偏好：
+
+- **`structured`**：机械可检字段（chapter_words / forbidden_chars / forbidden_phrases / fatigue_words / genre）
+- **`preferences`**：合并后的 Markdown 偏好正文（带来源标题）
+- **`sources`** / **`conflicts`**：来源链与异常清单（如有冲突需在 review 中说明）
+
+`commit_chapter` 已对结构化字段做了机械检查，结果在该工具返回的 `rule_violations` 数组中。审阅时按以下规则把违规事实映射进现有七维评审，**不新增第八维**：
+
+| violation.rule | 归到哪一维 | 处理建议 |
+|---|---|---|
+| `forbidden_chars` | aesthetic | severity=error → 至少 issue 一条，verdict 升级 polish |
+| `forbidden_phrases` | aesthetic | 同上 |
+| `fatigue_words` | aesthetic | severity=warning → issue 一条，evidence 引用原文 |
+| `chapter_words` | pacing | severity=error → polish/rewrite；warning → 视情况 |
+
+`preferences` 自然语言里的偏好按语义归类：
+
+- 人设偏好（"主角不傲娇"、"配角口吻"）→ **character**
+- 世界/设定偏好（"修炼境界顺序"、"灵根设定"）→ **consistency**
+- 风格偏好（"避免分析报告式"、"对话区分度"）→ **aesthetic**
+- 节奏/字数偏好 → **pacing**
+
+判定规则不变：accept / polish / rewrite 由现有 verdict 标准决定。机械违规只是事实，最终是否触发返工由整体审美判断决定。
+
 ### 4. 输出审阅
 
 调用 save_review，给出：

@@ -1,0 +1,79 @@
+---
+# 题材：非空时自动加载 assets/rules/genres/<genre>.md
+# Phase 1 内置仅占位，自定义题材包留到 Phase 3。
+genre: xianxia
+
+# 章节字数范围（min-max）。偏差 < 20% 报 warning；≥ 20% 报 error。
+chapter_words: 3000-6000
+
+# 字符/符号黑名单。出现 ≥ 1 次即 error。
+# 注意：中文双破折号是两个 em-dash 字符；写 "——" 匹配双个，写 "—" 匹配单个。
+forbidden_chars:
+  - "——"
+
+# 短语黑名单。出现 ≥ 1 次即 error。
+forbidden_phrases:
+  - "不是……而是"
+  - "核心动机"
+
+# 疲劳词阈值：本章超过 N 次才 warning（不跨章累计）。
+# 同时支持 list 形式：- 不禁  - 竟然  ← 默认阈值 1
+fatigue_words:
+  不禁: 1
+  竟然: 1
+  仿佛: 2
+---
+
+# 风格
+
+- 严禁破折号代替逗号；对话被打断的情况可保留。
+- 避免分析报告式表达（"核心矛盾在于……"），改用人物动作与对白。
+- 尽量多用身体感知（胃部痉挛、指节发白）替代情绪标签（紧张、愤怒）。
+
+# 角色
+
+- 主角"林尘"：性格冷静克制，外冷内热；不要写成傲娇也不要写成圣母。
+- 配角"师妹"：对主角有未明说的好感但克制；说话偏简短，不喋喋不休。
+
+# 设定
+
+- 修炼境界：练气 → 筑基 → 金丹 → 元婴 → 化神，每境九层。
+- 灵根分五行，主角是混沌灵根（极罕见）。
+
+# 偏好正文的语义提示
+
+Markdown 正文里的偏好由 editor 在审阅时语义判断，没有严格度字段：
+
+- **严禁/不准/绝不** — editor 倾向把违反者归 critical，触发 rewrite
+- **避免/不要** — editor 倾向 error/warning
+- **尽量/最好** — editor 仅作为参考偏好，不强制
+
+机械规则（front matter）由 commit_chapter 强制检查并返 rule_violations；
+自然语言规则（这段 Markdown）由 editor LLM 判断并映射到现有七维评审。
+
+# 使用说明
+
+把本文件复制为项目根的 `rules.md` 后即生效：
+
+```bash
+cp rules.md.example rules.md
+# 编辑 rules.md 改成你的偏好
+```
+
+加载优先级（高 → 低）：
+1. `./rules.md`（**当前工作目录规则**，绑定 cwd 而非 outputDir）
+2. `output/<novel>/meta/rules.learned.md`（Phase 2 系统学习的偏好，绑定具体小说）
+3. `~/.ainovel/rules.md`（你的全局偏好，跨书复用）
+4. `assets/rules/genres/<genre>.md`（题材内置规则）
+5. `assets/rules/default.md`（项目默认）
+
+多来源声明同一字段且值不一致时，**就近优先**且写入 `conflicts` 让 editor 可见。
+
+## 多本书并行的注意事项
+
+`./rules.md` 绑定 **当前工作目录**，不绑定小说输出目录。这意味着：
+
+- ✅ 推荐：每本书 cd 到独立目录启动（`cd works/xiyou && ainovel-cli` / `cd works/honglou && ainovel-cli`）— 每本书的 `./rules.md` 独立
+- ⚠️ 边缘：从同一 cwd 用 `-o output/xiyou` / `-o output/honglou` 切换两本书 — 这两本书会共享同一份 `./rules.md`
+
+如需"严格本书隔离"且不想换 cwd，把偏好放 `~/.ainovel/rules.md` 全局层，让所有书共享一套用户偏好。Phase 2 的 `rules.learned.md` 会写到 `output/<novel>/meta/`，跟具体小说绑定。
