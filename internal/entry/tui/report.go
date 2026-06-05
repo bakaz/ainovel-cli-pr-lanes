@@ -162,7 +162,7 @@ func renderReportText(report diag.Report, width int, startedAt, finishedAt time.
 		actionStyle := lipgloss.NewStyle().Foreground(colorSuccess)
 		for _, a := range report.Actions {
 			b.WriteString("\n")
-			b.WriteString(actionStyle.Render("["+string(a.Kind)+"]"))
+			b.WriteString(actionStyle.Render("[" + string(a.Kind) + "]"))
 			b.WriteString(" ")
 			b.WriteString(a.Summary)
 			b.WriteString("\n")
@@ -288,10 +288,9 @@ func wrapText(s string, maxWidth int) string {
 	if maxWidth <= 0 || lipgloss.Width(s) <= maxWidth {
 		return s
 	}
-	runes := []rune(s)
 	var b strings.Builder
 	lineW := 0
-	for _, r := range runes {
+	for _, r := range s {
 		w := lipgloss.Width(string(r))
 		if lineW+w > maxWidth && lineW > 0 {
 			b.WriteRune('\n')

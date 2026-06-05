@@ -62,4 +62,3 @@ func NewStopGuard(st *store.Store, onBlock func(reason string, consecutive int32
 		return agentcore.StopDecision{Allow: false, InjectMessage: inject}
 	}
 }
-

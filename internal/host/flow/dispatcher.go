@@ -35,8 +35,7 @@ func NewDispatcher(coordinator *agentcore.Agent, store *storepkg.Store) *Dispatc
 
 // Enable 打开路由派发；关闭时 EventToolExecEnd 到达不会发 FollowUp。
 // Host 在 Start/Resume 完成首条 prompt 之后启用，避免与启动流程冲突。
-func (d *Dispatcher) Enable()  { d.enabled.Store(true) }
-func (d *Dispatcher) Disable() { d.enabled.Store(false) }
+func (d *Dispatcher) Enable() { d.enabled.Store(true) }
 
 // Attach 订阅 Coordinator 事件；返回的函数在关闭时调用以解绑。
 func (d *Dispatcher) Attach() func() {

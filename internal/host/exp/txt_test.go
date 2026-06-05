@@ -52,7 +52,7 @@ func TestBuildLocations(t *testing.T) {
 	volumes := []domain.VolumeOutline{
 		{Index: 1, Title: "起源", Arcs: []domain.ArcOutline{
 			{Index: 1, Title: "少年初登场", Chapters: []domain.OutlineEntry{{}, {}}}, // 2 章
-			{Index: 2, Title: "宗门试炼", Chapters: []domain.OutlineEntry{{}}},        // 1 章
+			{Index: 2, Title: "宗门试炼", Chapters: []domain.OutlineEntry{{}}},      // 1 章
 		}},
 		{Index: 2, Title: "崛起", Arcs: []domain.ArcOutline{
 			{Index: 1, Title: "初战", Chapters: []domain.OutlineEntry{{}}},

@@ -1206,7 +1206,7 @@ var sparkleFrames = []string{
 }
 
 func renderEventSparkle(frame, width int) string {
-	pattern := []rune(sparkleFrames[frame%len(sparkleFrames)])
+	pattern := sparkleFrames[frame%len(sparkleFrames)]
 
 	var b strings.Builder
 	for _, ch := range pattern {

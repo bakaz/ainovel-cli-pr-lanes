@@ -63,10 +63,7 @@ func (pc ProviderConfig) RequiresAPIKey(name string) bool {
 	case "ollama", "bedrock":
 		return false
 	}
-	if pc.Type != "" {
-		return false
-	}
-	return true
+	return pc.Type == ""
 }
 
 // ProviderType 返回有效的 API 协议类型。
