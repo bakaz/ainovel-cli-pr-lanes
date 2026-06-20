@@ -5,7 +5,7 @@
 # 当前仍由 writer.md / editor.md 承载，待 Phase 1.5（F1 手测验证
 # working_memory 约束力后）再决定是否搬入本文件。
 #
-# 用户可在项目根 ./rules.md 或 ~/.ainovel/rules/ 目录（其下任意 .md）覆盖普通字段；
+# 用户可在 ./.ainovel/rules/ 或 ~/.ainovel/rules/ 目录（其下任意 .md）覆盖普通字段；
 # fatigue_words 按词合并，同一词由更近来源覆盖阈值。
 # 详细字段语义参见项目根 rules.md.example。
 
@@ -15,7 +15,7 @@ chapter_words: 3000-6000
 # 短语黑名单：出现 ≥1 次即 error。checker 做字面子串匹配，无通配符，
 # 故只放"定长固定串"的 AI 套句（低争议）；带变量的模式（如"不是X而是Y"）
 # 字面匹配抓不到，归 anti-ai-tone.md 语义层。
-# 破折号 "——" 在对话被打断时合法，有争议，不进内置默认，留给 ./rules.md 自配。
+# 破折号 "——" 在对话被打断时合法，有争议，不进内置默认，留给 ./.ainovel/rules/ 自配。
 forbidden_phrases:
   - "某种程度上"
   - "值得注意的是"

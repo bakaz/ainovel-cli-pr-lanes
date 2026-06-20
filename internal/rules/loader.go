@@ -20,8 +20,8 @@ type LoadOptions struct {
 	// HomeRulesDir 是 ~/.ainovel/rules/ 目录；loader 扫描其下所有顶层 .md（文件名字典序合并）。空表示跳过。
 	HomeRulesDir string
 
-	// ProjectRulesPath 是 ./rules.md（或调用方指定的项目根）；空表示跳过。
-	ProjectRulesPath string
+	// ProjectRulesDir 是 ./.ainovel/rules/ 目录（镜像全局，同样扫描其下所有顶层 .md）。空表示跳过。
+	ProjectRulesDir string
 }
 
 // Load 按 Default → Global → Project 顺序读取，返回升序排好的 Parsed 列表。
@@ -34,9 +34,7 @@ func Load(opts LoadOptions) []Parsed {
 		layers = append(layers, p)
 	}
 	layers = append(layers, readDirFromDisk(opts.HomeRulesDir, SourceGlobal)...)
-	if p, ok := readFromDisk(opts.ProjectRulesPath, SourceProject); ok {
-		layers = append(layers, p)
-	}
+	layers = append(layers, readDirFromDisk(opts.ProjectRulesDir, SourceProject)...)
 	return layers
 }
 
@@ -133,13 +131,17 @@ func readDirFromDisk(dir string, kind SourceKind) []Parsed {
 	return out
 }
 
-// DefaultProjectRulesPath 拼出 ./rules.md 的绝对路径（基于给定项目目录）。
-// 调用方传入项目根，避免在 loader 内部依赖 cwd。
-func DefaultProjectRulesPath(projectDir string) string {
+// ainovelDirName 是 ainovel 在 user / project 两级共用的 dotdir 名。
+// 全局 ~/.ainovel/rules/ 与项目 ./.ainovel/rules/ 由此对称。
+const ainovelDirName = ".ainovel"
+
+// DefaultProjectRulesDir 拼出 ./.ainovel/rules/ 的绝对路径（基于给定项目目录）。
+// 调用方传入项目根，避免在 loader 内部依赖 cwd；镜像 DefaultHomeRulesDir。
+func DefaultProjectRulesDir(projectDir string) string {
 	if projectDir == "" {
 		return ""
 	}
-	return filepath.Join(projectDir, "rules.md")
+	return filepath.Join(projectDir, ainovelDirName, "rules")
 }
 
 // DefaultHomeRulesDir 拼出 ~/.ainovel/rules/ 目录的绝对路径。
@@ -149,7 +151,7 @@ func DefaultHomeRulesDir() string {
 	if err != nil || home == "" {
 		return ""
 	}
-	return filepath.Join(home, ".ainovel", "rules")
+	return filepath.Join(home, ainovelDirName, "rules")
 }
 
 // homeRulesReadme 是首次引导时写入 ~/.ainovel/rules/README.txt 的说明。
@@ -180,7 +182,7 @@ const homeRulesReadme = `这里放全局写作偏好，跨所有书生效。
 
 不写也没关系：常见 AI 套句、疲劳词的机械基线已内置，开箱即用。
 
-加载优先级（高 → 低）：./rules.md（本书） > ~/.ainovel/rules/*.md（这里） > 内置默认
+加载优先级（高 → 低）：./.ainovel/rules/*.md（本书） > ~/.ainovel/rules/*.md（这里） > 内置默认
 `
 
 // EnsureHomeRulesDir 尽力创建 ~/.ainovel/rules/ 目录并写入 README.txt 引导，
@@ -208,16 +210,16 @@ func ensureRulesDirAt(dir string) error {
 // DefaultOptions 根据当前工作目录构造常用 LoadOptions。
 //
 // 适合 Host 启动时调用一次，让 ContextTool / CommitChapterTool 复用同一份配置。
-// 解析 cwd 失败时 ProjectRulesPath 留空（loader 会跳过该来源）。
+// 解析 cwd 失败时 ProjectRulesDir 留空（loader 会跳过该来源）。
 //
-// 路径语义：ProjectRulesPath 绑定 **当前工作目录（cwd）** 而非 outputDir。
-// 用户 cd 到不同目录启动写不同的书，./rules.md 自然跟着 cwd 走；如需跨书共享，
+// 路径语义：ProjectRulesDir 绑定 **当前工作目录（cwd）** 而非 outputDir。
+// 用户 cd 到不同目录启动写不同的书，./.ainovel/rules/ 自然跟着 cwd 走；如需跨书共享，
 // 放 ~/.ainovel/rules/ 全局目录即可（其下所有 .md 都会被加载）。
 func DefaultOptions(rulesFS fs.FS) LoadOptions {
 	cwd, _ := os.Getwd()
 	return LoadOptions{
-		RulesFS:          rulesFS,
-		HomeRulesDir:     DefaultHomeRulesDir(),
-		ProjectRulesPath: DefaultProjectRulesPath(cwd),
+		RulesFS:         rulesFS,
+		HomeRulesDir:    DefaultHomeRulesDir(),
+		ProjectRulesDir: DefaultProjectRulesDir(cwd),
 	}
 }

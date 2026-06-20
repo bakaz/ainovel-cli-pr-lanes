@@ -181,7 +181,7 @@ func (c *Config) ValidateBase() error {
 	// 默认 provider 必须有凭证
 	pc, ok := c.Providers[c.Provider]
 	if !ok {
-		return fmt.Errorf("provider %q 未在 providers 中配置凭证；若在 ./ainovel.json 里覆盖了 provider，需同时声明 providers.%s（含 api_key/base_url），不能只改顶层 provider: %w", c.Provider, c.Provider, errs.ErrConfig)
+		return fmt.Errorf("provider %q 未在 providers 中配置凭证；若在 ./.ainovel/config.json 里覆盖了 provider，需同时声明 providers.%s（含 api_key/base_url），不能只改顶层 provider: %w", c.Provider, c.Provider, errs.ErrConfig)
 	}
 	if pc.RequiresAPIKey(c.Provider) && pc.APIKey == "" {
 		return fmt.Errorf("provider %q has no api_key configured: %w", c.Provider, errs.ErrConfig)

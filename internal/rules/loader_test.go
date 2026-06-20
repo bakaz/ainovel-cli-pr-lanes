@@ -18,18 +18,21 @@ func TestLoad_ThreeLayers(t *testing.T) {
 	if err := os.MkdirAll(globalDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	projectPath := filepath.Join(tmp, "rules.md")
+	projectDir := filepath.Join(tmp, "project-rules")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(globalDir, "global.md"), []byte("---\nforbidden_chars:\n  - \"——\"\n---\n# 全局偏好\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(projectPath, []byte("---\nchapter_words: 4000-8000\n---\n# 项目偏好\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(projectDir, "project.md"), []byte("---\nchapter_words: 4000-8000\n---\n# 项目偏好\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	layers := Load(LoadOptions{
-		RulesFS:          rulesFS,
-		HomeRulesDir:     globalDir,
-		ProjectRulesPath: projectPath,
+		RulesFS:         rulesFS,
+		HomeRulesDir:    globalDir,
+		ProjectRulesDir: projectDir,
 	})
 
 	if len(layers) != 3 {
@@ -63,14 +66,17 @@ func TestLoad_GenreFieldIsPassThrough(t *testing.T) {
 		"genres/xianxia.md": {Data: []byte("---\nforbidden_chars:\n  - \"——\"\n---\n")},
 	}
 	tmp := t.TempDir()
-	projectPath := filepath.Join(tmp, "rules.md")
-	if err := os.WriteFile(projectPath, []byte("---\ngenre: xianxia\n---\n"), 0644); err != nil {
+	projectDir := filepath.Join(tmp, "project-rules")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "project.md"), []byte("---\ngenre: xianxia\n---\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	layers := Load(LoadOptions{
-		RulesFS:          rulesFS,
-		ProjectRulesPath: projectPath,
+		RulesFS:         rulesFS,
+		ProjectRulesDir: projectDir,
 	})
 
 	// 期望仅 default + project，无 genre 层
@@ -230,5 +236,47 @@ func TestEnsureRulesDirAt(t *testing.T) {
 	// README.txt 不被当规则(loader 只扫 .md)
 	if layers := Load(LoadOptions{HomeRulesDir: dir}); len(layers) != 0 {
 		t.Errorf("README.txt must not be loaded as a rule, got %d layers", len(layers))
+	}
+}
+
+// TestDefaultProjectRulesDir 锁死项目级规则目录镜像全局：./.ainovel/rules/。
+func TestDefaultProjectRulesDir(t *testing.T) {
+	proj := filepath.Join("/tmp", "demo-book")
+	want := filepath.Join(proj, ".ainovel", "rules")
+	if got := DefaultProjectRulesDir(proj); got != want {
+		t.Errorf("DefaultProjectRulesDir=%q, want %q", got, want)
+	}
+	if got := DefaultProjectRulesDir(""); got != "" {
+		t.Errorf("空项目根应返回空串，得到 %q", got)
+	}
+}
+
+// TestDefaultOptions_LoadsProjectRulesFromDotAinovel 端到端验证：
+// DefaultOptions 把 cwd 下的 ./.ainovel/rules/ 接进 SourceProject 来源。
+func TestDefaultOptions_LoadsProjectRulesFromDotAinovel(t *testing.T) {
+	proj := t.TempDir()
+	t.Chdir(proj)
+	rulesDir := filepath.Join(proj, ".ainovel", "rules")
+	if err := os.MkdirAll(rulesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rulesDir, "book.md"), []byte("---\nchapter_words: 4000-8000\n---\n# 本书偏好\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rulesFS := fstest.MapFS{"default.md": {Data: []byte("---\nchapter_words: 3000-6000\n---\n")}}
+	layers := Load(DefaultOptions(rulesFS))
+
+	var got *Parsed
+	for i := range layers {
+		if layers[i].Kind == SourceProject {
+			got = &layers[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("应从 ./.ainovel/rules/ 加载到项目规则层，得到 %+v", layers)
+	}
+	if b := Merge(layers); b.Structured.ChapterWords == nil || b.Structured.ChapterWords.Min != 4000 {
+		t.Errorf("项目规则应覆盖默认 chapter_words，得到 %+v", b.Structured.ChapterWords)
 	}
 }

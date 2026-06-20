@@ -30,7 +30,7 @@ func NeedsSetup(flagPath string) bool {
 			return false
 		}
 	}
-	if _, err := os.Stat("ainovel.json"); err == nil {
+	if _, err := os.Stat(projectConfigPath()); err == nil {
 		return false
 	}
 	return true

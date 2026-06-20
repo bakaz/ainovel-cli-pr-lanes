@@ -63,28 +63,29 @@ Markdown 正文里的偏好由 editor 在审阅时语义判断，没有严格度
 
 # 使用说明
 
-把本文件复制为项目根的 `rules.md` 后即生效：
+把本文件复制进项目级规则目录 `./.ainovel/rules/` 即生效（该目录镜像全局 `~/.ainovel/rules/`，同样放任意 `.md`）：
 
 ```bash
-cp rules.md.example rules.md
-# 编辑 rules.md 改成你的偏好
+mkdir -p .ainovel/rules
+cp rules.md.example .ainovel/rules/my-rules.md
+# 编辑 .ainovel/rules/my-rules.md 改成你的偏好
 ```
 
 加载优先级（高 → 低）三层：
 
-1. `./rules.md` — **本书规则**（绑定当前工作目录 cwd）
+1. `./.ainovel/rules/` 目录下任意 `.md` — **本书规则**（绑定当前工作目录 cwd，按文件名字典序合并）
 2. `~/.ainovel/rules/` 目录下任意 `.md` — **全局偏好**（跨书复用，按文件名字典序合并）
 3. `assets/rules/default.md` — **项目内置默认**（含去 AI 味机械基线；语义基线另在内置 `assets/references/anti-ai-tone.md`）
 
 多来源声明同一字段且值不一致时**就近优先**生效；`fatigue_words` 按词合并，同一词在多来源声明不同阈值时按就近优先。冲突写进内部诊断信息（不进 LLM 上下文，由 CLI 启动面板按需展示），不阻断加载。
 
-> 去 AI 味即此机制的一例：内置基线（机械 `default.md` + 语义 `anti-ai-tone.md`）兜底，你的 `rules.md` 叠加在其上——大白话正文写语义偏好（主路径），需要硬性禁词/字数检查时再可选加 front matter，零编译生效。
+> 去 AI 味即此机制的一例：内置基线（机械 `default.md` + 语义 `anti-ai-tone.md`）兜底，你的规则 `.md` 叠加在其上——大白话正文写语义偏好（主路径），需要硬性禁词/字数检查时再可选加 front matter，零编译生效。
 
 ## 多本书并行
 
-`./rules.md` 绑定 **当前工作目录**，不绑定小说输出目录：
+`./.ainovel/rules/` 绑定 **当前工作目录**，不绑定小说输出目录：
 
-- ✅ 推荐：每本书 cd 到独立目录启动（`cd works/xiyou && ainovel-cli` / `cd works/honglou && ainovel-cli`）— 每本书的 `./rules.md` 独立
-- ⚠️ 边缘：从同一 cwd 用 `-o output/xiyou` / `-o output/honglou` 切换两本书 — 这两本书会共享同一份 `./rules.md`
+- ✅ 推荐：每本书 cd 到独立目录启动（`cd works/xiyou && ainovel-cli` / `cd works/honglou && ainovel-cli`）— 每本书的 `./.ainovel/rules/` 独立
+- ⚠️ 边缘：从同一 cwd 用 `-o output/xiyou` / `-o output/honglou` 切换两本书 — 这两本书会共享同一份 `./.ainovel/rules/`
 
 如需"严格本书隔离"且不想换 cwd，把偏好放 `~/.ainovel/rules/` 全局目录，让所有书共享一套用户偏好。

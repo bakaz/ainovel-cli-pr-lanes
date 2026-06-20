@@ -241,8 +241,10 @@ ainovel-cli
 #### 配置文件查找顺序（后者覆盖前者）
 
 1. `~/.ainovel/config.json` — 全局配置
-2. `./ainovel.json` — 项目级覆盖（可选）
+2. `./.ainovel/config.json` — 项目级覆盖（可选）
 3. `--config path/to/config.json` — 命令行指定
+
+> 项目级 `.ainovel/` 是全局 `~/.ainovel/` 的镜像：同样的结构、只是根目录从家目录换成当前项目。配置放 `./.ainovel/config.json`，写作规则放 `./.ainovel/rules/*.md`（详见下文「去 AI 味与自定义规则」）。该目录含密钥，已默认加入 `.gitignore`。
 
 覆盖规则说明：
 
@@ -400,7 +402,7 @@ output/novel/meta/simulation_profile.json
 
 内置一份去 AI 味基线（`assets/` 下，出厂默认）：机械黑名单 `rules/default.md`（套句 / 疲劳词，commit 时确定性检查）+ 语义判据 `references/anti-ai-tone.md`（注入 writer / editor 规避与举证）。
 
-想叠加自己的偏好**无需改源码**：在 `~/.ainovel/rules/` 目录（全局，放任意 `.md`，按文件名字典序合并）或项目根 `./rules.md`（本书）里，**用大白话写偏好即可**（如「主角别写成圣母」「多用身体感知」），editor 会按语义审阅——零格式、零 YAML。想要「字数 / 禁词」这类硬性确定检查，再**可选地**在文件顶部加一段 front matter。就近覆盖、与内置基线叠加生效；完整字段见 [`rules.md.example`](rules.md.example)。
+想叠加自己的偏好**无需改源码**：在 `~/.ainovel/rules/` 目录（全局，放任意 `.md`，按文件名字典序合并）或 `./.ainovel/rules/` 目录（本书，同样放任意 `.md`，与全局同形态）里，**用大白话写偏好即可**（如「主角别写成圣母」「多用身体感知」），editor 会按语义审阅——零格式、零 YAML。想要「字数 / 禁词」这类硬性确定检查，再**可选地**在文件顶部加一段 front matter。就近覆盖、与内置基线叠加生效；完整字段见 [`rules.md.example`](rules.md.example)。
 
 ## 输出结构
 
