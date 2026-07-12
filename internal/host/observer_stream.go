@@ -63,32 +63,6 @@ func (o *observer) handleSubagentDelta(p *agentcore.ProgressPayload) {
 	}
 }
 
-func (o *observer) handleCoordinatorToolDelta(ev agentcore.Event) {
-	msg, ok := ev.Message.(agentcore.Message)
-	if !ok {
-		return
-	}
-	call, ok := latestToolCall(msg)
-	if !ok || call.Name == "" {
-		return
-	}
-	if call.Name == "subagent" {
-		o.ensureCoordinatorDispatchStarted(call)
-		o.updateCoordinatorDispatchSummaryFromDelta(ev.Delta)
-		return
-	}
-	o.ensureCoordinatorToolStarted(call.Name)
-	o.updateToolCallSummaryFromDelta("coordinator", call.Name, ev.Delta)
-}
-
-func latestToolCall(msg agentcore.Message) (agentcore.ToolCall, bool) {
-	calls := msg.ToolCalls()
-	if len(calls) == 0 {
-		return agentcore.ToolCall{}, false
-	}
-	return calls[len(calls)-1], true
-}
-
 func (o *observer) emitStreamDelta(delta string, thinking bool) {
 	if delta == "" {
 		return

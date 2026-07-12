@@ -30,9 +30,9 @@ func TestBuildSnapshot_EmptyAndZeroAreAbsent(t *testing.T) {
 			ChapterWords: &WordRange{Min: 3000, Max: 6000},
 		}},
 		{Source: "startup_prompt", Structured: Structured{
-			Genre:            "",                       // 占位空串 → 不覆盖
+			Genre:            "",                         // 占位空串 → 不覆盖
 			ChapterWords:     &WordRange{Min: 0, Max: 0}, // 零值 → 不覆盖
-			ForbiddenPhrases: []string{"", "  "},        // 全空 → 丢弃
+			ForbiddenPhrases: []string{"", "  "},         // 全空 → 丢弃
 		}},
 	})
 	if snap.Structured.Genre != "修仙" {

@@ -631,10 +631,15 @@ func (m Model) handleStartResultMsg(msg startResultMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(fetchSnapshot(m.runtime), m.textarea.Focus())
 		}
 		if wasStarting {
-			m.mode = modeNew
+			// 回车后已经进入工作台；启动阶段的 LLM 错误就在当前工作台展示，
+			// 不再退回欢迎页。
+			m.mode = modeRunning
 			m.snapshot.IsRunning = false
-			m.textarea.Placeholder = placeholderForNewMode(m.startupMode)
-			return m, tea.Batch(fetchSnapshot(m.runtime), m.textarea.Focus(), tea.DisableMouse)
+			m.snapshot.RuntimeState = "idle"
+			m.textarea.Placeholder = "启动失败，请检查模型配置或使用 /model 切换模型"
+			m.refreshStreamViewport()
+			m.refreshStateViewport()
+			return m, m.textarea.Focus()
 		}
 		if m.mode == modeNew {
 			m.textarea.Placeholder = placeholderForNewMode(m.startupMode)

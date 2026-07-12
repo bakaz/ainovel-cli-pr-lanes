@@ -20,100 +20,6 @@ func newTestStore(t *testing.T) *store.Store {
 	return s
 }
 
-func TestStopGuard_AllowsStopOnlyWhenComplete(t *testing.T) {
-	s := newTestStore(t)
-	if err := s.Progress.Init("test", 3); err != nil {
-		t.Fatalf("init progress: %v", err)
-	}
-
-	guard := NewStopGuard(s, nil)
-
-	// 尚未 Complete：必须阻拦 + 注入
-	decision := guard(context.Background(), agentcore.StopInfo{TurnIndex: 1})
-	if decision.Allow {
-		t.Fatal("stop must be blocked before Phase=Complete")
-	}
-	if decision.InjectMessage == "" {
-		t.Fatal("inject message required when blocking")
-	}
-
-	// 转 Complete：放行
-	if err := s.Progress.UpdatePhase(domain.PhaseComplete); err != nil {
-		t.Fatalf("update phase: %v", err)
-	}
-	decision = guard(context.Background(), agentcore.StopInfo{TurnIndex: 2})
-	if !decision.Allow {
-		t.Fatal("stop must be allowed when Phase=Complete")
-	}
-}
-
-func TestStopGuard_EscalatesAfterTooManyConsecutiveBlocks(t *testing.T) {
-	s := newTestStore(t)
-	if err := s.Progress.Init("test", 3); err != nil {
-		t.Fatalf("init progress: %v", err)
-	}
-
-	var blocks []string
-	guard := NewStopGuard(s, func(agent, reason string, _ int32) {
-		if agent != "coordinator" {
-			t.Errorf("coordinator guard must report agent=coordinator, got %q", agent)
-		}
-		blocks = append(blocks, reason)
-	})
-
-	for i := 0; i < maxConsecutiveBlocks; i++ {
-		decision := guard(context.Background(), agentcore.StopInfo{TurnIndex: i})
-		if decision.Escalate {
-			t.Fatalf("escalated too early at iteration %d", i)
-		}
-	}
-	decision := guard(context.Background(), agentcore.StopInfo{TurnIndex: maxConsecutiveBlocks})
-	if !decision.Escalate {
-		t.Fatalf("expected escalate after %d consecutive blocks", maxConsecutiveBlocks+1)
-	}
-	if len(blocks) != maxConsecutiveBlocks+1 {
-		t.Fatalf("audit callback called %d times, want %d", len(blocks), maxConsecutiveBlocks+1)
-	}
-	if blocks[len(blocks)-1] != "escalated" {
-		t.Fatalf("last audit reason should be 'escalated', got %q", blocks[len(blocks)-1])
-	}
-}
-
-func TestStopGuard_DefaultBlockMessageWaitsForHost(t *testing.T) {
-	s := newTestStore(t)
-	if err := s.Progress.Init("test", 3); err != nil {
-		t.Fatalf("init progress: %v", err)
-	}
-	if err := s.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
-		t.Fatalf("update phase: %v", err)
-	}
-
-	decision := NewStopGuard(s, nil)(context.Background(), agentcore.StopInfo{TurnIndex: 1})
-	if !strings.Contains(decision.InjectMessage, "[Host 下达指令]") {
-		t.Fatalf("inject message should point to Host instruction, got %q", decision.InjectMessage)
-	}
-	for _, forbidden := range []string{"查 novel_context", "调子代理"} {
-		if strings.Contains(decision.InjectMessage, forbidden) {
-			t.Fatalf("inject message should not suggest freelance action %q: %q", forbidden, decision.InjectMessage)
-		}
-	}
-}
-
-func TestStopGuard_DefaultBlockMessageAllowsCoordinatorJudgmentWhenNoRoute(t *testing.T) {
-	s := newTestStore(t)
-	if err := s.Progress.Init("test", 3); err != nil {
-		t.Fatalf("init progress: %v", err)
-	}
-
-	decision := NewStopGuard(s, nil)(context.Background(), agentcore.StopInfo{TurnIndex: 1})
-	if strings.Contains(decision.InjectMessage, "[Host 下达指令]") {
-		t.Fatalf("no-route inject should not tell coordinator to wait for Host, got %q", decision.InjectMessage)
-	}
-	if !strings.Contains(decision.InjectMessage, "裁定场景") {
-		t.Fatalf("no-route inject should mention coordinator judgment, got %q", decision.InjectMessage)
-	}
-}
-
 // TestSubAgentGuard_HardStopReasonEscalatesImmediately 验证：模型返回
 // safety / content_filter 这类不可恢复的 provider 端拒答时，子代理 StopGuard
 // 必须立即 Escalate 而不是注入催促消息。
@@ -169,36 +75,6 @@ func TestSubAgentGuard_NormalStopStillBlocks(t *testing.T) {
 	}
 	if d.InjectMessage == "" {
 		t.Fatal("normal stop must inject a follow-up message")
-	}
-}
-
-// TestStopGuard_NonConsecutiveTurnResetsCounter 验证：两次 block 之间 TurnIndex
-// 不相邻（中间 LLM 做了 tool call 或用户 resume）时，consecutive 计数重置。
-func TestStopGuard_NonConsecutiveTurnResetsCounter(t *testing.T) {
-	s := newTestStore(t)
-	if err := s.Progress.Init("test", 3); err != nil {
-		t.Fatalf("init progress: %v", err)
-	}
-
-	guard := NewStopGuard(s, nil)
-
-	for i := 0; i < maxConsecutiveBlocks; i++ {
-		if d := guard(context.Background(), agentcore.StopInfo{TurnIndex: i}); d.Escalate {
-			t.Fatalf("escalated too early at iteration %d", i)
-		}
-	}
-
-	d := guard(context.Background(), agentcore.StopInfo{TurnIndex: maxConsecutiveBlocks + 10})
-	if d.Escalate {
-		t.Fatal("non-consecutive block must NOT escalate; counter should have been reset")
-	}
-	if d.Allow {
-		t.Fatal("stop must still be blocked when Phase != Complete")
-	}
-
-	d = guard(context.Background(), agentcore.StopInfo{TurnIndex: 1})
-	if d.Escalate {
-		t.Fatal("resume (TurnIndex backflow) must NOT escalate")
 	}
 }
 

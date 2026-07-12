@@ -81,7 +81,7 @@
 - **`preferences`**：合并后的 Markdown 偏好正文（带来源标题）
 - **`sources`** / **`conflicts`**：来源链与异常清单（如有冲突需在 review 中说明）
 
-`commit_chapter` 已对结构化字段做了机械检查，结果在该工具返回的 `rule_violations` 数组中。审阅时按以下规则把违规事实映射进现有七维评审，**不新增第八维**：
+`commit_chapter` 已对结构化字段做了机械检查并落盘，结果经 `novel_context(chapter=N)` 顶层的 `rule_violations` 数组提供（无违规时该字段缺省）。审阅时按以下规则把违规事实映射进现有七维评审，**不新增第八维**：
 
 | violation.rule | 归到哪一维 | 处理建议 |
 |---|---|---|

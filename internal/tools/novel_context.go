@@ -95,6 +95,11 @@ func (t *ContextTool) Execute(_ context.Context, args json.RawMessage) (json.Raw
 		state := t.prepareChapterContext(a.Chapter, &seed, warn)
 		seed.apply(result)
 		t.buildChapterContext(result, state, warn)
+		// 该章的机械违规事实(commit 时按 user_rules 检查并落盘):
+		// editor 评审据此映射进七维(editor.md §机械检查映射);writer 返工时自查。
+		if violations := t.store.World.LoadRuleViolations(a.Chapter); len(violations) > 0 {
+			result["rule_violations"] = violations
+		}
 		// 数据语义标注（治复读交代）：episodic 是已写入正文的备忘，不是待写素材。
 		// 只挂容器内，不进顶层镜像。
 		if epi, ok := result["episodic_memory"].(map[string]any); ok && len(epi) > 0 {

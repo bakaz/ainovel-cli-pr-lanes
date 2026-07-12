@@ -195,7 +195,7 @@ LLM 侧职责：
 - **能落盘就继续**：只要 `meta/user_rules.json` 能写入，主创作必须继续。
 - **只有落盘失败才中止**：快照无法写入磁盘时才中止，因为后续运行没有稳定事实源。
 
-`save_user_rules` 工具契约（运行中）：永远尽量返回规则事实；normalizer 失败时保存 degraded 快照、返回 `status=degraded`，**不把技术错误当作 tool error 抛给 Coordinator**（否则 JSON/schema/网络错误会污染主流程，本项目历史上这类污染引发过死循环）；只有落盘失败这类无法继续的问题才返回 tool error。
+`save_user_rules` 工具契约（运行中）：永远尽量返回规则事实；normalizer 失败时保存 degraded 快照、返回 `status=degraded`，**不把技术错误当作 tool error 上抛**（否则 JSON/schema/网络错误会污染主流程，本项目历史上这类污染引发过死循环）；只有落盘失败这类无法继续的问题才返回 error。（该工具壳现已随 Coordinator 退役,契约由 `AddRuntimeRule` 直调继承。）
 
 ## 系统默认规则
 
@@ -232,8 +232,8 @@ System defaults
 
 归一化、合并、落盘是同一套逻辑，但有两个调用方，必须分清，否则会把启动准备混进主创作上下文：
 
-- **开书 / 刷新（启动侧，确定性）**：由 Host / 启动流程直接调用这套逻辑生成初始快照，不经 Coordinator、不进主创作 Run。这是确定性的启动准备任务。
-- **运行中更新（Coordinator 工具）**：`save_user_rules` 是运行时工具壳，复用同一套校验 / 合并 / 落盘逻辑，把无进度起点的新规则作为 `Runtime user update` 合并进快照。
+- **开书 / 刷新（启动侧，确定性）**：由 Host / 启动流程直接调用这套逻辑生成初始快照，不进主创作循环。这是确定性的启动准备任务。
+- **运行中更新（干预裁定动作）**：Arbiter 分诊出的 `rules` 动作由 Host 直接调 `userrules.Service.AddRuntimeRule`，复用同一套校验 / 合并 / 落盘逻辑，把无进度起点的新规则作为 `Runtime user update` 合并进快照。
 
 （实现上建议把这套逻辑收敛成一个内部服务，两个调用方共用；具体命名留给实现。）
 
@@ -250,7 +250,7 @@ System defaults
 - 不静默吞掉非法字段（记录并降级，见 §失败与降级）。
 - 不把原始文本当成最终 prompt 直接注入。
 
-运行中更新示例：用户说“以后都怎样”（无进度起点）→ Coordinator 调 `save_user_rules` → 归一化该条 → 作为 `Runtime user update` 以最高优先级合并进快照 → Coordinator 基于返回事实做简短回显。
+运行中更新示例：用户说“以后都怎样”（无进度起点）→ Arbiter 裁定为 `rules` 动作 → Host 经 `AddRuntimeRule` 归一化该条 → 作为 `Runtime user update` 以最高优先级合并进快照 → 事件流回显。
 
 ## 回显
 
@@ -264,7 +264,7 @@ System defaults
 ```
 
 - 启动 / 刷新：复用现有启动规则日志能力打印快照，不新增机制；共创场景可把回显并入共创确认环节。
-- 运行中：调用 `save_user_rules` 后由 Coordinator 基于工具返回事实简短回显。
+- 运行中：`AddRuntimeRule` 成功后经事件流回显（"写作规则已更新并持久化"）。
 - 降级：`status=degraded` 时，回显明确说明哪些来源未能解析、当前已按 raw preferences 运行、可重新生成快照。
 
 回显不是二次审批闸门；它的作用是让用户知道系统理解成了什么，发现错误后可以重新生成快照。
@@ -296,7 +296,7 @@ Writer 不重新理解原始启动 prompt，也不读原始 rules 文件。
 
 判据：**“怎么写” → save_user_rules；“写什么” → architect；“改已写的” → editor**。
 
-> 早期曾有 `save_directive`（带 `at_chapter` 进度锚点）与 `save_user_rules` 并存。实践发现两者在自由文本偏好上重叠，而“带不带进度锚点”是道模糊分类题（多数运行中要求天然都是“从现在起”），徒增 Coordinator 分类负担并曾引路由问题。真正绑定剧情进度的需求本就该由 architect 承载，故 2026-06-28 砍掉 `save_directive`。这是有意的 breaking change：老书遗留的 `meta/user_directives.json` 不再读取、不迁移，书仍可恢复续写，但旧 directive 里的历史偏好不会继续生效。
+> 早期曾有 `save_directive`（带 `at_chapter` 进度锚点）与 `save_user_rules` 并存。实践发现两者在自由文本偏好上重叠，而“带不带进度锚点”是道模糊分类题（多数运行中要求天然都是“从现在起”），徒增分类负担并曾引路由问题。真正绑定剧情进度的需求本就该由 architect 承载，故 2026-06-28 砍掉 `save_directive`。这是有意的 breaking change：老书遗留的 `meta/user_directives.json` 不再读取、不迁移，书仍可恢复续写，但旧 directive 里的历史偏好不会继续生效。
 
 ## 老书处理
 
@@ -313,13 +313,13 @@ Writer 不重新理解原始启动 prompt，也不读原始 rules 文件。
 1. 新增 `meta/user_rules.json` store。
 2. 新增独立的 LLM 归一化 pass（按来源），使用 schema 约束输出候选 `structured/preferences/sources/uncertain`。
 3. 新增 Go 侧确定性合并：按优先级对各来源做字段覆盖与文本拼接，生成快照。
-4. 把归一化 / 合并 / 落盘收敛成一套逻辑，两个调用方共用：启动侧直接调用生成初始快照（不经 Coordinator）；新增 `save_user_rules` 运行时工具壳复用它（挂给 Coordinator）。失败时按 §失败与降级 处理：来源降级为 raw preferences、快照 `status=degraded`、主创作继续；`save_user_rules` 不向 Coordinator 抛技术 tool error。
+4. 把归一化 / 合并 / 落盘收敛成一套逻辑，两个调用方共用：启动侧直接调用生成初始快照；运行中由干预裁定的 `rules` 动作经 `AddRuntimeRule` 复用。失败时按 §失败与降级 处理：来源降级为 raw preferences、快照 `status=degraded`、主创作继续。
 5. 把当前 `assets/rules/default.md` 的系统默认机械规则迁到代码内置结构或 JSON asset，保留阈值来源注释；删除用户 rules 的 YAML 解析路径，不做兼容层。
 6. rules 文件读取后不再直接把正文当 prompt 注入，而是归一化后合并进 `user_rules` 快照。
 7. 无快照的老书首次启动时惰性生成快照，并回显来源。
 8. `novel_context` 只注入 `meta/user_rules.json` 中的 `working_memory.user_rules`。
 9. `commit_chapter` 使用同一份 `user_rules.structured` 检查。
-10. Coordinator prompt 明确按"要改什么"三类分流：写作风格 / 质量类长期要求先 `save_user_rules` 再规划或续写；剧情 / 结构 / 人物 / 篇幅走 architect；已写章节返工走 editor（详见 §干预分类：三类去向）。
+10. 干预分诊（现由 Arbiter 承担,arbiter-intervention.md）明确按"要改什么"三类分流：写作风格 / 质量类长期要求走 `rules` 动作落快照；剧情 / 结构 / 人物 / 篇幅走 architect；已写章节返工走 editor（详见 §干预分类：三类去向）。
 
 ## 验收标准
 
@@ -334,7 +334,7 @@ Writer 不重新理解原始启动 prompt，也不读原始 rules 文件。
 - 来源优先级与字段覆盖由 Go 确定性执行，相同输入产出相同快照。
 - 运行中用户说“以后都怎样”，经 `save_user_rules` 合并进快照，后续章节的 `novel_context` 能看到更新。
 - 归一化失败不阻断写书：失败来源降级为 raw preferences，快照 `status=degraded`，主创作继续；只有快照无法落盘才中止。
-- `save_user_rules` 遇 normalizer 失败返回 `status=degraded`，不向 Coordinator 抛技术 tool error。
+- 归一化失败返回 `status=degraded`，不把技术错误上抛污染主流程。
 - 生成或更新快照后会回显 `structured` / `preferences` / 未提升项；降级时回显说明降级来源。
 - 新开一本书不会继承上一本书的 `user_rules`。
 - 非法结构化字段不静默忽略：记录并降级该来源，不阻断主流程。

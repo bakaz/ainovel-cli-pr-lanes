@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/ainovel-cli/internal/domain"
@@ -165,6 +166,7 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 		result["volume"] = a.Volume
 		result["arc"] = a.Arc
 		result["chapters"] = len(chapters)
+		t.consumeWriterFeedback()
 
 	case "append_volume":
 		if p, _ := t.store.Progress.Load(); p != nil && p.Phase == domain.PhaseComplete {
@@ -193,6 +195,7 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 		if chCount > 0 {
 			result["chapters"] = chCount
 		}
+		t.consumeWriterFeedback()
 
 	case "complete_book":
 		// 全书完结的唯一入口：直接推 Phase=Complete。
@@ -232,6 +235,7 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 		}
 		result["ending_direction"] = compass.EndingDirection
 		result["last_updated"] = compass.LastUpdated
+		t.consumeWriterFeedback()
 
 	default:
 		return nil, fmt.Errorf("unknown type %q, expected premise/outline/layered_outline/characters/world_rules/expand_arc/append_volume/update_compass/complete_book: %w", a.Type, errs.ErrToolArgs)
@@ -338,4 +342,12 @@ func normalizeFoundationContent(raw json.RawMessage) (string, error) {
 func (t *SaveFoundationTool) isWriting() bool {
 	p, _ := t.store.Progress.Load()
 	return p != nil && p.Phase == domain.PhaseWriting
+}
+
+// consumeWriterFeedback 结构操作(expand_arc/append_volume/update_compass)成功
+// 即视为反馈池已被参考,清空防止陈旧反馈反复影响后续规划。best-effort。
+func (t *SaveFoundationTool) consumeWriterFeedback() {
+	if err := t.store.Outline.ClearOutlineFeedback(); err != nil {
+		slog.Warn("清空 writer 反馈池失败", "module", "tools", "err", err)
+	}
 }

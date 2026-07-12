@@ -38,7 +38,9 @@ func (t *ReopenBookTool) Description() string {
 func (t *ReopenBookTool) ReadOnly(_ json.RawMessage) bool        { return false }
 func (t *ReopenBookTool) ConcurrencySafe(_ json.RawMessage) bool { return false }
 
-func (t *ReopenBookTool) ActivityDescription(_ json.RawMessage) string { return "重新打开全书返工" }
+func (t *ReopenBookTool) ActivityDescription(_ json.RawMessage) string {
+	return "重新打开全书返工"
+}
 
 func (t *ReopenBookTool) Schema() map[string]any {
 	return schema.Object(

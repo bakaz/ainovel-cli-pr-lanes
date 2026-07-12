@@ -41,7 +41,9 @@ func (s *RunMetaStore) saveUnlocked(meta domain.RunMeta) error {
 	return s.io.WriteJSONUnlocked("meta/run.json", meta)
 }
 
-// Init 初始化或更新运行元信息，保留已有的 SteerHistory。
+// Init 初始化或更新运行元信息;跨重启保留全部运行意图事实——
+// PlanStart 尤其关键:规划期(启动裁定已落盘、首个 foundation 未落盘)崩溃后,
+// 它是恢复规划师身份的唯一依据,被 Init 覆盖会让恢复直接停机。
 func (s *RunMetaStore) Init(style, provider, model string) error {
 	return s.io.WithWriteLock(func() error {
 		existing, err := s.loadUnlocked()
@@ -55,27 +57,12 @@ func (s *RunMetaStore) Init(style, provider, model string) error {
 			Model:     model,
 		}
 		if existing != nil {
-			meta.SteerHistory = existing.SteerHistory
 			meta.PendingSteer = existing.PendingSteer
 			meta.PlanningTier = existing.PlanningTier
 			meta.PausePoint = existing.PausePoint
+			meta.PlanStart = existing.PlanStart
 		}
 		return s.saveUnlocked(meta)
-	})
-}
-
-// AppendSteerEntry 追加用户干预记录。
-func (s *RunMetaStore) AppendSteerEntry(entry domain.SteerEntry) error {
-	return s.io.WithWriteLock(func() error {
-		meta, err := s.loadUnlocked()
-		if err != nil {
-			return err
-		}
-		if meta == nil {
-			meta = &domain.RunMeta{}
-		}
-		meta.SteerHistory = append(meta.SteerHistory, entry)
-		return s.saveUnlocked(*meta)
 	})
 }
 
@@ -150,6 +137,21 @@ func (s *RunMetaStore) SetPlanningTier(tier domain.PlanningTier) error {
 			meta = &domain.RunMeta{}
 		}
 		meta.PlanningTier = tier
+		return s.saveUnlocked(*meta)
+	})
+}
+
+// SetPlanStart 固化启动裁定事实(裁定先落事实再起执行;规划期崩溃恢复据此续跑)。
+func (s *RunMetaStore) SetPlanStart(rec domain.PlanStartRecord) error {
+	return s.io.WithWriteLock(func() error {
+		meta, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if meta == nil {
+			meta = &domain.RunMeta{}
+		}
+		meta.PlanStart = &rec
 		return s.saveUnlocked(*meta)
 	})
 }

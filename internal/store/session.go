@@ -31,20 +31,6 @@ func NewSessionStore(io *IO) *SessionStore {
 // 返回空字符串表示未知，调用方仍照常写入但不带 _meta，replay 时退回 ModelSet fallback。
 type ModelLookup func(agentName string) (provider, model string)
 
-// CoordinatorLogger 返回 coordinator 的 OnMessage 回调。
-// lookup 可为 nil，此时写入不带 _meta（兼容 cocreate 等无角色场景）。
-func (s *SessionStore) CoordinatorLogger(lookup ModelLookup) func(agentcore.AgentMessage) {
-	return func(msg agentcore.AgentMessage) {
-		var meta *sessionLogMeta
-		if lookup != nil {
-			meta = lookupMeta(lookup, "coordinator")
-		}
-		if err := s.logEntry("meta/sessions/coordinator.jsonl", msg, meta); err != nil {
-			slog.Warn("session log failed", "agent", "coordinator", "err", err)
-		}
-	}
-}
-
 // SubAgentLogger 返回子代理的 OnMessage 回调。
 func (s *SessionStore) SubAgentLogger(lookup ModelLookup) func(agentName, task string, msg agentcore.AgentMessage) {
 	return func(agentName, task string, msg agentcore.AgentMessage) {

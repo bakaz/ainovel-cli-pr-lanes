@@ -11,10 +11,20 @@ package flow
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	storepkg "github.com/voocel/ainovel-cli/internal/store"
 )
+
+// plannerForTier 从已落盘的规划级别推导规划师身份:short 归短篇规划师,
+// mid/long 归长篇规划师(与 coordinator 首次选型的口径一致)。
+func plannerForTier(tier domain.PlanningTier) string {
+	if tier == domain.PlanningTierShort {
+		return "architect_short"
+	}
+	return "architect_long"
+}
 
 // Instruction 指示 Host 下一步要求 Coordinator 调用的子代理与任务。
 type Instruction struct {
@@ -42,13 +52,21 @@ type State struct {
 
 	// 基础设定缺项（规划阶段的补齐信号）。
 	FoundationMissing []string
+
+	// 已落盘的规划级别（save_foundation 落 scale 时写入 RunMeta）。
+	// 空 = 首次规划尚未产出任何设定，规划师身份不可判定。
+	PlanningTier domain.PlanningTier
+
+	// 非分层书：最近完成章是否已有 scope=global 的全局审阅
+	//（仅在 ShouldReview 触发点有意义；分层书恒 false）。
+	HasGlobalReview bool
 }
 
 // Route 根据事实返回下一步指令；返回 nil 表示让 Coordinator LLM 自主裁定。
 //
 // 决策优先级（互斥，自上而下匹配第一个）：
 //  1. Phase=Complete        → nil（LLM 输出总结）
-//  2. Phase!=Writing        → nil（LLM 裁定规划师选型 / 规划补齐）
+//  2. 规划期设定缺项且规划师可判定 → 同一规划师补齐；否则 nil（LLM 裁定首次选型）
 //  3. PendingRewrites 非空  → writer 按队列重写/打磨
 //  4. Flow=Reviewing        → nil（dormant：当前无写入者，评审期 Flow 实为 writing）
 //  5. Flow=Steering         → nil（用户干预处理中）
@@ -70,8 +88,17 @@ func Route(s State) *Instruction {
 		return nil
 	}
 
-	// 2. 规划阶段由 Coordinator 裁定（选 architect_long/short + 补齐循环）
+	// 2. 规划期补齐：查表型决策——缺什么在 store，规划师身份从已落盘的 scale 推导
+	//    （short → architect_short，其余 → architect_long）。tier 为空说明首次规划
+	//    尚未落盘任何设定（选型是语义判断），交 Coordinator 裁定。
 	if p.Phase != domain.PhaseWriting {
+		if len(s.FoundationMissing) > 0 && s.PlanningTier != "" {
+			return &Instruction{
+				Agent:  plannerForTier(s.PlanningTier),
+				Task:   fmt.Sprintf("补齐基础设定缺项：%s（用 save_foundation 落盘对应 type，全部就绪后 foundation_ready=true）", strings.Join(s.FoundationMissing, "、")),
+				Reason: "基础设定缺项未齐，照缺项续派同一规划师",
+			}
+		}
 		return nil
 	}
 
@@ -136,6 +163,19 @@ func Route(s State) *Instruction {
 				Agent:  "architect_long",
 				Task:   "创建下一卷：按完结判定清单评估后调用 save_foundation——故事继续 → type=append_volume；故事接近终点 → type=append_volume 且卷 JSON 顶层带 \"final\": true（收官卷，整卷收线，写完自动完结）；全部完结条件当下已满足 → type=complete_book",
 				Reason: "卷末需决定追加新卷、收官卷或结束全书",
+			}
+		}
+	}
+
+	// 11. 非分层全局审阅：每 ReviewInterval 章一次(事实:该章的 global review 未落盘)。
+	//     原为 commit_chapter 返回值里的 review_required 信号,现按事实推导——
+	//     返回值只是事实的镜像,Route 从 store 直接看同一事实。
+	if !p.Layered && s.LastCompleted > 0 {
+		if due, reason := domain.ShouldReview(len(p.CompletedChapters)); due && !s.HasGlobalReview {
+			return &Instruction{
+				Agent:  "editor",
+				Task:   fmt.Sprintf("对前 %d 章做全局审阅（save_review scope=global, chapter=%d）", s.LastCompleted, s.LastCompleted),
+				Reason: reason,
 			}
 		}
 	}

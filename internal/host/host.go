@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,12 +13,13 @@ import (
 	"time"
 
 	"github.com/voocel/agentcore"
-	corecontext "github.com/voocel/agentcore/context"
 	"github.com/voocel/ainovel-cli/assets"
 	"github.com/voocel/ainovel-cli/internal/agents"
 	"github.com/voocel/ainovel-cli/internal/agents/ctxpack"
+	"github.com/voocel/ainovel-cli/internal/arbiter"
 	"github.com/voocel/ainovel-cli/internal/bootstrap"
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/flow"
 	"github.com/voocel/ainovel-cli/internal/host/exp"
 	"github.com/voocel/ainovel-cli/internal/host/imp"
 	"github.com/voocel/ainovel-cli/internal/host/sim"
@@ -29,27 +31,24 @@ import (
 	"github.com/voocel/ainovel-cli/internal/userrules"
 )
 
-// Host 是运行时薄外壳。
-// 职责：启动/恢复/干预注入/事件投影/模型管理。
-// 不做任何调度决策，不做空闲续跑。
+// Host 是运行时外壳:生命周期/干预入口/事件投影/模型管理。
+// 调度与执行在 engine(确定性循环);语义裁定在 arbiter(LLM-as-function)。
 type Host struct {
-	cfg               bootstrap.Config
-	bundle            assets.Bundle
-	store             *storepkg.Store
-	models            *bootstrap.ModelSet
-	coordinator       *agentcore.Agent
-	coordinatorCtxMgr *corecontext.ContextEngine // 切 default/coordinator 模型时联动 SetContextWindow + SetReserveTokens
-	thinkingApplier   agents.ApplyThinking       // /model 调推理强度时联动 live agent（coordinator + 子代理）
-	askUser           *tools.AskUserTool
-	writerRestore     *ctxpack.WriterRestorePack
-	observer          *observer
-	router            *Dispatcher
-	usage             *UsageTracker
-	usageCancel       context.CancelFunc // 停掉 autoSaveLoop 并触发最后一次 flush
-	budget            *BudgetSentinel    // 预算政策；未启用为 nil（方法 nil 安全）
-	budgetDetach      func()
-	pauser            *PausePointSentinel // 用户停靠点政策（方法 nil 安全）
-	notifier          *notify.Notifier    // 无人值守告警；未启用为 nil（Send nil 安全）
+	cfg             bootstrap.Config
+	bundle          assets.Bundle
+	store           *storepkg.Store
+	models          *bootstrap.ModelSet
+	engine          *engine
+	thinkingApplier agents.ApplyThinking // /model 调推理强度时联动各 Worker
+	askUser         *tools.AskUserTool
+	writerRestore   *ctxpack.WriterRestorePack
+	userRules       *userrules.Service
+	observer        *observer
+	usage           *UsageTracker
+	usageCancel     context.CancelFunc  // 停掉 autoSaveLoop 并触发最后一次 flush
+	budget          *BudgetSentinel     // 预算政策；未启用为 nil（方法 nil 安全）
+	pauser          *PausePointSentinel // 用户停靠点政策（方法 nil 安全）
+	notifier        *notify.Notifier    // 无人值守告警；未启用为 nil（Send nil 安全）
 
 	events   chan Event
 	streamCh chan string
@@ -59,6 +58,13 @@ type Host struct {
 	lifecycle  lifecycle
 	cocreating bool // 阶段共创占用：paused 窗口内堵住 import/simulate/continue 的并发介入
 	closeOnce  sync.Once
+
+	interMu sync.Mutex // 干预裁定 FIFO 串行(同一时刻至多一次在途咨询)
+
+	// runCtx 约束宿主侧的 LLM 裁定调用(启动裁定/干预分诊);Close 取消,
+	// 避免退出时仍有裁定在途且无法中断。
+	runCtx    context.Context
+	runCancel context.CancelFunc
 }
 
 type lifecycle string
@@ -115,52 +121,40 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 	usageCtx, usageCancel := context.WithCancel(context.Background())
 	usage.StartAutoSave(usageCtx)
 
-	var router *Dispatcher
-	var budget *BudgetSentinel
-	var pauser *PausePointSentinel
-	// onGuardBlock 与 router/budget 同款前置声明：h 构造后才能挂事件浮出闭包。
+	// onGuardBlock 前置声明:h 构造后才能挂事件浮出闭包。
 	var onGuardBlock func(agent, reason string, consecutive int32)
-	coordinator, askUser, restore, coordinatorCtxMgr, applyThinking := agents.BuildCoordinator(cfg, store, models, bundle, usage.Record, func(string) {
-		if budget != nil && budget.HandleBoundary() {
-			return
-		}
-		// 预算止损优先于验收暂停；停靠点命中则短路本轮派发
-		if pauser.HandleBoundary() {
-			return
-		}
-		if router != nil {
-			router.Dispatch()
-		}
-	}, func(agent, reason string, consecutive int32) {
-		if onGuardBlock != nil {
-			onGuardBlock(agent, reason, consecutive)
-		}
-	})
+	workers, askUser, restore, applyThinking := agents.BuildWorkers(cfg, store, models, bundle, usage.Record,
+		func(agent, reason string, consecutive int32) {
+			if onGuardBlock != nil {
+				onGuardBlock(agent, reason, consecutive)
+			}
+		})
 	store.Signals.ClearStaleSignals()
 
 	h := &Host{
-		cfg:               cfg,
-		bundle:            bundle,
-		store:             store,
-		models:            models,
-		coordinator:       coordinator,
-		coordinatorCtxMgr: coordinatorCtxMgr,
-		thinkingApplier:   applyThinking,
-		askUser:           askUser,
-		writerRestore:     restore,
-		usage:             usage,
-		usageCancel:       usageCancel,
-		events:            make(chan Event, 100),
-		streamCh:          make(chan string, 256),
-		done:              make(chan struct{}, 4),
-		lifecycle:         lifecycleIdle,
+		cfg:             cfg,
+		bundle:          bundle,
+		store:           store,
+		models:          models,
+		thinkingApplier: applyThinking,
+		askUser:         askUser,
+		writerRestore:   restore,
+		userRules:       userrules.NewService(store, models.Default, rules.DefaultOptions()),
+		usage:           usage,
+		usageCancel:     usageCancel,
+		events:          make(chan Event, 100),
+		streamCh:        make(chan string, 256),
+		done:            make(chan struct{}, 4),
+		lifecycle:       lifecycleIdle,
 	}
-	h.observer = newObserver(coordinator, store, h.emitEvent, h.emitDelta, h.emitClear)
+	h.runCtx, h.runCancel = context.WithCancel(context.Background())
+	h.observer = newObserver(store, h.emitEvent, h.emitDelta, h.emitClear)
+	// 宿主侧 Arbiter 与 Worker 共用同一条 ToolProgress → observer → 工作台链路。
+	h.runCtx = agentcore.WithToolProgress(h.runCtx, h.observer.workerProgress)
 	if cfg.Notify.IsEnabled() {
 		h.notifier = notify.New(cfg.Notify.Command, cfg.Notify.Events)
 	}
-	// 预算哨兵订阅子代理边界事件执行停机；Dispatcher 由工具执行链同步触发，
-	// 不再通过事件订阅抢占下一轮模型调用。
+	// 预算哨兵:Engine 在每轮循环边界直接调用 HandleBoundary(不再经事件订阅)。
 	if sentinel := NewBudgetSentinel(cfg.Budget,
 		func() float64 { c, _, _, _, _ := usage.Totals(); return c },
 		func(reason string) { h.abortWithEvent(reason, "error") },
@@ -170,9 +164,7 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 		},
 	); sentinel != nil {
 		h.budget = sentinel
-		budget = sentinel
 		usage.SetOnCost(sentinel.OnCost)
-		h.budgetDetach = coordinator.Subscribe(sentinel.HandleEvent)
 		// 计费盲区告警：模型不报 usage 时成本恒 0，预算永不触发——保险丝没接上必须喊人。
 		usage.SetOnMissingUsage(func() {
 			const blind = "预算盲区: 模型未返回 usage 数据，成本统计为 0，预算上限不会触发（自定义模型请确认注册表价格或上游 include_usage）"
@@ -181,9 +173,6 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 		})
 	}
 	// 停靠点哨兵：执行用户预约的"重写完暂停"指令，事件+notify 成对（架构 §2.3）。
-	// abort 注入必须自带 notify：暂停把 lifecycle 置 paused，waitDone 的 run_end
-	// 通知会因 wasRunning=false 跳过——不在这里发，挂机用户在最该被叫回来的
-	// 时刻收不到任何推送（abortWithEvent 本身只发屏内事件）。
 	h.pauser = NewPausePointSentinel(store,
 		func(reason string) {
 			h.abortWithEvent(reason, "info")
@@ -194,23 +183,12 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 			h.notifier.Send(notify.Notification{Kind: "pause_point", Level: level, Title: "ainovel: 验收停靠点", Body: summary})
 		},
 	)
-	pauser = h.pauser
-	h.router = NewDispatcher(coordinator, store)
-	router = h.router
-	// 重复指令告警：纯 telemetry，挂机时"模型可能在原地打转"值得喊人看一眼。
-	// 事件流与 notify 成对发出——notify 只是屏内事件的离屏副本（架构 §2.3）。
-	h.router.SetOnRepeat(func(agent, task string, n int) {
-		body := fmt.Sprintf("同一指令已第 %d 次下达（%s）：%s", n, agent, task)
-		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "指令重复: " + body, Level: "warn"})
-		h.notifier.Send(notify.Notification{Kind: "repeat", Level: "warn", Title: "ainovel: 指令重复", Body: body})
-	})
 	// StopGuard 拦截浮出：blocked 是高频自愈动作，只进屏内事件流（推送会刷屏）；
-	// escalated / hard_stop 意味着本轮子任务报废重派，事件+notify 成对发出（架构 §2.3）。
-	// 没有这层，拦截只进日志，用户在 TUI 上只看到"卡顿+token 变快"（issue #75）。
+	// escalated / hard_stop 意味着本轮子任务报废，事件+notify 成对发出（架构 §2.3）。
 	onGuardBlock = func(agent, reason string, n int32) {
 		switch reason {
 		case "escalated":
-			body := fmt.Sprintf("%s 连续 %d 次空转未落盘必要产物，本轮任务终止，交回 Coordinator 裁定", agent, n)
+			body := fmt.Sprintf("%s 连续 %d 次空转未落盘必要产物，本轮任务终止，交回 Engine 处理", agent, n)
 			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Agent: agent, Summary: "StopGuard 升级: " + body, Level: "warn"})
 			h.notifier.Send(notify.Notification{Kind: "stop_guard", Level: "warn", Title: "ainovel: StopGuard", Body: body})
 		case "hard_stop":
@@ -221,6 +199,26 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Agent: agent,
 				Summary: fmt.Sprintf("StopGuard: %s 未完成必要产物就试图结束，已拦截催促（连续第 %d 次）", agent, n), Level: "info"})
 		}
+	}
+	// Engine:确定性执行引擎(docs/engine-rfc.md)。arbiter 用 Default 模型(过渡限制,
+	// 见 engine-arbiter.md §4.2)。
+	h.engine = &engine{
+		store:         store,
+		workers:       workers,
+		arbiterModel:  newUsageTrackedModel(models.Default, usage.Record),
+		failurePrompt: bundle.Prompts.ArbiterFailure,
+		// 同步重询:阻塞引擎循环一次裁定(数秒),换取"干预先于后续创作生效"。
+		reconsult: h.handleIntervention,
+		observer:  h.observer,
+		budget:    h.budget,
+		pauser:    h.pauser,
+		refresh:   h.refreshWriterRestore,
+		emitEvent: h.emitEvent,
+		notify: func(kind, level, title, body string) {
+			h.notifier.Send(notify.Notification{Kind: kind, Level: level, Title: title, Body: body})
+		},
+		onPause: func(summary string) { h.abortWithEvent(summary, "warn") },
+		onDone:  h.runEnded,
 	}
 
 	if err := store.RunMeta.Init(cfg.Style, cfg.Provider, cfg.ModelName); err != nil {
@@ -284,8 +282,10 @@ func logUserRulesSnapshot(snap *rules.Snapshot) {
 	}
 }
 
-// StartPrepared 使用已编排完成的启动 prompt 开始创作。
-func (h *Host) StartPrepared(promptText string) error {
+// StartPrepared 用用户的**原始**创作要求开始创作:plan_start 裁定选规划师并扩充
+// 需求(原 coordinator 启动裁定 + BuildStartPrompt 脚手架的职责),裁定结果先固化为
+// 事实(PlanStartRecord)再启动 Engine——恢复永远依赖已落盘事实,不依赖重新裁定。
+func (h *Host) StartPrepared(rawRequirement string) error {
 	h.mu.Lock()
 	if h.lifecycle == lifecycleRunning {
 		h.mu.Unlock()
@@ -297,8 +297,8 @@ func (h *Host) StartPrepared(promptText string) error {
 	}
 	h.mu.Unlock()
 
-	promptText = strings.TrimSpace(promptText)
-	if promptText == "" {
+	rawRequirement = strings.TrimSpace(rawRequirement)
+	if rawRequirement == "" {
 		return fmt.Errorf("prompt is required")
 	}
 	if err := h.budget.Refuse(); err != nil {
@@ -311,24 +311,45 @@ func (h *Host) StartPrepared(promptText string) error {
 		return fmt.Errorf("init progress: %w", err)
 	}
 
-	slog.Info("开始创作", "module", "host", "prompt_len", len(promptText))
-	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "开始创作", Level: "info"})
-	h.observer.setAborting(false)
-	// 先重置重复追踪并启用路由，再启动 Prompt，避免首轮事件先于 Enable 抵达
-	h.router.ResetRepeat()
-	h.router.Enable()
-	if err := h.coordinator.Prompt(context.Background(), promptText); err != nil {
-		return fmt.Errorf("prompt: %w", err)
+	// 启动裁定:失败显式报错中止(启动期用户在场,报错优于猜测)。
+	start := time.Now()
+	decision, derr := arbiter.DecidePlanStart(h.runCtx, h.arbiterModel(),
+		h.bundle.Prompts.ArbiterPlanStart, rawRequirement, h.cfg.Style)
+	rec := storepkg.DecisionRecord{Kind: "plan_start", Decider: "arbiter", Input: rawRequirement,
+		Reason: decision.Reason, DurationMs: time.Since(start).Milliseconds()}
+	if data, err := json.Marshal(decision); err == nil && derr == nil {
+		rec.Decision = data
 	}
-	// 主动派发一次首条指令：若已进入写作阶段（Phase=Writing），Host 立即下达；
-	// 规划阶段 Route 返回 nil，无副作用。
-	h.router.Dispatch()
+	var recErr error
+	if rec, recErr = h.store.Decisions.Append(rec); recErr != nil {
+		slog.Warn("启动裁定审计落盘失败", "module", "host", "err", recErr)
+	}
+	if derr != nil {
+		return fmt.Errorf("启动裁定失败: %w", derr)
+	}
+	if err := h.store.RunMeta.SetPlanStart(domain.PlanStartRecord{
+		RawPrompt: rawRequirement, Planner: decision.Planner, PlannerTask: decision.Task, DecisionID: rec.ID,
+	}); err != nil {
+		return fmt.Errorf("记录启动裁定: %w", err)
+	}
 
+	slog.Info("开始创作", "module", "host", "planner", decision.Planner)
+	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM",
+		Summary: fmt.Sprintf("开始创作（规划师: %s——%s）", decision.Planner, decision.Reason), Level: "info"})
+	h.startEngine(&flow.Instruction{Agent: decision.Planner, Task: decision.Task, Reason: decision.Reason})
+	return nil
+}
+
+// startEngine 统一的引擎启动入口(Start/Resume/Continue/干预重启共用)。
+// lifecycle 必须先于 goroutine 启动置为 running:引擎可能立即结束(完本/无路由),
+// runEnded 会把 lifecycle 落到终态;若顺序颠倒,runEnded 先跑、这里再写 running,
+// UI 将永远显示"运行中"而引擎实际已停。
+func (h *Host) startEngine(initial *flow.Instruction) {
+	h.observer.setAborting(false)
 	h.mu.Lock()
 	h.lifecycle = lifecycleRunning
 	h.mu.Unlock()
-	go h.waitDone()
-	return nil
+	h.engine.start(initial)
 }
 
 // Resume 恢复模式：从 checkpoint + progress 生成 resume prompt 并启动。
@@ -344,7 +365,7 @@ func (h *Host) Resume() (string, error) {
 	}
 	h.mu.Unlock()
 
-	prompt, label, err := buildResumePrompt(h.store)
+	label, err := resumeLabel(h.store)
 	if err != nil {
 		return "", err
 	}
@@ -364,38 +385,145 @@ func (h *Host) Resume() (string, error) {
 	// 老书无快照时惰性生成（按 system_defaults + rules 文件归一化）；已有则廉价读取。
 	h.ensureUserRules()
 	h.refreshWriterRestore()
-	h.observer.setAborting(false)
-	h.router.ResetRepeat()
-	h.router.Enable()
-	if err := h.coordinator.Prompt(context.Background(), prompt); err != nil {
-		return "", fmt.Errorf("resume prompt: %w", err)
-	}
-	// PendingSteer 已随恢复 prompt 交付给 Coordinator，清除以免下次 Resume 重复注入同一条旧干预。
-	// ClearHandledSteer 幂等：PendingSteer 为空 / Flow 非 steering 时均为 no-op。
-	if err := h.store.ClearHandledSteer(); err != nil {
-		slog.Warn("清除已处理的 PendingSteer 失败", "module", "host", "err", err)
-	}
 	// 停靠点对账：崩溃恰在"排空后、消费前"时，用户手动 Resume 即视为放行。
 	h.pauser.ReconcileOnResume()
-	// 主动派发一次首条指令，避免 Coordinator 对恢复 prompt 只回文字而 StopGuard 反复拦截。
-	h.router.Dispatch()
-
-	h.mu.Lock()
-	h.lifecycle = lifecycleRunning
-	h.mu.Unlock()
-	go h.waitDone()
+	// 待处理干预(停机期留下的/裁定期崩溃残留的)必须先于引擎续跑裁定——
+	// 否则引擎可能抢在裁定前继续写出与干预相悖的章节。同步执行(阻塞数秒可接受,
+	// UI 已显示"恢复创作");doIntervention 成功后自行清除 PendingSteer 并按
+	// restart=true 拉起引擎。无待处理干预 → 直接续跑。
+	if meta, _ := h.store.RunMeta.Load(); meta != nil && meta.PendingSteer != "" {
+		h.doIntervention(meta.PendingSteer, true)
+		// 裁定失败(已回显)时也要恢复续跑——书不能因一条无法理解的旧干预卡死。
+		if !h.engine.isRunning() {
+			if err := h.budget.Refuse(); err == nil {
+				h.startEngine(nil)
+			}
+		}
+	} else {
+		// 只恢复事实,不恢复会话(RFC §6):Engine 从 store 重算路由续跑。
+		h.startEngine(nil)
+	}
+	// lifecycle 由 startEngine / runEnded 管理,此处不再覆写——
+	// 引擎立即结束(完本等)时覆写会把终态改回 running。
 	return label, nil
 }
 
-// interventionMsg 把用户文本包装成 Coordinator 可识别的干预消息。
-// Steer 与 Continue 共用同一 framing：两条入口的用户指令都带 `[用户干预]` 前缀，
-// 才能稳定触发 coordinator.md 的干预分类。否则 Continue 的裸文本会绕过路由规则，
-// Coordinator 失去分类锚点而误派子代理（曾导致"改已写章节"被派给 writer 撞 edit_chapter 守卫）。
-func interventionMsg(text string) agentcore.Message {
-	return agentcore.UserMsg("[用户干预] " + text)
+// handleIntervention 用户干预的统一裁定路径:Collect → Decide → 执行。
+// FIFO 串行(同一时刻至多一次在途咨询);answer/rules 即时执行,控制态动作
+// (pause/reopen/dispatch)引擎运行中排队边界提交、停机时立即执行。
+// restart=true(Continue 语义)时干预处理完确保引擎运行。
+func (h *Host) handleIntervention(text string) {
+	h.doIntervention(text, false)
 }
 
-// Continue 用指定 prompt 继续。停机后用户在输入框输入时调用。
+func (h *Host) doIntervention(text string, restart bool) {
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+
+	// 崩溃保护:裁定前先持久化(PendingSteer),成功应用或已当面回显失败后原子清除
+	// (ClearHandledSteer 同时复位 FlowSteering)。裁定期间崩溃 → 下次 Resume 重放。
+	if err := h.store.RunMeta.SetPendingSteer(text); err != nil {
+		slog.Warn("干预持久化失败(继续裁定,但崩溃保护失效)", "module", "host", "err", err)
+	}
+	clearPending := func() {
+		if err := h.store.ClearHandledSteer(); err != nil {
+			slog.Warn("清除已处理干预失败", "module", "host", "err", err)
+		}
+	}
+
+	facts := arbiter.CollectInterventionFacts(h.store)
+	facts.Running = h.engine.isRunning()
+
+	start := time.Now()
+	decision, derr := arbiter.DecideIntervention(h.runCtx, h.arbiterModel(),
+		h.bundle.Prompts.ArbiterIntervention, facts, text)
+
+	rec := storepkg.DecisionRecord{Kind: "intervention", Decider: "arbiter", Input: text,
+		Reason: decision.Reason, DurationMs: time.Since(start).Milliseconds()}
+	if cp := h.store.Checkpoints.LatestGlobal(); cp != nil {
+		rec.CheckpointSeq = cp.Seq
+	}
+	if data, err := json.Marshal(facts); err == nil {
+		rec.Facts = data
+	}
+	if derr == nil {
+		if data, err := json.Marshal(decision); err == nil {
+			rec.Decision = data
+		}
+	} else {
+		rec.Reason = "裁定失败: " + derr.Error()
+	}
+	if _, err := h.store.Decisions.Append(rec); err != nil {
+		slog.Warn("裁定审计落盘失败", "module", "host", "err", err)
+	}
+
+	if derr != nil {
+		// 宁可不动,不可误动:不产生任何写入,回显请用户换个说法。
+		// 已当面告知 → 清除 pending(留着会在下次 Resume 重放一条已知无法理解的指令)。
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Level: "warn",
+			Summary: "未能理解这条干预,请换个说法(未做任何修改)"})
+		clearPending()
+		return
+	}
+
+	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "裁定: " + decision.Reason, Level: "info"})
+	if decision.Answer != "" {
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: decision.Answer, Level: "info"})
+	}
+	// 任一动作持久化失败 → 保留 PendingSteer(恢复时整条重放重新裁定;
+	// pause/reopen 幂等、dispatch 经新事实重询,重放安全)。
+	actionsFailed := false
+	if decision.Rules != "" {
+		if snap, _, err := h.userRules.AddRuntimeRule(h.runCtx, decision.Rules); err != nil {
+			h.emitEvent(Event{Time: time.Now(), Category: "ERROR", Summary: "写作规则落盘失败: " + err.Error(), Level: "error"})
+			actionsFailed = true
+		} else if snap != nil {
+			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "写作规则已更新并持久化", Level: "info"})
+		}
+	}
+
+	if decision.Pause != nil || decision.Reopen != nil || decision.Dispatch != nil {
+		op := controlOp{pause: decision.Pause, reopen: decision.Reopen, dispatch: decision.Dispatch, text: text, facts: facts}
+		if !h.engine.enqueue(op) {
+			// 引擎未运行:立即执行;持久化失败 → 保留 PendingSteer,恢复时重放整条干预。
+			if err := h.engine.applyControlOp(context.Background(), op); err != nil {
+				h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Level: "warn",
+					Summary: "干预动作执行失败,已保留;恢复/继续时将自动重试"})
+				return
+			}
+			// reopen/dispatch 表达了继续创作的意图,拉起引擎。
+			if decision.Reopen != nil || decision.Dispatch != nil {
+				restart = true
+			}
+		}
+	}
+	if actionsFailed {
+		// 保留 PendingSteer:恢复/继续时整条重放重新裁定。
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Level: "warn",
+			Summary: "部分干预动作未成功,干预已保留;恢复/继续时自动重试"})
+		return
+	}
+	// 动作已成功应用/入队,清除崩溃保护(入队后引擎侧失败或退出竞态由 engine
+	// 回存 PendingSteer 兜底)。
+	clearPending()
+
+	if restart && !h.engine.isRunning() {
+		if err := h.budget.Refuse(); err != nil {
+			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: err.Error(), Level: "warn"})
+			return
+		}
+		h.pauser.ReconcileOnResume()
+		h.refreshWriterRestore()
+		h.startEngine(nil)
+	}
+}
+
+// arbiterModel 返回带用量追踪的裁定模型(token/成本进预算与 usage 系统)。
+func (h *Host) arbiterModel() agentcore.ChatModel {
+	return newUsageTrackedModel(h.models.Default, h.usage.Record)
+}
+
+// Continue 停机后用户在输入框输入时调用:干预裁定 + 确保引擎重新运行。
 func (h *Host) Continue(text string) error {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -406,63 +534,23 @@ func (h *Host) Continue(text string) error {
 		h.mu.Unlock()
 		return fmt.Errorf("阶段共创进行中，请先结束共创")
 	}
-	running := h.lifecycle == lifecycleRunning
 	h.mu.Unlock()
-
-	h.emitEvent(Event{Time: time.Now(), Category: "USER", Summary: "[继续] " + text, Level: "info"})
-
-	if running {
-		h.coordinator.FollowUp(interventionMsg(text))
-		return nil
-	}
-	// 停机后 → 注入并自动恢复（恢复 run 也受预算前置约束）
 	if err := h.budget.Refuse(); err != nil {
 		return err
 	}
-	// 与 Resume 对称：若停机由预算/Esc 抢在停靠点消费之前，用户显式继续=放行，
-	// 对账解除已满足的停靠点，避免恢复后首个边界立即再暂停。
-	h.pauser.ReconcileOnResume()
-	h.refreshWriterRestore()
-	h.observer.setAborting(false)
-	h.router.ResetRepeat()
-	h.router.Enable()
-	_, err := h.coordinator.Inject(interventionMsg(text))
-	if err != nil {
-		return fmt.Errorf("inject: %w", err)
-	}
-	// 与 Resume 对称：干预注入后主动派发一次当前路由指令。否则 Coordinator 只有
-	// 用户文本没有 Host 指令，若它对干预只回文字，StopGuard 的拦截又要求执行
-	// Host 指令，会陷入"无指令可执行"的僵局（继续后连续拦截直至熔断）。
-	// 派发晚于 Inject：用户干预先入上下文，指令后到，干预优先级不受影响。
-	h.router.Dispatch()
-	h.mu.Lock()
-	h.lifecycle = lifecycleRunning
-	h.mu.Unlock()
-	go h.waitDone()
+
+	h.emitEvent(Event{Time: time.Now(), Category: "USER", Summary: "[继续] " + text, Level: "info"})
+	go h.doIntervention(text, true)
 	return nil
 }
 
-// Steer 提交用户干预。
+// Steer 提交用户干预(运行中随时可用;停机时裁定后视动作决定是否拉起引擎)。
 func (h *Host) Steer(text string) {
-	h.mu.Lock()
-	running := h.lifecycle == lifecycleRunning
-	h.mu.Unlock()
-
 	h.emitEvent(Event{Time: time.Now(), Category: "USER", Summary: "[用户干预] " + text, Level: "info"})
-
-	msg := interventionMsg(text)
-	if running {
-		if _, err := h.coordinator.Inject(msg); err != nil {
-			slog.Error("steer inject 失败", "module", "host", "err", err)
-		}
-		return
-	}
-	// 停机：持久化待下次启动 + 反馈系统状态（"已保存"是 USER 事件之外的系统提示）
-	_ = h.store.RunMeta.SetPendingSteer(text)
-	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "干预已保存，下次启动时生效", Level: "info"})
+	go h.handleIntervention(text)
 }
 
-// Abort 暂停当前 coordinator。
+// Abort 暂停当前引擎循环。
 func (h *Host) Abort() bool {
 	return h.abortWithEvent("用户手动暂停当前创作", "warn")
 }
@@ -479,27 +567,25 @@ func (h *Host) abortWithEvent(summary, level string) bool {
 	if !running {
 		return false
 	}
-	// 置位必须在 coordinator.Abort 之前：cancel 传播会立刻引发 stream init / subagent
+	// 置位必须在 engine.abort 之前：cancel 传播会立刻引发 stream init / worker
 	// 失败事件，observer 凭此标志识别为 abort 衍生噪声并抑制。
 	h.observer.setAborting(true)
-	h.coordinator.Abort()
+	h.engine.abort()
 	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: summary, Level: level})
 	return true
 }
 
-// Close 终止 coordinator 并关闭事件通道。
+// Close 终止引擎并关闭事件通道。
 //
 // Usage 持久化语义：先取消 autoSaveLoop（它自行 flush 最后一次 dirty 状态），
-// 再补一次同步 SaveNow 收尾。已知缺口：AbortSilent 之后若仍有 in-flight LLM
-// 调用回来，触发的 OnMessage → Record 会更新内存但**不会被持久化**。这部分
-// "最末几百 token" 的丢失在下次启动时会由 session jsonl replay 自动补回。
+// 再补一次同步 SaveNow 收尾。终止后 in-flight LLM 调用的最末几百 token
+// 丢失由下次启动时 session jsonl replay 自动补回。
 func (h *Host) Close() {
 	h.observer.setAborting(true)
-	h.coordinator.AbortSilent()
-	if h.budgetDetach != nil {
-		h.budgetDetach()
-		h.budgetDetach = nil
+	if h.runCancel != nil {
+		h.runCancel() // 中断在途的宿主侧裁定调用
 	}
+	h.engine.abort()
 	if h.usageCancel != nil {
 		h.usageCancel()
 		h.usageCancel = nil
@@ -514,26 +600,20 @@ func (h *Host) Close() {
 	})
 }
 
-// waitDone 等待 coordinator 停机并发布终态事件。
-//
-// 不做任何续跑。Run 结束 = Host 进入终态：
+// runEnded 引擎循环结束(任何原因)时由 engine.onDone 回调:按 store 事实定终态。
 //   - Phase=Complete  → 标记 completed，发"创作完成"事件
-//   - 其它            → 标记 idle，发"Coordinator 停止"事件
-//
-// 用户要继续创作只有两条路径：手动 Continue（停机注入）或重启进程走 Resume。
-// 见 docs/architecture.md §13.3、§8.3。
-func (h *Host) waitDone() {
-	// 运行中退出时 Close() 可能已 close(h.done)（AbortSilent 只 cancel 不 join 本 goroutine），
-	// 末尾向 h.done 的发送会 panic；与 emitEvent 一致用 recover 兜住这段退出期竞态。
+//   - 其它            → 标记 idle/paused，发"创作停止"事件
+func (h *Host) runEnded() {
+	// 退出期 Close() 可能已 close(h.done)，末尾发送会 panic;recover 兜住竞态。
 	defer func() { recover() }()
-	h.coordinator.WaitForIdle()
 	h.observer.finalize()
 
 	h.mu.Lock()
 	progress, _ := h.store.Progress.Load()
 	if progress != nil && progress.Phase == domain.PhaseComplete {
 		h.lifecycle = lifecycleCompleted
-		summary := fmt.Sprintf("创作完成: %d 章 %d 字", len(progress.CompletedChapters), progress.TotalWordCount)
+		// 完本收尾:确定性生成(store 已有全部事实,不花 LLM 调用;RFC 末节)。
+		summary := completionSummary(h.store)
 		h.mu.Unlock()
 		slog.Info(summary, "module", "host")
 		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: summary, Level: "success"})
@@ -554,7 +634,7 @@ func (h *Host) waitDone() {
 		}
 		h.mu.Unlock()
 		if wasRunning {
-			summary := fmt.Sprintf("Coordinator 停止 (已完成 %d 章)", completed)
+			summary := fmt.Sprintf("引擎停止 (已完成 %d 章)", completed)
 			slog.Warn(summary, "module", "host")
 			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: summary, Level: "warn"})
 			h.notifier.Send(notify.Notification{
@@ -757,7 +837,8 @@ func (h *Host) Snapshot() UISnapshot {
 	snap.StatusLabel = deriveStatusLabel(snap)
 
 	// 恢复标签
-	if _, label, err := buildResumePrompt(h.store); err == nil && label != "" {
+	// 恢复标签
+	if label, err := resumeLabel(h.store); err == nil && label != "" {
 		snap.RecoveryLabel = label
 	}
 
@@ -766,36 +847,11 @@ func (h *Host) Snapshot() UISnapshot {
 	return snap
 }
 
-// fillContextStatus 填充 Coordinator 上下文健康度信息。
-func (h *Host) fillContextStatus(snap *UISnapshot) {
-	if h.coordinator == nil {
-		return
-	}
-	if usage := h.coordinator.BaselineContextUsage(); usage != nil {
-		snap.ContextTokens = usage.Tokens
-		snap.ContextWindow = usage.ContextWindow
-		snap.ContextPercent = usage.Percent
-	}
-	if ctx := h.coordinator.ContextSnapshot(); ctx != nil {
-		snap.ContextScope = ctx.Scope
-		snap.ContextStrategy = ctx.LastStrategy
-		snap.ContextActiveMessages = ctx.ActiveMessages
-		snap.ContextSummaryCount = ctx.SummaryMessages
-		snap.ContextCompactedCount = ctx.LastCompactedCount
-		snap.ContextKeptCount = ctx.LastKeptCount
-		if snap.ContextTokens == 0 {
-			if ctx.BaselineUsage != nil {
-				snap.ContextTokens = ctx.BaselineUsage.Tokens
-				snap.ContextWindow = ctx.BaselineUsage.ContextWindow
-				snap.ContextPercent = ctx.BaselineUsage.Percent
-			} else if ctx.Usage != nil {
-				snap.ContextTokens = ctx.Usage.Tokens
-				snap.ContextWindow = ctx.Usage.ContextWindow
-				snap.ContextPercent = ctx.Usage.Percent
-			}
-		}
-	}
-}
+// fillContextStatus 填充上下文健康度信息。
+// Coordinator 退役后主循环无常驻上下文;Worker 的上下文健康度经进度中继
+// (ProgressContext)进入 observer 的 per-agent 快照,由 Agents 面板展示。
+// 汇总字段留空,面板按 per-agent 数据渲染。
+func (h *Host) fillContextStatus(_ *UISnapshot) {}
 
 // fillDetails 填充详情区:设定、角色、最近 commit/review/摘要。
 func (h *Host) fillDetails(snap *UISnapshot, progress *domain.Progress) {
@@ -946,28 +1002,8 @@ func (h *Host) SwitchModel(role, provider, model string) error {
 	window, source := h.cfg.ResolveContextWindow(model)
 	bootstrap.LogContextWindowChoice(logRole, model, window, source)
 
-	// 切到 default/coordinator 时，联动 coordinator engine 的窗口与 reserve。
-	// writer/architect/editor 走 ContextManagerFactory 自动按新模型重建，不需要联动。
-	// 不联动会导致：1M→128k 切换时 coordinator engine 仍按 1M 算 threshold，
-	// 累积 messages 超过 128k 就 API 报错；128k→1M 时阈值被钉在 96k，浪费长上下文。
-	//
-	// 关键：必须用 models.CurrentSelection("coordinator") 拿"coordinator 实际使用"的模型
-	// 算窗口——而不是直接用切换目标的 model。当用户配了 roles.coordinator 单独模型时，
-	// 切 default 不影响 coordinator 实际模型；用切换目标的窗口去 SetContextWindow 会错
-	// 把 coordinator 阈值调到不相干的值（例：default 切 1M 模型时把 200k 的 coordinator
-	// engine 阈值拉到 891k，写超 200k 直接爆 API）。
-	if h.coordinatorCtxMgr != nil && (role == "" || role == "default" || role == "coordinator") {
-		_, coordinatorModel, _ := h.models.CurrentSelection("coordinator")
-		coordinatorWindow, coordSource := h.cfg.ResolveContextWindow(coordinatorModel)
-		h.coordinator.SetContextWindow(coordinatorWindow)
-		h.coordinatorCtxMgr.SetContextWindow(coordinatorWindow)
-		h.coordinatorCtxMgr.SetReserveTokens(bootstrap.CompactReserveTokens(coordinatorWindow))
-		// coordinator 实际模型与切换目标不同（用户切 default 但 coordinator 有专属 role）时，
-		// 上面 LogContextWindowChoice 打的是 default 的窗口，与实际生效值不一致；补一行。
-		if coordinatorModel != model {
-			bootstrap.LogContextWindowChoice("coordinator", coordinatorModel, coordinatorWindow, coordSource)
-		}
-	}
+	// 无常驻上下文需要联动:writer/architect/editor 的 ContextManager 走
+	// ContextManagerFactory,下次 spawn 自动按新模型窗口重建。
 
 	h.emitEvent(Event{
 		Time:     time.Now(),
@@ -980,7 +1016,7 @@ func (h *Host) SwitchModel(role, provider, model string) error {
 
 // concreteThinkingRoles 是可应用推理强度的具体角色（与 agents.ApplyThinking 路由一致）。
 // 调 default 时按各角色 ResolveReasoningEffort 逐个重新应用。
-var concreteThinkingRoles = []string{"coordinator", "architect", "writer", "editor"}
+var concreteThinkingRoles = []string{"architect", "writer", "editor"}
 
 // CurrentThinking 返回某角色当前生效的推理强度原始串（供 /model 面板同步当前值）。
 func (h *Host) CurrentThinking(role string) string {
@@ -1175,10 +1211,11 @@ func (h *Host) ResumeFromCoCreate(draft string) error {
 	h.cocreating = false
 	h.mu.Unlock()
 
-	// PauseForCoCreate 的 Abort 是异步的：恢复前等旧 run 收敛，回到与手动暂停后 Continue
-	// 一致的"真停机"前提，避免把续跑指令 steer 进正在退出的旧 run。非运行态进共创（未
-	// Abort）时 coordinator 本就 idle，WaitForIdle 立即返回。
-	h.coordinator.WaitForIdle()
+	// PauseForCoCreate 的 abort 是异步的:等引擎循环真正收敛再继续,回到与手动
+	// 暂停后 Continue 一致的"真停机"前提。共创窗口是人机交互时间尺度,短轮询无感。
+	for h.engine.isRunning() {
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "阶段共创完成，已注入后续方向并恢复创作", Level: "info"})
 	return h.Continue(stagePlanPrefix + draft)

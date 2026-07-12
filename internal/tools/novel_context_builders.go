@@ -685,6 +685,11 @@ func (t *ContextTool) buildArchitectFoundation(envelope *architectContextEnvelop
 		warn("foreshadow_ledger", err)
 	}
 	envelope.Foundation["foundation_status"] = t.foundationStatus()
+	// Writer 反馈池:commit_chapter 落盘的大纲偏离/建议,规划下一弧/卷时必须参考;
+	// expand_arc / append_volume / update_compass 成功后自动清空(已消费)。
+	if fbs := t.store.Outline.LoadPendingOutlineFeedback(); len(fbs) > 0 {
+		envelope.Foundation["writer_feedback"] = fbs
+	}
 }
 
 func (t *ContextTool) buildArchitectReferences(envelope *architectContextEnvelope, warn func(string, error)) {

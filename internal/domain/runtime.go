@@ -203,20 +203,24 @@ func NewArchitectMemoryPolicy() MemoryPolicy {
 
 // RunMeta 运行元信息，持久化到 meta/run.json。
 type RunMeta struct {
-	StartedAt    string       `json:"started_at"`
-	Provider     string       `json:"provider,omitempty"`
-	Style        string       `json:"style"`
-	Model        string       `json:"model"`
-	PlanningTier PlanningTier `json:"planning_tier,omitempty"`
-	SteerHistory []SteerEntry `json:"steer_history,omitempty"`
-	PendingSteer string       `json:"pending_steer,omitempty"` // 未完成的 Steer 指令，中断恢复时重新注入
-	PausePoint   *PausePoint  `json:"pause_point,omitempty"`   // 用户预约的验收停靠点，Host 边界消费
+	StartedAt    string           `json:"started_at"`
+	Provider     string           `json:"provider,omitempty"`
+	Style        string           `json:"style"`
+	Model        string           `json:"model"`
+	PlanningTier PlanningTier     `json:"planning_tier,omitempty"`
+	PlanStart    *PlanStartRecord `json:"plan_start,omitempty"`    // 启动裁定事实，规划期崩溃恢复的唯一依据
+	PendingSteer string           `json:"pending_steer,omitempty"` // 未完成的 Steer 指令，中断恢复时重新注入
+	PausePoint   *PausePoint      `json:"pause_point,omitempty"`   // 用户预约的验收停靠点，Host 边界消费
 }
 
-// SteerEntry 用户干预记录。
-type SteerEntry struct {
-	Input     string `json:"input"`
-	Timestamp string `json:"timestamp"`
+// PlanStartRecord 启动裁定的持久化事实(裁定先落事实,再起执行;恢复不重新裁定)。
+// 首个 save_foundation 落盘 scale 后,规划期恢复改由 PlanningTier 推导,本记录
+// 只覆盖"裁定完成到首次落盘之间"的窗口。DecisionID 关联 decisions.jsonl 审计。
+type PlanStartRecord struct {
+	RawPrompt   string `json:"raw_prompt"`
+	Planner     string `json:"planner"`
+	PlannerTask string `json:"planner_task"`
+	DecisionID  string `json:"decision_id,omitempty"`
 }
 
 // PauseAfterRewritesDrained 停靠点条件：重写队列排空后暂停。
