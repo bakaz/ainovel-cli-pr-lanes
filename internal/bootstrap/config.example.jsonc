@@ -38,7 +38,10 @@
       // ollama / bedrock / 显式 type 的自定义代理可以省略 api_key
       // base_url 需带 /v1（ollama 的 OpenAI 兼容端点在 /v1 下）
       "base_url": "http://localhost:11434/v1",
-      "models": ["qwen3:14b"]
+      "models": ["qwen3:14b"],
+      // 可选。流式空闲看门狗（Go duration，默认 "5m"）：LocalAI/ollama 等
+      // 本地慢推理首块可超 5 分钟，按 provider 放宽，不影响其它通道
+      "stream_idle_timeout": "15m"
     },
     "claude-code-proxy": {
       // 自定义 Anthropic 代理。如果上游限制只能由 Claude Code 客户端访问，

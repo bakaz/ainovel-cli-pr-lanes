@@ -46,7 +46,7 @@ phase=complete 不派发;writer 目标章未展开 → 改派 architect_long exp
 
 ## 5. 僵局协议
 
-每轮记录 (指令键=Agent+Task, checkpointSeq)。同键重派且 seq 未增 → repeat++;checkpoint 有推进 → 清零。
+每轮记录指令键 `Agent+Task`。上一轮执行后 Route 仍产生同键，说明任务后置条件未满足，`repeat++`；指令改变则清零。Worker 内部 `plan/draft/edit` 等中间 checkpoint 不算 Engine 级推进。
 repeat==3 → Arbiter `deadlock` 咨询;Arbiter 建议 retry **不清零**;repeat==5 → 硬熔断:暂停 + notify。
 (Coordinator 时代"不设阈值"依赖其自主性;确定性 Engine 必须有限界。)
 

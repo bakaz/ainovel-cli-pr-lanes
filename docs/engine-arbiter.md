@@ -53,7 +53,7 @@ Tools → Store(唯一事实源)
 | `plan_start` | 新书启动 | 选 short/long 规划师 + 扩充过短需求 |
 | `intervention` | 用户干预 | 查询 / 长效规则 / 剧情结构调整 / 已写返工 / 完本后返工或拒绝 |
 | `worker_failure` | Worker 报错**且确定性分类无出路** | 网络/参数/前置工件缺失等由确定性代码先分类,不送 Arbiter |
-| `deadlock` | 同一路由多次执行而 checkpoint 无推进 | 计数与终止语义见 §八 必答题 5 |
+| `deadlock` | 上一轮后仍产生同一路由指令 | 计数与终止语义见 §八 必答题 5 |
 | `completion_dispute` | **候补,有证据再加** | 卷末完结判定已由 Route 派 architect(分支 10)承担;仅"结构未到边界但故事该收"的中途分歧才需要,真实发生率未知,不预建 |
 
 完本总结不是裁定,是生成任务——由 Engine 直接派 editor 或一次普通 LLM 调用完成,不占 Arbiter 场景。
@@ -122,7 +122,7 @@ func DecideIntervention(ctx, model, facts, text) (InterventionDecision, error) /
 
 ```
 读事实 → Route / Arbiter 产出决定 → 核对前置条件 → 执行动作
-       → Worker 运行 → 检查 checkpoint 推进 → 下一轮
+       → Worker 运行 → 重算 Route 后置条件 → 下一轮
 ```
 
 - **不变量:控制状态只在 Engine 边界串行变更。**干预可在 Worker 运行期间并行咨询(只读安全、用户秒级看到 Answer/Reason 回显),但**改控制态的动作(pause/reopen/dispatch)进 Engine 队列,边界核对后提交**;answer(无状态)与 rules(内容平面,本章旧规则下章生效即语义)即时执行
@@ -178,7 +178,7 @@ type PlanStartRecord struct {
 2. **Engine 生命周期**:启动/暂停/中止/恢复;单 Worker 串行保证;/model 与 thinking 运行时切换
 3. **状态提交协议完整化**:§五 的 Expect 对账全场景化;Gate 拆除后 Engine 前置条件清单
 4. **错误分类学**:确定性分类(retry/reroute/terminal)先行,仅无出路者送 `worker_failure`;与 agentcore 层重试的分层
-5. **僵局协议**:同路由几次算僵局;成功返回但无 checkpoint 算几次;Arbiter 决定重试后计数是否清零;Arbiter 连续同一失败决策如何处理;何时终止而非无限咨询(Coordinator 的"不设阈值"依赖其自主性,确定性 Engine 必须有显式协议)
+5. **僵局协议**:同一 `Agent+Task` 连续重现即说明路由后置条件未满足；Worker 内部中间 checkpoint 不清零；Arbiter 决定 retry 不清零；3 次咨询、5 次硬熔断。
 6. **崩溃语义**:如何判定上一个 Worker 是否已产生有效事实
 7. **原型验收**:Observer/Usage/Context/模型切换/恢复五项与现状逐位对照
 

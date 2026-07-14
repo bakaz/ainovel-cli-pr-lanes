@@ -59,7 +59,7 @@ UI、诊断、事件日志都是从事件流 / 只读工件投影出来的被动
 
 **铁律一：工具只返事实，不返跨调度指令**。`commit_chapter` 返回 `arc_end` / `needs_expansion` 等结构化字段；不夹带 `[系统]` 类指令字符串。子代理内的 `next_step` 字段是事实陈述的内联指引（"我刚保存了 plan，下一步是 draft"），不算违反——见 §6.3。
 
-**铁律二：流程路由由 Flow Router 承担，执行由 Engine 承担**。`internal/flow/router.go` 的 `Route(state) → *Instruction` 是纯函数（万级组合穷举规格测试钉死）；Engine 每轮从 store 读事实、Route 推导指令、**直接程序化运行 Worker**（`subagent.Tool.Run`，类型化入参/结果/错误链），无 LLM 转发层。返回 nil 表示语义场景（完本收尾/等待干预）或自然停机。**僵局有显式限界**（RFC §5）：同指令重派且 checkpoint 无推进，3 次咨询 Arbiter、5 次硬熔断暂停——确定性 Engine 不允许无限空转。
+**铁律二：流程路由由 Flow Router 承担，执行由 Engine 承担**。`internal/flow/router.go` 的 `Route(state) → *Instruction` 是纯函数（万级组合穷举规格测试钉死）；Engine 每轮从 store 读事实、Route 推导指令、**直接程序化运行 Worker**（`subagent.Tool.Run`，类型化入参/结果/错误链），无 LLM 转发层。返回 nil 表示语义场景（完本收尾/等待干预）或自然停机。**僵局有显式限界**（RFC §5）：上一轮后 Route 仍产生同一 `Agent+Task`，即路由后置条件未满足；3 次咨询 Arbiter、5 次硬熔断暂停。Worker 内部中间 checkpoint 不重置计数，确定性 Engine 不允许无限空转。
 
 **铁律三：语义裁定走 Arbiter，每次裁定落盘**。启动选规划师、用户干预分诊、失败/僵局出路由 `internal/arbiter` 的逐场景 Decide 函数裁定：事实进、结构化决策出、机械校验兜底、decisions.jsonl 审计（可离线重放回归）。三个 Worker 保留各自的 `CheckpointDeltaGuard`（事实护栏：产物未落盘不得收工）。
 
@@ -204,7 +204,7 @@ Artifact 在 `store/outline.go` `drafts.go` `summaries.go` `characters.go` `worl
 | 工具参数非法 | Tools | validation 上抛，LLM 改参数 |
 | retryable（stream-idle 等） | subagent 层 | MaxRetries=7 就近重试，不出 Worker |
 | Worker 失败（guard 升级/hard_stop 等） | Engine | 确定性错误直接暂停；其余同指令重试一次 → Arbiter 裁定 retry/reroute/abort |
-| 僵局（同指令无 checkpoint 推进） | Engine | 3 次咨询 Arbiter，5 次硬熔断暂停 |
+| 僵局（同一路由指令连续重现） | Engine | 3 次咨询 Arbiter，5 次硬熔断暂停 |
 | 流式空响应 / 长思考 | litellm (`StreamIdleTimeout=5min`) | watchdog 触发重试 |
 
 ### 5.4 幂等
@@ -289,7 +289,7 @@ for {
     inst == nil → return          // 完本 / 语义停机,等 Continue
     precheck(inst)                // 原 ToolGate 的确定性化身:完本期丢弃派发;
                                   // writer 目标章未展开 → 改派 architect 展开
-    trackDeadlock(inst)           // 同指令 + checkpoint 无推进:3 次问 Arbiter,5 次熔断
+    trackDeadlock(inst)           // 同一 Agent+Task 连续重现:3 次问 Arbiter,5 次熔断
     runWorker(inst)               // subagent.Tool.Run + 进度中继 + DISPATCH 事件
     错误分类:确定性错误→暂停;首败重试一次;再败→Arbiter(retry/reroute/abort)
     哨兵边界:budget → pauser      // Worker 完成后(与旧 FlowBoundaryHook 时点一致)

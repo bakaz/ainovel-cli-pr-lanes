@@ -45,6 +45,37 @@ func (m *scriptedChatModel) GenerateStream(ctx context.Context, msgs []agentcore
 
 func (m *scriptedChatModel) SupportsTools() bool { return true }
 
+// editThenCancelModel 复现 #84：每次 Worker 都成功产生一个内容不同的
+// edit checkpoint，随后在同一 run 内返回 context canceled，始终没有 commit。
+type editThenCancelModel struct {
+	edits atomic.Int32
+}
+
+func (m *editThenCancelModel) Generate(_ context.Context, msgs []agentcore.Message, _ []agentcore.ToolSpec, _ ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
+	if len(msgs) > 0 && msgs[len(msgs)-1].Role == agentcore.RoleTool {
+		return nil, context.Canceled
+	}
+	n := int(m.edits.Add(1))
+	return &agentcore.LLMResponse{Message: testToolCallMsg("edit_chapter", map[string]any{
+		"chapter":    1,
+		"old_string": fmt.Sprintf("版本%d", n-1),
+		"new_string": fmt.Sprintf("版本%d", n),
+	})}, nil
+}
+
+func (m *editThenCancelModel) GenerateStream(ctx context.Context, msgs []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (<-chan agentcore.StreamEvent, error) {
+	resp, err := m.Generate(ctx, msgs, tools, opts...)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan agentcore.StreamEvent, 1)
+	ch <- agentcore.StreamEvent{Type: agentcore.StreamEventDone, Message: resp.Message, StopReason: resp.Message.StopReason}
+	close(ch)
+	return ch, nil
+}
+
+func (m *editThenCancelModel) SupportsTools() bool { return true }
+
 func testToolCallMsg(name string, args any) agentcore.Message {
 	data, _ := json.Marshal(args)
 	return agentcore.Message{
@@ -310,7 +341,7 @@ func TestEngine_RetriesUnfinishedPlanStart(t *testing.T) {
 		}
 		return testTextMsg(`{"action":"abort","reason":"规划师空转,停机"}`)
 	}}
-	// 规划师成功返回但不落任何盘 → checkpoint 恒无推进 → 僵局。
+	// 规划师成功返回但不落任何盘 → Route 始终返回同一补齐指令 → 僵局。
 	architect := subagent.Config{
 		Name: "architect_long", Description: "idle planner",
 		Model: &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
@@ -412,8 +443,8 @@ func TestEngine_PlanStartRetryFailurePauses(t *testing.T) {
 	}
 }
 
-// TestEngine_DeadlockConsultsArbiter 僵局路径:规划补齐指令反复执行无 checkpoint
-// 推进 → 第 3 次咨询 Arbiter → abort 停机 + deadlock 审计。
+// TestEngine_DeadlockConsultsArbiter 僵局路径:规划补齐指令连续重现
+// → 第 3 次咨询 Arbiter → abort 停机 + deadlock 审计。
 func TestEngine_DeadlockConsultsArbiter(t *testing.T) {
 	st := storepkg.NewStore(t.TempDir())
 	if err := st.Init(); err != nil {
@@ -427,7 +458,7 @@ func TestEngine_DeadlockConsultsArbiter(t *testing.T) {
 		t.Fatalf("tier: %v", err)
 	}
 
-	// architect 无守卫、成功返回但不落任何盘 → checkpoint 恒无推进
+	// architect 无守卫、成功返回但不落任何盘 → Route 指令恒定
 	lazy := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
 		return testTextMsg("知道了(什么也不做)")
 	}}
@@ -457,6 +488,76 @@ func TestEngine_DeadlockConsultsArbiter(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("deadlock 裁定必须落盘: %+v", recs)
+	}
+}
+
+// TestEngine_IntermediateCheckpointsDoNotMaskDeadlock 锁定 #84：Writer 反复修改
+// 草稿会产生新 digest 和新 edit checkpoint，但只要 Route 仍是同一个
+// "写第 1 章"，就说明 Engine 级后置条件(commit)未完成，必须继续累计僵局。
+func TestEngine_IntermediateCheckpointsDoNotMaskDeadlock(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("#84 回归", 1); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("phase: %v", err)
+	}
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{{Chapter: 1, Title: "第一章", CoreEvent: "开端"}}); err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+	if err := st.Drafts.SaveDraft(1, "版本0 正文初稿"); err != nil {
+		t.Fatalf("draft: %v", err)
+	}
+
+	writerModel := &editThenCancelModel{}
+	writer := subagent.Config{
+		Name: "writer", Description: "edit then cancel writer",
+		Model: writerModel, SystemPrompt: "test",
+		Tools:    []agentcore.Tool{tools.NewEditChapterTool(st)},
+		MaxTurns: 5,
+	}
+	// 即使 Arbiter 对 worker_failure / deadlock 一直要求 retry，现有第 5 次
+	// 硬熔断也必须在派发前截停，不得被 edit checkpoint 重置。
+	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		return testTextMsg(`{"action":"retry","reason":"继续重试"}`)
+	}}
+	e, _, done := newTestEngine(t, st, subagent.New(writer), arb)
+
+	if !e.start(nil) {
+		t.Fatal("engine start")
+	}
+	waitEngineDone(t, done)
+
+	if got := writerModel.edits.Load(); got != deadlockAbortAt-1 {
+		t.Fatalf("deadlock 应在第 %d 次派发前硬熔断，实际 edit %d 次", deadlockAbortAt, got)
+	}
+	var edits int
+	for _, cp := range st.Checkpoints.All() {
+		if cp.Scope.Matches(domain.ChapterScope(1)) && cp.Step == "edit" {
+			edits++
+		}
+	}
+	if edits != deadlockAbortAt-1 {
+		t.Fatalf("应保留 %d 条不同的 edit checkpoint，实际 %d", deadlockAbortAt-1, edits)
+	}
+	recs, err := st.Decisions.Recent(10)
+	if err != nil {
+		t.Fatalf("decisions: %v", err)
+	}
+	var hasWorkerFailure, hasDeadlock bool
+	for _, rec := range recs {
+		switch rec.Kind {
+		case "worker_failure":
+			hasWorkerFailure = true
+		case "deadlock":
+			hasDeadlock = true
+		}
+	}
+	if !hasWorkerFailure || !hasDeadlock {
+		t.Fatalf("应先记录 worker_failure 再记录 deadlock: %+v", recs)
 	}
 }
 

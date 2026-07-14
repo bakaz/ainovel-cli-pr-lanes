@@ -12,6 +12,8 @@ import (
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/subagent"
+	"github.com/voocel/litellm"
+
 	"github.com/voocel/ainovel-cli/internal/arbiter"
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/flow"
@@ -50,9 +52,9 @@ type engine struct {
 	pending []controlOp       // 干预的控制态动作,边界提交
 	next    *flow.Instruction // 下一轮优先执行的指令(plan_start / arbiter dispatch)
 
-	// 僵局追踪:同指令键重派且 checkpoint 无推进才累计。
+	// 僵局追踪:上一轮执行后 Route 仍产生同一指令键即累计。
+	// Router 指令是任务后置条件的投影；真正完成会让下一指令改变。
 	lastKey string
-	lastSeq int64
 	repeats int
 	// 失败重试:同指令键仅重试一次,再败问 Arbiter。
 	failedKey string
@@ -92,7 +94,7 @@ func (e *engine) start(initial *flow.Instruction) bool {
 	if initial != nil {
 		e.next = initial
 	}
-	e.lastKey, e.lastSeq, e.repeats, e.failedKey = "", 0, 0, ""
+	e.lastKey, e.repeats, e.failedKey = "", 0, ""
 	go e.run(ctx)
 	return true
 }
@@ -325,7 +327,10 @@ func writerTargetChapter(st *storepkg.Store) int {
 	return progress.NextChapter()
 }
 
-// trackDeadlock 维护僵局计数;repeats 达阈值时咨询 Arbiter,硬上限直接熔断。
+// trackDeadlock 维护僵局计数：连续出现同一 Agent+Task 说明上一轮
+// 没有满足路由后置条件。Worker 内部的 plan/draft/edit 等中间 checkpoint
+// 只用于恢复和观测，不能重置 Engine 级计数（issue #84）。
+// repeats 达阈值时咨询 Arbiter，硬上限直接熔断。
 // 返回 stop=true 表示本轮应结束循环;inst 可能被 Arbiter 改写(reroute)或置 nil(重算)。
 func (e *engine) trackDeadlock(ctx context.Context, inst **flow.Instruction) (stop bool) {
 	in := *inst
@@ -334,14 +339,10 @@ func (e *engine) trackDeadlock(ctx context.Context, inst **flow.Instruction) (st
 		return false
 	}
 	key := in.Agent + "\x00" + in.Task
-	seq := int64(0)
-	if cp := e.store.Checkpoints.LatestGlobal(); cp != nil {
-		seq = cp.Seq
-	}
-	if key == e.lastKey && seq == e.lastSeq {
+	if key == e.lastKey {
 		e.repeats++
 	} else {
-		e.lastKey, e.lastSeq, e.repeats = key, seq, 1
+		e.lastKey, e.repeats = key, 1
 	}
 	if e.repeats < deadlockConsultAt {
 		return false
@@ -427,7 +428,7 @@ func (e *engine) handleWorkerError(ctx context.Context, inst *flow.Instruction, 
 	})
 	e.recordFailureDecision("worker_failure", inst, facts, decision, err)
 	if err != nil {
-		e.pauseWithNotify(notify.KindWorkerFailure, "失败裁定不可用,已暂停等待人工介入: "+msg)
+		e.pauseWithNotify(notify.KindWorkerFailure, "失败裁定不可用,已暂停等待人工介入: "+msg+contentFilterAdvice(werr))
 		return true
 	}
 	switch decision.Action {
@@ -439,9 +440,20 @@ func (e *engine) handleWorkerError(ctx context.Context, inst *flow.Instruction, 
 		e.mu.Unlock()
 		return false
 	default: // abort
-		e.pauseWithNotify(notify.KindWorkerFailure, "失败裁定: "+decision.Reason)
+		e.pauseWithNotify(notify.KindWorkerFailure, "失败裁定: "+decision.Reason+contentFilterAdvice(werr))
 		return true
 	}
+}
+
+// contentFilterAdvice 给内容审核拦截的暂停附上用户可执行的出路。
+// 审核是服务商黑盒,预检/规避都不可行,能做的只有把决策递到用户手上;
+// 拦截本身不提前熔断——换上下文重派对它有真实自愈率(ch21-24 实测),
+// 走完"免费重试→仲裁"再暂停。
+func contentFilterAdvice(werr error) string {
+	if !litellm.IsContentFilterError(werr) {
+		return ""
+	}
+	return "。这是服务商内容审核拦截(非本地错误),可选: /model 切到无审核层的服务商后输入「继续」;或修改本章草稿(drafts/)措辞后再继续;原样重试大概率仍被拦"
 }
 
 // errInvalidWriteTarget 标记 runWorker 前置校验拦下的非法写作目标——引擎自身

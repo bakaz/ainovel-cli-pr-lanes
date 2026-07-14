@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/voocel/ainovel-cli/internal/errs"
 	"github.com/voocel/ainovel-cli/internal/notify"
@@ -89,5 +90,45 @@ func TestValidateBaseNotifyEventsMatchRuntimeContract(t *testing.T) {
 	cfg = validConfig([]string{"repeat"})
 	if err := cfg.ValidateBase(); !errors.Is(err, errs.ErrConfig) {
 		t.Fatalf("旧 repeat 事件应被拒绝，得到: %v", err)
+	}
+}
+
+func TestProviderStreamIdleTimeoutValue(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{"", defaultStreamIdleTimeout, false},
+		{"900s", 15 * time.Minute, false},
+		{"15m", 15 * time.Minute, false},
+		{"abc", 0, true},
+		{"-5s", 0, true},
+		{"0", 0, true}, // 不提供"关闭看门狗"——真死流需要有限界
+	}
+	for _, c := range cases {
+		got, err := ProviderConfig{StreamIdleTimeout: c.in}.StreamIdleTimeoutValue()
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("%q 应报错", c.in)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Errorf("%q = (%v, %v), want %v", c.in, got, err, c.want)
+		}
+	}
+}
+
+func TestValidateBaseRejectsBadStreamIdleTimeout(t *testing.T) {
+	cfg := Config{
+		Provider:  "openrouter",
+		ModelName: "test-model",
+		Providers: map[string]ProviderConfig{
+			"openrouter": {APIKey: "sk-test-123456", StreamIdleTimeout: "fast"},
+		},
+	}
+	if err := cfg.ValidateBase(); !errors.Is(err, errs.ErrConfig) {
+		t.Fatalf("非法 stream_idle_timeout 应拒绝并包装 ErrConfig，得到: %v", err)
 	}
 }

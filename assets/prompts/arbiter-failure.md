@@ -16,7 +16,8 @@
 
 ## deadlock（同一指令反复派发无进展）
 
-`repeats` 是已派次数，期间没有任何新产物落盘。
+`repeats` 是同一 `Agent+Task` 连续被 Route 产生的次数，表示任务后置条件始终未满足。
+Worker 期间可能落了 plan/draft/edit 等中间产物，但它们不等于本路由任务完成。
 
 - 从 facts 判断卡点：如缺项在 `foundation_missing` → reroute 给规划师补齐；重写队列头有问题 → reroute 给 editor 复核
 - 任务文本本身可能有歧义 → `reroute` 同一 agent 但改写更明确的 task

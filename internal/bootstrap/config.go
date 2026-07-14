@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/voocel/agentcore/llm"
 	"github.com/voocel/ainovel-cli/internal/errs"
@@ -60,6 +61,33 @@ type ProviderConfig struct {
 	// Extra 透传给 provider 级配置（litellm.ProviderConfig.Extra），用于 HTTP
 	// headers、user_agent、anthropic_beta 等客户端/传输层选项。
 	Extra map[string]any `json:"extra,omitempty"`
+	// StreamIdleTimeout 流式空闲看门狗：超过该时长收不到任何 chunk 即断流
+	// （Go duration 字符串，如 "900s" / "15m"）。留空默认 5m——云端服务的合理上界；
+	// LocalAI/ollama 等自建慢推理首块可远超 5 分钟，按 provider 放宽即可，
+	// 不拖累其它通道的挂死检测（#79）。
+	StreamIdleTimeout string `json:"stream_idle_timeout,omitempty"`
+}
+
+// defaultStreamIdleTimeout：长输出 + 长 ctx 场景下，reasoning-aware provider
+// （mimo / deepseek-r1 等）思考阶段如果 server 端不流式发 reasoning delta，
+// SSE 整段会保持沉默。litellm 默认 watchdog 是 2 分钟，对 8000 字写作章节经常
+// 触发误杀；5 分钟覆盖绝大多数实测案例（参见 tasks/todo.md plan→draft 思考时长统计）。
+const defaultStreamIdleTimeout = 5 * time.Minute
+
+// StreamIdleTimeoutValue 解析该 provider 的流式空闲超时；留空回落默认值。
+func (pc ProviderConfig) StreamIdleTimeoutValue() (time.Duration, error) {
+	s := strings.TrimSpace(pc.StreamIdleTimeout)
+	if s == "" {
+		return defaultStreamIdleTimeout, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q (use Go duration like \"900s\" / \"15m\")", s)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("must be positive, got %q", s)
+	}
+	return d, nil
 }
 
 // RequiresAPIKey 返回该 provider 是否必须显式配置 api_key。
@@ -293,6 +321,9 @@ func validateProviderConfigText(name string, pc ProviderConfig) error {
 	case "", "chat", "responses":
 	default:
 		return fmt.Errorf("provider %q api must be chat or responses: %w", name, errs.ErrConfig)
+	}
+	if _, err := pc.StreamIdleTimeoutValue(); err != nil {
+		return fmt.Errorf("provider %q stream_idle_timeout: %w: %w", name, err, errs.ErrConfig)
 	}
 	return nil
 }
