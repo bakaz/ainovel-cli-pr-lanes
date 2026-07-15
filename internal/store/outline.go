@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
@@ -237,7 +238,17 @@ func (s *OutlineStore) CheckArcBoundary(chapter int) (*ArcBoundary, error) {
 }
 
 // expandArcUnlocked 内部方法，在 Store.ExpandArc 跨域协调中调用。
-func (s *OutlineStore) expandArcUnlocked(volumeIdx, arcIdx int, chapters []domain.OutlineEntry) ([]domain.VolumeOutline, error) {
+func (s *OutlineStore) expandArcUnlocked(volumeIdx, arcIdx int, expansion domain.ArcExpansion) ([]domain.VolumeOutline, error) {
+	if strings.TrimSpace(expansion.Title) == "" {
+		return nil, fmt.Errorf("弧标题不能为空")
+	}
+	if strings.TrimSpace(expansion.Goal) == "" {
+		return nil, fmt.Errorf("弧目标不能为空")
+	}
+	if len(expansion.Chapters) == 0 {
+		return nil, fmt.Errorf("展开弧必须至少包含一章")
+	}
+
 	var volumes []domain.VolumeOutline
 	if err := s.io.ReadJSONUnlocked("layered_outline.json", &volumes); err != nil {
 		return nil, fmt.Errorf("load layered_outline: %w", err)
@@ -251,7 +262,20 @@ func (s *OutlineStore) expandArcUnlocked(volumeIdx, arcIdx int, chapters []domai
 			if volumes[vi].Arcs[ai].Index != arcIdx {
 				continue
 			}
-			volumes[vi].Arcs[ai].Chapters = chapters
+			if volumes[vi].Arcs[ai].IsExpanded() {
+				current := domain.ArcExpansion{
+					Title:    volumes[vi].Arcs[ai].Title,
+					Goal:     volumes[vi].Arcs[ai].Goal,
+					Chapters: volumes[vi].Arcs[ai].Chapters,
+				}
+				if reflect.DeepEqual(current, expansion) {
+					return volumes, nil
+				}
+				return nil, fmt.Errorf("arc already expanded: volume=%d, arc=%d", volumeIdx, arcIdx)
+			}
+			volumes[vi].Arcs[ai].Title = expansion.Title
+			volumes[vi].Arcs[ai].Goal = expansion.Goal
+			volumes[vi].Arcs[ai].Chapters = expansion.Chapters
 			volumes[vi].Arcs[ai].EstimatedChapters = 0
 			found = true
 			break

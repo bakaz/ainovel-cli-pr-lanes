@@ -220,6 +220,56 @@ func TestSaveFoundationAppendVolume(t *testing.T) {
 	}
 }
 
+func TestSaveFoundationExpandArcCalibratesTarget(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "选择",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已完成弧", Goal: "建立同盟", Chapters: []domain.OutlineEntry{{Title: "分裂", CoreEvent: "同盟意外破裂"}}},
+			{Index: 2, Title: "旧标题", Goal: "维持同盟", EstimatedChapters: 4},
+		},
+	}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"type": "expand_arc", "volume": 1, "arc": 2,
+		"content": map[string]any{
+			"title": "裂盟之后",
+			"goal":  "让分裂后的双方以不同选择推进同一主线",
+			"chapters": []map[string]any{{
+				"title": "各走一边", "core_event": "双方分别追索真相", "hook": "两条线索意外重合", "scenes": []string{"分道", "追索"},
+			}},
+		},
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute expand_arc: %v", err)
+	}
+	var facts map[string]any
+	if err := json.Unmarshal(result, &facts); err != nil {
+		t.Fatalf("Unmarshal result: %v", err)
+	}
+	if facts["title"] != "裂盟之后" || facts["goal"] != "让分裂后的双方以不同选择推进同一主线" {
+		t.Fatalf("expected calibrated facts, got %+v", facts)
+	}
+	volumes, err := s.Outline.LoadLayeredOutline()
+	if err != nil {
+		t.Fatalf("LoadLayeredOutline: %v", err)
+	}
+	if got := volumes[0].Arcs[1]; got.Title != "裂盟之后" || got.Goal != "让分裂后的双方以不同选择推进同一主线" || len(got.Chapters) != 1 {
+		t.Fatalf("unexpected expanded arc: %+v", got)
+	}
+}
+
 func TestSaveFoundationAppendVolumeValidation(t *testing.T) {
 	dir := t.TempDir()
 	s := store.NewStore(dir)

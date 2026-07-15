@@ -276,6 +276,15 @@ func TestContextToolArchitectModeIncludesPlanningAndFoundation(t *testing.T) {
 	if err := s.Init(); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
+	if err := s.Progress.Init("test", 6); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatalf("SetLayered: %v", err)
+	}
+	if err := s.Progress.UpdateVolumeArc(1, 1); err != nil {
+		t.Fatalf("UpdateVolumeArc: %v", err)
+	}
 	if err := s.Outline.SavePremise(`## 题材和基调
 群像冒险，偏冷峻史诗。
 
@@ -346,6 +355,11 @@ func TestContextToolArchitectModeIncludesPlanningAndFoundation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("SaveLayeredOutline: %v", err)
 	}
+	if err := s.Summaries.SaveArcSummary(domain.ArcSummary{
+		Volume: 1, Arc: 1, Title: "启程", Summary: "队伍建立，但因真相分歧出现裂痕。", KeyEvents: []string{"队伍建立", "分歧浮现"},
+	}); err != nil {
+		t.Fatalf("SaveArcSummary: %v", err)
+	}
 	if err := s.Outline.SaveCompass(domain.StoryCompass{
 		EndingDirection: "揭开古老真相",
 		EstimatedScale:  "预计 3 卷",
@@ -394,6 +408,7 @@ func TestContextToolArchitectModeIncludesPlanningAndFoundation(t *testing.T) {
 		"characters",
 		"layered_outline",
 		"skeleton_arcs",
+		"arc_summaries",
 		"compass",
 		"style_rules",
 		"references",

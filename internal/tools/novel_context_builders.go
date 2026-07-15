@@ -616,6 +616,17 @@ func (t *ContextTool) buildArchitectPlanning(envelope *architectContextEnvelope,
 	} else {
 		warn("volume_summaries", err)
 	}
+	// 卷摘要承接已完成卷；当前卷的弧摘要承接最近实际剧情。扩弧时两者与
+	// 骨架目标同时交给 Architect，让模型自行决定保留还是修订未写计划。
+	if progress, err := t.store.Progress.Load(); err == nil && progress != nil && progress.CurrentVolume > 0 {
+		if arcSummaries, err := t.store.Summaries.LoadArcSummaries(progress.CurrentVolume); err == nil && len(arcSummaries) > 0 {
+			envelope.Planning["arc_summaries"] = arcSummaries
+		} else {
+			warn("arc_summaries", err)
+		}
+	} else {
+		warn("progress_for_arc_summaries", err)
+	}
 
 	// completion_signals 把"全书是否该结尾"的关键事实集中呈现，
 	// 让架构师在裁定 complete_book / append_volume 时一眼看到对照面。

@@ -106,6 +106,63 @@ func TestCheckArcBoundaryNextArcInSameVolume(t *testing.T) {
 	}
 }
 
+func TestExpandArcCalibratesUnwrittenPlan(t *testing.T) {
+	s := setupLayered(t, []domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "起步",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "旧弧", Goal: "造成计划外的决裂", Chapters: []domain.OutlineEntry{{Title: "决裂", CoreEvent: "同伴离队", Hook: "去向不明"}}},
+			{Index: 2, Title: "原骨架", Goal: "按原计划同行", EstimatedChapters: 8},
+		},
+	}})
+
+	expansion := domain.ArcExpansion{
+		Title: "分途追索",
+		Goal:  "承认决裂已经发生，让两条行动线分别逼近同一真相",
+		Chapters: []domain.OutlineEntry{
+			{Title: "两张地图", CoreEvent: "两队从不同线索出发", Hook: "线索指向同一地点"},
+			{Title: "隔墙回声", CoreEvent: "双方隔空影响彼此选择", Hook: "重逢代价浮现"},
+		},
+	}
+	if err := s.ExpandArc(1, 2, expansion); err != nil {
+		t.Fatalf("ExpandArc: %v", err)
+	}
+
+	volumes, err := s.Outline.LoadLayeredOutline()
+	if err != nil {
+		t.Fatalf("LoadLayeredOutline: %v", err)
+	}
+	got := volumes[0].Arcs[1]
+	if got.Title != expansion.Title || got.Goal != expansion.Goal {
+		t.Fatalf("expected calibrated title/goal, got title=%q goal=%q", got.Title, got.Goal)
+	}
+	if got.EstimatedChapters != 0 || len(got.Chapters) != 2 {
+		t.Fatalf("expected expanded arc, got estimated=%d chapters=%d", got.EstimatedChapters, len(got.Chapters))
+	}
+	flat, err := s.Outline.LoadOutline()
+	if err != nil {
+		t.Fatalf("LoadOutline: %v", err)
+	}
+	if len(flat) != 3 || flat[1].Chapter != 2 || flat[2].Chapter != 3 {
+		t.Fatalf("expected continuous flattened outline, got %+v", flat)
+	}
+	progress, err := s.Progress.Load()
+	if err != nil {
+		t.Fatalf("LoadProgress: %v", err)
+	}
+	if progress.TotalChapters != 3 {
+		t.Fatalf("expected total chapters 3, got %d", progress.TotalChapters)
+	}
+
+	if err := s.ExpandArc(1, 2, expansion); err != nil {
+		t.Fatalf("same expansion must be idempotent: %v", err)
+	}
+	changed := expansion
+	changed.Goal = "事后改写已展开弧"
+	if err := s.ExpandArc(1, 2, changed); err == nil {
+		t.Fatal("expected a different expansion to reject overwriting the expanded arc")
+	}
+}
+
 func TestAppendVolumeValidation(t *testing.T) {
 	s := setupLayered(t, []domain.VolumeOutline{{
 		Index: 1, Title: "第一卷", Theme: "起步",

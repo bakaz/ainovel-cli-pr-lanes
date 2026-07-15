@@ -134,15 +134,15 @@ func (s *Store) Init() error {
 
 // ── 跨域协调方法 ──
 
-// ExpandArc 将骨架弧展开为详细章节（Outline + Progress 联动）。
-func (s *Store) ExpandArc(volumeIdx, arcIdx int, chapters []domain.OutlineEntry) error {
+// ExpandArc 将骨架弧校准并展开为详细章节（Outline + Progress 联动）。
+func (s *Store) ExpandArc(volumeIdx, arcIdx int, expansion domain.ArcExpansion) error {
 	s.crossMu.Lock()
 	defer s.crossMu.Unlock()
 
 	s.Outline.io.mu.Lock()
 	defer s.Outline.io.mu.Unlock()
 
-	volumes, err := s.Outline.expandArcUnlocked(volumeIdx, arcIdx, chapters)
+	volumes, err := s.Outline.expandArcUnlocked(volumeIdx, arcIdx, expansion)
 	if err != nil {
 		return err
 	}

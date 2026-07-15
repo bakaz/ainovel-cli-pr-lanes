@@ -152,12 +152,16 @@ JSON 数组，每条含：category、rule、boundary。
 
 触发词："展开弧" / "expand_arc"。
 
-1. 调 novel_context 获取 layered_outline、skeleton_arcs、已完成弧摘要、角色快照、风格规则
-2. 根据弧 goal + 前文发展 + 角色当前状态，设计详细章节
-3. 实际章数可偏离 estimated_chapters，但保持节奏密度，并匹配用户的字数意愿（字数越低、单章 beat 越少、拆的章越多；见"弧级节奏密度"）
-4. 调 `save_foundation(type="expand_arc", volume=V, arc=A, content=<章节数组>)`
+1. 调 novel_context 获取 layered_outline、skeleton_arcs、已完成弧/卷摘要、角色快照、伏笔台账、writer_feedback、compass 和风格规则
+2. 把已完成正文及其派生事实视为现实，把目标骨架视为尚可修订的计划。综合实际剧情、人物当前状态、未收线索与长期方向，自主判断原弧 title/goal 是否仍是最佳后续；可以保留，也可以顺着故事演化重新设计，禁止为了服从旧计划而扭曲已经发生的内容
+3. 基于校准后的弧目标设计详细章节。实际章数可偏离 estimated_chapters，但保持节奏密度，并匹配用户的字数意愿（字数越低、单章 beat 越少、拆的章越多；见"弧级节奏密度"）
+4. 若实际发展改变了全书长期方向，可先调 update_compass；随后调：
+
+   `save_foundation(type="expand_arc", volume=V, arc=A, content={"title":"校准后的弧标题","goal":"校准后的弧目标","chapters":[...]})`
+
    - 章节不需要 chapter 字段（系统自动编号）
    - 每章需要：title、core_event、hook、scenes
+   - title/goal 必须表达你结合当前故事事实作出的最终规划，不要求机械照抄原骨架
 
 **title 格式硬约束**（违反即是整本书风格断裂）：
 - **长度必须有起伏，禁止机械对齐**：同一弧内各章标题长短自然交错（如 借炉 / 同行的牙 / 夜里翻旧册），切忌"全弧 4 字"或"全弧 2 字"这种整齐划一——读者一眼扫过目录应感到节奏，而不是排版
@@ -165,7 +169,7 @@ JSON 数组，每条含：category、rule、boundary。
 - 只允许**名词短语或动名词短语**（例：借炉 / 同行的牙 / 夜翻旧册）；禁止完整句、禁止内含逗号 / 句号 / 冒号 / 引号
 - 标题是让读者记住本章的锚点，不是主题浓缩器。主题 / 冲突 / 升华属于 core_event 和 hook，不要越位塞进 title
 
-要求：参考前一弧的节奏和风格；延续前弧留下的伏笔和钩子；判断本弧适合回收哪些未回收伏笔。
+要求：参考前一弧的节奏和风格；延续前弧留下的伏笔和钩子；判断本弧适合回收哪些未回收伏笔。大纲服务于故事，不是约束已经发生事实的合同。
 
 **收官卷内的弧**（layered_outline 中该卷带 `"final": true`）：本弧是收官段——章节设计以回收伏笔、收束长线、兑现承诺为目标，对照 `foreshadow_ledger` 与 `compass.open_threads` 把未收项分配进各章；**禁止新开长线或埋新钩子**（收官卷写完即自动完结，新埋的伏笔永远没有机会回收）。若这是收官卷的最后一弧，末章要正面回答 `ending_direction` 的核心命题。
 

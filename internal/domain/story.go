@@ -70,6 +70,14 @@ type ArcOutline struct {
 // IsExpanded 判断弧是否已展开（有详细章节）。
 func (a *ArcOutline) IsExpanded() bool { return len(a.Chapters) > 0 }
 
+// ArcExpansion 是 Architect 在结构边界对一个未写弧作出的完整规划。
+// Title/Goal 不是骨架的机械副本：模型可依据已完成正文修订尚未发生的计划。
+type ArcExpansion struct {
+	Title    string         `json:"title"`
+	Goal     string         `json:"goal"`
+	Chapters []OutlineEntry `json:"chapters"`
+}
+
 // TotalChapters 计算分层大纲的当前规划总章数。
 // 已展开弧按真实章节数计，骨架弧按 EstimatedChapters 计。
 // Progress.TotalChapters 用它判断长篇上下文策略；真正可写章节仍来自 FlattenOutline。
