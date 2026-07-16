@@ -171,9 +171,11 @@ func TestBuildStoryStateSummary_Populated(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.Outline.SaveCompass(domain.StoryCompass{
-		EndingDirection: "主角登临绝巅",
-		OpenThreads:     []string{"师门血仇未报"},
-		EstimatedScale:  "预计 4-6 卷",
+		Long: domain.LongCompass{
+			EndingDirection: "主角登临绝巅",
+			OpenThreads:     []string{"师门血仇未报"},
+			EstimatedScale:  "预计 4-6 卷",
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}

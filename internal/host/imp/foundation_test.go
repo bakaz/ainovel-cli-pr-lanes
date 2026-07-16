@@ -117,7 +117,7 @@ func TestReverseFoundation_ParsesValid(t *testing.T) {
 	if len(got.Volumes) != 1 || len(domain.FlattenOutline(got.Volumes)) != 2 {
 		t.Errorf("volumes wrong: %+v", got.Volumes)
 	}
-	if got.Compass == nil || len(got.Compass.OpenThreads) == 0 {
+	if got.Compass == nil || len(got.Compass.Long.OpenThreads) == 0 {
 		t.Errorf("compass should be parsed with open_threads: %+v", got.Compass)
 	}
 	if !strings.Contains(llm.got[0].TextContent(), "with 2") {
