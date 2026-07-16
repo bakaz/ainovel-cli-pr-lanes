@@ -54,8 +54,8 @@ func newArchitectContextEnvelope() architectContextEnvelope {
 
 func (e chapterContextEnvelope) apply(result map[string]any) {
 	// 合并而非替换：Execute 的章节路径会先后 apply 两个信封（seed + buildChapterContext），
-	// 整体赋值会让第二次 apply 丢弃 seed 的容器内容，working_memory.* 等 canonical
-	// 路径随之失效（prompt 指针指向空气，模型只能靠顶层镜像模糊容错）。
+	// 整体赋值会让第二次 apply 丢弃 seed 的容器内容。这里只维护 canonical
+	// 容器，同时为兼容老测试保留顶层镜像。
 	mergeEnvelopeSection(result, "working_memory", e.Working)
 	mergeEnvelopeSection(result, "episodic_memory", e.Episodic)
 	mergeEnvelopeSection(result, "reference_pack", e.References)
@@ -582,7 +582,13 @@ func (t *ContextTool) buildArchitectPlanning(envelope *architectContextEnvelope,
 	var layered []domain.VolumeOutline
 	if l, err := t.store.Outline.LoadLayeredOutline(); err == nil && len(l) > 0 {
 		layered = l
-		envelope.Planning["layered_outline"] = layered
+		progress, progressErr := t.store.Progress.Load()
+		warn("progress", progressErr)
+		includeNearbyChapterDetail := t.role == "architect"
+		envelope.Planning["layered_outline"] = planningLayeredOutlineView(layered, progress, includeNearbyChapterDetail)
+		if includeNearbyChapterDetail {
+			envelope.Planning["outline_detail_policy"] = planningOutlineDetailPolicy(layered, progress)
+		}
 		var skeletonArcs []map[string]any
 		for _, v := range layered {
 			for _, a := range v.Arcs {
@@ -607,12 +613,14 @@ func (t *ContextTool) buildArchitectPlanning(envelope *architectContextEnvelope,
 	var compass *domain.StoryCompass
 	if c, err := t.store.Outline.LoadCompass(); err == nil && c != nil {
 		compass = c
-		envelope.Planning["compass"] = compass
+		// 首轮只装 long/current 的稳定字段。详细 Long Reference 即便对 Architect
+		// 也用 read_planning_reference 按需读取，避免每轮固定支付整包成本。
+		envelope.Planning["compass"] = compassContextView(compass, false)
 	} else {
 		warn("compass", err)
 	}
 	if volSummaries, err := t.store.Summaries.LoadAllVolumeSummaries(); err == nil && len(volSummaries) > 0 {
-		envelope.Planning["volume_summaries"] = volSummaries
+		envelope.Planning["volume_summaries"] = planningVolumeSummaryView(volSummaries)
 	} else {
 		warn("volume_summaries", err)
 	}
@@ -649,10 +657,13 @@ func (t *ContextTool) completionSignals(layered []domain.VolumeOutline, compass 
 		}
 	}
 	if compass != nil {
-		if compass.EstimatedScale != "" {
-			signals["compass_estimated_scale"] = compass.EstimatedScale
+		if compass.Long.EstimatedScale != "" {
+			signals["compass_estimated_scale"] = compass.Long.EstimatedScale
 		}
-		signals["open_threads_count"] = len(compass.OpenThreads)
+		signals["long_open_threads_count"] = len(compass.Long.OpenThreads)
+		if compass.Current != nil {
+			signals["current_open_threads_count"] = len(compass.Current.OpenThreads)
+		}
 	}
 	if active, err := t.store.World.LoadActiveForeshadow(); err == nil {
 		signals["active_foreshadow_count"] = len(active)
@@ -711,4 +722,133 @@ func (t *ContextTool) buildArchitectReferences(envelope *architectContextEnvelop
 	}
 
 	envelope.References["references"] = t.architectReferences()
+}
+
+// compassContextView 返回按角色裁剪的只读视图。Store 中仍持久化完整 Long
+// Reference，常规 long/current 字段对所有获准读取 Compass 的角色保持一致。
+func compassContextView(compass *domain.StoryCompass, includeLongReference bool) *domain.StoryCompass {
+	if compass == nil {
+		return nil
+	}
+	view := *compass
+	if !includeLongReference {
+		view.Long.Reference = nil
+	}
+	return &view
+}
+
+// planningLayeredOutlineView 始终完整保留所有卷纲与弧纲；只有弧下逐章
+// chapters[] 按视野裁剪为当前卷及物理相邻的上一卷、下一卷。更远卷可由
+// read_planning_reference 批量补读完整章节细纲。Store 原始大纲不变。
+func planningLayeredOutlineView(layered []domain.VolumeOutline, progress *domain.Progress, includeNearbyChapterDetail bool) []map[string]any {
+	currentIndex := -1
+	flatArcCount := 0
+	currentVolumeIndex := 0
+	for _, volume := range layered {
+		for _, arc := range volume.Arcs {
+			if progress != nil && volume.Index == progress.CurrentVolume && arc.Index == progress.CurrentArc {
+				currentIndex = flatArcCount
+			}
+			flatArcCount++
+		}
+	}
+	if currentIndex < 0 && flatArcCount > 0 {
+		currentIndex = 0
+	}
+	if progress != nil {
+		for i, volume := range layered {
+			if volume.Index == progress.CurrentVolume {
+				currentVolumeIndex = i
+				break
+			}
+		}
+	}
+
+	flatIndex := 0
+	view := make([]map[string]any, 0, len(layered))
+	for volumeIndex, volume := range layered {
+		keepChapterDetail := includeNearbyChapterDetail && volumeIndex >= currentVolumeIndex-1 && volumeIndex <= currentVolumeIndex+1
+		volumeView := map[string]any{
+			"index": volume.Index,
+			"title": volume.Title,
+			"theme": volume.Theme,
+		}
+		if volume.Final {
+			volumeView["final"] = true
+		}
+		arcs := make([]map[string]any, 0, len(volume.Arcs))
+		for _, arc := range volume.Arcs {
+			arcView := map[string]any{
+				"index": arc.Index,
+				"title": arc.Title,
+				"goal":  arc.Goal,
+			}
+			if !arc.IsExpanded() {
+				arcView["status"] = "skeleton"
+				arcView["estimated_chapters"] = arc.EstimatedChapters
+			} else {
+				arcView["status"] = "planned"
+				if flatIndex < currentIndex {
+					arcView["status"] = "completed"
+				} else if flatIndex == currentIndex {
+					arcView["status"] = "active"
+				}
+				arcView["chapter_count"] = len(arc.Chapters)
+				arcView["chapter_start"] = arc.Chapters[0].Chapter
+				arcView["chapter_end"] = arc.Chapters[len(arc.Chapters)-1].Chapter
+				arcView["chapter_detail"] = keepChapterDetail
+				if keepChapterDetail {
+					arcView["chapters"] = arc.Chapters
+				}
+			}
+			arcs = append(arcs, arcView)
+			flatIndex++
+		}
+		volumeView["arcs"] = arcs
+		view = append(view, volumeView)
+	}
+	return view
+}
+
+// planningOutlineDetailPolicy 显式告诉 Architect 哪些卷已经包含 chapters[]，
+// 防止它把远处卷的完整弧纲误判为信息缺失并逐卷查询。
+func planningOutlineDetailPolicy(layered []domain.VolumeOutline, progress *domain.Progress) map[string]any {
+	currentVolumeIndex := 0
+	if progress != nil {
+		for i, volume := range layered {
+			if volume.Index == progress.CurrentVolume {
+				currentVolumeIndex = i
+				break
+			}
+		}
+	}
+	loaded := make([]int, 0, 3)
+	for i := currentVolumeIndex - 1; i <= currentVolumeIndex+1; i++ {
+		if i >= 0 && i < len(layered) {
+			loaded = append(loaded, layered[i].Index)
+		}
+	}
+	return map[string]any{
+		"all_volume_outlines":    true,
+		"all_arc_outlines":       true,
+		"chapter_detail_volumes": loaded,
+		"remote_reader":          "read_planning_reference",
+		"max_reader_calls":       2,
+		"reader_hint":            "只有确需远处的 chapters[] 或 Long Reference 时才调用；多个卷号一次批量请求",
+	}
+}
+
+// planningVolumeSummaryView 明确保留所有卷摘要的完整结构。调用方使用
+// canonical planning_memory，不再靠顶层副本消耗第二份预算。
+func planningVolumeSummaryView(summaries []domain.VolumeSummary) []domain.VolumeSummary {
+	return slices.Clone(summaries)
+}
+
+// safeMaxCompleted 对 maxCompletedChapter 做 nil-safe 封装。
+// progress 为 nil 时返回 0，不 panic。
+func safeMaxCompleted(progress *domain.Progress) int {
+	if progress == nil {
+		return 0
+	}
+	return maxCompletedChapter(progress.CompletedChapters)
 }

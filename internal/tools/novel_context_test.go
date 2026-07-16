@@ -399,8 +399,10 @@ func TestContextToolArchitectModeIncludesPlanningAndFoundation(t *testing.T) {
 		t.Fatalf("SaveArcSummary: %v", err)
 	}
 	if err := s.Outline.SaveCompass(domain.StoryCompass{
-		EndingDirection: "揭开古老真相",
-		EstimatedScale:  "预计 3 卷",
+		Long: domain.LongCompass{
+			EndingDirection: "揭开古老真相",
+			EstimatedScale:  "预计 3 卷",
+		},
 	}); err != nil {
 		t.Fatalf("SaveCompass: %v", err)
 	}

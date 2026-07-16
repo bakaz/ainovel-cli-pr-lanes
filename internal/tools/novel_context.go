@@ -127,20 +127,51 @@ func (t *ContextTool) Execute(_ context.Context, args json.RawMessage) (json.Raw
 	}
 
 	t.buildUserRules(result)
+	if a.Chapter > 0 && t.role == "editor" {
+		t.buildEditorCompass(result, warn)
+	}
 
 	if len(warnings) > 0 {
 		result["_warnings"] = warnings
 	}
 
-	// 优先级预算：总大小超过阈值时自动裁剪低优先级数据
-	if a.Chapter > 0 {
-		trimByBudget(result, 100*1024) // Writer: 100KB
-	} else {
-		trimByBudget(result, 60*1024) // Architect: 60KB
-	}
+	// 角色化软预算：高频 Writer/Editor 使用 200KB，低频的全局规划
+	// Architect 放宽到 500KB。没有安全裁剪项时仍允许略超目标。
+	trimByBudget(result, contextSoftBudgetForRole(t.role))
 
 	result["_loading_summary"] = buildLoadingSummary(result, a.Chapter)
 	return json.Marshal(result)
+}
+
+func contextSoftBudgetForRole(role string) int {
+	if role == "architect" {
+		return planningContextSoftBudget
+	}
+	return defaultContextSoftBudget
+}
+
+const (
+	defaultContextSoftBudget  = 200 * 1024
+	planningContextSoftBudget = 500 * 1024
+)
+
+// buildEditorCompass 只给 Editor 的章节审阅视图补充完整 Compass；Writer 不读 Compass。
+func (t *ContextTool) buildEditorCompass(result map[string]any, warn func(string, error)) {
+	compass, err := t.store.Outline.LoadCompass()
+	if err != nil {
+		warn("compass", err)
+		return
+	}
+	if compass == nil {
+		return
+	}
+	planning, ok := result["planning_memory"].(map[string]any)
+	if !ok {
+		planning = map[string]any{}
+		result["planning_memory"] = planning
+	}
+	// Editor 审计 long/current 方向，但不加载仅供 Architect 规划的详细长期参考。
+	planning["compass"] = compassContextView(compass, false)
 }
 
 // buildLoadingSummary 从已组装的 result 中统计各项数据量，生成一行可读摘要。
@@ -152,8 +183,11 @@ func buildLoadingSummary(result map[string]any, chapter int) string {
 	} else {
 		parts = append(parts, "architect")
 	}
-	if tier, ok := result["planning_tier"].(domain.PlanningTier); ok && tier != "" {
-		parts = append(parts, fmt.Sprintf("tier=%s", tier))
+	if value, ok := contextValue(result, "planning_tier"); ok {
+		tier, _ := value.(domain.PlanningTier)
+		if tier != "" {
+			parts = append(parts, fmt.Sprintf("tier=%s", tier))
+		}
 	}
 
 	// 卷弧位置
@@ -163,7 +197,7 @@ func buildLoadingSummary(result map[string]any, chapter int) string {
 
 	var items []string
 	countSlice := func(key string) int {
-		if v, ok := result[key]; ok {
+		if v, ok := contextValue(result, key); ok {
 			if s, ok := v.([]domain.Character); ok {
 				return len(s)
 			}
@@ -222,14 +256,16 @@ func buildLoadingSummary(result map[string]any, chapter int) string {
 	if n := countSlice("recent_state_changes"); n > 0 {
 		items = append(items, fmt.Sprintf("状态变化:%d", n))
 	}
-	if _, ok := result["previous_tail"]; ok {
+	if _, ok := contextValue(result, "previous_tail"); ok {
 		items = append(items, "前章尾部:ok")
 	}
-	if _, ok := result["style_rules"]; ok {
+	if _, ok := contextValue(result, "style_rules"); ok {
 		items = append(items, "风格规则:ok")
 	}
-	if n := sliceLen(result["related_chapters"]); n > 0 {
-		items = append(items, fmt.Sprintf("相关章:%d", n))
+	if related, ok := contextValue(result, "related_chapters"); ok {
+		if n := sliceLen(related); n > 0 {
+			items = append(items, fmt.Sprintf("相关章:%d", n))
+		}
 	}
 	if selected, ok := result["selected_memory"].(map[string]any); ok && len(selected) > 0 {
 		if n := sliceLen(selected["story_threads"]); n > 0 {
@@ -241,8 +277,11 @@ func buildLoadingSummary(result map[string]any, chapter int) string {
 	}
 
 	// 参考资料
-	if refs, ok := result["references"].(map[string]string); ok && len(refs) > 0 {
-		items = append(items, fmt.Sprintf("参考:%d项", len(refs)))
+	if value, ok := contextValue(result, "references"); ok {
+		refs, _ := value.(map[string]string)
+		if len(refs) > 0 {
+			items = append(items, fmt.Sprintf("参考:%d项", len(refs)))
+		}
 	}
 	if pack, ok := result["reference_pack"].(map[string]any); ok && len(pack) > 0 {
 		items = append(items, fmt.Sprintf("参考包:%d", len(pack)))
@@ -479,25 +518,26 @@ func (t *ContextTool) ContextSummary() string {
 	return strings.Join(parts, ", ")
 }
 
-// trimByBudget 按优先级裁剪 result，使 JSON 总大小不超过 budget 字节。
-// 优先级（从低到高）：references < voice_samples < style_anchors < previous_tail < timeline
-//
-//	< recent_state_changes < foreshadow_ledger < relationship_state < 其余（不裁剪）
+// trimByBudget 按优先级裁剪 result，使 style_rules 内容尽量不超 budget。
+// style_rules 独立保留且不计入预算，避免"保护文风"反过来挤掉时间线、伏笔、
+// 关系等非文风内容；其余字段仍严格沿用既有裁剪优先级。
 //
 // 裁剪的 key 会记录到 result["_trimmed"] 供日志排查。
 func trimByBudget(result map[string]any, budget int) {
-	// 先测量当前大小
-	data, err := json.Marshal(result)
-	if err != nil || len(data) <= budget {
+	size, err := contextBudgetSize(result)
+	if err != nil || size <= budget {
 		return
 	}
 
-	// 按优先级从低到高列出可裁剪的 key
+	var trimmed []string
+	// 按优先级从低到高列出可实质裁剪的 key。完整扁平 outline 对 Writer
+	// 属于最低优先级：当前章/下一章细纲已在 working_memory；规划角色没有该字段。
 	trimOrder := []string{
+		"outline",
+		"style_anchors_auto",
+		"style_anchors",
 		"references",
 		"voice_samples",
-		"style_anchors",
-		"style_rules",
 		"style_stats",
 		"previous_tail",
 		"timeline",
@@ -506,15 +546,14 @@ func trimByBudget(result map[string]any, budget int) {
 		"relationship_state",
 	}
 
-	var trimmed []string
 	for _, key := range trimOrder {
-		if _, ok := result[key]; !ok {
+		if !contextKeyExists(result, key) {
 			continue
 		}
 		deleteContextKey(result, key)
 		trimmed = append(trimmed, key)
-		data, err = json.Marshal(result)
-		if err != nil || len(data) <= budget {
+		size, err = contextBudgetSize(result)
+		if err != nil || size <= budget {
 			break
 		}
 	}
@@ -523,15 +562,74 @@ func trimByBudget(result map[string]any, budget int) {
 	}
 }
 
+var contextContainerKeys = []string{
+	"working_memory",
+	"episodic_memory",
+	"planning_memory",
+	"foundation_memory",
+	"reference_pack",
+	"selected_memory",
+}
+
+func contextValue(result map[string]any, key string) (any, bool) {
+	if value, ok := result[key]; ok {
+		return value, true
+	}
+	for _, containerKey := range contextContainerKeys {
+		if section, ok := result[containerKey].(map[string]any); ok {
+			if value, exists := section[key]; exists {
+				return value, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// contextBudgetSize 只在预算测量视图中去掉 style_rules，
+// 真实 result 不变。
+// canonical 容器目前只有一层，因此浅复制容器即可避免昂贵的通用深拷贝。
+func contextBudgetSize(result map[string]any) (int, error) {
+	view := make(map[string]any, len(result))
+	for key, value := range result {
+		if key == "style_rules" {
+			continue
+		}
+		isContainer := false
+		for _, containerKey := range contextContainerKeys {
+			if key == containerKey {
+				isContainer = true
+				break
+			}
+		}
+		if !isContainer {
+			view[key] = value
+			continue
+		}
+		section, ok := value.(map[string]any)
+		if !ok {
+			view[key] = value
+			continue
+		}
+		sectionView := make(map[string]any, len(section))
+		for sectionKey, sectionValue := range section {
+			if sectionKey != "style_rules" {
+				sectionView[sectionKey] = sectionValue
+			}
+		}
+		view[key] = sectionView
+	}
+	data, err := json.Marshal(view)
+	return len(data), err
+}
+
+func contextKeyExists(result map[string]any, key string) bool {
+	_, ok := contextValue(result, key)
+	return ok
+}
+
 func deleteContextKey(result map[string]any, key string) {
 	delete(result, key)
-	for _, containerKey := range []string{
-		"working_memory",
-		"episodic_memory",
-		"planning_memory",
-		"foundation_memory",
-		"reference_pack",
-	} {
+	for _, containerKey := range contextContainerKeys {
 		section, ok := result[containerKey].(map[string]any)
 		if !ok {
 			continue

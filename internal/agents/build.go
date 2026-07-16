@@ -127,6 +127,11 @@ func BuildWorkers(
 		architectCtx,
 		tools.NewSaveFoundationTool(store),
 	}
+	architectLongTools := []agentcore.Tool{
+		architectCtx,
+		tools.NewSaveFoundationTool(store),
+		tools.NewReadPlanningReferenceTool(store),
+	}
 	writerTools := []agentcore.Tool{
 		writerCtx,
 		readChapter,
@@ -214,7 +219,7 @@ func BuildWorkers(
 		Description:         "长篇规划师：为连载型、可持续升级的故事生成分层设定与卷弧大纲",
 		Model:               architectModel,
 		SystemPrompt:        bundle.Prompts.ArchitectLong,
-		Tools:               architectTools,
+		Tools:               architectLongTools,
 		MaxTurns:            20,
 		MaxRetries:          subagentMaxRetries,
 		ThinkingLevel:       architectThinking,

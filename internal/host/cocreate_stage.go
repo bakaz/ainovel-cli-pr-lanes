@@ -32,14 +32,14 @@ func buildStoryStateSummary(s *store.Store) string {
 	}
 
 	if compass, _ := s.Outline.LoadCompass(); compass != nil {
-		if dir := strings.TrimSpace(compass.EndingDirection); dir != "" {
+		if dir := strings.TrimSpace(compass.Long.EndingDirection); dir != "" {
 			fmt.Fprintf(&b, "- 终局方向：%s\n", dir)
 		}
-		if compass.EstimatedScale != "" {
-			fmt.Fprintf(&b, "- 预估规模：%s\n", compass.EstimatedScale)
+		if compass.Long.EstimatedScale != "" {
+			fmt.Fprintf(&b, "- 预估规模：%s\n", compass.Long.EstimatedScale)
 		}
-		if len(compass.OpenThreads) > 0 {
-			fmt.Fprintf(&b, "- 活跃长线：%s\n", strings.Join(compass.OpenThreads, "；"))
+		if len(compass.Long.OpenThreads) > 0 {
+			fmt.Fprintf(&b, "- 活跃长线：%s\n", strings.Join(compass.Long.OpenThreads, "；"))
 		}
 	}
 

@@ -218,16 +218,19 @@ func TestSaveAndLoadCompass(t *testing.T) {
 	}
 
 	// 空 direction 应失败
-	if err := s.Outline.SaveCompass(domain.StoryCompass{EstimatedScale: "3 卷"}); err == nil {
+	if err := s.Outline.SaveCompass(domain.StoryCompass{Long: domain.LongCompass{EstimatedScale: "3 卷"}}); err == nil {
 		t.Fatal("expected error for empty ending_direction")
 	}
 
 	// 正常保存
 	compass := domain.StoryCompass{
-		EndingDirection: "主角面对最终抉择",
-		OpenThreads:     []string{"线索A", "关系B"},
-		EstimatedScale:  "预计 4-6 卷",
-		LastUpdated:     12,
+		Long: domain.LongCompass{
+			EndingDirection: "主角面对最终抉择",
+			OpenThreads:     []string{"线索A", "关系B"},
+			EstimatedScale:  "预计 4-6 卷",
+			LastUpdated:     12,
+		},
+		Current: &domain.Compass{Direction: "先解决眼前困局", OpenThreads: []string{"短线C"}, LastUpdated: 13},
 	}
 	if err := s.Outline.SaveCompass(compass); err != nil {
 		t.Fatalf("SaveCompass: %v", err)
@@ -240,11 +243,11 @@ func TestSaveAndLoadCompass(t *testing.T) {
 	if loaded == nil {
 		t.Fatal("expected compass, got nil")
 	}
-	if loaded.EndingDirection != "主角面对最终抉择" {
-		t.Fatalf("expected direction %q, got %q", "主角面对最终抉择", loaded.EndingDirection)
+	if loaded.Long.EndingDirection != "主角面对最终抉择" {
+		t.Fatalf("expected direction %q, got %q", "主角面对最终抉择", loaded.Long.EndingDirection)
 	}
-	if len(loaded.OpenThreads) != 2 {
-		t.Fatalf("expected 2 threads, got %d", len(loaded.OpenThreads))
+	if len(loaded.Long.OpenThreads) != 2 || loaded.Current == nil || len(loaded.Current.OpenThreads) != 1 {
+		t.Fatalf("unexpected threads: %+v", loaded)
 	}
 }
 

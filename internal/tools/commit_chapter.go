@@ -663,7 +663,7 @@ func layeredBookComplete(st *store.Store, progress *domain.Progress) bool {
 	}
 	// 5. 指南针活跃长线必须收束（无 compass / 长线未清都交回架构师裁定）
 	compass, cerr := st.Outline.LoadCompass()
-	if cerr != nil || compass == nil || len(compass.OpenThreads) > 0 {
+	if cerr != nil || compass == nil || len(compass.Long.OpenThreads) > 0 {
 		return false
 	}
 	return true
