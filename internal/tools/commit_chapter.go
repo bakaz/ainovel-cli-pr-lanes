@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"unicode/utf8"
 	"time"
 
 	"github.com/voocel/agentcore/schema"
@@ -373,7 +374,7 @@ func (t *CommitChapterTool) checkRules(text string) []rules.Violation {
 	if snap, err := t.store.UserRules.Load(); err == nil && snap != nil {
 		structured = snap.Structured
 	}
-	return append(violations, rules.Check(text, structured)...)
+	return append(violations, rules.Check(text, utf8.RuneCountInString(text), structured)...)
 }
 
 // executeRewriteCommit 处理打磨/重写章节的提交：覆盖终稿与摘要、更新字数、drain 队列。

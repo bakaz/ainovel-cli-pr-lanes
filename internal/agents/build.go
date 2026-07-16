@@ -116,17 +116,19 @@ func BuildWorkers(
 	recordUsage UsageRecorder,
 	onGuardBlock guard.BlockHook,
 ) (*subagent.Tool, *tools.AskUserTool, *ctxpack.WriterRestorePack, ApplyThinking) {
-	// 共享工具
-	contextTool := tools.NewContextTool(store, bundle.References, cfg.Style)
+	// 角色定制上下文工具
+	architectCtx := tools.NewContextToolForRole(store, bundle.References, cfg.Style, "architect")
+	writerCtx := tools.NewContextToolForRole(store, bundle.References, cfg.Style, "writer")
+	editorCtx := tools.NewContextToolForRole(store, bundle.References, cfg.Style, "editor")
 	readChapter := tools.NewReadChapterTool(store)
 	askUser := tools.NewAskUserTool()
 
 	architectTools := []agentcore.Tool{
-		contextTool,
+		architectCtx,
 		tools.NewSaveFoundationTool(store),
 	}
 	writerTools := []agentcore.Tool{
-		contextTool,
+		writerCtx,
 		readChapter,
 		tools.NewPlanChapterTool(store),
 		tools.NewDraftChapterTool(store),
@@ -135,7 +137,7 @@ func BuildWorkers(
 		tools.NewCommitChapterTool(store),
 	}
 	editorTools := []agentcore.Tool{
-		contextTool,
+		editorCtx,
 		readChapter,
 		tools.NewSaveReviewTool(store),
 		tools.NewSaveArcSummaryTool(store),

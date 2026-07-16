@@ -148,7 +148,7 @@ func (t *ContextTool) buildUserRules(result map[string]any) {
 		working = map[string]any{}
 		result["working_memory"] = working
 	}
-	working["user_rules"] = snap.Payload()
+	working["user_rules"] = snap.PayloadForRole(t.role)
 }
 
 func (t *ContextTool) buildSimulationProfile(result map[string]any, sectionKey string, warn func(string, error)) {

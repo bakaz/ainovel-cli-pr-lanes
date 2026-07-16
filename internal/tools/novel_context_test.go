@@ -13,6 +13,44 @@ import (
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
+func TestContextToolSelectsRoleRuleView(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	snap := rules.BuildSnapshot([]rules.Candidate{
+		{Source: "d", Preferences: "共同", Scope: rules.ScopeDefault},
+		{Source: "a", Preferences: "规划", Scope: rules.ScopeArchitect},
+		{Source: "w", Preferences: "正文", Scope: rules.ScopeWriter},
+		{Source: "e", Preferences: "审阅", Scope: rules.ScopeEditor},
+	})
+	if err := st.UserRules.Save(&snap); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]struct{ yes, no []string }{
+		"coordinator": {[]string{"共同"}, []string{"规划", "正文", "审阅"}},
+		"architect":   {[]string{"共同", "规划"}, []string{"正文", "审阅"}},
+		"writer":      {[]string{"共同", "正文"}, []string{"规划", "审阅"}},
+		"editor":      {[]string{"共同", "正文", "审阅"}, []string{"规划"}},
+	}
+	for role, want := range cases {
+		result := map[string]any{}
+		NewContextToolForRole(st, References{}, "default", role).buildUserRules(result)
+		working := result["working_memory"].(map[string]any)
+		payload := working["user_rules"].(map[string]any)
+		text := payload["preferences"].(string)
+		for _, item := range want.yes {
+			if !strings.Contains(text, item) {
+				t.Fatalf("%s 应看到 %q: %q", role, item, text)
+			}
+		}
+		for _, item := range want.no {
+			if strings.Contains(text, item) {
+				t.Fatalf("%s 不应看到 %q: %q", role, item, text)
+			}
+		}
+	}
+}
+
+
+
 func TestContextToolInjectsStyleStats(t *testing.T) {
 	dir := t.TempDir()
 	st := store.NewStore(dir)

@@ -39,12 +39,18 @@ type ContextTool struct {
 	store *store.Store
 	refs  References
 	style string
+	role  string
 }
 
-// NewContextTool 创建上下文工具。
-// user_rules 由 buildUserRules 直接读本书快照（meta/user_rules.json）注入，不再依赖加载选项。
+// NewContextToolForRole 创建角色隔离的上下文工具。返回 JSON 形状保持不变，
+// 只有 working_memory.user_rules.preferences 会按角色选择分区。
+func NewContextToolForRole(store *store.Store, refs References, style, role string) *ContextTool {
+	return &ContextTool{store: store, refs: refs, style: style, role: role}
+}
+
+// NewContextTool 保持向后兼容，等价于 NewContextToolForRole 传入空 role。
 func NewContextTool(store *store.Store, refs References, style string) *ContextTool {
-	return &ContextTool{store: store, refs: refs, style: style}
+	return NewContextToolForRole(store, refs, style, "")
 }
 
 func (t *ContextTool) Name() string { return "novel_context" }

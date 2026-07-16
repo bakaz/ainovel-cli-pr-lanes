@@ -2,16 +2,18 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 
 	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/errs"
+	"github.com/voocel/ainovel-cli/internal/rules"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
-// CheckConsistencyTool 返回章节内容和全部状态数据，供 Agent 自行对照判断。
+// CheckConsistencyTool 返回草稿摘要、机械违规和全部状态数据，供 Agent 自行对照判断。
 // 纯 IO 工具：只负责加载数据，不注入指令。
 type CheckConsistencyTool struct {
 	store *store.Store
@@ -23,7 +25,7 @@ func NewCheckConsistencyTool(store *store.Store) *CheckConsistencyTool {
 
 func (t *CheckConsistencyTool) Name() string { return "check_consistency" }
 func (t *CheckConsistencyTool) Description() string {
-	return "加载已写草稿和对照数据（世界规则、伏笔、关系、别名、最近摘要），供你检查一致性。必须在 draft_chapter 之后调用"
+	return "检查已写草稿的规则违规，并加载世界规则、伏笔、关系、别名、最近摘要供语义自审。只返回草稿摘要，不重复返回全文；必须在 draft_chapter 之后调用"
 }
 func (t *CheckConsistencyTool) Label() string { return "一致性检查" }
 
@@ -58,8 +60,16 @@ func (t *CheckConsistencyTool) Execute(_ context.Context, args json.RawMessage) 
 	if content == "" {
 		return nil, fmt.Errorf("no content found for chapter %d: %w", a.Chapter, errs.ErrToolPrecondition)
 	}
-	result["content"] = content
+	digest := sha256.Sum256([]byte(content))
+	result["content_digest"] = fmt.Sprintf("sha256:%x", digest[:])
 	result["word_count"] = wordCount
+	violations := append([]rules.Violation{}, rules.Lint(content)...)
+	structured := rules.SystemDefaults().Structured
+	if snap, loadErr := t.store.UserRules.Load(); loadErr == nil && snap != nil {
+		structured = snap.Structured
+	}
+	violations = append(violations, rules.Check(content, wordCount, structured)...)
+	result["rule_violations"] = violations
 
 	// 对照数据：保留全局性的一致性检查数据，避免重复加载 novel_context 已有的窗口数据
 	if rules, _ := t.store.World.LoadWorldRules(); len(rules) > 0 {
