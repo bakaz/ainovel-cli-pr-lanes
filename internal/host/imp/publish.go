@@ -145,6 +145,19 @@ func jsonEqual(a, b any) bool {
 // publishChapter 复用 commit_chapter 发布单章；已完成章节由其幂等检查跳过（RFC §12.3）。
 func publishChapter(ctx context.Context, st *store.Store, commit ChapterCommitter, chapter int, content string, f ImportedChapterFacts) error {
 	if st.Progress.IsChapterCompleted(chapter) {
+		// 崩溃可能落在 MarkChapterComplete 与 ClearPendingCommit 之间：pending_commit 残留
+		// 指向本章。直接跳过会绕开 commit 工具专为此窗口准备的清理分支（补 checkpoint+清残留），
+		// 下一章 Execute 将以「存在未恢复的章节提交」拒绝，导入每次重跑都死在同一处且
+		// 需手工删 meta/pending_commit.json 才能解锁。命中残留时仍走工具幂等路径完成清理。
+		if pending, _ := st.Signals.LoadPendingCommit(); pending != nil && pending.Chapter == chapter {
+			raw, err := json.Marshal(commitArgs(chapter, f))
+			if err != nil {
+				return fmt.Errorf("marshal commit ch%d：%w", chapter, err)
+			}
+			if _, err := commit.Execute(ctx, raw); err != nil {
+				return fmt.Errorf("commit ch%d：%w", chapter, err)
+			}
+		}
 		return nil
 	}
 	if err := st.Drafts.SaveDraft(chapter, content); err != nil {

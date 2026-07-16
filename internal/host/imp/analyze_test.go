@@ -18,7 +18,9 @@ func TestDiscardAnalysesAfter(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	discardAnalysesAfter(ws, 2, 5)
+	if err := discardAnalysesAfter(ws, 2, 5); err != nil {
+		t.Fatalf("清理不应失败：%v", err)
+	}
 	for c := 1; c <= 2; c++ {
 		if !ws.has(analysisPath(c)) {
 			t.Fatalf("新鲜前缀章 %d 应保留", c)
@@ -99,6 +101,17 @@ func TestValidateBatchRejections(t *testing.T) {
 	f.HookType = "bogus"
 	if err := validateBatch(&AnalysisBatchResult{Chapters: []ImportedChapterFacts{f}}, seg, 0, 1); err == nil {
 		t.Fatal("非法 hook_type 应拒绝")
+	}
+	// 枚举大小写变体：校验通过并就地归一化为小写——commit_chapter 不复验枚举，
+	// 变体直通正式状态会被精确串消费的逻辑视为未知类型。
+	_ = json.Unmarshal([]byte(factsJSON(1, seg.Chapters[0].Title)), &f)
+	f.HookType, f.DominantStrand = "Crisis", "QUEST"
+	got := &AnalysisBatchResult{Chapters: []ImportedChapterFacts{f}}
+	if err := validateBatch(got, seg, 0, 1); err != nil {
+		t.Fatalf("大小写变体应通过校验：%v", err)
+	}
+	if got.Chapters[0].HookType != "crisis" || got.Chapters[0].DominantStrand != "quest" {
+		t.Fatalf("枚举应归一化为小写落盘：%+v", got.Chapters[0])
 	}
 }
 

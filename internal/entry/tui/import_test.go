@@ -1,6 +1,115 @@
 package tui
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/voocel/ainovel-cli/internal/host/imp"
+)
+
+// TestImportHistoryCoalescesRetryLines 守护重试行原地更新：同 Key 连续事件只占一行
+// （"第 N/7 次"在一行跳动），被普通进度行隔断后另起一行，保持时间序。
+func TestImportHistoryCoalescesRetryLines(t *testing.T) {
+	s := newImportState(1, "book.txt", 100, 40, nil)
+	base := len(s.history)
+	retry := func(msg string) imp.Event {
+		return imp.Event{Time: time.Now(), Stage: imp.StageSegmenting, Message: msg, Level: "warn", Key: "retry:segmenting"}
+	}
+	s.appendEvent(retry("1s 后重试（第 1/7 次）"), 80)
+	s.appendEvent(retry("2s 后重试（第 2/7 次）"), 80)
+	s.appendEvent(retry("4s 后重试（第 3/7 次）"), 80)
+	if got := len(s.history) - base; got != 1 {
+		t.Fatalf("同 Key 连续重试应合并为 1 行，得 %d", got)
+	}
+	if last := s.history[len(s.history)-1]; last.message != "4s 后重试（第 3/7 次）" {
+		t.Fatalf("合并行应更新为最新消息，得 %q", last.message)
+	}
+	// 普通进度行隔断后，新重试另起一行。
+	s.appendEvent(imp.Event{Time: time.Now(), Stage: imp.StageAnalyzing, Message: "分析第 1 章起的连续批次..."}, 80)
+	s.appendEvent(retry("1s 后重试（第 1/7 次）"), 80)
+	if got := len(s.history) - base; got != 3 {
+		t.Fatalf("隔断后重试应另起一行，共 3 行，得 %d", got)
+	}
+}
+
+// TestRenderImportLineWrapsWithoutClipping 守护错误详情完整可见：正文按扣除前缀后的
+// 剩余宽度换行、续行对齐，任何一行都不得超出 contentW——viewport 对超宽行是硬裁，
+// 错误里的 HTTP 状态/provider/模型正是排查依据，截掉等于白报错。
+func TestRenderImportLineWrapsWithoutClipping(t *testing.T) {
+	ln := importLine{
+		at:      time.Now(),
+		stage:   imp.StageSegmenting,
+		message: "切分区间 L1..L171",
+		err: errors.New("imp: 模型调用失败（请求参数非法，HTTP 400，openrouter，deepseek/deepseek-chat）：" +
+			"Provider returned error: invalid request payload with a very long gateway message tail"),
+	}
+	const contentW = 80
+	out := renderImportLine(ln, contentW, time.Now())
+	// 换行可能在任意字符处断开，去掉空白后比对，只验证内容一个字不丢。
+	norm := func(s string) string {
+		return strings.Map(func(r rune) rune {
+			if r == ' ' || r == '\n' {
+				return -1
+			}
+			return r
+		}, s)
+	}
+	for _, want := range []string{"HTTP 400", "openrouter", "gateway message tail"} {
+		if !strings.Contains(norm(out), norm(want)) {
+			t.Fatalf("行内容缺少 %q：%q", want, out)
+		}
+	}
+	for i, line := range strings.Split(out, "\n") {
+		if w := lipgloss.Width(line); w > contentW {
+			t.Fatalf("第 %d 行宽 %d 超出 %d，会被 viewport 裁掉：%q", i, w, contentW, line)
+		}
+	}
+	// 窄终端：前缀（时间戳+图标+长阶段名）可占掉大半行宽，正文须另起行而非按下限硬凑超宽。
+	ln.stage = imp.StageAwaitingConfirmation
+	const narrowW = 40
+	for i, line := range strings.Split(renderImportLine(ln, narrowW, time.Now()), "\n") {
+		if w := lipgloss.Width(line); w > narrowW {
+			t.Fatalf("窄终端第 %d 行宽 %d 超出 %d：%q", i, w, narrowW, line)
+		}
+	}
+}
+
+// TestWrapTextResetsAtNewlines 守护多行消息换行：'\n' 处必须重置行宽计数，否则只要
+// 任一行触发换行，其后每行都会被误判超宽插入伪换行+缩进，整份确认预览被打散。
+func TestWrapTextResetsAtNewlines(t *testing.T) {
+	in := strings.Repeat("宽", 30) + "\n短行一\n短行二"
+	out := wrapText(in, 20)
+	for i, l := range strings.Split(out, "\n") {
+		if w := lipgloss.Width(l); w > 20 {
+			t.Fatalf("第 %d 行宽 %d 超出 20：%q", i, w, l)
+		}
+	}
+	if !strings.Contains(out, "\n短行一\n短行二") {
+		t.Fatalf("原有短行不得被打散：%q", out)
+	}
+}
+
+// TestRetryCountdown 守护倒计时渲染契约（事件面板与导入面板共用）：
+// 未设截止或已到点返回空（请求已在途）；剩余时间向上取整到秒，逐秒递减且不出现 0s。
+func TestRetryCountdown(t *testing.T) {
+	now := time.Now()
+	if got := retryCountdown(time.Time{}, now); got != "" {
+		t.Fatalf("零值截止应返回空，得 %q", got)
+	}
+	if got := retryCountdown(now.Add(-time.Second), now); got != "" {
+		t.Fatalf("已到点应返回空，得 %q", got)
+	}
+	if got := retryCountdown(now.Add(7500*time.Millisecond), now); got != "8s 后重试" {
+		t.Fatalf("7.5s 应上取整为 8s，得 %q", got)
+	}
+	if got := retryCountdown(now.Add(300*time.Millisecond), now); got != "1s 后重试" {
+		t.Fatalf("不足 1s 应显示 1s，得 %q", got)
+	}
+}
 
 // TestParseImportArgsGuide 守护 --guide 解析：自然语言指导可含空格（其后 token 全部并入），
 // 可与其它选项组合（置于最后），空内容报错。

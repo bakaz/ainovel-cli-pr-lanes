@@ -596,6 +596,13 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			m.refreshStreamViewport()
 			m.streamDirty = false
 		}
+		if s := m.importer; s != nil && !s.done && !s.paused {
+			// 导入运行中：尾随星标与重试倒计时都在 viewport 内容里，按 tick 重算。
+			// 挂在 cursor tick（120ms）上与流式面板光标同速——同款星星不该一快一慢。
+			s.frame = m.cursorIdx
+			boxW, _ := reportModalSize(m.width, m.height)
+			s.refresh(paddedModalContentWidth(boxW))
+		}
 		return m, tickCursor(), true
 	case streamDeltaMsg:
 		if len(m.streamRounds) == 0 {
@@ -763,6 +770,10 @@ func (m *Model) applyEvent(ev host.Event) {
 			// Summary 非空时允许覆盖（结束态可能带补充信息）；否则保留首次
 			if ev.Summary != "" {
 				existing.Summary = ev.Summary
+			}
+			// 重试事件同 ID 跨 attempt 更新，新截止时刻要跟上，倒计时才会随之重置
+			if !ev.RetryAt.IsZero() {
+				existing.RetryAt = ev.RetryAt
 			}
 			return
 		}

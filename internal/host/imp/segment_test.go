@@ -2,6 +2,10 @@ package imp
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -141,17 +145,6 @@ func TestResolveSegmentationRejections(t *testing.T) {
 		name string
 		ds   []BoundaryDecision
 	}{
-		{"倒序", []BoundaryDecision{
-			{UnitID: "L3", Kind: kindChapter}, {UnitID: "L1", Kind: kindChapter},
-		}},
-		{"空正文", []BoundaryDecision{
-			{UnitID: "L1", Kind: kindChapter}, {UnitID: "L2", Kind: kindChapter},
-			// L2 之后 L3.. 有正文，但构造一个末尾空章：
-			{UnitID: "L7", Kind: kindChapter},
-		}},
-		{"起始未归属非空文本", []BoundaryDecision{
-			{UnitID: "L3", Kind: kindChapter}, // L1/L2 非空却无归属
-		}},
 		{"无章节", []BoundaryDecision{
 			{UnitID: "L1", Kind: kindFrontMatter},
 		}},
@@ -165,6 +158,113 @@ func TestResolveSegmentationRejections(t *testing.T) {
 				t.Fatalf("应被拒绝：%s", c.name)
 			}
 		})
+	}
+}
+
+// TestResolveSegmentationReordersAndDedups 守护终局兜底的坐标纪律：块内模型偶发乱序按
+// 字节排序确定性恢复（实测 319 个边界曾败于 1 处倒序，且块缓存会让失败确定性复现）；
+// 同字节重复保留先出现者并记 Notes 交确认预览。
+func TestResolveSegmentationReordersAndDedups(t *testing.T) {
+	norm, units := segFixture()
+	seg, err := resolveSegmentation(norm, units, []BoundaryDecision{
+		{UnitID: "L3", Kind: kindChapter, Title: "第一章 风起"},
+		{UnitID: "L1", Kind: kindChapter, Title: "开篇"}, // 乱序：位置在 L3 之前
+		{UnitID: "L6", Kind: kindChapter, Title: "第二章 云涌"},
+		{UnitID: "L6", Kind: kindChapter, Title: "第二章 重复"}, // 同字节重复
+	})
+	if err != nil {
+		t.Fatalf("乱序/重复应被确定性修复而非拒绝：%v", err)
+	}
+	if len(seg.Chapters) != 3 {
+		t.Fatalf("应得 3 章，得 %d：%+v", len(seg.Chapters), seg.Chapters)
+	}
+	if seg.Chapters[0].Title != "开篇" || seg.Chapters[0].Start != 0 {
+		t.Fatalf("排序后首章应为位置最前的边界：%+v", seg.Chapters[0])
+	}
+	if seg.Chapters[2].Title != "第二章 云涌" {
+		t.Fatalf("同字节重复应保留先出现者：%+v", seg.Chapters[2])
+	}
+	if len(seg.Notes) != 1 || !strings.Contains(seg.Notes[0], "重合") {
+		t.Fatalf("重复边界应记入 Notes：%v", seg.Notes)
+	}
+}
+
+// TestResolveSegmentationAbsorbsLeadingText 守护起始漏报的确定性修复：书首简介/广告等非空
+// 头部文本若被模型漏报边界，不得终局否决——漏报已进块缓存，否决会让重跑零调用确定性复现
+// 失败。Go 补一个 front_matter 兜住 [0, first) 并记 Notes 交确认预览。
+func TestResolveSegmentationAbsorbsLeadingText(t *testing.T) {
+	norm, units := segFixture()
+	// 只报了 L3 起的章节：L1/L2 非空文本无归属。
+	seg, err := resolveSegmentation(norm, units, []BoundaryDecision{
+		{UnitID: "L3", Kind: kindChapter, Title: "第一章 风起"},
+		{UnitID: "L6", Kind: kindChapter, Title: "第二章 云涌"},
+	})
+	if err != nil {
+		t.Fatalf("起始未归属文本应被收为 front_matter 而非拒绝：%v", err)
+	}
+	if len(seg.Matter) != 1 || seg.Matter[0].Kind != kindFrontMatter || seg.Matter[0].Start != 0 {
+		t.Fatalf("应补出从 0 起的 front_matter：%+v", seg.Matter)
+	}
+	if len(seg.Chapters) != 2 || seg.Chapters[0].Start == 0 {
+		t.Fatalf("章节不应吞掉头部文本：%+v", seg.Chapters)
+	}
+	if len(seg.Notes) != 1 || !strings.Contains(seg.Notes[0], "未被模型归属") {
+		t.Fatalf("应记录人工核对说明：%v", seg.Notes)
+	}
+}
+
+// TestValidateProjectedBoundariesOwnedDiscipline 守护调用期校验的覆盖面：owned 区内的
+// 非法 kind 与坏 anchor 必须在调用期带反馈重问——放行会随块进缓存，终局 resolve 才发现时
+// 重跑零调用复读同一份坏数据；上下文区边界注定被裁掉，不为其重问。
+func TestValidateProjectedBoundariesOwnedDiscipline(t *testing.T) {
+	_, units := segFixture()
+	unitByID := map[string]SourceUnit{}
+	proj, owned := map[string]bool{}, map[string]bool{}
+	for _, u := range units {
+		unitByID[u.ID] = u
+		proj[u.ID] = true
+	}
+	owned["L1"], owned["L2"], owned["L3"] = true, true, true
+
+	cases := []struct {
+		name    string
+		b       BoundaryDecision
+		wantErr bool
+	}{
+		{"owned 非法 kind", BoundaryDecision{UnitID: "L1", Kind: "volume"}, true},
+		{"owned 坏 anchor", BoundaryDecision{UnitID: "L3", Kind: kindChapter, Anchor: "不存在的锚"}, true},
+		{"owned 合法 anchor", BoundaryDecision{UnitID: "L3", Kind: kindChapter, Anchor: "第一章"}, false},
+		{"上下文区非法 kind 不重问", BoundaryDecision{UnitID: "L6", Kind: "volume"}, false},
+		{"投影外幻觉 ID", BoundaryDecision{UnitID: "L99", Kind: kindChapter}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateProjectedBoundaries([]BoundaryDecision{c.b}, proj, owned, unitByID)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("wantErr=%v，得 %v", c.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestSegmentClearsChunksOnResolveFailure 守护「缓存确定性复现」的总闸：终局整合失败时
+// 块缓存已无价值（digest 恒匹配，重跑零调用复读同一批边界再死一次），必须清除换取下次
+// 重新切分的模型机会；决策快照经 errSemantic 统一落 failures/。
+func TestSegmentClearsChunksOnResolveFailure(t *testing.T) {
+	norm, units := segFixture()
+	// 模型把全书标成 front_matter：无章节，Go 无法确定性修复，终局失败。
+	m := &mockModel{responses: []string{`{"boundaries":[{"unit_id":"L1","kind":"front_matter","title":"前言"}]}`}}
+	w := &Workspace{dir: t.TempDir()}
+	_, err := Segment(context.Background(), m, "sys", norm, units, "", 0, 0, 4096, callProfile{}, w, "id-1")
+	if err == nil {
+		t.Fatal("无章节应终局失败")
+	}
+	var se *errSemantic
+	if !errors.As(err, &se) {
+		t.Fatalf("终局失败应为 errSemantic（统一落 failures/），得 %T", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(w.dir, dirSegmentChunks)); !os.IsNotExist(statErr) {
+		t.Fatalf("终局失败后块缓存应被清除：%v", statErr)
 	}
 }
 
@@ -225,12 +325,126 @@ func TestSegmentWithMockModel(t *testing.T) {
 		{"unit_id":"L6","kind":"chapter","title":"第二章 云涌"}
 	]}`
 	m := &mockModel{responses: []string{resp}}
-	seg, err := Segment(context.Background(), m, "sys", norm, units, "", 0, 0, 4096, callProfile{})
+	seg, err := Segment(context.Background(), m, "sys", norm, units, "", 0, 0, 4096, callProfile{}, nil, "")
 	if err != nil {
 		t.Fatalf("Segment: %v", err)
 	}
 	if len(seg.Chapters) != 2 {
 		t.Fatalf("应得 2 章，得 %d", len(seg.Chapters))
+	}
+}
+
+// TestResolveSegmentationAbsorbsEmptyChapter 守护脏源容错：真实网络小说源常见"已锁定/付费章节"
+// 占位标题（标题在、正文缺失）。这类边界不得整体失败——终局一票否决会浪费切分阶段全部模型调用；
+// 占位段并入前段（文本一字不丢），记入 Notes 由确认预览呈现人工核对。
+func TestResolveSegmentationAbsorbsEmptyChapter(t *testing.T) {
+	norm, units := segFixture()
+	// L5 "卷二" 行被模型标成章节标题：其 span [L5,L6) 无正文 → 并入第一章。
+	decisions := []BoundaryDecision{
+		{UnitID: "L1", Kind: kindFrontMatter, Title: "前言"},
+		{UnitID: "L3", Kind: kindChapter, Title: "第一章 风起"},
+		{UnitID: "L5", Kind: kindChapter, Title: "第五章 [本章节已锁定]"},
+		{UnitID: "L6", Kind: kindChapter, Title: "第二章 云涌"},
+	}
+	seg, err := resolveSegmentation(norm, units, decisions)
+	if err != nil {
+		t.Fatalf("空正文占位章应被吸收而非整体失败：%v", err)
+	}
+	if len(seg.Chapters) != 2 {
+		t.Fatalf("应得 2 章（占位并入前段），得 %d", len(seg.Chapters))
+	}
+	if got := seg.Content(norm, 0); !strings.Contains(got, "卷二") {
+		t.Fatalf("占位段应并入第一章（文本不丢）：%q", got)
+	}
+	if len(seg.Notes) != 1 || !strings.Contains(seg.Notes[0], "已锁定") {
+		t.Fatalf("应记录一条人工核对说明：%v", seg.Notes)
+	}
+	// 首点即空正文章节：无前段可并 → 落为 front_matter，同样不失败。
+	seg, err = resolveSegmentation(norm, units, []BoundaryDecision{
+		{UnitID: "L1", Kind: kindChapter, Title: "占位"}, // [L1,L2) 单行标题无正文
+		{UnitID: "L2", Kind: kindChapter, Title: "第一章"},
+	})
+	if err != nil {
+		t.Fatalf("首点空正文应落为 front_matter：%v", err)
+	}
+	if len(seg.Matter) != 1 || seg.Matter[0].Kind != kindFrontMatter {
+		t.Fatalf("首点空正文应为 front_matter：%+v", seg.Matter)
+	}
+}
+
+// TestSegmentClipsContextBoundaries 守护坐标纪律的 Go 侧执行：模型在上下文区返回的边界
+// 不触发语义重问（弱模型常 3 次耗尽拖垮整块），由代码直接裁掉——该边界归相邻块管辖，
+// 相邻块会在自己的 owned 区间报告它，保留会造成跨块重复/乱序。
+func TestSegmentClipsContextBoundaries(t *testing.T) {
+	norm, units := segFixture()
+	chunks := planChunks(units, 40)
+	if len(chunks) < 2 {
+		t.Fatalf("fixture 应分出至少 2 块，得 %d", len(chunks))
+	}
+	// 每块响应：owned 首单元一个章节边界；第一块额外夹带一个下一块首单元（上下文区）的边界。
+	responses := make([]string, len(chunks))
+	for ci, owned := range chunks {
+		bs := fmt.Sprintf(`{"unit_id":%q,"kind":"chapter","title":"第%d章"}`, units[owned[0]].ID, ci+1)
+		if ci == 0 {
+			bs += fmt.Sprintf(`,{"unit_id":%q,"kind":"chapter","title":"越界"}`, units[chunks[1][0]].ID)
+		}
+		responses[ci] = `{"boundaries":[` + bs + `]}`
+	}
+	// 裁剪说明走普通进度回显（例行坐标纪律，非警示——warn 色会让用户误以为出错）。
+	var clipNotes int
+	prof := callProfile{progress: func(_, _ int, s string) {
+		if strings.Contains(s, "裁掉") {
+			clipNotes++
+		}
+	}}
+	seg, err := Segment(context.Background(), &mockModel{responses: responses}, "sys", norm, units, "", 40, 2, 4096, prof, nil, "")
+	if err != nil {
+		t.Fatalf("上下文区边界应被裁掉而非失败：%v", err)
+	}
+	if len(seg.Chapters) != len(chunks) {
+		t.Fatalf("应得 %d 章（越界边界不重复计入），得 %d", len(chunks), len(seg.Chapters))
+	}
+	if clipNotes != 1 {
+		t.Fatalf("应回显 1 条裁剪说明，得 %d", clipNotes)
+	}
+}
+
+// TestSegmentReusesChunkArtifacts 守护块级断点：切分逐块落盘边界缓存，重跑时 digest 匹配的块
+// 零模型调用直接复用——切分是最昂贵阶段，任何一块失败不应重付已完成块（与 analyze/synthesize 同哲学）。
+func TestSegmentReusesChunkArtifacts(t *testing.T) {
+	norm, units := segFixture()
+	chunks := planChunks(units, 40)
+	responses := make([]string, len(chunks))
+	for ci, owned := range chunks {
+		responses[ci] = fmt.Sprintf(`{"boundaries":[{"unit_id":%q,"kind":"chapter","title":"第%d章"}]}`, units[owned[0]].ID, ci+1)
+	}
+	w := &Workspace{dir: t.TempDir()}
+	m1 := &mockModel{responses: responses}
+	seg1, err := Segment(context.Background(), m1, "sys", norm, units, "", 40, 2, 4096, callProfile{}, w, "id-1")
+	if err != nil {
+		t.Fatalf("首跑：%v", err)
+	}
+	if m1.i != len(chunks) {
+		t.Fatalf("首跑应调用 %d 次，得 %d", len(chunks), m1.i)
+	}
+	m2 := &mockModel{responses: responses}
+	seg2, err := Segment(context.Background(), m2, "sys", norm, units, "", 40, 2, 4096, callProfile{}, w, "id-1")
+	if err != nil {
+		t.Fatalf("重跑：%v", err)
+	}
+	if m2.i != 0 {
+		t.Fatalf("digest 匹配的块应零调用复用，实际调用 %d 次", m2.i)
+	}
+	if len(seg2.Chapters) != len(seg1.Chapters) {
+		t.Fatalf("复用结果应一致：%d != %d", len(seg2.Chapters), len(seg1.Chapters))
+	}
+	// 身份变化（换 prompt 版本/指导/源）→ 缓存自然失配，全部重做。
+	m3 := &mockModel{responses: responses}
+	if _, err := Segment(context.Background(), m3, "sys", norm, units, "", 40, 2, 4096, callProfile{}, w, "id-2"); err != nil {
+		t.Fatalf("身份变化重跑：%v", err)
+	}
+	if m3.i != len(chunks) {
+		t.Fatalf("身份变化应全部重做（%d 次调用），得 %d", len(chunks), m3.i)
 	}
 }
 

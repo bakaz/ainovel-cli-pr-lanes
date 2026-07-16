@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/tools"
@@ -126,6 +128,41 @@ func TestRunSetsCompletionHold(t *testing.T) {
 	}
 }
 
+// TestRunRejectsDifferentSource 守护换源拦截（RFC §12.1/§18.2）：工作区进行中传入不同
+// 内容的源文件必须明确报错——ingest 只在无工作区时执行，不比对会静默从旧书断点继续、
+// 把旧书发布完毕而新文件一个字节都没读。同一文件重复传路径是常见恢复习惯，按内容摘要比对放行。
+func TestRunRejectsDifferentSource(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	a := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(a, []byte("第一章\n正文一\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Ingest(dir, a, Options{}.intent()); err != nil {
+		t.Fatalf("建立工作区：%v", err)
+	}
+	b := filepath.Join(dir, "b.txt")
+	if err := os.WriteFile(b, []byte("完全不同的另一本书\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ch, err := Run(context.Background(), testDeps(st, &mockModel{responses: []string{"{}"}}), Options{SourcePath: b})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var runErr error
+	for ev := range ch {
+		if ev.Stage == StageError {
+			runErr = ev.Err
+		}
+	}
+	if runErr == nil || !strings.Contains(runErr.Error(), "内容不同") {
+		t.Fatalf("不同源文件应被明确拒绝，得 %v", runErr)
+	}
+}
+
 // TestStoryChoiceIgnoresStaleResolution 守护 #5：重新综合后旧故事裁定失效，
 // storyChoice 不得把旧 open/closed 静默套到新 synthesis 上（否则用户不会被重新征询）。
 func TestStoryChoiceIgnoresStaleResolution(t *testing.T) {
@@ -185,14 +222,20 @@ func TestRunSavesFailureOnSemanticError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	var failed bool
+	var failed, warned bool
 	for ev := range ch {
 		if ev.Stage == StageError {
 			failed = true
 		}
+		if ev.Level == "warn" {
+			warned = true // 校验重问必须以 warn 事件回显（不带 Key，各自成行保留历史）
+		}
 	}
 	if !failed {
 		t.Fatal("非法输出应以 StageError 结束")
+	}
+	if !warned {
+		t.Fatal("语义重试应发出带 Key 的 warn 事件")
 	}
 	ws := OpenWorkspace(dir)
 	if !ws.has("failures/last-response.txt") {
@@ -278,15 +321,35 @@ func TestBudgetsFromRuntime(t *testing.T) {
 	}
 }
 
-// TestCallProfileOptions 验证 thinking 仅在非 Auto 时发送、JSON Object 按能力启用（RFC §13.1/§13.2）。
+// TestProfileForKeyPolicy 守护事件合并范围：请求退避（带截止时刻）同 Key 原地跳动；
+// 校验重问是跨调用的语义事件，不带 Key 各自成行——切分逐块调用，共用 Key 会让后块覆盖前块，
+// 面板只剩一条 unit_id 不断变化的行，排查线索全丢；step 是普通进度事件（无警示级别）。
+func TestProfileForKeyPolicy(t *testing.T) {
+	r := &runner{events: make(chan Event, 3)}
+	prof := r.profileFor(Caller{}, StageSegmenting)
+	prof.notify("退避", time.Now().Add(time.Second))
+	prof.notify("重问", time.Time{})
+	prof.step(2, 12, "切分第 %d/%d 块...", 2, 12)
+	backoff, reask, step := <-r.events, <-r.events, <-r.events
+	if backoff.Key == "" || backoff.Level != "warn" || backoff.RetryAt.IsZero() {
+		t.Fatalf("请求退避应为带 Key 与截止时刻的 warn 事件：%+v", backoff)
+	}
+	if reask.Key != "" || reask.Level != "warn" {
+		t.Fatalf("校验重问应为不带 Key 的 warn 事件（独立成行）：%+v", reask)
+	}
+	if step.Level != "" || step.Current != 2 || step.Total != 12 {
+		t.Fatalf("step 应为普通进度事件：%+v", step)
+	}
+}
+
+// TestCallProfileOptions 验证 thinking 仅在非 Auto 时发送，且绝不发 response_format——
+// response_format 支持是模型级事实，按 provider 级能力表发送会对不支持的模型直接 HTTP 400
+// （openrouter × tencent/hy3 实测），结构化输出统一靠 prompt 契约 + extract/validate 兜底。
 func TestCallProfileOptions(t *testing.T) {
 	if got := (callProfile{}).callOptions(100); len(got) != 1 {
 		t.Fatalf("零值只应带 maxTokens，得 %d 个 option", len(got))
 	}
-	if got := (callProfile{thinking: "high", jsonObject: true}).callOptions(100); len(got) != 3 {
-		t.Fatalf("thinking+jsonObject 应带 3 个 option，得 %d", len(got))
-	}
-	if got := (callProfile{jsonObject: true}).callOptions(100); len(got) != 2 {
-		t.Fatalf("仅 jsonObject 应带 2 个 option，得 %d", len(got))
+	if got := (callProfile{thinking: "high"}).callOptions(100); len(got) != 2 {
+		t.Fatalf("thinking 应带 2 个 option，得 %d", len(got))
 	}
 }

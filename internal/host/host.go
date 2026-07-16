@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/voocel/agentcore"
-	"github.com/voocel/agentcore/llm"
 	"github.com/voocel/ainovel-cli/assets"
 	"github.com/voocel/ainovel-cli/internal/agents"
 	"github.com/voocel/ainovel-cli/internal/agents/ctxpack"
@@ -1453,10 +1452,11 @@ func (h *Host) importCaller(fn string) imp.Caller {
 	return imp.Caller{Model: model, Runtime: h.importModelRuntime(role, model)}
 }
 
-// importModelRuntime 探测所选档位角色模型的调用能力，供 imp 双预算 / thinking / 结构化输出自适应使用（RFC §13/§21）。
+// importModelRuntime 探测所选档位角色模型的调用能力，供 imp 双预算 / thinking 自适应使用（RFC §13/§21）。
 // 探测失败的字段留零值，imp 侧回退保守默认，保证无能力信息也能正确运行。
-// TODO(json-schema)：结构化输出目前只探测 JSON Object；与全仓其它调用点统一改造 JSON Schema 模式时，
-// 在此一并探测 Structured.JSONSchema 能力（见 imp/call.go callProfile 的 TODO）。
+// 不探测结构化输出能力：litellm 能力表是 provider 级，response_format 支持是模型级事实，
+// 按 provider 级发送对不支持的模型是硬 400（见 imp/call.go callProfile 注释）。
+// TODO(json-schema)：与全仓其它调用点统一改造 JSON Schema 模式时，在此按模型级核验能力。
 func (h *Host) importModelRuntime(role string, model agentcore.ChatModel) imp.ModelRuntime {
 	var rt imp.ModelRuntime
 	_, name, _ := h.models.CurrentSelection(role)
@@ -1473,10 +1473,6 @@ func (h *Host) importModelRuntime(role string, model agentcore.ChatModel) imp.Mo
 		if resolved, ok := agents.ResolveThinkingForModel(model, level); ok {
 			rt.Thinking = resolved
 		}
-	}
-	// 结构化输出：provider 支持 JSON Object mode 则启用（仍统一走 extract+validate 兜底）。
-	if cp, ok := model.(llm.CapabilityProvider); ok {
-		rt.JSONObject = cp.Capabilities().Structured.JSONObject == llm.SupportYes
 	}
 	return rt
 }

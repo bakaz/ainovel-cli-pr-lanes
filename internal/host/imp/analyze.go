@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
+
 	"maps"
 	"os"
 	"slices"
@@ -101,10 +101,15 @@ func analyzedChapters(w *Workspace, seg *Segmentation, normalized []byte, segIde
 
 // discardAnalysesAfter 删除章号 > keep 的逐章分析工件，使"重分析某章即失效其后全部分析"成立（#4a）。
 // 正常前向分析时 keep 之后本就无工件，为幂等无操作；仅在中途重分析（越过新鲜前缀）时清理陈旧尾部。
-func discardAnalysesAfter(w *Workspace, keep, total int) {
+// 删除失败必须传播：这是该不变量的唯一执行点，吞掉错误会让陈旧尾部（逐章 digest 恒匹配）
+// 被当作新鲜前缀复用，综合将消费新旧混拼的事实且无任何报错。
+func discardAnalysesAfter(w *Workspace, keep, total int) error {
 	for c := keep + 1; c <= total; c++ {
-		_ = os.Remove(w.path(analysisPath(c)))
+		if err := os.Remove(w.path(analysisPath(c))); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("清理陈旧分析工件 %s：%w", analysisPath(c), err)
+		}
 	}
+	return nil
 }
 
 // loadPriorFacts 读取 1..count 章已落盘的事实，供 ledger 构造。
@@ -238,6 +243,10 @@ func validateBatch(r *AnalysisBatchResult, seg *Segmentation, start, end int) er
 				return fmt.Errorf("章 %d foreshadow[%d] plant 需 description", f.Chapter, j)
 			}
 		}
+		// 枚举按小写校验就按小写落盘：commit_chapter 不复验枚举，大小写变体会直通正式状态
+		//（HookHistory 等按精确串消费，变体被视为未知类型），校验通过即归一化。
+		r.Chapters[i].HookType = strings.ToLower(f.HookType)
+		r.Chapters[i].DominantStrand = strings.ToLower(f.DominantStrand)
 	}
 	return nil
 }
@@ -273,15 +282,19 @@ func AnalyzeNext(ctx context.Context, m callModel, systemPrompt string, w *Works
 					}
 					w.writeFailure(FailureMeta{Stage: "analyze", Detail: fmt.Sprintf("批次 %d-%d 长度截断", start+1, end),
 						StopReason: "length", PrefixSalvage: fmt.Sprintf("available:%d", len(salvaged))}, tr.Raw)
-					slog.Info("imp 分析截断，打捞连续前缀", "batch_start", start+1, "salvaged", len(salvaged))
+					prof.logger().Info("imp 分析截断，打捞连续前缀", "batch_start", start+1, "salvaged", len(salvaged))
+					echoChapterFacts(prof, salvaged)
 					return len(salvaged), nil
 				}
 				// 无可打捞前缀：记录不可用并「失败 + 缩小重组批」，单章仍截断则报容量不足。
 				w.writeFailure(FailureMeta{Stage: "analyze", Detail: fmt.Sprintf("批次 %d-%d 长度截断，无可打捞前缀", start+1, end),
 					StopReason: "length", PrefixSalvage: "unavailable"}, tr.Raw)
 				if end-start > 1 {
-					slog.Warn("imp 分析截断，缩小重组批", "batch", fmt.Sprintf("%d-%d", start+1, end), "prefix_salvage", "unavailable")
+					prof.logger().Warn("imp 分析截断，缩小重组批", "batch", fmt.Sprintf("%d-%d", start+1, end), "prefix_salvage", "unavailable")
 					end = start + (end-start)/2
+					// 无 Key 的进度行：既让用户看见缩批动作，也隔断前后两次独立调用的
+					// 退避行按同 Key 误合并（Key 契约只覆盖同一调用内的瞬态退避）。
+					prof.step(0, 0, "输出被长度截断且无可打捞前缀，缩小批次为第 %d-%d 章重试", start+1, end)
 					continue
 				}
 				return 0, fmt.Errorf("章 %d 单章批次仍被长度截断，模型可见输出能力不足", start+1)
@@ -296,7 +309,16 @@ func AnalyzeNext(ctx context.Context, m callModel, systemPrompt string, w *Works
 				return i, fmt.Errorf("落盘章 %d 分析：%w", ch, err)
 			}
 		}
+		echoChapterFacts(prof, res.Chapters)
 		return end - start, nil
+	}
+}
+
+// echoChapterFacts 把模型对每章的核心理解回显到面板——用户应看见模型读懂了什么，
+// 而非只有机械的批次计数（§14.1）。
+func echoChapterFacts(prof callProfile, facts []ImportedChapterFacts) {
+	for _, f := range facts {
+		prof.step(0, 0, "第 %d 章〈%s〉：%s", f.Chapter, snippet(f.Title, 24), snippet(f.CoreEvent, 60))
 	}
 }
 
@@ -344,7 +366,7 @@ func salvagePrefix(raw string, seg *Segmentation, start int) []ImportedChapterFa
 		if err := validateBatch(&one, seg, idx, idx+1); err != nil {
 			break
 		}
-		out = append(out, f)
+		out = append(out, one.Chapters[0]) // validateBatch 已就地归一化枚举，取校验后的值
 	}
 	return out
 }

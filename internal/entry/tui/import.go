@@ -27,9 +27,11 @@ type importState struct {
 	startedAt  time.Time
 	finishedAt time.Time
 	history    []importLine
+	totalLines int // 累计日志行数（history 达到 importHistoryMax 后仍继续计数）
 	err        error
 	done       bool // 终态（完成/出错）
 	paused     bool // 管线在 awaiting 处停下、事件通道已关闭：面板可关闭，非终态
+	frame      int  // cursor tick（120ms，与流式光标同速）同步的动画帧：尾随星标与倒计时靠它逐 tick 重算
 	cancel     context.CancelFunc
 	viewport   viewport.Model
 }
@@ -40,8 +42,18 @@ type importLine struct {
 	current int
 	total   int
 	message string
+	level   string    // "warn" 重试/退避警示
+	key     string    // 非空时同 key 连续行原地更新（对齐事件面板 ID 机制）
+	retryAt time.Time // 非零 = 下次重试截止时刻，渲染时算剩余秒数形成倒计时
 	err     error
+
+	rendered  string // 按 renderedW 缓存的渲染结果；历史可达千行级，逐 tick 全量重排会卡死面板
+	renderedW int
 }
+
+// importHistoryMax 是面板内存中保留的日志行上限：千章级书逐章回显 + 逐章发布会
+// 无上限增长，既耗内存又拖慢重渲染。日志文件（logs/import.log）始终保有全量转录。
+const importHistoryMax = 1000
 
 func newImportState(reqID int, source string, width, height int, cancel context.CancelFunc) *importState {
 	boxW, boxH := reportModalSize(width, height)
@@ -66,10 +78,20 @@ func (s *importState) appendEvent(ev imp.Event, contentW int) {
 	if ev.Err != nil {
 		s.err = ev.Err
 	}
-	s.history = append(s.history, importLine{
+	line := importLine{
 		at: ev.Time, stage: ev.Stage, current: ev.Current, total: ev.Total,
-		message: ev.Message, err: ev.Err,
-	})
+		message: ev.Message, level: ev.Level, key: ev.Key, retryAt: ev.RetryAt, err: ev.Err,
+	}
+	// 同 Key 且紧邻 → 原地更新（7 次退避在一行跳动）；被其它进度行隔断则另起一行，保持时间序。
+	if ev.Key != "" && len(s.history) > 0 && s.history[len(s.history)-1].key == ev.Key {
+		s.history[len(s.history)-1] = line
+	} else {
+		s.totalLines++
+		s.history = append(s.history, line)
+		if len(s.history) > importHistoryMax {
+			s.history = append(s.history[:0], s.history[len(s.history)-importHistoryMax:]...)
+		}
+	}
 	if ev.Stage == imp.StageDone || ev.Stage == imp.StageError {
 		s.done = true
 		s.finishedAt = ev.Time
@@ -112,25 +134,38 @@ func (s *importState) refresh(contentW int) {
 	}
 	b.WriteString("\n\n")
 
-	// 历史日志
+	// 历史日志。每行一个语义图标列（对齐事件面板形态）：
+	// ✗ 红=失败 · ↻ 橙=退避重试/校验重问（同键原地跳动） · ✓ 绿=完成 · · 灰=普通进度。
 	b.WriteString(titleStyle.Render("流程日志"))
 	b.WriteString(" ")
-	b.WriteString(dimStyle.Render(fmt.Sprintf("(%d 条)", len(s.history))))
+	if s.totalLines > len(s.history) {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("(%d 条，仅显示最近 %d，全量见 logs/import.log)", s.totalLines, len(s.history))))
+	} else {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("(%d 条)", s.totalLines)))
+	}
 	b.WriteString("\n")
-	for _, ln := range s.history {
+	now := time.Now()
+	for i := range s.history {
+		ln := &s.history[i]
+		// 已定稿行按宽度缓存渲染结果：refresh 每 120ms tick 都跑，千行级历史全量
+		// 重排（wrapText+逐行套色）是平方级开销，publish 阶段会肉眼可见卡顿。
+		// 只有倒计时仍活跃的行需要逐 tick 重算（到点后多算 2s 以清掉徽标）。
+		live := !ln.retryAt.IsZero() && now.Before(ln.retryAt.Add(2*time.Second))
+		if ln.rendered == "" || ln.renderedW != contentW || live {
+			ln.rendered = renderImportLine(*ln, contentW, now)
+			ln.renderedW = contentW
+		}
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render(ln.at.Format("15:04:05")))
-		b.WriteString(" ")
-		b.WriteString(stageStyle.Render(string(ln.stage)))
-		if ln.total > 0 && ln.current > 0 {
-			b.WriteString(mutedStyle.Render(fmt.Sprintf(" %d/%d", ln.current, ln.total)))
-		}
-		b.WriteString(" ")
-		if ln.err != nil {
-			b.WriteString(errStyle.Render(ln.message + " — " + ln.err.Error()))
-		} else {
-			b.WriteString(wrapText(ln.message, contentW))
-		}
+		b.WriteString(ln.rendered)
+	}
+
+	running := !s.done && !s.paused
+	if running {
+		// 尾随光标：流式面板同款单星跟在最后一条日志下方，cursor tick 驱动逐帧跳动，
+		// 与顶部"进行中"指示行呼应——日志尾部有它，退避等待期也一眼可见管线还活着。
+		b.WriteString("\n\n")
+		b.WriteString(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).
+			Render(streamCursorFrames[s.frame%len(streamCursorFrames)]))
 	}
 
 	// 收尾提示
@@ -157,33 +192,144 @@ func (s *importState) refresh(contentW int) {
 		b.WriteString(dimStyle.Render("Esc 取消导入"))
 	}
 
+	// 跟尾只在用户位于底部时生效：refresh 现在每 tick 都跑（动画/倒计时），
+	// 无条件 GotoBottom 会把运行中向上翻阅的用户每 350ms 拽回底部。
+	atBottom := s.viewport.AtBottom()
 	s.viewport.SetContent(b.String())
-	if !s.done && !s.paused {
+	if running && atBottom {
 		s.viewport.GotoBottom()
 	}
 }
 
-func renderImportModal(width, height int, s *importState) string {
+// renderImportLine 渲染一条流程日志行：时间戳 + 语义图标列 + 阶段（+进度）+ 正文。
+// 正文按扣除前缀后的剩余宽度换行，续行对齐正文起点；超宽只换行绝不裁剪——
+// viewport 对超宽行是硬裁，错误里的 HTTP 状态/provider/模型正是排查依据，截掉等于白报错。
+func renderImportLine(ln importLine, contentW int, now time.Time) string {
+	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
+	mutedStyle := lipgloss.NewStyle().Foreground(colorMuted)
+	okStyle := lipgloss.NewStyle().Foreground(colorSuccess)
+	errStyle := lipgloss.NewStyle().Foreground(colorError)
+	warnStyle := lipgloss.NewStyle().Foreground(colorReview)
+	stageStyle := lipgloss.NewStyle().Foreground(colorAccent2)
+
+	var p strings.Builder
+	p.WriteString(dimStyle.Render(ln.at.Format("15:04:05")))
+	p.WriteString(" ")
+	switch {
+	case ln.err != nil:
+		p.WriteString(errStyle.Bold(true).Render("✗"))
+	case ln.level == "warn":
+		p.WriteString(warnStyle.Bold(true).Render("↻"))
+	case ln.stage == imp.StageDone:
+		p.WriteString(okStyle.Bold(true).Render("✓"))
+	default:
+		p.WriteString(dimStyle.Render("·"))
+	}
+	p.WriteString(" ")
+	p.WriteString(stageStyle.Render(string(ln.stage)))
+	if ln.total > 0 && ln.current > 0 {
+		p.WriteString(mutedStyle.Render(fmt.Sprintf(" %d/%d", ln.current, ln.total)))
+	}
+	p.WriteString(" ")
+	prefix := p.String()
+
+	var text string
+	style := lipgloss.NewStyle()
+	switch {
+	case ln.err != nil:
+		text = ln.message + " — " + ln.err.Error()
+		style = errStyle
+	case ln.level == "warn":
+		text = ln.message
+		if cd := retryCountdown(ln.retryAt, now); cd != "" {
+			text += " · " + cd
+		}
+		style = warnStyle
+	default:
+		text = ln.message
+	}
+	// 逐行套色后自行拼接：lipgloss 对多行字符串会把每行补齐到块内最宽行，
+	// 前缀只在首行，整块渲染会让首行超出 contentW 被 viewport 裁掉。
+	prefixW := lipgloss.Width(prefix)
+	wrapW := contentW - prefixW
+	if wrapW < 20 {
+		// 窄终端下前缀（时间戳+图标+长阶段名+进度）已占掉大半行宽：正文另起行浅缩进，
+		// 换行宽度始终受 contentW 约束——按 20 列下限硬凑会让首行超宽被 viewport 裁掉，
+		// 恰好裁掉错误尾部的 HTTP 状态/provider 等排查依据。
+		var out strings.Builder
+		out.WriteString(prefix)
+		for _, l := range strings.Split(wrapText(text, max(10, contentW-4)), "\n") {
+			out.WriteString("\n    ")
+			out.WriteString(style.Render(l))
+		}
+		return out.String()
+	}
+	lines := strings.Split(wrapText(text, wrapW), "\n")
+	var out strings.Builder
+	out.WriteString(prefix)
+	out.WriteString(style.Render(lines[0]))
+	pad := strings.Repeat(" ", prefixW)
+	for _, l := range lines[1:] {
+		out.WriteString("\n")
+		out.WriteString(pad)
+		out.WriteString(style.Render(l))
+	}
+	return out.String()
+}
+
+func renderImportModal(width, height int, s *importState, frame int) string {
 	if s == nil {
 		return ""
 	}
 	boxW, boxH := reportModalSize(width, height)
 	contentW := paddedModalContentWidth(boxW)
+	running := !s.done && !s.paused
 	if s.viewport.Width != contentW {
 		s.viewport.Width = contentW
 		s.refresh(contentW)
 	}
-	if s.viewport.Height != boxH-4 {
-		s.viewport.Height = boxH - 4
+	vpH := boxH - 4
+	if running {
+		vpH -= 2 // 顶部活动指示行 + 空行
+	}
+	if s.viewport.Height != vpH {
+		s.viewport.Height = vpH
 	}
 
 	hint := "  ↑↓ 滚动 · Esc 取消/关闭"
-	if s.paused && s.stage == imp.StageAwaitingConfirmation {
+	switch {
+	case s.paused && s.stage == imp.StageAwaitingConfirmation:
 		hint = "  ↑↓ 滚动 · y 确认切分 · Esc 关闭"
+	case running:
+		hint = "  ↑↓ 滚动 · Esc 取消"
 	}
-	modal := renderPaddedModalFrame(boxW, boxH, "外部小说导入", hint,
-		strings.Split(s.viewport.View(), "\n"))
+
+	body := strings.Split(s.viewport.View(), "\n")
+	if running {
+		// 运行中的活动指示：单颗流式面板同款星星 + 已用时。刻意用慢速 spinner 帧（350ms）——
+		// 与日志尾部 120ms 的快速尾随光标拉开节奏，顶部是常驻状态行，太快反而扎眼。
+		// 挂在 viewport 外的固定行——viewport 内容只随事件刷新，动画放里面不会动；
+		// 没有它，长时模型调用/退避重试期间面板纹丝不动，用户会误以为卡死。
+		star := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).
+			Render(streamCursorFrames[frame%len(streamCursorFrames)])
+		status := lipgloss.NewStyle().Foreground(colorMuted).
+			Render(fmt.Sprintf(" 进行中 · 已用时 %s", formatElapsed(time.Since(s.startedAt))))
+		body = append([]string{star + status, ""}, body...)
+	}
+	modal := renderPaddedModalFrame(boxW, boxH, "外部小说导入", hint, body)
 	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, modal)
+}
+
+// formatElapsed 渲染 mm:ss 已用时（超过 1 小时进位到 h:mm:ss）。
+func formatElapsed(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	sec := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, sec)
+	}
+	return fmt.Sprintf("%02d:%02d", m, sec)
 }
 
 func (m Model) handleImportKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -234,6 +380,7 @@ func (m Model) confirmImportSegmentation() (tea.Model, tea.Cmd) {
 	}
 	state.source = prev.source
 	state.history = append([]importLine(nil), prev.history...)
+	state.totalLines = prev.totalLines
 	boxW, _ := reportModalSize(m.width, m.height)
 	state.refresh(paddedModalContentWidth(boxW))
 	m.importer = state

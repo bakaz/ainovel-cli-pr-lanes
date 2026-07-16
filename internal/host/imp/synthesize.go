@@ -21,6 +21,7 @@ const (
 const (
 	synthesisSchemaVersion  = 1
 	synthesizePromptVersion = "synthesize-v1"
+	rangePromptVersion      = "range-v1" // 纳入 rangeInputDigest，改 Range prompt 时递增，否则旧区间摘要仍被误判有效
 )
 
 // ImportedArcRange / ImportedVolumeRange：综合只返回卷弧范围，不重复输出所有章节（RFC §10.3）。
@@ -136,7 +137,7 @@ func Synthesize(ctx context.Context, m callModel, bookPrompt, rangePrompt string
 		return synthesizeBook(ctx, m, bookPrompt, compactFacts(facts), len(facts), maxTokens, prof)
 	}
 	digests := make([]RangeDigest, 0, len(ranges))
-	for _, r := range ranges {
+	for ri, r := range ranges {
 		rangeFacts := facts[r[0]:r[1]]
 		startCh, endCh := rangeFacts[0].Chapter, rangeFacts[len(rangeFacts)-1].Chapter
 		want := rangeInputDigest(rangeFacts)
@@ -146,6 +147,7 @@ func Synthesize(ctx context.Context, m callModel, bookPrompt, rangePrompt string
 			digests = append(digests, art.Payload)
 			continue
 		}
+		prof.step(ri+1, len(ranges), "区间摘要 %d/%d（第 %d-%d 章）...", ri+1, len(ranges), startCh, endCh)
 		rd, err := callStructured[RangeDigest](ctx, m, rangePrompt, buildRangePayload(rangeFacts), maxTokens, prof, func(d *RangeDigest) error {
 			if strings.TrimSpace(d.Plot) == "" {
 				return fmt.Errorf("range digest plot 为空")
@@ -178,6 +180,7 @@ func Synthesize(ctx context.Context, m callModel, bookPrompt, rangePrompt string
 // 每轮严格减少摘要数量，故必然收敛；单个摘要即便超预算也不再拆（下层已是最小语义单元），
 // 交最终调用，若因此截断由 callStructured 显式报错而非静默溢出。
 func reduceToFit(ctx context.Context, m callModel, rangePrompt string, digests []RangeDigest, budgetBytes, maxTokens int, prof callProfile) ([]RangeDigest, error) {
+	round := 0
 	for len(digests) > 1 {
 		if budgetBytes <= 0 {
 			return digests, nil
@@ -190,9 +193,12 @@ func reduceToFit(ctx context.Context, m callModel, rangePrompt string, digests [
 		if len(groups) >= len(digests) {
 			return digests, nil // 无法再合并（每组仅一个摘要）
 		}
+		round++
 		merged := make([]RangeDigest, 0, len(groups))
-		for _, g := range groups {
+		for gi, g := range groups {
 			startCh, endCh := g[0].StartChapter, g[len(g)-1].EndChapter
+			prof.step(gi+1, len(groups), "归并区间摘要（第 %d 轮 %d/%d，第 %d-%d 章）...",
+				round, gi+1, len(groups), startCh, endCh)
 			rd, err := callStructured[RangeDigest](ctx, m, rangePrompt, buildDigestReducePayload(g), maxTokens, prof, func(d *RangeDigest) error {
 				if strings.TrimSpace(d.Plot) == "" {
 					return fmt.Errorf("合并区间 plot 为空")
@@ -244,18 +250,21 @@ func rangeDigestPath(startChapter, endChapter int) string {
 	return fmt.Sprintf("%s/%06d-%06d.json", dirRangeDigests, startChapter, endChapter)
 }
 
-// rangeInputDigest 绑定该连续区间的紧凑事实与综合 schema 版本（RFC §6.3）。
+// rangeInputDigest 绑定该连续区间的紧凑事实与 Range prompt/schema 版本（RFC §6.3）。
 func rangeInputDigest(facts []ImportedChapterFacts) string {
-	return Digest([]byte(fmt.Sprintf("range\x00v%d\x00%s", synthesisSchemaVersion, compactFacts(facts))))
+	return Digest([]byte(fmt.Sprintf("range\x00%s\x00v%d\x00%s", rangePromptVersion, synthesisSchemaVersion, compactFacts(facts))))
 }
 
 func synthesizeBook(ctx context.Context, m callModel, systemPrompt, payload string, n, maxTokens int, prof callProfile) (*BookSynthesis, error) {
+	prof.step(0, 0, "生成全书综合（premise/characters/大纲结构）...")
 	s, err := callStructured[BookSynthesis](ctx, m, systemPrompt, buildBookPayload(payload, n), maxTokens, prof, func(s *BookSynthesis) error {
 		return validateSynthesis(s, n)
 	})
 	if err != nil {
 		return nil, err
 	}
+	// 回显模型的全书理解：这是导入最核心的语义产出，值得让用户第一时间看见。
+	prof.step(0, 0, "模型概括全书：%s", snippet(s.Premise, 80))
 	return &s, nil
 }
 

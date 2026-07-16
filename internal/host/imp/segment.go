@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -50,6 +51,7 @@ type Segmentation struct {
 	Chapters  []ChapterSpan `json:"chapters"`
 	Matter    []MatterSpan  `json:"matter,omitempty"`    // group / front / back
 	Uncertain []int         `json:"uncertain,omitempty"` // 标记 uncertain 的章节号，供预览提示
+	Notes     []string      `json:"notes,omitempty"`     // 切分期需人工核对的说明（如空正文占位标题并入前段）
 }
 
 // Content 返回第 i 个章节的归一化正文（含标题行）。
@@ -80,7 +82,6 @@ func resolveSegmentation(normalized []byte, units []SourceUnit, decisions []Boun
 		d    BoundaryDecision
 	}
 	points := make([]point, 0, len(decisions))
-	prevByte := -1
 	for i, d := range decisions {
 		switch d.Kind {
 		case kindChapter, kindGroup, kindFrontMatter, kindBackMatter:
@@ -91,21 +92,49 @@ func resolveSegmentation(normalized []byte, units []SourceUnit, decisions []Boun
 		if err != nil {
 			return nil, err
 		}
-		if b <= prevByte {
-			return nil, fmt.Errorf("边界[%d] 未按 (Line,Part) 数值序严格递增（byte %d <= %d）", i, b, prevByte)
-		}
-		prevByte = b
 		points = append(points, point{byte: b, d: d})
 	}
-	// 首个边界必须落在文本起点，否则起始存在未归属文本（RFC §8.3.5）。
-	if points[0].byte != 0 {
-		if strings.TrimSpace(string(normalized[:points[0].byte])) != "" {
-			return nil, fmt.Errorf("首个边界前存在未归属的非空文本（byte 0..%d）", points[0].byte)
+	// 模型偶发的乱序与重复是坐标纪律问题，Go 确定性修复而非终局否决——全部块成功后因
+	// 两个边界次序颠倒废弃整个切分阶段，代价不可接受（实测 319 个边界败于 1 处块内倒序，
+	// 且块缓存会让失败确定性复现）。块间顺序由 owned 区间不重叠保证，乱序只可能发生在
+	// 块内：按字节稳定排序即恢复真实顺序，零信息损失；同字节重复保留先出现者并记 Notes
+	// 交确认预览人工核对。
+	sort.SliceStable(points, func(i, j int) bool { return points[i].byte < points[j].byte })
+	var notes []string
+	uniq := points[:0]
+	for _, p := range points {
+		if n := len(uniq); n > 0 && uniq[n-1].byte == p.byte {
+			notes = append(notes, fmt.Sprintf("边界 %q 与 %q 重合（byte %d），已保留前者",
+				boundaryLabel(uniq[n-1].d), boundaryLabel(p.d), p.byte))
+			continue
 		}
+		uniq = append(uniq, p)
+	}
+	points = uniq
+	// 首个边界前的非空文本（书首简介/广告等，模型漏报起始边界）不终局否决：Go 确定性
+	// 补一个 front_matter 兜住 [0, first)，记 Notes 交确认预览人工核对——漏报已进块缓存，
+	// 终局否决会让重跑零调用复现同一失败（与空正文章节吸收同哲学，RFC §8.3.5）。
+	if head := points[0].byte; head != 0 && strings.TrimSpace(string(normalized[:head])) != "" {
+		notes = append(notes, fmt.Sprintf("起始 %d 字节文本未被模型归属（%s…），已收为 front_matter，请核对是否漏切章节",
+			head, snippet(string(normalized[:min(head, 48)]), 24)))
+		points = append([]point{{byte: 0, d: BoundaryDecision{UnitID: units[0].ID, Kind: kindFrontMatter}}}, points...)
 	}
 
-	seg := &Segmentation{}
+	seg := &Segmentation{Notes: notes}
 	chapterNo := 0
+	// absorb 把一段并入最近产出的 span（章节或附属区域皆可），无可并入时返回 false。
+	absorb := func(end int) bool {
+		ci, mi := len(seg.Chapters)-1, len(seg.Matter)-1
+		switch {
+		case ci >= 0 && (mi < 0 || seg.Chapters[ci].Start > seg.Matter[mi].Start):
+			seg.Chapters[ci].End = end
+		case mi >= 0:
+			seg.Matter[mi].End = end
+		default:
+			return false
+		}
+		return true
+	}
 	for i, p := range points {
 		start := p.byte
 		if i == 0 {
@@ -122,7 +151,15 @@ func resolveSegmentation(normalized []byte, units []SourceUnit, decisions []Boun
 		switch p.d.Kind {
 		case kindChapter:
 			if strings.TrimSpace(bodyAfterTitle(normalized, p.byte, end)) == "" {
-				return nil, fmt.Errorf("章节 %q 正文范围为空（byte %d..%d）", title, start, end)
+				// 真实网络小说源常见"已锁定/付费章节"占位：标题在、正文缺失。不整体失败——
+				// 终局一票否决会浪费切分阶段的全部模型调用；标题行并入前段（文本一字不丢），
+				// 记入 Notes 由确认预览呈现，人工不认可可用 --guide 裁定（RFC §8.4 的停点正为此存在）。
+				seg.Notes = append(seg.Notes,
+					fmt.Sprintf("章节标题 %q 无正文（byte %d..%d），已并入前段（常见于锁定/付费占位章节）", title, start, end))
+				if !absorb(end) {
+					seg.Matter = append(seg.Matter, MatterSpan{Kind: kindFrontMatter, Title: title, Start: start, End: end})
+				}
+				continue
 			}
 			chapterNo++
 			seg.Chapters = append(seg.Chapters, ChapterSpan{Number: chapterNo, Title: title, Start: start, End: end})
@@ -185,7 +222,8 @@ func planChunks(units []SourceUnit, budgetBytes int) [][2]int {
 }
 
 // buildProjection 组装一个 owned 区间的结构投影 payload（含少量上下文），模型只为 owned 返回边界。
-func buildProjection(units []SourceUnit, owned [2]int, contextMargin int, guidance string) string {
+// 同时返回投影内全部 unit_id 集合（owned + 上下文区），供输出校验区分幻觉与越界。
+func buildProjection(units []SourceUnit, owned [2]int, contextMargin int, guidance string) (string, map[string]bool) {
 	lo := owned[0] - contextMargin
 	if lo < 0 {
 		lo = 0
@@ -208,11 +246,13 @@ func buildProjection(units []SourceUnit, owned [2]int, contextMargin int, guidan
 		OwnedEnd:     units[owned[1]-1].ID,
 		UserGuidance: guidance,
 	}
+	ids := make(map[string]bool, hi-lo)
 	for i := lo; i < hi; i++ {
 		proj.Units = append(proj.Units, projUnit{ID: units[i].ID, Text: units[i].Text})
+		ids[units[i].ID] = true
 	}
 	data, _ := json.MarshalIndent(proj, "", "  ")
-	return string(data)
+	return string(data), ids
 }
 
 // segmentInputDigest 覆盖分段动作实际消费的语义输入：归一化源、用户指导、prompt 版本（RFC §6.3）。
@@ -220,39 +260,136 @@ func segmentInputDigest(normalizedDigest, guidance, promptVersion string) string
 	return Digest([]byte(strings.Join([]string{"segment", promptVersion, normalizedDigest, guidance}, "\x00")))
 }
 
+// segmentChunkPath / segmentChunkDigest：块级边界缓存的工件路径与身份。
+// 身份绑定切分身份（源+指导+prompt 版本）与块的 owned 单元范围——上游任何变化都使缓存自然失配。
+func segmentChunkPath(owned [2]int) string {
+	return fmt.Sprintf("%s/chunk-%06d-%06d.json", dirSegmentChunks, owned[0], owned[1])
+}
+
+func segmentChunkDigest(identity, loID, hiID string) string {
+	return Digest([]byte(strings.Join([]string{"segment-chunk", identity, loID, hiID}, "\x00")))
+}
+
 // Segment 对整份归一化文本做语义切分：逐 owned 区间调用模型识别边界，再全文覆盖校验。
 // contextMargin 上下文单元数，chunkBytes owned 区间字节预算，maxTokens 单次输出预算。
-func Segment(ctx context.Context, m callModel, systemPrompt string, normalized []byte, units []SourceUnit, guidance string, chunkBytes, contextMargin, maxTokens int, prof callProfile) (*Segmentation, error) {
+// w 非空时逐块落盘边界缓存（identity = segmentInputDigest）：单块可达数分钟，任何一块失败
+// 不应重付已完成块的调用——与 analyze 逐章、synthesize 逐区间同一哲学，此前切分是
+// 唯一没有阶段内持久化的昂贵阶段，一处失败即全部重来。
+func Segment(ctx context.Context, m callModel, systemPrompt string, normalized []byte, units []SourceUnit, guidance string, chunkBytes, contextMargin, maxTokens int, prof callProfile, w *Workspace, identity string) (*Segmentation, error) {
 	chunks := planChunks(units, chunkBytes)
+	unitByID := make(map[string]SourceUnit, len(units))
+	for _, u := range units {
+		unitByID[u.ID] = u
+	}
 	var decisions []BoundaryDecision
-	for _, owned := range chunks {
-		payload := buildProjection(units, owned, contextMargin, guidance)
+	for ci, owned := range chunks {
 		lo, hi := units[owned[0]], units[owned[1]-1]
+		rel, want := segmentChunkPath(owned), segmentChunkDigest(identity, lo.ID, hi.ID)
+		if w != nil {
+			if art, err := readArtifact[boundaryBatch](w, rel); err == nil && art.InputDigest == want {
+				decisions = append(decisions, art.Payload.Boundaries...)
+				continue
+			}
+		}
+		// 单块模型调用可达数分钟，逐块回显推进 + 累计边界数，面板才不会整段静默像卡死。
+		prof.step(ci+1, len(chunks), "切分第 %d/%d 块（%s..%s），已识别 %d 个边界...",
+			ci+1, len(chunks), lo.ID, hi.ID, len(decisions))
+		payload, projIDs := buildProjection(units, owned, contextMargin, guidance)
 		ownedIDs := make(map[string]bool, owned[1]-owned[0])
 		for i := owned[0]; i < owned[1]; i++ {
 			ownedIDs[units[i].ID] = true
 		}
 		batch, err := callStructured[boundaryBatch](ctx, m, systemPrompt, payload, maxTokens, prof, func(b *boundaryBatch) error {
-			return validateOwnedBoundaries(b.Boundaries, ownedIDs)
+			return validateProjectedBoundaries(b.Boundaries, projIDs, ownedIDs, unitByID)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("切分区间 %s..%s：%w", lo.ID, hi.ID, err)
 		}
-		decisions = append(decisions, batch.Boundaries...)
+		// 上下文区边界归相邻块管辖（它会在自己的 owned 区间再报告一次），Go 直接裁掉：
+		// 坐标纪律由代码执行，语义重试只留给真正的语义失败——旧行为对越界反馈重问，
+		// 弱模型常把 3 次尝试全部耗尽拖垮整块（RFC §8.1「模型管语义，Go 管坐标」）。
+		kept := make([]BoundaryDecision, 0, len(batch.Boundaries))
+		for _, bd := range batch.Boundaries {
+			if ownedIDs[bd.UnitID] {
+				kept = append(kept, bd)
+			}
+		}
+		if n := len(batch.Boundaries) - len(kept); n > 0 {
+			// 例行坐标纪律而非异常，用普通进度回显——警示色会让用户误以为出错。
+			prof.step(0, 0, "已裁掉 %d 个上下文区多报的边界（归相邻块自行报告，非错误）", n)
+		}
+		// 回显模型的语义判断（识别出的标题），让用户看见模型读懂了什么，而非只有机械计数。
+		if len(kept) > 0 {
+			prof.step(0, 0, "模型识别出：%s", previewBoundaries(kept))
+		}
+		if w != nil {
+			if err := writeArtifact(w, rel, want, boundaryBatch{Boundaries: kept}); err != nil {
+				return nil, fmt.Errorf("落盘切分块 %s..%s：%w", lo.ID, hi.ID, err)
+			}
+		}
+		decisions = append(decisions, kept...)
 	}
-	return resolveSegmentation(normalized, units, decisions)
+	seg, err := resolveSegmentation(normalized, units, decisions)
+	if err != nil {
+		// 终局整合失败时块缓存已无价值：digest 恒匹配会让重跑零调用复读同一批边界、
+		// 确定性复现同一失败。清缓存换取下次重新切分的模型机会；决策快照经 errSemantic
+		// 统一落 failures/ 供事后排查。
+		if w != nil {
+			w.clearDir(dirSegmentChunks)
+		}
+		raw, _ := json.MarshalIndent(decisions, "", "  ")
+		return nil, &errSemantic{Raw: string(raw), Err: fmt.Errorf("整合全书切分失败（块缓存已清除，重跑将重新切分）：%w", err)}
+	}
+	return seg, nil
 }
 
-// validateOwnedBoundaries 校验单区间返回的边界都落在本次 owned range 内（RFC §8.1/§8.3.1）。
-// 上下文区（context margin）只供模型判断语境，不得在此返回边界；越界即反馈重问，
-// 避免相邻块各自为对方 owned 返回边界造成的跨块顺序冲突。
-func validateOwnedBoundaries(bs []BoundaryDecision, ownedIDs map[string]bool) error {
+// boundaryLabel 给边界决策一个可读标识：标题优先，无标题回落到 kind@unit_id。
+func boundaryLabel(d BoundaryDecision) string {
+	if t := strings.TrimSpace(d.Title); t != "" {
+		return t
+	}
+	return d.Kind + "@" + d.UnitID
+}
+
+// previewBoundaries 把一批边界决策压成一行标题预览（最多 3 个 + 计数），供面板回显。
+func previewBoundaries(bs []BoundaryDecision) string {
+	titles := make([]string, 0, 3)
+	for _, b := range bs {
+		titles = append(titles, snippet(boundaryLabel(b), 24))
+		if len(titles) == 3 {
+			break
+		}
+	}
+	s := strings.Join(titles, " / ")
+	if len(bs) > len(titles) {
+		s += fmt.Sprintf("（共 %d 处）", len(bs))
+	}
+	return s
+}
+
+// validateProjectedBoundaries 调用期校验一批边界决策：unit_id 必须存在于本次投影
+// （owned + 上下文区，投影外是幻觉 → 带反馈重问）；owned 区内的边界还须 kind 合法、
+// anchor 可解析——这些坏值调用期不拦会随块落进缓存，终局 resolve 才发现时 digest 恒匹配、
+// 重跑零调用复读同一份坏数据，失败确定性复现（RFC §8.3）。上下文区边界不查 kind/anchor：
+// 它们会被坐标纪律裁掉，为注定丢弃的数据重问是浪费。
+func validateProjectedBoundaries(bs []BoundaryDecision, projIDs, ownedIDs map[string]bool, unitByID map[string]SourceUnit) error {
 	for _, b := range bs {
 		if b.UnitID == "" {
 			return fmt.Errorf("边界缺 unit_id")
 		}
+		if !projIDs[b.UnitID] {
+			return fmt.Errorf("边界 unit_id %q 不存在于本次投影中", b.UnitID)
+		}
 		if !ownedIDs[b.UnitID] {
-			return fmt.Errorf("边界 unit_id %q 不在本次 owned 区间内（不得为上下文区返回边界）", b.UnitID)
+			continue
+		}
+		switch b.Kind {
+		case kindChapter, kindGroup, kindFrontMatter, kindBackMatter:
+		default:
+			return fmt.Errorf("边界 %s kind 非法：%q（只能是 chapter/group/front_matter/back_matter）", b.UnitID, b.Kind)
+		}
+		if _, err := resolveBoundaryByte(unitByID, b.UnitID, b.Anchor); err != nil {
+			return err
 		}
 	}
 	return nil

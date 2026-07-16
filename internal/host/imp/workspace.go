@@ -60,6 +60,7 @@ const (
 	fileStoryResolve = "story-resolution.json"
 	dirAnalyses      = "analyses"
 	dirRangeDigests  = "range-digests"
+	dirSegmentChunks = "segment-chunks"
 	dirFailures      = "failures"
 )
 
@@ -208,6 +209,11 @@ func readArtifact[T any](w *Workspace, rel string) (*Artifact[T], error) {
 		return nil, fmt.Errorf("%s schema 版本 %d != %d，请用匹配版本继续或重新导入", rel, a.SchemaVersion, workspaceSchemaVersion)
 	}
 	return &a, nil
+}
+
+// clearDir best-effort 删除工作区内某个中间缓存目录：阶段最终工件落盘后，块级缓存即失去意义。
+func (w *Workspace) clearDir(rel string) {
+	_ = os.RemoveAll(w.path(rel))
 }
 
 // FailureMeta 是最近一次失败的诊断元数据（RFC §14.2）。

@@ -46,9 +46,12 @@ const (
 type Event struct {
 	Time      time.Time
 	Stage     Stage
-	Current   int    // 章节/区间进度
-	Total     int    // 总数
-	Message   string // 人类可读描述
-	Err       error  // StageError 时携带
-	Continued bool   // StageDone 时由 Host 置位：是否已自动接力启动 Engine（--continue × auto）
+	Current   int       // 章节/区间进度
+	Total     int       // 总数
+	Message   string    // 人类可读描述
+	Level     string    // ""=普通进度；"warn"=退避重试/校验重问等警示状态
+	Key       string    // 非空时 UI 对同 Key 连续事件原地更新（如 7 次退避在一行变动），对齐事件面板 ID 机制
+	RetryAt   time.Time // 非零 = 下次重试的截止时刻；UI 据此逐秒倒计时渲染，到点即清（请求已在途）
+	Err       error     // StageError 时携带
+	Continued bool      // StageDone 时由 Host 置位：是否已自动接力启动 Engine（--continue × auto）
 }
