@@ -3,10 +3,12 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/errs"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -355,7 +357,9 @@ func TestSaveFoundationUpdateCompass(t *testing.T) {
 
 	tool := NewSaveFoundationTool(s)
 	args, _ := json.Marshal(map[string]any{
-		"type": "update_compass",
+		"type":    "update_compass",
+		"section": "long",
+		"reason":  "初始建立全书终局方向",
 		"content": map[string]any{
 			"ending_direction": "主角面对最终抉择",
 			"open_threads":     []string{"线索A", "关系B"},
@@ -371,11 +375,11 @@ func TestSaveFoundationUpdateCompass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadCompass: %v", err)
 	}
-	if compass == nil || compass.EndingDirection != "主角面对最终抉择" {
+	if compass == nil || compass.Long.EndingDirection != "主角面对最终抉择" {
 		t.Fatalf("unexpected compass: %+v", compass)
 	}
-	if len(compass.OpenThreads) != 2 {
-		t.Fatalf("expected 2 open threads, got %d", len(compass.OpenThreads))
+	if len(compass.Long.OpenThreads) != 2 {
+		t.Fatalf("expected 2 open threads, got %d", len(compass.Long.OpenThreads))
 	}
 }
 
@@ -395,7 +399,9 @@ func TestSaveFoundationUpdateCompassOverridesLastUpdated(t *testing.T) {
 
 	tool := NewSaveFoundationTool(s)
 	args, _ := json.Marshal(map[string]any{
-		"type": "update_compass",
+		"type":    "update_compass",
+		"section": "long",
+		"reason":  "用户改变长期方向",
 		"content": map[string]any{
 			"ending_direction": "主角面对最终抉择",
 			"open_threads":     []string{"线索A"},
@@ -410,8 +416,8 @@ func TestSaveFoundationUpdateCompassOverridesLastUpdated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadCompass: %v", err)
 	}
-	if compass.LastUpdated != 5 {
-		t.Fatalf("expected LastUpdated=5 (max of CompletedChapters), got %d", compass.LastUpdated)
+	if compass.Long.LastUpdated != 5 {
+		t.Fatalf("expected LastUpdated=5 (max of CompletedChapters), got %d", compass.Long.LastUpdated)
 	}
 }
 
@@ -425,11 +431,65 @@ func TestSaveFoundationUpdateCompassRequiresDirection(t *testing.T) {
 	tool := NewSaveFoundationTool(s)
 	args, _ := json.Marshal(map[string]any{
 		"type":    "update_compass",
+		"section": "long",
+		"reason":  "初始建立",
 		"content": map[string]any{"estimated_scale": "3 卷"},
 	})
 	_, err := tool.Execute(context.Background(), args)
 	if err == nil {
 		t.Fatal("expected error when ending_direction is empty")
+	}
+}
+
+func TestSaveFoundationCompassMergesSectionsAndRequiresLongReason(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewSaveFoundationTool(s)
+	call := func(input map[string]any) error {
+		raw, _ := json.Marshal(input)
+		_, err := tool.Execute(context.Background(), raw)
+		return err
+	}
+	if err := call(map[string]any{
+		"type": "update_compass", "section": "long", "reason": "初始建立",
+		"content": map[string]any{"ending_direction": "终局", "open_threads": []string{"长线"}, "estimated_scale": "5卷"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := s.Outline.LoadCompass()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed.Long.Reference = json.RawMessage(`{"schema":"long-reference.v1"}`)
+	if err := s.Outline.SaveCompass(*seed); err != nil {
+		t.Fatal(err)
+	}
+	if err := call(map[string]any{
+		"type": "update_compass", "section": "current",
+		"content": map[string]any{"direction": "先追查失踪案", "open_threads": []string{"短线"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := call(map[string]any{
+		"type": "update_compass", "section": "long", "content": map[string]any{"estimated_scale": "6卷"},
+	}); !errors.Is(err, errs.ErrToolArgs) {
+		t.Fatalf("long without reason should fail, got %v", err)
+	}
+	if err := call(map[string]any{
+		"type": "update_compass", "section": "long", "reason": "用户要求扩篇",
+		"content": map[string]any{"estimated_scale": "6卷"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.Outline.LoadCompass()
+	if got.Long.EndingDirection != "终局" || got.Long.EstimatedScale != "6卷" || len(got.Long.OpenThreads) != 1 || got.Current == nil || got.Current.Direction != "先追查失踪案" {
+		t.Fatalf("section merge failed: %+v", got)
+	}
+	var reference map[string]any
+	if err := json.Unmarshal(got.Long.Reference, &reference); err != nil || reference["schema"] != "long-reference.v1" {
+		t.Fatalf("long reference should survive partial updates: %s (err=%v)", got.Long.Reference, err)
 	}
 }
 

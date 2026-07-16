@@ -27,6 +27,7 @@ type Store struct {
 	Sessions    *SessionStore
 	Usage       *UsageStore
 	Simulation  *SimulationStore
+	StyleAnchors *StyleAnchorsStore
 	Decisions   *DecisionStore
 
 	crossMu sync.Mutex // 保护跨域原子操作
@@ -52,8 +53,9 @@ func NewStore(dir string) *Store {
 		Checkpoints: NewCheckpointStore(io),
 		Sessions:    NewSessionStore(newIO(dir)),
 		Usage:       NewUsageStore(newIO(dir)),
-		Simulation:  NewSimulationStore(newIO(dir)),
-		Decisions:   NewDecisionStore(newIO(dir)),
+		Simulation:   NewSimulationStore(newIO(dir)),
+		StyleAnchors: NewStyleAnchorsStore(newIO(dir)),
+		Decisions:    NewDecisionStore(newIO(dir)),
 	}
 }
 

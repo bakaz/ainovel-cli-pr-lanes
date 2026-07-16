@@ -24,7 +24,7 @@ func NewSaveFoundationTool(store *store.Store) *SaveFoundationTool {
 
 func (t *SaveFoundationTool) Name() string { return "save_foundation" }
 func (t *SaveFoundationTool) Description() string {
-	return "保存小说基础设定（premise/outline/characters/world_rules/compass 等）。**这是唯一持久化入口**：未经此工具调用保存的内容不会进入 store，只在消息里输出 Markdown/JSON 等于丢失。参数固定为 {type, content, scale?, volume?, arc?}。type 可选 premise / outline / layered_outline / characters / world_rules / expand_arc / append_volume / update_compass / complete_book。premise 时 content 必须是 Markdown 字符串；其他类型 content 优先直接传 JSON 数组或对象。expand_arc 校准并展开一个未写骨架弧（需 volume + arc，content 为 {title, goal, chapters}，可依据已完成正文修订原骨架目标）；append_volume 追加新卷（content 为完整 VolumeOutline JSON，含弧结构；顶层带 \"final\": true 即宣告收官卷——全书在该卷收束，所有章节写完后自动完结，无需再调 complete_book）；update_compass 更新终局方向（content 为 StoryCompass JSON）；complete_book 宣告全书完结（content 传空对象 {}，直接推 Phase=Complete；工具会校验：大纲内章节已全部写完、无返工队列，否则拒绝——想提前收束用 append_volume 的 final 收官卷）。append_volume / complete_book 必须带 reason 参数（一句话判定理由，对照完结判定清单，记入裁定审计）。scale 可选，仅允许 short / mid / long。"
+	return "保存小说基础设定（premise/outline/characters/world_rules/compass 等）。**这是唯一持久化入口**：未经此工具调用保存的内容不会进入 store，只在消息里输出 Markdown/JSON 等于丢失。参数固定为 {type, content, scale?, volume?, arc?, section?, reason?}。type 可选 premise / outline / layered_outline / characters / world_rules / expand_arc / append_volume / update_compass / complete_book。premise 时 content 必须是 Markdown 字符串；其他类型 content 优先直接传 JSON 数组或对象。expand_arc 校准并展开一个未写骨架弧（需 volume + arc，content 为 {title, goal, chapters}，可依据已完成正文修订原骨架目标）；append_volume 追加新卷（content 为完整 VolumeOutline JSON，含弧结构；顶层带 \"final\": true 即宣告收官卷——全书在该卷收束，所有章节写完后自动完结，无需再调 complete_book）；update_compass 采用 section=long/current 合并更新对应部分，long 更新必须给 reason；也可省略 section 并用 content={long:{...},current:{...}}。complete_book 宣告全书完结（content 传空对象 {}，直接推 Phase=Complete；工具会校验：大纲内章节已全部写完、无返工队列，否则拒绝——想提前收束用 append_volume 的 final 收官卷）。append_volume / complete_book 必须带 reason 参数（一句话判定理由，对照完结判定清单，记入裁定审计）。scale 可选，仅允许 short / mid / long。"
 }
 func (t *SaveFoundationTool) Label() string { return "保存设定" }
 
@@ -41,7 +41,8 @@ func (t *SaveFoundationTool) Schema() map[string]any {
 		schema.Property("scale", schema.Enum("规划级别", "short", "mid", "long")),
 		schema.Property("volume", schema.Int("目标卷序号（仅 expand_arc 时必传）")),
 		schema.Property("arc", schema.Int("目标弧序号（仅 expand_arc 时必传）")),
-		schema.Property("reason", schema.String("卷末判定理由（append_volume / complete_book 时必填）：对照完结判定清单，一句话说明为何续卷、宣告收官或完结")),
+		schema.Property("section", schema.Enum("update_compass 可选更新分区", "long", "current")),
+		schema.Property("reason", schema.String("卷末判定理由（append_volume / complete_book 时必填）或更新 long compass 的必要原因；current compass 更新可省略")),
 	)
 }
 
@@ -52,6 +53,7 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 		Scale   string          `json:"scale"`
 		Volume  int             `json:"volume"`
 		Arc     int             `json:"arc"`
+		Section string          `json:"section"`
 		Reason  string          `json:"reason"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -252,20 +254,18 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 		result["phase"] = string(domain.PhaseComplete)
 
 	case "update_compass":
-		var compass domain.StoryCompass
-		if err := decode("compass", &compass); err != nil {
+		compass, err := t.mergeCompassUpdate(content, a.Section, a.Reason)
+		if err != nil {
 			return nil, err
-		}
-		// 工具层强制覆盖 LastUpdated 为当前已完成章节数，不信任 LLM 自填。
-		// LLM 通常忘填或留 0，会让 diag.CompassDrift 误报、Router 路由失真。
-		if p, _ := t.store.Progress.Load(); p != nil {
-			compass.LastUpdated = p.LatestCompleted()
 		}
 		if err := t.store.Outline.SaveCompass(compass); err != nil {
 			return nil, fmt.Errorf("save compass: %w: %w", errs.ErrStoreWrite, err)
 		}
-		result["ending_direction"] = compass.EndingDirection
-		result["last_updated"] = compass.LastUpdated
+		result["section"] = a.Section
+		result["long"] = compass.Long
+		result["current"] = compass.Current
+		result["ending_direction"] = compass.Long.EndingDirection
+		result["last_updated"] = compass.Long.LastUpdated
 		t.consumeWriterFeedback()
 
 	default:
@@ -301,6 +301,98 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 		}
 	}
 	return json.Marshal(result)
+}
+
+type longCompassPatch struct {
+	EndingDirection *string   `json:"ending_direction"`
+	OpenThreads     *[]string `json:"open_threads"`
+	EstimatedScale  *string   `json:"estimated_scale"`
+}
+
+type currentCompassPatch struct {
+	Direction   *string   `json:"direction"`
+	OpenThreads *[]string `json:"open_threads"`
+}
+
+func (t *SaveFoundationTool) mergeCompassUpdate(content, section, reason string) (domain.StoryCompass, error) {
+	section = strings.ToLower(strings.TrimSpace(section))
+	var longPatch *longCompassPatch
+	var currentPatch *currentCompassPatch
+
+	switch section {
+	case "long":
+		var patch longCompassPatch
+		if err := decodeFoundationJSON("long compass", content, &patch); err != nil {
+			return domain.StoryCompass{}, err
+		}
+		longPatch = &patch
+	case "current":
+		var patch currentCompassPatch
+		if err := decodeFoundationJSON("current compass", content, &patch); err != nil {
+			return domain.StoryCompass{}, err
+		}
+		currentPatch = &patch
+	case "":
+		var patch struct {
+			Long    *longCompassPatch    `json:"long"`
+			Current *currentCompassPatch `json:"current"`
+		}
+		if err := decodeFoundationJSON("compass", content, &patch); err != nil {
+			return domain.StoryCompass{}, err
+		}
+		longPatch, currentPatch = patch.Long, patch.Current
+		// 兼容原版调用形态：省略 section 且直接传 v1 long 字段。
+		if longPatch == nil && currentPatch == nil {
+			var legacy longCompassPatch
+			if err := decodeFoundationJSON("long compass", content, &legacy); err != nil {
+				return domain.StoryCompass{}, err
+			}
+			longPatch = &legacy
+		}
+	default:
+		return domain.StoryCompass{}, fmt.Errorf("invalid compass section %q: %w", section, errs.ErrToolArgs)
+	}
+
+	if longPatch != nil && strings.TrimSpace(reason) == "" {
+		return domain.StoryCompass{}, fmt.Errorf("更新 long compass 必须提供 reason: %w", errs.ErrToolArgs)
+	}
+	existing, err := t.store.Outline.LoadCompass()
+	if err != nil {
+		return domain.StoryCompass{}, fmt.Errorf("load compass: %w: %w", errs.ErrStoreRead, err)
+	}
+	var compass domain.StoryCompass
+	if existing != nil {
+		compass = *existing
+	}
+	lastUpdated := 0
+	if p, _ := t.store.Progress.Load(); p != nil {
+		lastUpdated = p.LatestCompleted()
+	}
+	if longPatch != nil {
+		if longPatch.EndingDirection != nil {
+			compass.Long.EndingDirection = strings.TrimSpace(*longPatch.EndingDirection)
+		}
+		if longPatch.OpenThreads != nil {
+			compass.Long.OpenThreads = append([]string(nil), (*longPatch.OpenThreads)...)
+		}
+		if longPatch.EstimatedScale != nil {
+			compass.Long.EstimatedScale = strings.TrimSpace(*longPatch.EstimatedScale)
+		}
+		compass.Long.LastUpdated = lastUpdated
+	}
+	if currentPatch != nil {
+		if compass.Current == nil {
+			compass.Current = &domain.Compass{}
+		}
+		if currentPatch.Direction != nil {
+			compass.Current.Direction = strings.TrimSpace(*currentPatch.Direction)
+		}
+		if currentPatch.OpenThreads != nil {
+			compass.Current.OpenThreads = append([]string(nil), (*currentPatch.OpenThreads)...)
+		}
+		compass.Current.LastUpdated = lastUpdated
+	}
+	return compass, nil
 }
 
 func foundationArtifact(t string) string {

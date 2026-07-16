@@ -102,6 +102,49 @@ func resolvedRoleThinking(model agentcore.ChatModel, cfg bootstrap.Config, role 
 	return resolved
 }
 
+// workerToolsets is the production tool composition for each Engine worker.
+// BuildWorkers and contract tests share this helper so lists cannot drift.
+type workerToolsets struct {
+	ArchitectShort []agentcore.Tool
+	ArchitectLong  []agentcore.Tool
+	Writer         []agentcore.Tool
+	Editor         []agentcore.Tool
+}
+
+func buildWorkerToolsets(store *store.Store, bundle assets.Bundle, style string) workerToolsets {
+	readChapter := tools.NewReadChapterTool(store)
+	architectCtx := tools.NewContextToolForRole(store, bundle.References, style, "architect")
+	writerCtx := tools.NewContextToolForRole(store, bundle.References, style, "writer")
+	editorCtx := tools.NewContextToolForRole(store, bundle.References, style, "editor")
+	return workerToolsets{
+		ArchitectShort: []agentcore.Tool{
+			architectCtx,
+			tools.NewSaveFoundationTool(store),
+		},
+		ArchitectLong: []agentcore.Tool{
+			architectCtx,
+			tools.NewSaveFoundationTool(store),
+			tools.NewReadPlanningReferenceTool(store),
+		},
+		Writer: []agentcore.Tool{
+			writerCtx,
+			readChapter,
+			tools.NewPlanChapterTool(store),
+			tools.NewDraftChapterTool(store),
+			tools.NewEditChapterTool(store),
+			tools.NewCheckConsistencyTool(store),
+			tools.NewCommitChapterTool(store),
+		},
+		Editor: []agentcore.Tool{
+			editorCtx,
+			readChapter,
+			tools.NewSaveReviewTool(store),
+			tools.NewSaveArcSummaryTool(store),
+			tools.NewSaveVolumeSummaryTool(store),
+		},
+	}
+}
+
 // BuildWorkers 组装三个 Worker(architect_short/long、writer、editor)为可程序化
 // 调用的 subagent.Tool——Engine 直接调用其 Run(类型化入口),无 LLM 中间层
 // (docs/engine-rfc.md §1)。
@@ -116,31 +159,12 @@ func BuildWorkers(
 	recordUsage UsageRecorder,
 	onGuardBlock guard.BlockHook,
 ) (*subagent.Tool, *tools.AskUserTool, *ctxpack.WriterRestorePack, ApplyThinking) {
-	// 共享工具
-	contextTool := tools.NewContextTool(store, bundle.References, cfg.Style)
-	readChapter := tools.NewReadChapterTool(store)
 	askUser := tools.NewAskUserTool()
-
-	architectTools := []agentcore.Tool{
-		contextTool,
-		tools.NewSaveFoundationTool(store),
-	}
-	writerTools := []agentcore.Tool{
-		contextTool,
-		readChapter,
-		tools.NewPlanChapterTool(store),
-		tools.NewDraftChapterTool(store),
-		tools.NewEditChapterTool(store),
-		tools.NewCheckConsistencyTool(store),
-		tools.NewCommitChapterTool(store),
-	}
-	editorTools := []agentcore.Tool{
-		contextTool,
-		readChapter,
-		tools.NewSaveReviewTool(store),
-		tools.NewSaveArcSummaryTool(store),
-		tools.NewSaveVolumeSummaryTool(store),
-	}
+	ts := buildWorkerToolsets(store, bundle, cfg.Style)
+	architectShortTools := ts.ArchitectShort
+	architectLongTools := ts.ArchitectLong
+	writerTools := ts.Writer
+	editorTools := ts.Editor
 
 	// Provider failover 只记日志,不通知宿主
 	reportFailover := func(ev bootstrap.FailoverEvent) {
@@ -193,7 +217,7 @@ func BuildWorkers(
 		Description:        "短篇规划师：为单卷、单冲突、高密度故事生成紧凑设定与扁平大纲",
 		Model:              architectModel,
 		SystemPrompt:       bundle.Prompts.ArchitectShort,
-		Tools:              architectTools,
+		Tools:              architectShortTools,
 		MaxTurns:           15,
 		MaxRetries:         subagentMaxRetries,
 		ThinkingLevel:      architectThinking,
@@ -212,7 +236,7 @@ func BuildWorkers(
 		Description:         "长篇规划师：为连载型、可持续升级的故事生成分层设定与卷弧大纲",
 		Model:               architectModel,
 		SystemPrompt:        bundle.Prompts.ArchitectLong,
-		Tools:               architectTools,
+		Tools:               architectLongTools,
 		MaxTurns:            20,
 		MaxRetries:          subagentMaxRetries,
 		ThinkingLevel:       architectThinking,

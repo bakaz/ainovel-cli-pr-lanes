@@ -1,5 +1,7 @@
 package domain
 
+import "encoding/json"
+
 // Novel 小说元信息。
 type Novel struct {
 	Name          string `json:"name"`
@@ -49,13 +51,63 @@ func FinaleVolume(volumes []VolumeOutline) int {
 	return 0
 }
 
-// StoryCompass 终局方向指南针，替代固定的骨架卷列表。
-// Architect 在每次卷边界时可更新，允许故事方向随创作演化。
+// StoryCompass 把稳定的全书终局方向与可自由调整的近期方向分开。
 type StoryCompass struct {
-	EndingDirection string   `json:"ending_direction"`          // 终局方向（主题性描述）
-	OpenThreads     []string `json:"open_threads,omitempty"`    // 活跃长线（需收束才能结局）
-	EstimatedScale  string   `json:"estimated_scale,omitempty"` // 模糊规模（如"预计 4-6 卷"）
-	LastUpdated     int      `json:"last_updated,omitempty"`    // 更新时的已完成章节数
+	Long    LongCompass `json:"long"`
+	Current *Compass    `json:"current,omitempty"`
+}
+
+type LongCompass struct {
+	EndingDirection string   `json:"ending_direction"`
+	OpenThreads     []string `json:"open_threads,omitempty"`
+	EstimatedScale  string   `json:"estimated_scale,omitempty"`
+	LastUpdated     int      `json:"last_updated,omitempty"`
+	// Reference 保存书籍自定义的长期规划资料。它不参与完成判定，也不会被
+	// update_compass 的常规字段更新覆盖；仅由 Architect 按需工具读取。
+	Reference json.RawMessage `json:"reference,omitempty"`
+}
+
+// Compass 是 Architect 可随弧推进自由编辑的短罗盘；不重复大纲的卷/弧字段。
+type Compass struct {
+	Direction   string   `json:"direction,omitempty"`
+	OpenThreads []string `json:"open_threads,omitempty"`
+	LastUpdated int      `json:"last_updated,omitempty"`
+}
+
+// UnmarshalJSON 兼容 v1 在根部保存 ending_direction/open_threads/estimated_scale 的文件。
+func (s *StoryCompass) UnmarshalJSON(data []byte) error {
+	type currentShape StoryCompass
+	var current currentShape
+	if err := json.Unmarshal(data, &current); err != nil {
+		return err
+	}
+	if current.Long.EndingDirection != "" || current.Current != nil {
+		*s = StoryCompass(current)
+		return nil
+	}
+	var legacy struct {
+		EndingDirection string   `json:"ending_direction"`
+		OpenThreads     []string `json:"open_threads"`
+		EstimatedScale  string   `json:"estimated_scale"`
+		LastUpdated     int      `json:"last_updated"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	s.Long = LongCompass{
+		EndingDirection: legacy.EndingDirection,
+		OpenThreads:     legacy.OpenThreads,
+		EstimatedScale:  legacy.EstimatedScale,
+		LastUpdated:     legacy.LastUpdated,
+	}
+	return nil
+}
+
+func (s StoryCompass) LatestUpdated() int {
+	if s.Current != nil && s.Current.LastUpdated > s.Long.LastUpdated {
+		return s.Current.LastUpdated
+	}
+	return s.Long.LastUpdated
 }
 
 // ArcOutline 弧级大纲。

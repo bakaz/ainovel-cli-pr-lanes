@@ -347,8 +347,8 @@ func validateAppendVolume(existing []domain.VolumeOutline, vol domain.VolumeOutl
 
 // SaveCompass 保存终局方向指南针。
 func (s *OutlineStore) SaveCompass(compass domain.StoryCompass) error {
-	if compass.EndingDirection == "" {
-		return fmt.Errorf("ending_direction 不能为空")
+	if strings.TrimSpace(compass.Long.EndingDirection) == "" {
+		return fmt.Errorf("long.ending_direction 不能为空")
 	}
 	return s.io.WriteJSON("meta/compass.json", compass)
 }

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/ainovel-cli/internal/domain"
@@ -122,7 +123,8 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 		}
 		// 打磨/重写路径：章节虽已完成，但仍在 pending_rewrites 中，允许覆盖并 drain 队列
 		progress, _ := t.store.Progress.Load()
-		if progress != nil && slices.Contains(progress.PendingRewrites, a.Chapter) {
+		inRewriteQueue := progress != nil && slices.Contains(progress.PendingRewrites, a.Chapter)
+		if inRewriteQueue {
 			return t.executeRewriteCommit(a.Chapter, a.Summary, a.Characters, a.KeyEvents,
 				a.HookType, a.DominantStrand, progress)
 		}
@@ -373,7 +375,7 @@ func (t *CommitChapterTool) checkRules(text string) []rules.Violation {
 	if snap, err := t.store.UserRules.Load(); err == nil && snap != nil {
 		structured = snap.Structured
 	}
-	return append(violations, rules.Check(text, structured)...)
+	return append(violations, rules.Check(text, utf8.RuneCountInString(text), structured)...)
 }
 
 // executeRewriteCommit 处理打磨/重写章节的提交：覆盖终稿与摘要、更新字数、drain 队列。
@@ -662,7 +664,7 @@ func layeredBookComplete(st *store.Store, progress *domain.Progress) bool {
 	}
 	// 5. 指南针活跃长线必须收束（无 compass / 长线未清都交回架构师裁定）
 	compass, cerr := st.Outline.LoadCompass()
-	if cerr != nil || compass == nil || len(compass.OpenThreads) > 0 {
+	if cerr != nil || compass == nil || len(compass.Long.OpenThreads) > 0 {
 		return false
 	}
 	return true
