@@ -86,7 +86,8 @@ func (t *EditChapterTool) Execute(ctx context.Context, args json.RawMessage) (js
 	// 归属检查：已完成章节必须在重写队列中，避免污染终稿
 	if t.store.Progress.IsChapterCompleted(a.Chapter) {
 		progress, _ := t.store.Progress.Load()
-		if progress == nil || !slices.Contains(progress.PendingRewrites, a.Chapter) {
+		inRewriteQueue := progress != nil && slices.Contains(progress.PendingRewrites, a.Chapter)
+		if !inRewriteQueue {
 			return nil, fmt.Errorf("第 %d 章已完成且不在 PendingRewrites 队列中，不能编辑；需修改请先由 editor 评审触发重写/打磨: %w", a.Chapter, errs.ErrToolPrecondition)
 		}
 	}

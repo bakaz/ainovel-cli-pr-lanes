@@ -1,25 +1,33 @@
 package tools
 
 import (
+	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/rules"
+	"github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/stylestat"
 )
 
 type contextBuildState struct {
-	chapter         int
-	profile         domain.ContextProfile
-	progress        *domain.Progress
-	runMeta         *domain.RunMeta
-	currentEntry    *domain.OutlineEntry
-	chapterPlan     *domain.ChapterPlan
-	storyThreads    []domain.RecallItem
-	foreshadow      []domain.ForeshadowEntry
-	relationships   []domain.RelationshipEntry
-	allStateChanges []domain.StateChange
-	styleRules      *domain.WritingStyleRules
+	chapter          int
+	profile          domain.ContextProfile
+	progress         *domain.Progress
+	runMeta          *domain.RunMeta
+	currentEntry     *domain.OutlineEntry
+	chapterPlan      *domain.ChapterPlan
+	storyThreads     []domain.RecallItem
+	foreshadow       []domain.ForeshadowEntry
+	relationships    []domain.RelationshipEntry
+	allStateChanges  []domain.StateChange
+	styleRules       *domain.WritingStyleRules
+	styleRulesCompass *domain.WritingStyleRulesCompass // Compass 双层格式
+	styleAnchorsManual *domain.StyleAnchorsV1          // 归一化后的手动锚点（meta/style_anchors.json）
+	styleAnchorsAuto  []string                          // 自动提取的风格锚点（仅当无 manual 且无 style_rules 时 legacy 回退，或 include_auto=true）
+	manStatus         store.ManualFileStatus             // 手动文件状态
+	hasStyleRules     bool                               // 缓存是否存在 style_rules
 }
 
 type chapterContextEnvelope struct {
@@ -54,17 +62,14 @@ func newArchitectContextEnvelope() architectContextEnvelope {
 
 func (e chapterContextEnvelope) apply(result map[string]any) {
 	// 合并而非替换：Execute 的章节路径会先后 apply 两个信封（seed + buildChapterContext），
-	// 整体赋值会让第二次 apply 丢弃 seed 的容器内容，working_memory.* 等 canonical
-	// 路径随之失效（prompt 指针指向空气，模型只能靠顶层镜像模糊容错）。
+	// 整体赋值会让第二次 apply 丢弃 seed 的容器内容。这里只维护 canonical
+	// 容器，不再为历史 prompt 生成同名顶层镜像。
 	mergeEnvelopeSection(result, "working_memory", e.Working)
 	mergeEnvelopeSection(result, "episodic_memory", e.Episodic)
 	mergeEnvelopeSection(result, "reference_pack", e.References)
 	if len(e.Selected) > 0 {
 		mergeEnvelopeSection(result, "selected_memory", e.Selected)
 	}
-	mergeContextSection(result, e.Working)
-	mergeContextSection(result, e.Episodic)
-	mergeContextSection(result, e.References)
 }
 
 // mergeEnvelopeSection 把 section 合并进 result[key] 的既有容器；容器不存在时直接挂载。
@@ -82,15 +87,6 @@ func (e architectContextEnvelope) apply(result map[string]any) {
 	result["planning_memory"] = e.Planning
 	result["foundation_memory"] = e.Foundation
 	result["reference_pack"] = e.References
-	mergeContextSection(result, e.Planning)
-	mergeContextSection(result, e.Foundation)
-	mergeContextSection(result, e.References)
-}
-
-func mergeContextSection(result map[string]any, section map[string]any) {
-	for key, value := range section {
-		result[key] = value
-	}
 }
 
 // buildProgressStatus 在 Architect 不传 chapter 时返回进度摘要。
@@ -148,7 +144,7 @@ func (t *ContextTool) buildUserRules(result map[string]any) {
 		working = map[string]any{}
 		result["working_memory"] = working
 	}
-	working["user_rules"] = snap.Payload()
+	working["user_rules"] = snap.PayloadForRole(t.role)
 }
 
 func (t *ContextTool) buildSimulationProfile(result map[string]any, sectionKey string, warn func(string, error)) {
@@ -309,6 +305,65 @@ func (t *ContextTool) prepareChapterContext(chapter int, envelope *chapterContex
 	styleRules, styleErr := t.store.World.LoadStyleRules()
 	warn("style_rules", styleErr)
 	state.styleRules = styleRules
+	// 尝试加载 compass 双层格式（兼容旧单体）
+	styleRulesCompass, compassErr := t.store.World.LoadStyleRulesCompass()
+	if compassErr != nil {
+		warn("style_rules_compass", compassErr)
+	} else if styleRulesCompass != nil {
+		state.styleRulesCompass = styleRulesCompass
+	}
+
+	// 加载手动风格锚点（含旧格式兼容）
+	manRes := t.store.StyleAnchors.LoadManual()
+	if len(manRes.Warnings) > 0 {
+		for _, w := range manRes.Warnings {
+			warn("style_anchors", fmt.Errorf("%s", w))
+		}
+	}
+
+	// 仅正文笔法（prose/dialogue/taboos）算 style_rules；outline-only 不应阻断 anchor fallback
+	state.hasStyleRules = state.styleRulesCompass != nil && state.styleRulesCompass.HasProseStyleContent()
+	state.manStatus = manRes.Status
+
+	switch manRes.Status {
+	case store.StatusValid, store.StatusLegacyFormat:
+		// 有效手动文件（含旧格式转换后）
+		state.styleAnchorsManual = manRes.Anchors
+		// 仅当 include_auto=true 时加载 auto 锚点
+		if manRes.Anchors.IncludeAuto {
+			var maxCompleted int
+			if progress != nil {
+				maxCompleted = maxCompletedChapter(progress.CompletedChapters)
+			}
+			if anchors := t.store.Drafts.ExtractStyleAnchors(3, maxCompleted); len(anchors) > 0 {
+				state.styleAnchorsAuto = anchors
+			}
+		}
+
+	case store.StatusEmptyValid:
+		// 有效空文件：manual 存在但 anchors 为空 → 不触发任何 auto
+		state.styleAnchorsManual = manRes.Anchors
+
+	case store.StatusCorrupted:
+		// 损坏 → fail closed：绝不注入 manual 也绝不注入任何 auto（即使无 style_rules）
+		state.styleAnchorsManual = nil
+		state.styleAnchorsAuto = nil
+
+	case store.StatusNotExist:
+		// 无手动文件
+		state.styleAnchorsManual = nil
+		// 仅当无 style_rules 时保留 legacy 自动回退
+		if !state.hasStyleRules {
+			var maxCompleted int
+			if progress != nil {
+				maxCompleted = maxCompletedChapter(progress.CompletedChapters)
+			}
+			if anchors := t.store.Drafts.ExtractStyleAnchors(3, maxCompleted); len(anchors) > 0 {
+				state.styleAnchorsAuto = anchors
+			}
+		}
+	}
+
 	state.storyThreads = t.selectStoryThreads(state)
 	if len(state.storyThreads) > 0 && len(state.storyThreads) < storyThreadRecallMinSelected {
 		state.storyThreads = nil
@@ -525,15 +580,21 @@ func (t *ContextTool) buildChapterEpisodicMemory(envelope *chapterContextEnvelop
 }
 
 func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope, state contextBuildState) {
-	if state.styleRules != nil {
+	// ── 角色门控：所有 anchor 类字段（manual/auto/legacy）仅 Writer/Editor 可见 ──
+	isWriterOrEditor := t.role == "writer" || t.role == "editor"
+
+	// 1. style_rules：仅 Writer/Editor 注入正文笔法（prose/dialogue/taboos）；
+	//    Architect/Coordinator 即使 chapter>0 也不应注入 prose style_rules。
+	if isWriterOrEditor && state.styleRulesCompass != nil && state.styleRulesCompass.HasProseStyleContent() {
+		envelope.References["style_rules"] = buildCompassProseInjectionView(state.styleRulesCompass)
+	} else if isWriterOrEditor && state.styleRules != nil && (len(state.styleRules.Prose) > 0 || len(state.styleRules.Dialogue) > 0 || len(state.styleRules.Taboos) > 0) {
 		envelope.References["style_rules"] = state.styleRules
-	} else {
-		var maxCompleted int
-		if state.progress != nil {
-			maxCompleted = maxCompletedChapter(state.progress.CompletedChapters)
-		}
-		if anchors := t.store.Drafts.ExtractStyleAnchors(3, maxCompleted); len(anchors) > 0 {
-			envelope.References["style_anchors"] = anchors
+	} else if isWriterOrEditor && state.manStatus == store.StatusNotExist {
+		// 无风格规则且无手动文件时回退到 legacy style_anchors / voice_samples
+		// 注意：auto 锚点已在 prepareChapterContext 中一次性提取至 state.styleAnchorsAuto，
+		// 此处不得再次调用 ExtractStyleAnchors。
+		if len(state.styleAnchorsAuto) > 0 {
+			envelope.References["style_anchors"] = state.styleAnchorsAuto
 		}
 
 		if state.currentEntry != nil {
@@ -543,7 +604,7 @@ func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope
 				if c.Tier == "secondary" || c.Tier == "decorative" {
 					continue
 				}
-				samples := t.store.Drafts.ExtractDialogue(c.Name, c.Aliases, 3, maxCompleted)
+				samples := t.store.Drafts.ExtractDialogue(c.Name, c.Aliases, 3, safeMaxCompleted(state.progress))
 				if len(samples) > 0 {
 					voiceSamples = append(voiceSamples, map[string]any{
 						"character": c.Name,
@@ -560,7 +621,190 @@ func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope
 		}
 	}
 
+	// 2. style_anchors_manual：仅 Writer/Editor，按当前章节过滤，只注入精简视图（id+excerpt）
+	if isWriterOrEditor && state.styleAnchorsManual != nil && len(state.styleAnchorsManual.Anchors) > 0 {
+		if injection := state.styleAnchorsManual.ToInjectionView(state.chapter); len(injection) > 0 {
+			envelope.References["style_anchors_manual"] = injection
+		}
+	}
+
+	// 3. style_anchors_auto：仅 Writer/Editor，仅当 include_auto=true 时低优先级注入
+	if isWriterOrEditor && len(state.styleAnchorsAuto) > 0 &&
+		state.styleAnchorsManual != nil && state.styleAnchorsManual.IncludeAuto {
+		envelope.References["style_anchors_auto"] = state.styleAnchorsAuto
+	}
+
 	envelope.References["references"] = t.writerReferences(state.chapter)
+}
+
+// buildCompassProseInjectionView Writer/Editor：仅 prose/dialogue/taboos（无 outline）。
+func buildCompassProseInjectionView(compass *domain.WritingStyleRulesCompass) map[string]any {
+	view := map[string]any{
+		"_compass": "双层正文风格规则。long（长期基线）优先于 current（当前弧定制）。不含规划 outline。",
+	}
+	hasLong := compass.Long != nil && (len(compass.Long.Prose) > 0 || len(compass.Long.Dialogue) > 0 || len(compass.Long.Taboos) > 0)
+	hasCurrent := compass.Current != nil && (len(compass.Current.Prose) > 0 || len(compass.Current.Dialogue) > 0 || len(compass.Current.Taboos) > 0)
+	if hasLong {
+		view["long"] = map[string]any{
+			"prose":    compass.Long.Prose,
+			"dialogue": compass.Long.Dialogue,
+			"taboos":   compass.Long.Taboos,
+		}
+	}
+	if hasCurrent {
+		cur := map[string]any{
+			"volume": compass.Current.Volume,
+			"arc":    compass.Current.Arc,
+		}
+		if len(compass.Current.Prose) > 0 {
+			cur["prose"] = compass.Current.Prose
+		}
+		if len(compass.Current.Dialogue) > 0 {
+			cur["dialogue"] = compass.Current.Dialogue
+		}
+		if len(compass.Current.Taboos) > 0 {
+			cur["taboos"] = compass.Current.Taboos
+		}
+		if compass.Current.LastUpdated != "" {
+			cur["last_updated"] = compass.Current.LastUpdated
+		}
+		view["current"] = cur
+	}
+	longHasProse := hasLong && len(compass.Long.Prose) > 0
+	longHasTaboos := hasLong && len(compass.Long.Taboos) > 0
+	longHasDialogue := hasLong && len(compass.Long.Dialogue) > 0
+	if longHasProse {
+		view["prose"] = compass.Long.Prose
+	}
+	if longHasTaboos {
+		view["taboos"] = compass.Long.Taboos
+	}
+	if longHasDialogue {
+		view["dialogue"] = compass.Long.Dialogue
+	}
+	if hasCurrent {
+		if !longHasProse && len(compass.Current.Prose) > 0 {
+			view["prose"] = compass.Current.Prose
+		}
+		if !longHasTaboos && len(compass.Current.Taboos) > 0 {
+			view["taboos"] = compass.Current.Taboos
+		}
+		if len(compass.Current.Dialogue) > 0 {
+			if longHasDialogue {
+				existingVoices := compass.Long.Dialogue
+				existingNames := make(map[string]bool, len(existingVoices))
+				for _, v := range existingVoices {
+					existingNames[v.Name] = true
+				}
+				for _, v := range compass.Current.Dialogue {
+					if !existingNames[v.Name] {
+						existingVoices = append(existingVoices, v)
+					}
+				}
+				view["dialogue"] = existingVoices
+			} else {
+				view["dialogue"] = compass.Current.Dialogue
+			}
+		}
+		view["volume"] = compass.Current.Volume
+		view["arc"] = compass.Current.Arc
+		if compass.Current.LastUpdated != "" {
+			view["last_updated"] = compass.Current.LastUpdated
+		}
+	}
+	return view
+}
+
+// buildCompassOutlineInjectionView Architect：仅 outline 规划规则（无 prose/dialogue/taboos）。
+func buildCompassOutlineInjectionView(compass *domain.WritingStyleRulesCompass) map[string]any {
+	if compass == nil || !compass.HasOutlineContent() {
+		return nil
+	}
+	view := map[string]any{
+		"_compass": "规划层 outline 规则。约束 core_event/scenes 的 beat 形态，不是正文笔法。long 优先，current 追加。",
+	}
+	var longO, curO *domain.OutlinePlanningRules
+	if compass.Long != nil && compass.Long.Outline.HasContent() {
+		longO = compass.Long.Outline
+		view["long"] = map[string]any{"outline": longO}
+	}
+	if compass.Current != nil && compass.Current.Outline.HasContent() {
+		curO = compass.Current.Outline
+		cur := map[string]any{
+			"volume":  compass.Current.Volume,
+			"arc":     compass.Current.Arc,
+			"outline": curO,
+		}
+		if compass.Current.LastUpdated != "" {
+			cur["last_updated"] = compass.Current.LastUpdated
+		}
+		view["current"] = cur
+		view["volume"] = compass.Current.Volume
+		view["arc"] = compass.Current.Arc
+	}
+	if merged := mergeOutlinePlanning(longO, curO); merged != nil {
+		view["outline"] = merged
+	}
+	return view
+}
+
+// buildCompassInjectionView 完整视图（测试/诊断用；运行时按角色拆分注入）。
+func buildCompassInjectionView(compass *domain.WritingStyleRulesCompass) map[string]any {
+	view := buildCompassProseInjectionView(compass)
+	if outlineView := buildCompassOutlineInjectionView(compass); outlineView != nil {
+		if o, ok := outlineView["outline"]; ok {
+			view["outline"] = o
+		}
+		if long, ok := view["long"].(map[string]any); ok {
+			if ol, ok := outlineView["long"].(map[string]any); ok {
+				if o, ok := ol["outline"]; ok {
+					long["outline"] = o
+				}
+			}
+		} else if ol, ok := outlineView["long"]; ok {
+			view["long"] = ol
+		}
+		if cur, ok := view["current"].(map[string]any); ok {
+			if oc, ok := outlineView["current"].(map[string]any); ok {
+				if o, ok := oc["outline"]; ok {
+					cur["outline"] = o
+				}
+			}
+		} else if oc, ok := outlineView["current"]; ok {
+			view["current"] = oc
+		}
+	}
+	view["_compass"] = "双层风格规则。long（长期基线）优先于 current（当前弧定制）。"
+	return view
+}
+
+// mergeOutlinePlanning 合并 long/current 规划规则：long 在前，current 追加未重复条目。
+func mergeOutlinePlanning(long, current *domain.OutlinePlanningRules) *domain.OutlinePlanningRules {
+	out := &domain.OutlinePlanningRules{}
+	seenBeat := map[string]bool{}
+	seenAnti := map[string]bool{}
+	appendUnique := func(dst *[]string, seen map[string]bool, items []string) {
+		for _, s := range items {
+			s = strings.TrimSpace(s)
+			if s == "" || seen[s] {
+				continue
+			}
+			seen[s] = true
+			*dst = append(*dst, s)
+		}
+	}
+	if long != nil {
+		appendUnique(&out.BeatRules, seenBeat, long.BeatRules)
+		appendUnique(&out.AntiPatterns, seenAnti, long.AntiPatterns)
+	}
+	if current != nil {
+		appendUnique(&out.BeatRules, seenBeat, current.BeatRules)
+		appendUnique(&out.AntiPatterns, seenAnti, current.AntiPatterns)
+	}
+	if !out.HasContent() {
+		return nil
+	}
+	return out
 }
 
 func (t *ContextTool) buildArchitectContext(result map[string]any, warn func(string, error)) {
@@ -582,7 +826,13 @@ func (t *ContextTool) buildArchitectPlanning(envelope *architectContextEnvelope,
 	var layered []domain.VolumeOutline
 	if l, err := t.store.Outline.LoadLayeredOutline(); err == nil && len(l) > 0 {
 		layered = l
-		envelope.Planning["layered_outline"] = layered
+		progress, progressErr := t.store.Progress.Load()
+		warn("progress", progressErr)
+		includeNearbyChapterDetail := t.role == "architect"
+		envelope.Planning["layered_outline"] = planningLayeredOutlineView(layered, progress, includeNearbyChapterDetail)
+		if includeNearbyChapterDetail {
+			envelope.Planning["outline_detail_policy"] = planningOutlineDetailPolicy(layered, progress)
+		}
 		var skeletonArcs []map[string]any
 		for _, v := range layered {
 			for _, a := range v.Arcs {
@@ -607,12 +857,14 @@ func (t *ContextTool) buildArchitectPlanning(envelope *architectContextEnvelope,
 	var compass *domain.StoryCompass
 	if c, err := t.store.Outline.LoadCompass(); err == nil && c != nil {
 		compass = c
-		envelope.Planning["compass"] = compass
+		// 首轮只装 long/current 的稳定字段。详细 Long Reference 即便对 Architect
+		// 也改由 read_planning_reference 按需读取，避免每轮固定支付整包成本。
+		envelope.Planning["compass"] = compassContextView(compass, false)
 	} else {
 		warn("compass", err)
 	}
 	if volSummaries, err := t.store.Summaries.LoadAllVolumeSummaries(); err == nil && len(volSummaries) > 0 {
-		envelope.Planning["volume_summaries"] = volSummaries
+		envelope.Planning["volume_summaries"] = planningVolumeSummaryView(volSummaries)
 	} else {
 		warn("volume_summaries", err)
 	}
@@ -634,6 +886,126 @@ func (t *ContextTool) buildArchitectPlanning(envelope *architectContextEnvelope,
 	envelope.Planning["completion_signals"] = t.completionSignals(layered, compass)
 }
 
+// compassContextView 返回按角色裁剪的只读视图。Store 中仍持久化完整 Long
+// Reference，常规 long/current 字段对所有获准读取 Compass 的角色保持一致。
+func compassContextView(compass *domain.StoryCompass, includeLongReference bool) *domain.StoryCompass {
+	if compass == nil {
+		return nil
+	}
+	view := *compass
+	if !includeLongReference {
+		view.Long.Reference = nil
+	}
+	return &view
+}
+
+// planningLayeredOutlineView 始终完整保留所有卷纲与弧纲；只有弧下逐章的
+// chapters[] 按视野裁剪为当前卷及物理相邻的上一卷、下一卷。更远卷可由
+// read_planning_reference 批量补读完整章节细纲。Store 原始大纲不变。
+func planningLayeredOutlineView(layered []domain.VolumeOutline, progress *domain.Progress, includeNearbyChapterDetail bool) []map[string]any {
+	currentIndex := -1
+	flatArcCount := 0
+	currentVolumeIndex := 0
+	for _, volume := range layered {
+		for _, arc := range volume.Arcs {
+			if progress != nil && volume.Index == progress.CurrentVolume && arc.Index == progress.CurrentArc {
+				currentIndex = flatArcCount
+			}
+			flatArcCount++
+		}
+	}
+	if currentIndex < 0 && flatArcCount > 0 {
+		currentIndex = 0
+	}
+	if progress != nil {
+		for i, volume := range layered {
+			if volume.Index == progress.CurrentVolume {
+				currentVolumeIndex = i
+				break
+			}
+		}
+	}
+
+	flatIndex := 0
+	view := make([]map[string]any, 0, len(layered))
+	for volumeIndex, volume := range layered {
+		keepChapterDetail := includeNearbyChapterDetail && volumeIndex >= currentVolumeIndex-1 && volumeIndex <= currentVolumeIndex+1
+		volumeView := map[string]any{
+			"index": volume.Index,
+			"title": volume.Title,
+			"theme": volume.Theme,
+		}
+		if volume.Final {
+			volumeView["final"] = true
+		}
+		arcs := make([]map[string]any, 0, len(volume.Arcs))
+		for _, arc := range volume.Arcs {
+			arcView := map[string]any{
+				"index": arc.Index,
+				"title": arc.Title,
+				"goal":  arc.Goal,
+			}
+			if !arc.IsExpanded() {
+				arcView["status"] = "skeleton"
+				arcView["estimated_chapters"] = arc.EstimatedChapters
+			} else {
+				arcView["status"] = "planned"
+				if flatIndex < currentIndex {
+					arcView["status"] = "completed"
+				} else if flatIndex == currentIndex {
+					arcView["status"] = "active"
+				}
+				arcView["chapter_count"] = len(arc.Chapters)
+				arcView["chapter_start"] = arc.Chapters[0].Chapter
+				arcView["chapter_end"] = arc.Chapters[len(arc.Chapters)-1].Chapter
+				arcView["chapter_detail"] = keepChapterDetail
+				if keepChapterDetail {
+					arcView["chapters"] = arc.Chapters
+				}
+			}
+			arcs = append(arcs, arcView)
+			flatIndex++
+		}
+		volumeView["arcs"] = arcs
+		view = append(view, volumeView)
+	}
+	return view
+}
+
+// planningOutlineDetailPolicy 显式告诉 Architect 哪些卷已经包含 chapters[]，
+// 防止它把远处卷的完整弧纲误判为信息缺失并逐卷查询。
+func planningOutlineDetailPolicy(layered []domain.VolumeOutline, progress *domain.Progress) map[string]any {
+	currentVolumeIndex := 0
+	if progress != nil {
+		for i, volume := range layered {
+			if volume.Index == progress.CurrentVolume {
+				currentVolumeIndex = i
+				break
+			}
+		}
+	}
+	loaded := make([]int, 0, 3)
+	for i := currentVolumeIndex - 1; i <= currentVolumeIndex+1; i++ {
+		if i >= 0 && i < len(layered) {
+			loaded = append(loaded, layered[i].Index)
+		}
+	}
+	return map[string]any{
+		"all_volume_outlines":    true,
+		"all_arc_outlines":       true,
+		"chapter_detail_volumes": loaded,
+		"remote_reader":          "read_planning_reference",
+		"max_reader_calls":       2,
+		"reader_hint":            "只有确需远处卷 chapters[] 或 Long Reference 时才调用；多个卷号一次批量请求",
+	}
+}
+
+// planningVolumeSummaryView 明确保留所有卷摘要的完整结构。调用方使用
+// canonical planning_memory，不再靠顶层副本消耗第二份预算。
+func planningVolumeSummaryView(summaries []domain.VolumeSummary) []domain.VolumeSummary {
+	return slices.Clone(summaries)
+}
+
 func (t *ContextTool) completionSignals(layered []domain.VolumeOutline, compass *domain.StoryCompass) map[string]any {
 	signals := map[string]any{}
 	if progress, _ := t.store.Progress.Load(); progress != nil {
@@ -649,10 +1021,13 @@ func (t *ContextTool) completionSignals(layered []domain.VolumeOutline, compass 
 		}
 	}
 	if compass != nil {
-		if compass.EstimatedScale != "" {
-			signals["compass_estimated_scale"] = compass.EstimatedScale
+		if compass.Long.EstimatedScale != "" {
+			signals["compass_estimated_scale"] = compass.Long.EstimatedScale
 		}
-		signals["open_threads_count"] = len(compass.OpenThreads)
+		signals["long_open_threads_count"] = len(compass.Long.OpenThreads)
+		if compass.Current != nil {
+			signals["current_open_threads_count"] = len(compass.Current.OpenThreads)
+		}
 	}
 	if active, err := t.store.World.LoadActiveForeshadow(); err == nil {
 		signals["active_foreshadow_count"] = len(active)
@@ -704,11 +1079,26 @@ func (t *ContextTool) buildArchitectFoundation(envelope *architectContextEnvelop
 }
 
 func (t *ContextTool) buildArchitectReferences(envelope *architectContextEnvelope, warn func(string, error)) {
-	if styleRules, err := t.store.World.LoadStyleRules(); err == nil && styleRules != nil {
-		envelope.References["style_rules"] = styleRules
-	} else {
-		warn("style_rules", err)
+	// Architect 只注入规划 outline 规则，不注入 prose/dialogue/taboos（避免半个 Writer）
+	// 非 architect 角色走 chapter 路径时不注入 outline 规则。
+	if t.role == "architect" {
+		if compass, err := t.store.World.LoadStyleRulesCompass(); err == nil && compass != nil && compass.HasOutlineContent() {
+			if view := buildCompassOutlineInjectionView(compass); view != nil {
+				envelope.References["style_rules"] = view
+			}
+		} else if err != nil {
+			warn("style_rules_compass", err)
+		}
 	}
 
 	envelope.References["references"] = t.architectReferences()
+}
+
+// safeMaxCompleted 是 maxCompletedChapter 的 nil-safe 封装。
+// progress 为 nil 时返回 0，不 panic。
+func safeMaxCompleted(progress *domain.Progress) int {
+	if progress == nil {
+		return 0
+	}
+	return maxCompletedChapter(progress.CompletedChapters)
 }

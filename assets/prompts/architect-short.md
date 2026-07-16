@@ -77,7 +77,7 @@
 - title
 - core_event
 - hook
-- scenes（3-5 个要点，描述本章的关键段落和事件）
+- scenes（结构对象数组，每对象含 goal（必填）、action（必填）、conflict（必填）、outcome（必填）、sensory_anchor（可选））；描述本章的关键段落和事件
 
 要求：
 

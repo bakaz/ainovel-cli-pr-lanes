@@ -153,7 +153,7 @@ func seededWriterStore(t *testing.T) *storepkg.Store {
 	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
 		{Chapter: 1, Title: "第一章", CoreEvent: "开场"},
 		{Chapter: 2, Title: "第二章", CoreEvent: "冲突升级"},
-		{Chapter: 3, Title: "第三章", CoreEvent: "追查线索", Scenes: []string{"主角追查失踪案", "发现旧仓库线索"}},
+		{Chapter: 3, Title: "第三章", CoreEvent: "追查线索", Scenes: domain.SceneList{{Action: "主角追查失踪案"}, {Action: "发现旧仓库线索"}}},
 	}); err != nil {
 		t.Fatalf("SaveOutline: %v", err)
 	}

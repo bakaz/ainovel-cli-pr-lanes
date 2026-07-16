@@ -1,7 +1,6 @@
 package rules
 
 import (
-	"fmt"
 	"maps"
 	"strings"
 )
@@ -14,12 +13,12 @@ import (
 // 注入给模型的只有 Structured + Preferences（见 Payload）；Version / Status / Sources /
 // Uncertain 是运维与诊断元数据，不进 working_memory.user_rules。
 type Snapshot struct {
-	Version     int        `json:"version"`
-	Status      Status     `json:"status"`
-	Structured  Structured `json:"structured"`
-	Preferences string     `json:"preferences"`
-	Sources     []string   `json:"sources"`
-	Uncertain   []string   `json:"uncertain"`
+	Version     int               `json:"version"`
+	Status      Status            `json:"status"`
+	Structured  Structured        `json:"structured"`
+	Preferences PreferenceBuckets `json:"preferences"`
+	Sources     []string          `json:"sources"`
+	Uncertain   []string          `json:"uncertain"`
 }
 
 // Status 标记快照归一化是否完整成功。
@@ -33,9 +32,6 @@ const (
 )
 
 // SnapshotVersion 是当前快照 schema 版本，便于未来迁移。
-// v2：chapter_words 退出 structured（字数是语义软约束，走 preferences）。
-// v1 快照直接加载兼容：未知字段被反序列化忽略，下次叠加保存时自然收敛为 v2；
-// 刻意不做"版本不符即重建"——那会丢掉 AddRuntimeRule 运行中追加的不可再生规则。
 const SnapshotVersion = 2
 
 // Candidate 是单个来源归一化后的候选结果。
@@ -46,8 +42,12 @@ type Candidate struct {
 	Source      string     // 可读来源标签，进入 Snapshot.Sources（如 system_defaults / startup_prompt / global:my.md）
 	Structured  Structured // 该来源候选结构化字段
 	Preferences string     // 该来源的自然语言偏好正文
-	Uncertain   []string   // 该来源故意未提升到 structured 的项 + 原因（诊断）
-	Degraded    bool       // 该来源归一化失败、已降级为 raw preferences
+	Scope       RuleScope  // 偏好分区；空值按 default 处理
+	// ScopedPreferences 允许一个来源同时贡献多个角色分区；Normalizer v2 使用它，
+	// Preferences+Scope 保留给旧回复和降级路径。
+	ScopedPreferences map[RuleScope]string
+	Uncertain         []string // 该来源故意未提升到 structured 的项 + 原因（诊断）
+	Degraded          bool     // 该来源归一化失败、已降级为 raw preferences
 }
 
 // Payload 返回注入 working_memory.user_rules 的形态：只暴露 structured + preferences。
@@ -55,8 +55,29 @@ type Candidate struct {
 func (s Snapshot) Payload() map[string]any {
 	return map[string]any{
 		"structured":  s.Structured,
-		"preferences": s.Preferences,
+		"preferences": s.Preferences.AllText(),
 	}
+}
+
+// PayloadForRole 保持运行时协议不变，只选择该角色应该看到的分区再拼接。
+func (s Snapshot) PayloadForRole(role string) map[string]any {
+	return map[string]any{
+		"structured":  s.Structured,
+		"preferences": s.Preferences.TextForRole(role),
+	}
+}
+
+// Migrate 修复旧快照版本和手工编辑后的条目。v1 字符串由
+// PreferenceBuckets.UnmarshalJSON 自动放入 default。
+func (s *Snapshot) Migrate() {
+	if s == nil {
+		return
+	}
+	s.Version = SnapshotVersion
+	if s.Status == "" {
+		s.Status = StatusReady
+	}
+	s.Preferences.Normalize()
 }
 
 // BuildSnapshot 把按优先级（低→高）排好的候选确定性合并成快照。
@@ -72,11 +93,13 @@ func BuildSnapshot(cands []Candidate) Snapshot {
 		Status:  StatusReady,
 		Sources: make([]string, 0, len(cands)),
 	}
-	var prefs []string
 	for _, c := range cands {
 		s := sanitizeStructured(c.Structured)
 		if s.Genre != "" {
 			snap.Structured.Genre = s.Genre
+		}
+		if s.ChapterWords != nil {
+			snap.Structured.ChapterWords = s.ChapterWords
 		}
 		if len(s.ForbiddenChars) > 0 {
 			snap.Structured.ForbiddenChars = s.ForbiddenChars
@@ -88,13 +111,7 @@ func BuildSnapshot(cands []Candidate) Snapshot {
 			snap.Structured.FatigueWords = mergeFatigueWords(snap.Structured.FatigueWords, s.FatigueWords)
 		}
 
-		if p := strings.TrimSpace(c.Preferences); p != "" {
-			if src := strings.TrimSpace(c.Source); src != "" {
-				prefs = append(prefs, fmt.Sprintf("## [%s]\n\n%s", src, p))
-			} else {
-				prefs = append(prefs, p)
-			}
-		}
+		appendCandidatePreferences(&snap.Preferences, c)
 		if src := strings.TrimSpace(c.Source); src != "" {
 			snap.Sources = append(snap.Sources, src)
 		}
@@ -103,13 +120,12 @@ func BuildSnapshot(cands []Candidate) Snapshot {
 			snap.Status = StatusDegraded
 		}
 	}
-	snap.Preferences = strings.Join(prefs, "\n\n")
 	return snap
 }
 
 // OverlaySnapshot 把一个高优先级候选叠加到已有快照上（候选胜出）。
 //
-// 用于运行中 Arbiter rules 动作：不重新归一化所有来源，只把新规则覆盖进当前快照——
+// 用于运行中 save_user_rules：不重新归一化所有来源，只把新规则覆盖进当前快照——
 // structured 按字段覆盖、preferences 追加一段、sources/uncertain 累加、降级传播。
 func OverlaySnapshot(base Snapshot, cand Candidate) Snapshot {
 	out := base
@@ -117,6 +133,9 @@ func OverlaySnapshot(base Snapshot, cand Candidate) Snapshot {
 	s := sanitizeStructured(cand.Structured)
 	if s.Genre != "" {
 		out.Structured.Genre = s.Genre
+	}
+	if s.ChapterWords != nil {
+		out.Structured.ChapterWords = s.ChapterWords
 	}
 	if len(s.ForbiddenChars) > 0 {
 		out.Structured.ForbiddenChars = s.ForbiddenChars
@@ -127,17 +146,7 @@ func OverlaySnapshot(base Snapshot, cand Candidate) Snapshot {
 	if len(s.FatigueWords) > 0 {
 		out.Structured.FatigueWords = mergeFatigueWords(cloneFatigue(out.Structured.FatigueWords), s.FatigueWords)
 	}
-	if p := strings.TrimSpace(cand.Preferences); p != "" {
-		section := p
-		if src := strings.TrimSpace(cand.Source); src != "" {
-			section = fmt.Sprintf("## [%s]\n\n%s", src, p)
-		}
-		if strings.TrimSpace(out.Preferences) == "" {
-			out.Preferences = section
-		} else {
-			out.Preferences = out.Preferences + "\n\n" + section
-		}
-	}
+	appendCandidatePreferences(&out.Preferences, cand)
 	if src := strings.TrimSpace(cand.Source); src != "" {
 		out.Sources = append(append([]string{}, out.Sources...), src)
 	}
@@ -148,6 +157,17 @@ func OverlaySnapshot(base Snapshot, cand Candidate) Snapshot {
 		out.Status = StatusDegraded
 	}
 	return out
+}
+
+func appendCandidatePreferences(dst *PreferenceBuckets, cand Candidate) {
+	for _, scope := range allRuleScopes() {
+		if p := strings.TrimSpace(cand.ScopedPreferences[scope]); p != "" {
+			dst.Append(scope, cand.Source, p)
+		}
+	}
+	if p := strings.TrimSpace(cand.Preferences); p != "" {
+		dst.Append(cand.Scope, cand.Source, p)
+	}
 }
 
 // mergeFatigueWords 按词叠加疲劳词阈值，src 覆盖 dst 中的同词阈值（就近优先）。
@@ -181,6 +201,7 @@ func SystemDefaults() Candidate {
 	return Candidate{
 		Source: "system_defaults",
 		Structured: Structured{
+			ChapterWords: &WordRange{Min: 3000, Max: 6000},
 			// 定长固定串的 AI 套句；checker 字面子串匹配，带变量的模式（不是X而是Y）归语义层。
 			ForbiddenPhrases: []string{"某种程度上", "值得注意的是", "不知为何", "五味杂陈"},
 			FatigueWords: map[string]int{
@@ -192,17 +213,40 @@ func SystemDefaults() Candidate {
 	}
 }
 
-// sanitizeStructured 落实"空值/零值=字段缺失"：归一化器可能吐 genre:"" 这类占位
-// （原型实测），必须当作未声明，避免污染合并与机械检查。
+// sanitizeStructured 落实"空值/零值=字段缺失"：归一化器可能吐 genre:""、chapter_words.min:0
+// 这类占位（原型实测），必须当作未声明，避免污染合并与机械检查。
 func sanitizeStructured(s Structured) Structured {
 	out := Structured{}
 	if g := strings.TrimSpace(s.Genre); g != "" {
 		out.Genre = g
 	}
+	out.ChapterWords = sanitizeWordRange(s.ChapterWords)
 	out.ForbiddenChars = nonEmptyStrings(s.ForbiddenChars)
 	out.ForbiddenPhrases = nonEmptyStrings(s.ForbiddenPhrases)
 	out.FatigueWords = sanitizeFatigueWords(s.FatigueWords)
 	return out
+}
+
+// sanitizeWordRange 处理零值与非法区间：min/max 同为 0 表示无约束（丢弃）；
+// 单边为 0 合法（checker 把 0 当"该侧无界"）；min>max>0 非法，丢弃整段。
+func sanitizeWordRange(r *WordRange) *WordRange {
+	if r == nil {
+		return nil
+	}
+	min, max := r.Min, r.Max
+	if min < 0 {
+		min = 0
+	}
+	if max < 0 {
+		max = 0
+	}
+	if min == 0 && max == 0 {
+		return nil
+	}
+	if max > 0 && min > max {
+		return nil
+	}
+	return &WordRange{Min: min, Max: max}
 }
 
 func nonEmptyStrings(in []string) []string {

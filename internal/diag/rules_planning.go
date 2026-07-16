@@ -63,7 +63,7 @@ func CompassDrift(snap *Snapshot) []Finding {
 		return nil
 	}
 
-	gap := snap.LatestCompleted() - snap.Compass.LastUpdated
+	gap := snap.LatestCompleted() - snap.Compass.LatestUpdated()
 	if gap <= ThresholdCompassDrift {
 		return nil
 	}
@@ -75,7 +75,7 @@ func CompassDrift(snap *Snapshot) []Finding {
 		AutoLevel:  AutoNone,
 		Target:     "prompt.architect",
 		Title:      fmt.Sprintf("指南针已 %d 章未更新", gap),
-		Evidence:   fmt.Sprintf("last_updated=ch%d, latest=ch%d, open_threads=%d", snap.Compass.LastUpdated, snap.LatestCompleted(), len(snap.Compass.OpenThreads)),
+		Evidence:   fmt.Sprintf("last_updated=ch%d, latest=ch%d, long_open_threads=%d", snap.Compass.LatestUpdated(), snap.LatestCompleted(), len(snap.Compass.Long.OpenThreads)),
 		Suggestion: "Architect 应在弧/卷边界更新 compass。检查 architect-long.md 中是否包含 compass 更新指令。",
 	}}
 }

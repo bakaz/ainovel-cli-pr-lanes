@@ -215,9 +215,10 @@ func TestSaveReviewDerivesVerdictFromScore(t *testing.T) {
 			{"dimension": "hook", "score": 76, "verdict": "warning", "comment": "钩子一般"},
 			{"dimension": "aesthetic", "score": 85, "verdict": "warning", "comment": "语言成立"}, // 不一致：85 却填 warning
 		},
-		"issues":  []map[string]any{},
-		"verdict": "accept",
-		"summary": "ok",
+		"issues":            []map[string]any{},
+		"verdict":           "accept",
+		"summary":           "ok",
+		"affected_chapters": []int{3},
 	})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
@@ -366,5 +367,199 @@ func TestSaveReviewDoesNotDirtyQueueOnIllegalFlowTransition(t *testing.T) {
 	}
 	if p.Flow != domain.FlowRewriting {
 		t.Fatalf("Flow 应保持 rewriting，got %s", p.Flow)
+	}
+	if rev, err := s.World.LoadReview(8); err != nil {
+		t.Fatalf("LoadReview: %v", err)
+	} else if rev != nil {
+		t.Fatalf("非法 flow 迁移时不应落盘 review，got %+v", rev)
+	}
+}
+
+// TestSaveReviewRejectsEscalationWithoutAffectedChapters_ContractMissed
+// 验证：Editor 给 accept + contract_status=missed 升为 rewrite，但未提供
+// affected_chapters 时，返回明确的校验错误，不得默认回退为最新章节。
+func TestSaveReviewRejectsEscalationWithoutAffectedChapters_ContractMissed(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 10); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	for ch := 1; ch <= 5; ch++ {
+		if err := s.Progress.MarkChapterComplete(ch, 3000, "", ""); err != nil {
+			t.Fatalf("MarkChapterComplete(%d): %v", ch, err)
+		}
+	}
+
+	tool := NewSaveReviewTool(s)
+	args, err := json.Marshal(map[string]any{
+		"chapter": 5,
+		"scope":   "chapter",
+		"dimensions": []map[string]any{
+			{"dimension": "consistency", "score": 85, "comment": "一致"},
+			{"dimension": "character", "score": 82, "comment": "稳定"},
+			{"dimension": "pacing", "score": 78, "comment": "略慢"},
+			{"dimension": "continuity", "score": 84, "comment": "连贯"},
+			{"dimension": "foreshadow", "score": 80, "comment": "正常"},
+			{"dimension": "hook", "score": 76, "comment": "钩子一般"},
+			{"dimension": "aesthetic", "score": 81, "comment": "语言成立"},
+		},
+		"issues":          []map[string]any{},
+		"contract_status": "missed",
+		"contract_misses": []string{"主线推进完全偏离约定"},
+		"contract_notes":  "合同完全未履行。",
+		"verdict":         "accept",
+		"summary":         "章节有严重问题。",
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	if _, err := tool.Execute(context.Background(), args); err == nil {
+		t.Fatal("expected error for missing affected_chapters after escalation to rewrite, got nil")
+	} else if !strings.Contains(err.Error(), "affected_chapters is required") {
+		t.Fatalf("expected affected_chapters validation error, got: %v", err)
+	}
+}
+
+// TestSaveReviewRejectsEscalationWithoutAffectedChapters_ContractPartial
+// 验证：Editor 给 accept + contract_status=partial 升为 polish，但未提供
+// affected_chapters 时，不得默认回退为最新章节，应报校验错误。
+func TestSaveReviewRejectsEscalationWithoutAffectedChapters_ContractPartial(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 10); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	for ch := 1; ch <= 5; ch++ {
+		if err := s.Progress.MarkChapterComplete(ch, 3000, "", ""); err != nil {
+			t.Fatalf("MarkChapterComplete(%d): %v", ch, err)
+		}
+	}
+
+	tool := NewSaveReviewTool(s)
+	args, err := json.Marshal(map[string]any{
+		"chapter": 5,
+		"scope":   "chapter",
+		"dimensions": []map[string]any{
+			{"dimension": "consistency", "score": 85, "comment": "一致"},
+			{"dimension": "character", "score": 82, "comment": "稳定"},
+			{"dimension": "pacing", "score": 78, "comment": "略慢"},
+			{"dimension": "continuity", "score": 84, "comment": "连贯"},
+			{"dimension": "foreshadow", "score": 80, "comment": "正常"},
+			{"dimension": "hook", "score": 76, "comment": "钩子一般"},
+			{"dimension": "aesthetic", "score": 81, "comment": "语言成立"},
+		},
+		"issues":          []map[string]any{},
+		"contract_status": "partial",
+		"contract_misses": []string{"未明确埋下内门试炼邀请"},
+		"contract_notes":  "主线推进达成，但 contract 漏项。",
+		"verdict":         "accept",
+		"summary":         "章节基本完成但 contract 有漏项。",
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	if _, err := tool.Execute(context.Background(), args); err == nil {
+		t.Fatal("expected error for missing affected_chapters after escalation to polish, got nil")
+	} else if !strings.Contains(err.Error(), "affected_chapters is required") {
+		t.Fatalf("expected affected_chapters validation error, got: %v", err)
+	}
+}
+
+// TestSaveReviewRejectsEscalationWithoutAffectedChapters_ScorecardGate
+// 验证：Editor 给 accept，评分卡关键维度不合格升为 rewrite，但未提供
+// affected_chapters 时报错，不得默认回退为最新章节。
+func TestSaveReviewRejectsEscalationWithoutAffectedChapters_ScorecardGate(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 10); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	for ch := 1; ch <= 5; ch++ {
+		if err := s.Progress.MarkChapterComplete(ch, 3000, "", ""); err != nil {
+			t.Fatalf("MarkChapterComplete(%d): %v", ch, err)
+		}
+	}
+
+	tool := NewSaveReviewTool(s)
+	// consistency 是 critical 维度，score=45 会触发 scorecard 升级到 rewrite
+	args, err := json.Marshal(map[string]any{
+		"chapter": 5,
+		"scope":   "chapter",
+		"dimensions": []map[string]any{
+			{"dimension": "consistency", "score": 45, "comment": "严重不一致"}, // critical fail → rewrite
+			{"dimension": "character", "score": 82, "comment": "稳定"},
+			{"dimension": "pacing", "score": 78, "comment": "略慢"},
+			{"dimension": "continuity", "score": 84, "comment": "连贯"},
+			{"dimension": "foreshadow", "score": 80, "comment": "正常"},
+			{"dimension": "hook", "score": 76, "comment": "钩子一般"},
+			{"dimension": "aesthetic", "score": 81, "comment": "语言成立"},
+		},
+		"issues":  []map[string]any{},
+		"verdict": "accept",
+		"summary": "章节有严重不一致问题。",
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	if _, err := tool.Execute(context.Background(), args); err == nil {
+		t.Fatal("expected error for missing affected_chapters after scorecard escalation, got nil")
+	} else if !strings.Contains(err.Error(), "affected_chapters is required") {
+		t.Fatalf("expected affected_chapters validation error, got: %v", err)
+	}
+}
+
+// TestSaveReviewAllowsEscalationWithAffectedChapters
+// 验证：Editor 给 accept 但提供 affected_chapters 时，即使 escalation 将
+// verdict 提升到 polish/rewrite，仍能正常执行不报错。
+func TestSaveReviewAllowsEscalationWithAffectedChapters(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 10); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	for ch := 1; ch <= 5; ch++ {
+		if err := s.Progress.MarkChapterComplete(ch, 3000, "", ""); err != nil {
+			t.Fatalf("MarkChapterComplete(%d): %v", ch, err)
+		}
+	}
+
+	tool := NewSaveReviewTool(s)
+	args, err := json.Marshal(map[string]any{
+		"chapter": 5,
+		"scope":   "chapter",
+		"dimensions": []map[string]any{
+			{"dimension": "consistency", "score": 85, "comment": "一致"},
+			{"dimension": "character", "score": 82, "comment": "稳定"},
+			{"dimension": "pacing", "score": 78, "comment": "略慢"},
+			{"dimension": "continuity", "score": 84, "comment": "连贯"},
+			{"dimension": "foreshadow", "score": 80, "comment": "正常"},
+			{"dimension": "hook", "score": 76, "comment": "钩子一般"},
+			{"dimension": "aesthetic", "score": 81, "comment": "语言成立"},
+		},
+		"issues":            []map[string]any{},
+		"contract_status":   "partial",
+		"contract_misses":   []string{"未明确埋下内门试炼邀请"},
+		"contract_notes":    "主线推进达成，但 contract 漏项。",
+		"verdict":           "accept",
+		"summary":           "章节基本完成但需打磨部分内容。",
+		"affected_chapters": []int{5},
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("Execute should succeed when affected_chapters is provided, got: %v", err)
 	}
 }
