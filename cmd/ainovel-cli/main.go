@@ -4,13 +4,17 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/voocel/agentcore"
 	"github.com/voocel/ainovel-cli/assets"
 	"github.com/voocel/ainovel-cli/internal/bootstrap"
 	"github.com/voocel/ainovel-cli/internal/entry/headless"
 	"github.com/voocel/ainovel-cli/internal/entry/tui"
 	"github.com/voocel/ainovel-cli/internal/eval"
+	"github.com/voocel/ainovel-cli/internal/observe"
 	"github.com/voocel/ainovel-cli/internal/rules"
 	buildversion "github.com/voocel/ainovel-cli/internal/version"
 )
@@ -28,6 +32,11 @@ func main() {
 	// 子命令在常规 flag 解析之前拦截：eval 是离线评测 harness，参数体系独立。
 	if len(os.Args) > 1 && os.Args[1] == "eval" {
 		os.Exit(eval.Command(os.Args[2:]))
+	}
+
+	// observe 是只读探活子命令。
+	if name := earlyCommand(os.Args); name == "observe" {
+		os.Exit(observeCommand(os.Args[2:]))
 	}
 
 	opts, args, err := parseCLIOptions(os.Args[1:])
@@ -225,6 +234,141 @@ func runSelfUpdate(target string) error {
 	fmt.Printf("ainovel-cli 已更新到 %s\n", result.Version)
 	fmt.Printf("安装位置：%s\n", result.Path)
 	return nil
+}
+
+// ── observe command ─────────────────────────────────────────
+
+// earlyCommand returns the subcommand name if the first non-program argument
+// is a recognized early-production subcommand (observe), or "" otherwise.
+func earlyCommand(argv []string) string {
+	if len(argv) < 2 {
+		return ""
+	}
+	switch argv[1] {
+	case "observe":
+		return "observe"
+	}
+	return ""
+}
+
+// observeConfigLoader is a test-observable variable for loading config.
+// Production loads the real user config (not an empty stub).
+var observeConfigLoader = func() (bootstrap.Config, error) {
+	cfg, err := bootstrap.LoadConfig("")
+	if err != nil {
+		return bootstrap.Config{}, err
+	}
+	cfg.FillDefaults()
+	if err := cfg.ValidateBase(); err != nil {
+		return bootstrap.Config{}, err
+	}
+	return cfg, nil
+}
+
+// observeModelSetFactory is a test-observable variable for creating a ModelSet.
+var observeModelSetFactory = func(cfg bootstrap.Config) (observeModelSet, error) {
+	return bootstrap.NewModelSet(cfg)
+}
+
+// observeModelBuilder builds a default model from config (no coordinator role).
+var observeModelBuilder = func(cfg bootstrap.Config) (agentcore.ChatModel, error) {
+	ms, err := observeModelSetFactory(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return ms.ForRole("default"), nil
+}
+
+// observeModelSet matches the ForRole method used by observe.
+type observeModelSet interface {
+	ForRole(role string) agentcore.ChatModel
+}
+
+// observeCommand implements the "observe" subcommand.
+func observeCommand(argv []string) int {
+	var dir string
+	var timeout time.Duration
+	dupDir := false
+	dupTimeout := false
+
+	for i := 0; i < len(argv); i++ {
+		switch argv[i] {
+		case "--dir":
+			if dupDir {
+				fmt.Fprintln(os.Stderr, "error: --dir 只能指定一次")
+				return 1
+			}
+			dupDir = true
+			if i+1 >= len(argv) {
+				fmt.Fprintln(os.Stderr, "error: --dir 缺少值")
+				return 1
+			}
+			i++
+			dir = argv[i]
+		case "--timeout":
+			if dupTimeout {
+				fmt.Fprintln(os.Stderr, "error: --timeout 只能指定一次")
+				return 1
+			}
+			dupTimeout = true
+			if i+1 >= len(argv) {
+				fmt.Fprintln(os.Stderr, "error: --timeout 缺少值")
+				return 1
+			}
+			i++
+			d, err := time.ParseDuration(argv[i])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: --timeout 无效: %v\n", err)
+				return 1
+			}
+			timeout = d
+		default:
+			if strings.HasPrefix(argv[i], "-") {
+				fmt.Fprintf(os.Stderr, "error: 未知 flag %q\n", argv[i])
+				return 1
+			}
+			fmt.Fprintf(os.Stderr, "error: 不支持参数 %q\n", argv[i])
+			return 1
+		}
+	}
+
+	if dir == "" {
+		fmt.Fprintln(os.Stderr, "error: --dir 是必需的")
+		return 1
+	}
+	if !filepath.IsAbs(dir) {
+		fmt.Fprintln(os.Stderr, "error: --dir 必须是绝对路径")
+		return 1
+	}
+	if timeout <= 0 {
+		fmt.Fprintln(os.Stderr, "error: --timeout 必须是正数时长（如 30s）")
+		return 1
+	}
+
+	cfg, err := observeConfigLoader()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: 加载配置失败: %v\n", err)
+		return 1
+	}
+	model, err := observeModelBuilder(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: 构建模型失败: %v\n", err)
+		return 1
+	}
+	result, err := observe.Run(context.Background(), observe.Options{
+		Dir:     dir,
+		Timeout: timeout,
+		Model:   model,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if !result.Success {
+		fmt.Fprintf(os.Stderr, "observe 失败: %s\n", result.Reason)
+		return 1
+	}
+	return 0
 }
 
 func loadPrompt(opts cliOptions) (string, error) {
