@@ -705,6 +705,77 @@ func TestStyleRulesCompass_LoadStyleRulesMergesLongAndCurrent(t *testing.T) {
 	}
 }
 
+func TestStyleRules_SavePreservesOutlineSameVolumeArc(t *testing.T) {
+	s := newTestStore(t)
+
+	// 先保存含 outline 的 current
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 2,
+		Prose:   []string{"测试规则"},
+		Outline: &domain.OutlinePlanningRules{BeatRules: []string{"每场必须 beat"}},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+
+	// 用旧 API 写入同一 volume/arc，但不带 Outline
+	if err := s.World.SaveStyleRules(domain.WritingStyleRules{
+		Volume: 1, Arc: 2,
+		Prose:     []string{"更新后规则"},
+		UpdatedAt: "2024-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("SaveStyleRules: %v", err)
+	}
+
+	// outline 应保留
+	compass, err := s.World.LoadStyleRulesCompass()
+	if err != nil {
+		t.Fatalf("LoadStyleRulesCompass: %v", err)
+	}
+	if compass.Current == nil {
+		t.Fatal("current should exist")
+	}
+	if compass.Current.Outline == nil || !compass.Current.Outline.HasContent() {
+		t.Fatal("outline should be preserved for same volume/arc")
+	}
+	if len(compass.Current.Outline.BeatRules) == 0 || compass.Current.Outline.BeatRules[0] != "每场必须 beat" {
+		t.Fatalf("outline content changed: %+v", compass.Current.Outline)
+	}
+}
+
+func TestStyleRules_SaveDoesNotPreserveOutlineDifferentVolumeArc(t *testing.T) {
+	s := newTestStore(t)
+
+	// 先保存含 outline 的 current (vol1, arc2)
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 2,
+		Prose:   []string{"测试规则"},
+		Outline: &domain.OutlinePlanningRules{BeatRules: []string{"旧弧 outline"}},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+
+	// 用旧 API 写入不同 volume/arc (vol2, arc1)，不带 Outline
+	if err := s.World.SaveStyleRules(domain.WritingStyleRules{
+		Volume: 2, Arc: 1,
+		Prose:     []string{"新弧规则"},
+		UpdatedAt: "2024-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("SaveStyleRules: %v", err)
+	}
+
+	// outline 不应保留（跨 volume/arc）
+	compass, err := s.World.LoadStyleRulesCompass()
+	if err != nil {
+		t.Fatalf("LoadStyleRulesCompass: %v", err)
+	}
+	if compass.Current == nil {
+		t.Fatal("current should exist")
+	}
+	if compass.Current.Outline != nil {
+		t.Fatal("outline should NOT be preserved for different volume/arc")
+	}
+}
+
 // ── Reason 与合并视图相关测试 ──
 
 func TestStyleRulesCompass_RejectLongWithoutReason(t *testing.T) {

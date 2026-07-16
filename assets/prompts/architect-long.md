@@ -78,6 +78,7 @@ JSON 数组，每条含：category、rule、boundary。
 - 章节 title 用名词/动名词短语，**长短自然交错**，不要每章卡同一字数（第一弧的标题节奏会被后续弧沿用，开篇就别整齐划一）
 - estimated_chapters ≥ 8（太短无法展开节奏循环）
 - 角色调度与 characters 一致，弧目标受 world_rules 约束
+- **详细章节的 scenes** 为结构对象数组：每对象含 goal/action/conflict/outcome（必填）与 sensory_anchor（可选）；节拍形态参考 `style_rules` 中的 outline 规划规则（若有）
 
 调用 `save_foundation(type="layered_outline", scale="long", content=<JSON数组>)`。
 
@@ -169,7 +170,8 @@ JSON 数组，每条含：category、rule、boundary。
 
    - 章节不需要 chapter 字段（系统自动编号）
    - 每章需要：title、core_event、hook、scenes
-   - title/goal 必须表达你结合当前故事事实作出的最终规划，不要求机械照抄原骨架
+   - scenes 是结构对象数组，每对象含 goal（必填）、action（必填）、conflict（必填）、outcome（必填）、sensory_anchor（可选）
+   - scenes 的节拍密度参考 style_rules 中的 outline 规划规则（若有）
 
 **title 格式硬约束**（违反即是整本书风格断裂）：
 - **长度必须有起伏，禁止机械对齐**：同一弧内各章标题长短自然交错（如 借炉 / 同行的牙 / 夜里翻旧册），切忌"全弧 4 字"或"全弧 2 字"这种整齐划一——读者一眼扫过目录应感到节奏，而不是排版

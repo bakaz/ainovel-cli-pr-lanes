@@ -120,6 +120,9 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 		if err := decode("outline", &entries); err != nil {
 			return nil, err
 		}
+		if err := validateChapterScenes(entries); err != nil {
+			return nil, err
+		}
 		if err := t.store.Outline.SaveOutline(entries); err != nil {
 			return nil, fmt.Errorf("save outline: %w: %w", errs.ErrStoreWrite, err)
 		}
@@ -136,6 +139,15 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 		var volumes []domain.VolumeOutline
 		if err := decode("layered_outline", &volumes); err != nil {
 			return nil, err
+		}
+		for _, vol := range volumes {
+			for _, arc := range vol.Arcs {
+				if len(arc.Chapters) > 0 {
+					if err := validateChapterScenes(arc.Chapters); err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 		if err := t.store.Outline.SaveLayeredOutline(volumes); err != nil {
 			return nil, fmt.Errorf("save layered_outline: %w: %w", errs.ErrStoreWrite, err)
@@ -182,6 +194,9 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 		if err := decode("expand_arc", &expansion); err != nil {
 			return nil, err
 		}
+		if err := validateChapterScenes(expansion.Chapters); err != nil {
+			return nil, err
+		}
 		if err := t.store.ExpandArc(a.Volume, a.Arc, expansion); err != nil {
 			return nil, fmt.Errorf("expand arc: %w: %w", errs.ErrStoreWrite, err)
 		}
@@ -199,6 +214,14 @@ func (t *SaveFoundationTool) Execute(_ context.Context, args json.RawMessage) (j
 		var vol domain.VolumeOutline
 		if err := decode("append_volume", &vol); err != nil {
 			return nil, err
+		}
+		// 校验新卷中所有已展开弧的场景
+		for _, arc := range vol.Arcs {
+			if len(arc.Chapters) > 0 {
+				if err := validateChapterScenes(arc.Chapters); err != nil {
+					return nil, err
+				}
+			}
 		}
 		prior, _ := t.store.Outline.LoadLayeredOutline()
 		if err := t.store.AppendVolume(vol); err != nil {
@@ -500,4 +523,21 @@ func (t *SaveFoundationTool) consumeWriterFeedback() {
 	if err := t.store.Outline.ClearOutlineFeedback(); err != nil {
 		slog.Warn("清空 writer 反馈池失败", "module", "tools", "err", err)
 	}
+}
+
+// validateChapterScenes 校验章节数组中的场景节拍。
+// 非 legacy 结构场景的 goal/action/conflict/outcome 四必填必须非空。
+// 遗留 string 格式（仅 action 有值）兼容通过。
+func validateChapterScenes(chapters []domain.OutlineEntry) error {
+	for i, ch := range chapters {
+		for j, sc := range ch.Scenes {
+			if sc.IsLegacy() {
+				continue // 遗留 string 格式兼容通过
+			}
+			if err := sc.ValidateRequired(); err != nil {
+				return fmt.Errorf("chapters[%d].scenes[%d].%w", i, j, err)
+			}
+		}
+	}
+	return nil
 }

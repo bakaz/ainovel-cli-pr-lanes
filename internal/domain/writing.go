@@ -94,15 +94,63 @@ type CharacterVoice struct {
 
 // ── 双层 StyleRules Compass（轻量模式） ──
 
+// OutlinePlanningRules 规划层规则：约束 expand_arc/append_volume 的 beat 形态，
+// 不是正文笔法。由 style_rules.long/current.outline 承载，供 Architect 消费。
+type OutlinePlanningRules struct {
+	BeatRules    []string `json:"beat_rules,omitempty"`    // 正向：每场/每章应如何规划
+	AntiPatterns []string `json:"anti_patterns,omitempty"` // 规划反模式（时间表/账本主轴等）
+}
+
+// HasContent 检查 outline 规划规则是否非空（忽略纯空白条目）。
+func (o *OutlinePlanningRules) HasContent() bool {
+	if o == nil {
+		return false
+	}
+	for _, s := range o.BeatRules {
+		if strings.TrimSpace(s) != "" {
+			return true
+		}
+	}
+	for _, s := range o.AntiPatterns {
+		if strings.TrimSpace(s) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// HasProseStyleContent 是否含正文风格规则（prose/dialogue/taboos），不含 outline。
+func (c *WritingStyleRulesCompass) HasProseStyleContent() bool {
+	if c == nil {
+		return false
+	}
+	if c.Long != nil && (len(c.Long.Prose) > 0 || len(c.Long.Dialogue) > 0 || len(c.Long.Taboos) > 0) {
+		return true
+	}
+	if c.Current != nil && (len(c.Current.Prose) > 0 || len(c.Current.Dialogue) > 0 || len(c.Current.Taboos) > 0) {
+		return true
+	}
+	return false
+}
+
+// HasOutlineContent 是否含规划 outline 规则。
+func (c *WritingStyleRulesCompass) HasOutlineContent() bool {
+	if c == nil {
+		return false
+	}
+	return (c.Long != nil && c.Long.Outline.HasContent()) || (c.Current != nil && c.Current.Outline.HasContent())
+}
+
 // StyleRulesLong 跨弧基线风格规则（Compass 长期层）。
 // 长期规则是全书统一的风格基准，不包含局部装置名、循环次数、积分算法、具体参数。
 // 更新必须显式给出 reason 且做字段级合并。
 type StyleRulesLong struct {
-	Prose       []string         `json:"prose,omitempty"`    // 3-5 条叙述风格规则，每条 ≤50 字
-	Dialogue    []CharacterVoice `json:"dialogue,omitempty"` // 角色对话风格规则，跨弧稳定
-	Taboos      []string         `json:"taboos,omitempty"`   // 全书通用禁忌
-	Reason      string           `json:"reason,omitempty"`   // 上次更新原因（审计元数据）
-	LastUpdated string           `json:"last_updated,omitempty"` // ISO8601 更新时间
+	Prose       []string               `json:"prose,omitempty"`    // 3-5 条叙述风格规则，每条 ≤50 字
+	Dialogue    []CharacterVoice       `json:"dialogue,omitempty"` // 角色对话风格规则，跨弧稳定
+	Taboos      []string               `json:"taboos,omitempty"`   // 全书通用禁忌
+	Outline     *OutlinePlanningRules  `json:"outline,omitempty"`  // 规划层 beat 规则（非正文笔法）
+	Reason      string                 `json:"reason,omitempty"`   // 上次更新原因（审计元数据）
+	LastUpdated string                 `json:"last_updated,omitempty"` // ISO8601 更新时间
 }
 
 // Validate 检查 long 规则是否含有禁止的局部实现细节。
@@ -122,12 +170,16 @@ func (s *StyleRulesLong) Validate() error {
 		{"阈值", "长期规则不应包含具体参数阈值（属于当前弧细节）"},
 		{"参数配置", "长期规则不应包含具体参数配置（属于当前弧细节）"},
 	}
-	// 收集所有文本（含 dialogue 规则）
+	// 收集所有文本（含 dialogue / outline 规则）
 	var allText string
 	allText += strings.Join(s.Prose, "\n") + "\n"
 	allText += strings.Join(s.Taboos, "\n") + "\n"
 	for _, d := range s.Dialogue {
 		allText += strings.Join(d.Rules, "\n") + "\n"
+	}
+	if s.Outline != nil {
+		allText += strings.Join(s.Outline.BeatRules, "\n") + "\n"
+		allText += strings.Join(s.Outline.AntiPatterns, "\n") + "\n"
 	}
 	for _, f := range forbidden {
 		if matched, _ := regexp.MatchString(f.pattern, allText); matched {
@@ -141,12 +193,13 @@ func (s *StyleRulesLong) Validate() error {
 // 由 Editor 在弧边界时生成，仅作用于当前弧。
 // 同字段在 long 和 current 都有定义时，long 优先（由上下文注入保证）。
 type StyleRulesCurrent struct {
-	Volume      int              `json:"volume"`
-	Arc         int              `json:"arc"`
-	Prose       []string         `json:"prose,omitempty"`
-	Dialogue    []CharacterVoice `json:"dialogue,omitempty"`
-	Taboos      []string         `json:"taboos,omitempty"`
-	LastUpdated string           `json:"last_updated,omitempty"` // ISO8601
+	Volume      int                   `json:"volume"`
+	Arc         int                   `json:"arc"`
+	Prose       []string              `json:"prose,omitempty"`
+	Dialogue    []CharacterVoice      `json:"dialogue,omitempty"`
+	Taboos      []string              `json:"taboos,omitempty"`
+	Outline     *OutlinePlanningRules `json:"outline,omitempty"` // 本弧规划 beat 补充
+	LastUpdated string                `json:"last_updated,omitempty"` // ISO8601
 }
 
 // WritingStyleRulesCompass 双层风格规则罗盘（持久化到 meta/style_rules.json）。
@@ -195,8 +248,8 @@ func (c *WritingStyleRulesCompass) HasContent() bool {
 	if c == nil {
 		return false
 	}
-	return (c.Long != nil && (len(c.Long.Prose) > 0 || len(c.Long.Dialogue) > 0 || len(c.Long.Taboos) > 0)) ||
-		(c.Current != nil && (len(c.Current.Prose) > 0 || len(c.Current.Dialogue) > 0 || len(c.Current.Taboos) > 0))
+	return (c.Long != nil && (len(c.Long.Prose) > 0 || len(c.Long.Dialogue) > 0 || len(c.Long.Taboos) > 0 || c.Long.Outline.HasContent())) ||
+		(c.Current != nil && (len(c.Current.Prose) > 0 || len(c.Current.Dialogue) > 0 || len(c.Current.Taboos) > 0 || c.Current.Outline.HasContent()))
 }
 
 // ConflictsWithLong 保留供外部调用，但不再做文本级冲突拒绝。
@@ -210,7 +263,7 @@ func ConflictsWithLong(current *StyleRulesCurrent, long *StyleRulesLong) error {
 
 // HasContent 检查 long 层是否包含任何有效规则。
 func (s *StyleRulesLong) HasContent() bool {
-	return s != nil && (len(s.Prose) > 0 || len(s.Dialogue) > 0 || len(s.Taboos) > 0)
+	return s != nil && (len(s.Prose) > 0 || len(s.Dialogue) > 0 || len(s.Taboos) > 0 || s.Outline.HasContent())
 }
 
 // StyleRulesCurrentsEqual 比较两个 current 指针的等效性（用于条件恢复判定）。
@@ -241,7 +294,20 @@ func StyleRulesCurrentsEqual(a, b *StyleRulesCurrent) bool {
 			return false
 		}
 	}
+	if !outlinePlanningEqual(a.Outline, b.Outline) {
+		return false
+	}
 	return true
+}
+
+func outlinePlanningEqual(a, b *OutlinePlanningRules) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return !a.HasContent() && !b.HasContent()
+	}
+	return stringSlicesEqual(a.BeatRules, b.BeatRules) && stringSlicesEqual(a.AntiPatterns, b.AntiPatterns)
 }
 
 func stringSlicesEqual(a, b []string) bool {

@@ -997,8 +997,8 @@ func (h *Host) fillDetails(snap *UISnapshot, progress *domain.Progress) {
 	}
 	if progress != nil && progress.Layered {
 		if compass, _ := h.store.Outline.LoadCompass(); compass != nil {
-			snap.CompassDirection = compass.EndingDirection
-			snap.CompassScale = compass.EstimatedScale
+			snap.CompassDirection = compass.Long.EndingDirection
+			snap.CompassScale = compass.Long.EstimatedScale
 		}
 		if volumes, _ := h.store.Outline.LoadLayeredOutline(); len(volumes) > 0 {
 			for _, v := range volumes {

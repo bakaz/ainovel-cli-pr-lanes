@@ -3,6 +3,7 @@ package tools
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/rules"
@@ -320,7 +321,8 @@ func (t *ContextTool) prepareChapterContext(chapter int, envelope *chapterContex
 		}
 	}
 
-	state.hasStyleRules = (state.styleRulesCompass != nil && state.styleRulesCompass.HasContent()) || state.styleRules != nil
+	// 仅正文笔法（prose/dialogue/taboos）算 style_rules；outline-only 不应阻断 anchor fallback
+	state.hasStyleRules = state.styleRulesCompass != nil && state.styleRulesCompass.HasProseStyleContent()
 	state.manStatus = manRes.Status
 
 	switch manRes.Status {
@@ -581,11 +583,11 @@ func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope
 	// ── 角色门控：所有 anchor 类字段（manual/auto/legacy）仅 Writer/Editor 可见 ──
 	isWriterOrEditor := t.role == "writer" || t.role == "editor"
 
-	// 1. style_rules（Compass）：维持既有语义不变（所有角色可见）
-	if state.styleRulesCompass != nil && state.styleRulesCompass.HasContent() {
-		injected := buildCompassInjectionView(state.styleRulesCompass)
-		envelope.References["style_rules"] = injected
-	} else if state.styleRules != nil {
+	// 1. style_rules：仅 Writer/Editor 注入正文笔法（prose/dialogue/taboos）；
+	//    Architect/Coordinator 即使 chapter>0 也不应注入 prose style_rules。
+	if isWriterOrEditor && state.styleRulesCompass != nil && state.styleRulesCompass.HasProseStyleContent() {
+		envelope.References["style_rules"] = buildCompassProseInjectionView(state.styleRulesCompass)
+	} else if isWriterOrEditor && state.styleRules != nil && (len(state.styleRules.Prose) > 0 || len(state.styleRules.Dialogue) > 0 || len(state.styleRules.Taboos) > 0) {
 		envelope.References["style_rules"] = state.styleRules
 	} else if isWriterOrEditor && state.manStatus == store.StatusNotExist {
 		// 无风格规则且无手动文件时回退到 legacy style_anchors / voice_samples
@@ -635,18 +637,13 @@ func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope
 	envelope.References["references"] = t.writerReferences(state.chapter)
 }
 
-// buildCompassInjectionView 构造 compass 风格的上下文注入视图。
-// 注入结构：顶层含 long 和 current 两个子对象完整呈现，同时提供
-// 扁平合并视图（long 优先，current 补充 long 未定义的字段）。
-func buildCompassInjectionView(compass *domain.WritingStyleRulesCompass) map[string]any {
+// buildCompassProseInjectionView Writer/Editor：仅 prose/dialogue/taboos（无 outline）。
+func buildCompassProseInjectionView(compass *domain.WritingStyleRulesCompass) map[string]any {
 	view := map[string]any{
-		"_compass": "双层风格规则。long（长期基线）优先于 current（当前弧定制）。",
+		"_compass": "双层正文风格规则。long（长期基线）优先于 current（当前弧定制）。不含规划 outline。",
 	}
-
 	hasLong := compass.Long != nil && (len(compass.Long.Prose) > 0 || len(compass.Long.Dialogue) > 0 || len(compass.Long.Taboos) > 0)
 	hasCurrent := compass.Current != nil && (len(compass.Current.Prose) > 0 || len(compass.Current.Dialogue) > 0 || len(compass.Current.Taboos) > 0)
-
-	// 1. long 子对象（完整呈现）
 	if hasLong {
 		view["long"] = map[string]any{
 			"prose":    compass.Long.Prose,
@@ -654,8 +651,6 @@ func buildCompassInjectionView(compass *domain.WritingStyleRulesCompass) map[str
 			"taboos":   compass.Long.Taboos,
 		}
 	}
-
-	// 2. current 子对象（完整呈现，含 volume/arc/last_updated）
 	if hasCurrent {
 		cur := map[string]any{
 			"volume": compass.Current.Volume,
@@ -675,13 +670,9 @@ func buildCompassInjectionView(compass *domain.WritingStyleRulesCompass) map[str
 		}
 		view["current"] = cur
 	}
-
-	// 3. 扁平合并视图（long 优先，current 补充）
-	// 用标记记录 long 已定义了哪些字段，避免 nil long 字段挡住 current
 	longHasProse := hasLong && len(compass.Long.Prose) > 0
 	longHasTaboos := hasLong && len(compass.Long.Taboos) > 0
 	longHasDialogue := hasLong && len(compass.Long.Dialogue) > 0
-
 	if longHasProse {
 		view["prose"] = compass.Long.Prose
 	}
@@ -691,7 +682,6 @@ func buildCompassInjectionView(compass *domain.WritingStyleRulesCompass) map[str
 	if longHasDialogue {
 		view["dialogue"] = compass.Long.Dialogue
 	}
-
 	if hasCurrent {
 		if !longHasProse && len(compass.Current.Prose) > 0 {
 			view["prose"] = compass.Current.Prose
@@ -699,7 +689,6 @@ func buildCompassInjectionView(compass *domain.WritingStyleRulesCompass) map[str
 		if !longHasTaboos && len(compass.Current.Taboos) > 0 {
 			view["taboos"] = compass.Current.Taboos
 		}
-		// dialogue: 合并——long 中已有的角色不重复，补充 current 独有的角色
 		if len(compass.Current.Dialogue) > 0 {
 			if longHasDialogue {
 				existingVoices := compass.Long.Dialogue
@@ -723,8 +712,99 @@ func buildCompassInjectionView(compass *domain.WritingStyleRulesCompass) map[str
 			view["last_updated"] = compass.Current.LastUpdated
 		}
 	}
-
 	return view
+}
+
+// buildCompassOutlineInjectionView Architect：仅 outline 规划规则（无 prose/dialogue/taboos）。
+func buildCompassOutlineInjectionView(compass *domain.WritingStyleRulesCompass) map[string]any {
+	if compass == nil || !compass.HasOutlineContent() {
+		return nil
+	}
+	view := map[string]any{
+		"_compass": "规划层 outline 规则。约束 core_event/scenes 的 beat 形态，不是正文笔法。long 优先，current 追加。",
+	}
+	var longO, curO *domain.OutlinePlanningRules
+	if compass.Long != nil && compass.Long.Outline.HasContent() {
+		longO = compass.Long.Outline
+		view["long"] = map[string]any{"outline": longO}
+	}
+	if compass.Current != nil && compass.Current.Outline.HasContent() {
+		curO = compass.Current.Outline
+		cur := map[string]any{
+			"volume":  compass.Current.Volume,
+			"arc":     compass.Current.Arc,
+			"outline": curO,
+		}
+		if compass.Current.LastUpdated != "" {
+			cur["last_updated"] = compass.Current.LastUpdated
+		}
+		view["current"] = cur
+		view["volume"] = compass.Current.Volume
+		view["arc"] = compass.Current.Arc
+	}
+	if merged := mergeOutlinePlanning(longO, curO); merged != nil {
+		view["outline"] = merged
+	}
+	return view
+}
+
+// buildCompassInjectionView 完整视图（测试/诊断用；运行时按角色拆分注入）。
+func buildCompassInjectionView(compass *domain.WritingStyleRulesCompass) map[string]any {
+	view := buildCompassProseInjectionView(compass)
+	if outlineView := buildCompassOutlineInjectionView(compass); outlineView != nil {
+		if o, ok := outlineView["outline"]; ok {
+			view["outline"] = o
+		}
+		if long, ok := view["long"].(map[string]any); ok {
+			if ol, ok := outlineView["long"].(map[string]any); ok {
+				if o, ok := ol["outline"]; ok {
+					long["outline"] = o
+				}
+			}
+		} else if ol, ok := outlineView["long"]; ok {
+			view["long"] = ol
+		}
+		if cur, ok := view["current"].(map[string]any); ok {
+			if oc, ok := outlineView["current"].(map[string]any); ok {
+				if o, ok := oc["outline"]; ok {
+					cur["outline"] = o
+				}
+			}
+		} else if oc, ok := outlineView["current"]; ok {
+			view["current"] = oc
+		}
+	}
+	view["_compass"] = "双层风格规则。long（长期基线）优先于 current（当前弧定制）。"
+	return view
+}
+
+// mergeOutlinePlanning 合并 long/current 规划规则：long 在前，current 追加未重复条目。
+func mergeOutlinePlanning(long, current *domain.OutlinePlanningRules) *domain.OutlinePlanningRules {
+	out := &domain.OutlinePlanningRules{}
+	seenBeat := map[string]bool{}
+	seenAnti := map[string]bool{}
+	appendUnique := func(dst *[]string, seen map[string]bool, items []string) {
+		for _, s := range items {
+			s = strings.TrimSpace(s)
+			if s == "" || seen[s] {
+				continue
+			}
+			seen[s] = true
+			*dst = append(*dst, s)
+		}
+	}
+	if long != nil {
+		appendUnique(&out.BeatRules, seenBeat, long.BeatRules)
+		appendUnique(&out.AntiPatterns, seenAnti, long.AntiPatterns)
+	}
+	if current != nil {
+		appendUnique(&out.BeatRules, seenBeat, current.BeatRules)
+		appendUnique(&out.AntiPatterns, seenAnti, current.AntiPatterns)
+	}
+	if !out.HasContent() {
+		return nil
+	}
+	return out
 }
 
 func (t *ContextTool) buildArchitectContext(result map[string]any, warn func(string, error)) {
@@ -999,18 +1079,15 @@ func (t *ContextTool) buildArchitectFoundation(envelope *architectContextEnvelop
 }
 
 func (t *ContextTool) buildArchitectReferences(envelope *architectContextEnvelope, warn func(string, error)) {
-	// Compass 双层优先
-	if compass, err := t.store.World.LoadStyleRulesCompass(); err == nil && compass != nil && compass.HasContent() {
-		envelope.References["style_rules"] = buildCompassInjectionView(compass)
-	} else {
-		if err != nil {
-			warn("style_rules_compass", err)
-		}
-		// 回退到旧单体格式
-		if styleRules, err := t.store.World.LoadStyleRules(); err == nil && styleRules != nil {
-			envelope.References["style_rules"] = styleRules
+	// Architect 只注入规划 outline 规则，不注入 prose/dialogue/taboos（避免半个 Writer）
+	// 非 architect 角色走 chapter 路径时不注入 outline 规则。
+	if t.role == "architect" {
+		if compass, err := t.store.World.LoadStyleRulesCompass(); err == nil && compass != nil && compass.HasOutlineContent() {
+			if view := buildCompassOutlineInjectionView(compass); view != nil {
+				envelope.References["style_rules"] = view
+			}
 		} else if err != nil {
-			warn("style_rules", err)
+			warn("style_rules_compass", err)
 		}
 	}
 

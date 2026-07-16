@@ -272,8 +272,8 @@ func TestContextToolChapterModeIncludesWorkingAndReferenceFields(t *testing.T) {
 		t.Fatalf("SavePremise: %v", err)
 	}
 	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
-		{Chapter: 1, Title: "入门", CoreEvent: "主角进入宗门", Scenes: []string{"拜师", "立誓"}},
-		{Chapter: 2, Title: "试炼", CoreEvent: "参加外门试炼", Scenes: []string{"集合", "出发"}},
+		{Chapter: 1, Title: "入门", CoreEvent: "主角进入宗门", Scenes: domain.SceneList{{Action: "拜师"}, {Action: "立誓"}}},
+		{Chapter: 2, Title: "试炼", CoreEvent: "参加外门试炼", Scenes: domain.SceneList{{Action: "集合"}, {Action: "出发"}}},
 	}); err != nil {
 		t.Fatalf("SaveOutline: %v", err)
 	}
@@ -485,6 +485,14 @@ func TestContextToolArchitectModeIncludesPlanningAndFoundation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("SaveStyleRules: %v", err)
 	}
+	// Architect 只消费 outline 规划规则，不消费 prose
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Outline: &domain.OutlinePlanningRules{
+			BeatRules: []string{"每场 goal→action→conflict→outcome"},
+		},
+	}, "test: architect outline rules"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
 	if err := s.RunMeta.SetPlanningTier(domain.PlanningTierLong); err != nil {
 		t.Fatalf("SetPlanningTier: %v", err)
 	}
@@ -536,6 +544,14 @@ func TestContextToolArchitectModeIncludesPlanningAndFoundation(t *testing.T) {
 		if _, ok := referencePack[key]; !ok {
 			t.Fatalf("expected reference_pack.%s", key)
 		}
+	}
+	// Architect style_rules 应是 outline 投影，不含 prose
+	styleRules := referencePack["style_rules"].(map[string]any)
+	if _, ok := styleRules["outline"]; !ok {
+		t.Fatalf("architect style_rules should include outline, got %#v", styleRules)
+	}
+	if _, ok := styleRules["prose"]; ok {
+		t.Fatalf("architect style_rules must not include prose, got %#v", styleRules)
 	}
 	for _, mirror := range []string{"planning_tier", "layered_outline", "skeleton_arcs", "compass", "premise_sections", "premise_structure", "characters", "foundation_status", "style_rules", "references"} {
 		if _, ok := payload[mirror]; ok {
@@ -643,8 +659,8 @@ func TestContextToolSelectedMemoryRecallsStoryThreadsAndReviewLessons(t *testing
 		t.Fatalf("Init: %v", err)
 	}
 	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
-		{Chapter: 1, Title: "邀约", CoreEvent: "长老暗中给出内门试炼邀请", Scenes: []string{"密谈", "留下试炼令"}},
-		{Chapter: 2, Title: "试炼前夜", CoreEvent: "林砚准备回应内门试炼邀请", Hook: "谁在背后推动这场试炼", Scenes: []string{"整理线索", "决定赴约"}},
+		{Chapter: 1, Title: "邀约", CoreEvent: "长老暗中给出内门试炼邀请", Scenes: domain.SceneList{{Action: "密谈"}, {Action: "留下试炼令"}}},
+		{Chapter: 2, Title: "试炼前夜", CoreEvent: "林砚准备回应内门试炼邀请", Hook: "谁在背后推动这场试炼", Scenes: domain.SceneList{{Action: "整理线索"}, {Action: "决定赴约"}}},
 	}); err != nil {
 		t.Fatalf("SaveOutline: %v", err)
 	}
@@ -745,7 +761,7 @@ func TestContextToolSelectedMemorySurfacesAgingForeshadow(t *testing.T) {
 	}
 	// 当前章主题与所有伏笔都不沾边，确保相关性召回为空，只剩账龄回填生效。
 	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
-		{Chapter: 50, Title: "瘟疫", CoreEvent: "林砚在城南医馆救治瘟疫病患", Scenes: []string{"熬药", "封锁街巷"}},
+		{Chapter: 50, Title: "瘟疫", CoreEvent: "林砚在城南医馆救治瘟疫病患", Scenes: domain.SceneList{{Action: "熬药"}, {Action: "封锁街巷"}}},
 	}); err != nil {
 		t.Fatalf("SaveOutline: %v", err)
 	}
@@ -902,7 +918,7 @@ func TestContextToolFallsBackToFullForeshadowWhenSelectionIsTooSparse(t *testing
 	}
 	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
 		{Chapter: 1, Title: "邀约", CoreEvent: "长老暗中给出内门试炼邀请"},
-		{Chapter: 2, Title: "试炼前夜", CoreEvent: "林砚准备回应内门试炼邀请", Scenes: []string{"整理线索", "决定赴约"}},
+		{Chapter: 2, Title: "试炼前夜", CoreEvent: "林砚准备回应内门试炼邀请", Scenes: domain.SceneList{{Action: "整理线索"}, {Action: "决定赴约"}}},
 	}); err != nil {
 		t.Fatalf("SaveOutline: %v", err)
 	}
@@ -1078,6 +1094,281 @@ func TestContextToolDoesNotInjectUserDirectives(t *testing.T) {
 		if _, ok := working["user_rules"].(map[string]any); !ok {
 			t.Errorf("[%s] working_memory.user_rules 应稳定注入", name)
 		}
+	}
+}
+
+// ── outline-only compass 不阻断 anchor fallback ──
+
+// TestOutlineOnlyCompass_WriterNoStyleRules 验证 outline-only compass
+// 不会使 hasStyleRules=true，Writer 不会注入 outline 规则。
+func TestOutlineOnlyCompass_WriterNoStyleRules(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	s.Init()
+	s.Progress.Init("test", 5)
+	s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	})
+	s.Outline.SavePremise("## 题材和基调\n测试\n")
+
+	// 只保存 outline 规则，无 prose/dialogue/taboos
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Outline: &domain.OutlinePlanningRules{
+			BeatRules: []string{"每场必须 goal→action→conflict→outcome"},
+		},
+	}, "test: outline only"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 2})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+
+	// 不应有 style_rules（outline-only 不是 prose rules）
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp != nil {
+		if _, exists := rp["style_rules"]; exists {
+			t.Fatal("outline-only compass must not inject style_rules for writer")
+		}
+	}
+}
+
+// TestOutlineOnlyCompass_ArchitectGetsOutline 验证 outline-only compass 下
+// Architect 仍可看到 outline 规则。
+func TestOutlineOnlyCompass_ArchitectGetsOutline(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	s.Init()
+	s.Progress.Init("test", 5)
+	s.Progress.SetLayered(true)
+	s.Progress.UpdateVolumeArc(1, 1)
+
+	// 只保存 outline 规则，无 prose/dialogue/taboos
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Outline: &domain.OutlinePlanningRules{
+			BeatRules: []string{"每场必须 goal→action→conflict→outcome"},
+		},
+	}, "test: outline only"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "architect")
+	args, _ := json.Marshal(map[string]any{})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp == nil {
+		t.Fatal("expected reference_pack")
+	}
+	sr, exists := rp["style_rules"]
+	if !exists {
+		t.Fatal("architect should see style_rules from outline-only compass")
+	}
+	srMap, ok := sr.(map[string]any)
+	if !ok {
+		t.Fatalf("style_rules should be map: %T", sr)
+	}
+	if _, hasOutline := srMap["outline"]; !hasOutline {
+		t.Fatalf("architect style_rules should contain outline: %#v", srMap)
+	}
+	if _, hasProse := srMap["prose"]; hasProse {
+		t.Fatal("architect style_rules must not contain prose")
+	}
+}
+
+// TestOutlineOnlyCompass_CoordinatorNoOutline 验证非 architect 角色
+// 走 chapter=0 路径时不会注入 outline 规则。
+func TestOutlineOnlyCompass_CoordinatorNoOutline(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	s.Init()
+	s.Progress.Init("test", 5)
+
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Outline: &domain.OutlinePlanningRules{
+			BeatRules: []string{"每场必须 beat"},
+		},
+	}, "test: outline only"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "coordinator")
+	args, _ := json.Marshal(map[string]any{})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp != nil {
+		if _, exists := rp["style_rules"]; exists {
+			t.Fatal("coordinator must not see style_rules from outline-only compass")
+		}
+	}
+}
+
+// ── chapter 路径 prose style_rules 角色门控 ──
+//
+// Compass 同时含 prose + outline 时：
+//   - Writer chapter>0  →  reference_pack.style_rules 含 prose，不含 outline
+//   - Architect chapter>0 →  reference_pack 应无 prose style_rules
+//   - Coordinator chapter>0 → reference_pack 应无 prose style_rules
+
+func TestCompassProseStyleRules_RoleGate_ChapterPath_WriterHasProse(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	s.Init()
+	s.Progress.Init("test", 5)
+	s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	})
+	s.Outline.SavePremise("## 题材和基调\n测试\n")
+
+	// Compass: 同时含 prose + outline
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose:  []string{"保持短句"},
+		Taboos: []string{"不水字数"},
+		Dialogue: []domain.CharacterVoice{
+			{Name: "主角", Rules: []string{"简洁"}},
+		},
+		Outline: &domain.OutlinePlanningRules{
+			BeatRules: []string{"每场必须 goal→action→conflict→outcome"},
+		},
+	}, "test: prose + outline"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 2})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp == nil {
+		t.Fatal("expected reference_pack")
+	}
+	sr, exists := rp["style_rules"]
+	if !exists {
+		t.Fatal("writer should see style_rules")
+	}
+	srMap, _ := sr.(map[string]any)
+	if srMap == nil {
+		t.Fatalf("style_rules should be map, got %T", sr)
+	}
+	if _, hasProse := srMap["prose"]; !hasProse {
+		t.Fatal("writer style_rules must contain prose")
+	}
+	// writer 不应有 outline
+	if _, hasOutline := srMap["outline"]; hasOutline {
+		t.Fatal("writer style_rules must not contain outline")
+	}
+}
+
+func TestCompassProseStyleRules_RoleGate_ChapterPath_ArchitectNoProse(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	s.Init()
+	s.Progress.Init("test", 5)
+	s.Progress.SetLayered(true)
+	s.Progress.UpdateVolumeArc(1, 1)
+	s.Outline.SavePremise("## 题材和基调\n测试\n")
+
+	// Compass: 同时含 prose + outline
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose:  []string{"保持短句"},
+		Taboos: []string{"不水字数"},
+		Outline: &domain.OutlinePlanningRules{
+			BeatRules: []string{"每场必须 beat"},
+		},
+	}, "test: prose + outline"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+
+	// Architect 调 chapter>0（理论上 novel_context 的 chapter 路径）
+	tool := NewContextToolForRole(s, References{}, "default", "architect")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+
+	// reference_pack 不应有 prose style_rules
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp == nil {
+		return // 无 reference_pack 也接受（说明完全未触发注入）
+	}
+	sr, exists := rp["style_rules"]
+	if !exists {
+		return // 无 style_rules 也接受
+	}
+	srMap, _ := sr.(map[string]any)
+	if srMap == nil {
+		return
+	}
+	if _, hasProse := srMap["prose"]; hasProse {
+		t.Fatal("architect(chapter>0) must not get prose style_rules")
+	}
+}
+
+func TestCompassProseStyleRules_RoleGate_ChapterPath_CoordinatorNoProse(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	s.Init()
+	s.Progress.Init("test", 5)
+	s.Outline.SavePremise("## 题材和基调\n测试\n")
+
+	// Compass: 同时含 prose + outline
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose:  []string{"保持短句"},
+		Taboos: []string{"不水字数"},
+		Outline: &domain.OutlinePlanningRules{
+			BeatRules: []string{"每场必须 beat"},
+		},
+	}, "test: prose + outline"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "coordinator")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp == nil {
+		return
+	}
+	sr, exists := rp["style_rules"]
+	if !exists {
+		return
+	}
+	srMap, _ := sr.(map[string]any)
+	if srMap == nil {
+		return
+	}
+	if _, hasProse := srMap["prose"]; hasProse {
+		t.Fatal("coordinator(chapter>0) must not get prose style_rules")
 	}
 }
 

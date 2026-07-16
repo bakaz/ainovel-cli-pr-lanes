@@ -57,19 +57,18 @@ func TestBuildWorkers_ToolComposition(t *testing.T) {
 		t.Error("all agents must have tools")
 	}
 
-	// novel_context 指针身份：由于 wrapTools 会包裹每一工具，
-	// 我们用 unwrapInner 提取原始指针比较。
-	shortInner := unwrapInner(ts.ArchitectShort[0])
-	longInner := unwrapInner(ts.ArchitectLong[0])
-	writerInner := unwrapInner(ts.Writer[0])
-	editorInner := unwrapInner(ts.Editor[0])
-	if shortInner != longInner {
+	// novel_context 指针身份：architect_short/long 共享同一实例，与 writer/editor 隔离。
+	shortCtx := ts.ArchitectShort[0]
+	longCtx := ts.ArchitectLong[0]
+	writerCtx := ts.Writer[0]
+	editorCtx := ts.Editor[0]
+	if shortCtx != longCtx {
 		t.Error("architect_short and architect_long should share the same novel_context instance")
 	}
-	if shortInner == writerInner {
+	if shortCtx == writerCtx {
 		t.Error("architect and writer should use different novel_context instances")
 	}
-	if writerInner == editorInner {
+	if writerCtx == editorCtx {
 		t.Error("writer and editor should use different novel_context instances")
 	}
 
@@ -103,15 +102,4 @@ func toolNames(list []agentcore.Tool) []string {
 		names[i] = t.Name()
 	}
 	return names
-}
-
-// unwrapInner returns the innermost tool by peeling timeoutTool wrappers.
-func unwrapInner(t agentcore.Tool) agentcore.Tool {
-	for {
-		if wt, ok := t.(*timeoutTool); ok {
-			t = wt.tool
-			continue
-		}
-		return t
-	}
 }

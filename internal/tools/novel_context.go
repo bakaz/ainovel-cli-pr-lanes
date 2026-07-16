@@ -357,7 +357,7 @@ func (t *ContextTool) loadFilteredCharacters(result map[string]any, chapter int,
 		result["characters"] = chars
 		return
 	}
-	sceneText := strings.Join(entry.Scenes, " ") + " " + entry.CoreEvent + " " + entry.Title
+	sceneText := domain.FlattenScenes(entry.Scenes) + " " + entry.CoreEvent + " " + entry.Title
 
 	var filtered []domain.Character
 	for _, c := range chars {
@@ -670,10 +670,7 @@ func (t *ContextTool) buildRelatedChapters(
 	}
 
 	// 拼接大纲文本用于关键词匹配
-	outlineText := entry.Title + " " + entry.CoreEvent
-	for _, s := range entry.Scenes {
-		outlineText += " " + s
-	}
+	outlineText := entry.Title + " " + entry.CoreEvent + " " + domain.FlattenScenes(entry.Scenes)
 
 	// 1. 伏笔反查：活跃伏笔的描述是否与当前章大纲相关
 	for _, f := range foreshadow {
@@ -934,7 +931,7 @@ func recallFocusTerms(entry *domain.OutlineEntry, plan *domain.ChapterPlan) []st
 	add(entry.CoreEvent)
 	add(entry.Hook)
 	for _, scene := range entry.Scenes {
-		add(scene)
+		add(scene.Text())
 	}
 	if plan != nil {
 		add(plan.Goal)

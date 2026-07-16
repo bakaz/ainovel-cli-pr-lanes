@@ -700,3 +700,369 @@ func TestSaveFoundationCompleteBookRejectsWithPendingRewrites(t *testing.T) {
 		t.Fatalf("phase should not be Complete with PendingRewrites: %s", progress.Phase)
 	}
 }
+
+// TestSaveFoundationExpandArcValidatesScenes 验证 expand_arc 对场景节拍的校验。
+func TestSaveFoundationExpandArcValidatesScenes(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "选择",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已完成弧", Goal: "建立同盟", Chapters: []domain.OutlineEntry{{Title: "分裂", CoreEvent: "同盟意外破裂"}}},
+			{Index: 2, Title: "旧标题", Goal: "维持同盟", EstimatedChapters: 4},
+		},
+	}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+
+	// 1. 完整 object scenes → 成功
+	args, _ := json.Marshal(map[string]any{
+		"type": "expand_arc", "volume": 1, "arc": 2,
+		"content": map[string]any{
+			"title": "裂盟之后",
+			"goal":  "让分裂后的双方以不同选择推进同一主线",
+			"chapters": []map[string]any{{
+				"title": "各走一边", "core_event": "追索", "hook": "意外重合",
+				"scenes": []map[string]any{
+					{"goal": "分道", "action": "主角独自上路", "conflict": "遭遇追兵", "outcome": "逃脱"},
+					{"goal": "追索", "action": "寻找线索", "conflict": "线索中断", "outcome": "发现新方向"},
+				},
+			}},
+		},
+	})
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("完整 object scenes 应成功: %v", err)
+	}
+
+	// 2. 缺 goal 的 object scene → 拒绝
+	s2 := store.NewStore(dir) // 复用同一目录重新加载
+	s2.Progress.Init("test", 5)
+	expansionWithMissing := map[string]any{
+		"title": "裂盟之后",
+		"goal":  "让分裂后的双方以不同选择推进同一主线",
+		"chapters": []map[string]any{{
+			"title": "各走一边", "core_event": "追索", "hook": "意外重合",
+			"scenes": []map[string]any{
+				{"action": "主角独自上路", "conflict": "遭遇追兵", "outcome": "逃脱"}, // 缺 goal
+			},
+		}},
+	}
+	// 需要先恢复骨架弧状态（前一个 expand_arc 已展开）
+	if err := s2.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "选择",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已完成弧", Goal: "建立同盟", Chapters: []domain.OutlineEntry{{Title: "分裂", CoreEvent: "同盟意外破裂"}}},
+			{Index: 2, Title: "旧标题", Goal: "维持同盟", EstimatedChapters: 4},
+		},
+	}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	tool2 := NewSaveFoundationTool(s2)
+	args2, _ := json.Marshal(map[string]any{
+		"type": "expand_arc", "volume": 1, "arc": 2,
+		"content": expansionWithMissing,
+	})
+	_, err := tool2.Execute(context.Background(), args2)
+	if err == nil {
+		t.Fatal("缺 goal 的 object scene 应拒绝")
+	}
+	if !strings.Contains(err.Error(), "goal: required") {
+		t.Fatalf("应提示 goal: required，实际: %v", err)
+	}
+
+	// 3. 旧 string scenes 兼容通过
+	s3 := store.NewStore(dir)
+	s3.Progress.Init("test", 5)
+	if err := s3.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "选择",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已完成弧", Goal: "建立同盟", Chapters: []domain.OutlineEntry{{Title: "分裂", CoreEvent: "同盟意外破裂"}}},
+			{Index: 2, Title: "旧标题", Goal: "维持同盟", EstimatedChapters: 4},
+		},
+	}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	tool3 := NewSaveFoundationTool(s3)
+	args3, _ := json.Marshal(map[string]any{
+		"type": "expand_arc", "volume": 1, "arc": 2,
+		"content": map[string]any{
+			"title": "裂盟之后",
+			"goal":  "让分裂后的双方以不同选择推进同一主线",
+			"chapters": []map[string]any{{
+				"title": "各走一边", "core_event": "追索", "hook": "意外重合",
+				"scenes": []string{"分道", "追索"}, // 旧 string 格式
+			}},
+		},
+	})
+	if _, err := tool3.Execute(context.Background(), args3); err != nil {
+		t.Fatalf("旧 string scenes 应兼容通过: %v", err)
+	}
+
+	// 4. action-only object 不是 legacy，应拒绝
+	s4 := store.NewStore(dir)
+	s4.Progress.Init("test", 5)
+	if err := s4.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "选择",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已完成弧", Goal: "建立同盟", Chapters: []domain.OutlineEntry{{Title: "分裂", CoreEvent: "同盟意外破裂"}}},
+			{Index: 2, Title: "旧标题", Goal: "维持同盟", EstimatedChapters: 4},
+		},
+	}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	tool4 := NewSaveFoundationTool(s4)
+	args4, _ := json.Marshal(map[string]any{
+		"type": "expand_arc", "volume": 1, "arc": 2,
+		"content": map[string]any{
+			"title": "裂盟之后",
+			"goal":  "让分裂后的双方以不同选择推进同一主线",
+			"chapters": []map[string]any{{
+				"title": "各走一边", "core_event": "追索", "hook": "意外重合",
+				"scenes": []map[string]any{
+					{"action": "只有行动没有其它字段"},
+				},
+			}},
+		},
+	})
+	if _, err := tool4.Execute(context.Background(), args4); err == nil {
+		t.Fatal("action-only object scene 应拒绝")
+	} else if !strings.Contains(err.Error(), "goal: required") {
+		t.Fatalf("应提示 goal: required，实际: %v", err)
+	}
+}
+
+// TestSaveFoundationAppendVolumeValidatesScenes 验证 append_volume 对场景节拍的校验。
+func TestSaveFoundationAppendVolumeValidatesScenes(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 0); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+
+	// 初始 cluster
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "起步",
+		Arcs: []domain.ArcOutline{{
+			Index: 1, Title: "首弧", Goal: "目标",
+			Chapters: []domain.OutlineEntry{{Title: "第一章", CoreEvent: "开局"}},
+		}},
+	}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+
+	// 1. 完整 object scenes → 成功
+	args, _ := json.Marshal(map[string]any{
+		"type": "append_volume", "reason": "需要新卷",
+		"content": map[string]any{
+			"index": 2, "title": "第二卷", "theme": "升级",
+			"arcs": []map[string]any{{
+				"index": 1, "title": "弧一", "goal": "目标",
+				"chapters": []map[string]any{{
+					"title": "新章", "core_event": "推进",
+					"scenes": []map[string]any{
+						{"goal": "探索", "action": "进入新区域", "conflict": "遇到怪物", "outcome": "击败怪物"},
+					},
+				}},
+			}},
+		},
+	})
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("完整 object scenes 应成功: %v", err)
+	}
+
+	// 2. 旧 string scenes 兼容通过
+	s2 := store.NewStore(dir)
+	s2.Progress.Init("test", 0)
+	if err := s2.Progress.SetLayered(true); err != nil {
+		t.Fatalf("SetLayered: %v", err)
+	}
+	s2.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "起步",
+		Arcs: []domain.ArcOutline{{
+			Index: 1, Title: "首弧", Goal: "目标",
+			Chapters: []domain.OutlineEntry{{Title: "第一章", CoreEvent: "开局"}},
+		}},
+	}})
+	tool2 := NewSaveFoundationTool(s2)
+	args2, _ := json.Marshal(map[string]any{
+		"type": "append_volume", "reason": "测试兼容",
+		"content": map[string]any{
+			"index": 3, "title": "第三卷", "theme": "过渡",
+			"arcs": []map[string]any{{
+				"index": 1, "title": "弧", "goal": "g",
+				"chapters": []map[string]any{{
+					"title": "章", "core_event": "e",
+					"scenes": []string{"旧格式场景"},
+				}},
+			}},
+		},
+	})
+	if _, err := tool2.Execute(context.Background(), args2); err != nil {
+		t.Fatalf("旧 string scenes 应兼容通过: %v", err)
+	}
+}
+
+// TestSaveFoundationOutlineRejectsIncompleteObject 验证 outline 初始保存拒绝残缺 object scene。
+func TestSaveFoundationOutlineRejectsIncompleteObject(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+
+	// 残缺 object（缺少 conflict）
+	args, _ := json.Marshal(map[string]any{
+		"type": "outline",
+		"content": []map[string]any{
+			{
+				"chapter": 1, "title": "第一章", "core_event": "开场", "hook": "钩子",
+				"scenes": []map[string]any{
+					{"goal": "g", "action": "a", "outcome": "o"}, // 缺 conflict
+				},
+			},
+		},
+		"scale": "short",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("outline 初始保存应拒绝残缺 object scene")
+	}
+	if !strings.Contains(err.Error(), "conflict: required") {
+		t.Fatalf("应提示 conflict: required，实际: %v", err)
+	}
+}
+
+// TestSaveFoundationOutlineAcceptsLegacyString 验证 outline 初始保存接受 legacy string scenes。
+func TestSaveFoundationOutlineAcceptsLegacyString(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+
+	args, _ := json.Marshal(map[string]any{
+		"type": "outline",
+		"content": []map[string]any{
+			{
+				"chapter": 1, "title": "第一章", "core_event": "开场", "hook": "钩子",
+				"scenes": []string{"旧格式场景一", "旧格式场景二"},
+			},
+		},
+		"scale": "short",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("outline 初始保存应接受 legacy string scenes: %v", err)
+	}
+}
+
+// TestSaveFoundationLayeredOutlineRejectsIncompleteObject 验证 layered_outline 初始保存拒绝残缺 object scene。
+func TestSaveFoundationLayeredOutlineRejectsIncompleteObject(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatalf("SetLayered: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+
+	// 残缺 object 场景（缺 goal）
+	args, _ := json.Marshal(map[string]any{
+		"type": "layered_outline",
+		"content": []map[string]any{
+			{
+				"index": 1, "title": "第一卷", "theme": "起步",
+				"arcs": []map[string]any{
+					{
+						"index": 1, "title": "弧一", "goal": "目标",
+						"chapters": []map[string]any{
+							{
+								"title": "第一章", "core_event": "开场",
+								"scenes": []map[string]any{
+									{"action": "只有 action"}, // 缺 goal
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("layered_outline 初始保存应拒绝残缺 object scene")
+	}
+	if !strings.Contains(err.Error(), "goal: required") {
+		t.Fatalf("应提示 goal: required，实际: %v", err)
+	}
+}
+
+// TestSaveFoundationLayeredOutlineAcceptsLegacyString 验证 layered_outline 初始保存接受 legacy string scenes。
+func TestSaveFoundationLayeredOutlineAcceptsLegacyString(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatalf("SetLayered: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(s)
+
+	args, _ := json.Marshal(map[string]any{
+		"type": "layered_outline",
+		"content": []map[string]any{
+			{
+				"index": 1, "title": "第一卷", "theme": "起步",
+				"arcs": []map[string]any{
+					{
+						"index": 1, "title": "弧一", "goal": "目标",
+						"chapters": []map[string]any{
+							{
+								"title": "第一章", "core_event": "开场",
+								"scenes": []string{"旧格式场景"},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("layered_outline 初始保存应接受 legacy string scenes: %v", err)
+	}
+}

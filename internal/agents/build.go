@@ -117,16 +117,16 @@ func buildWorkerToolsets(store *store.Store, bundle assets.Bundle, style string)
 	writerCtx := tools.NewContextToolForRole(store, bundle.References, style, "writer")
 	editorCtx := tools.NewContextToolForRole(store, bundle.References, style, "editor")
 	return workerToolsets{
-		ArchitectShort: wrapTools([]agentcore.Tool{
+		ArchitectShort: []agentcore.Tool{
 			architectCtx,
 			tools.NewSaveFoundationTool(store),
-		}),
-		ArchitectLong: wrapTools([]agentcore.Tool{
+		},
+		ArchitectLong: []agentcore.Tool{
 			architectCtx,
 			tools.NewSaveFoundationTool(store),
 			tools.NewReadPlanningReferenceTool(store),
-		}),
-		Writer: wrapTools([]agentcore.Tool{
+		},
+		Writer: []agentcore.Tool{
 			writerCtx,
 			readChapter,
 			tools.NewPlanChapterTool(store),
@@ -134,14 +134,14 @@ func buildWorkerToolsets(store *store.Store, bundle assets.Bundle, style string)
 			tools.NewEditChapterTool(store),
 			tools.NewCheckConsistencyTool(store),
 			tools.NewCommitChapterTool(store),
-		}),
-		Editor: wrapTools([]agentcore.Tool{
+		},
+		Editor: []agentcore.Tool{
 			editorCtx,
 			readChapter,
 			tools.NewSaveReviewTool(store),
 			tools.NewSaveArcSummaryTool(store),
 			tools.NewSaveVolumeSummaryTool(store),
-		}),
+		},
 	}
 }
 

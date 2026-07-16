@@ -404,7 +404,7 @@ func renderOutline(entries []domain.OutlineEntry) string {
 		if len(e.Scenes) > 0 {
 			b.WriteString("**场景**：\n")
 			for i, sc := range e.Scenes {
-				fmt.Fprintf(&b, "%d. %s\n", i+1, sc)
+				fmt.Fprintf(&b, "%d. %s\n", i+1, sc.Text())
 			}
 			b.WriteString("\n")
 		}

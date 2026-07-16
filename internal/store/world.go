@@ -302,6 +302,8 @@ func (s *WorldStore) LoadWorldRules() ([]domain.WorldRule, error) {
 // SaveStyleRules 保存写作风格规则（兼容旧调用方：以 compass 格式持久化，
 // 旧单体内容自动迁入 current 层）。读取改写语义：保留已有 long 层，
 // 仅写入 current 层。内部复用 SaveStyleRulesCurrent。
+// 旧 API 不含 Outline：同 volume/arc 更新时保留已有 current.outline，避免弧摘要静默清掉规划规则。
+// 不在锁外预读 compass：outline 保留完全依赖 SaveStyleRulesCurrent 写锁内的判断。
 func (s *WorldStore) SaveStyleRules(rules domain.WritingStyleRules) error {
 	current := domain.StyleRulesCurrent{
 		Volume:      rules.Volume,
@@ -395,6 +397,7 @@ func (s *WorldStore) LoadStyleRulesCompass() (*domain.WritingStyleRulesCompass, 
 
 // SaveStyleRulesCurrent 仅更新 compass 的 current 层，保留 long 层不变。
 // 不做文本冲突拒绝（语义冲突由 long 优先的上下文合并保证）。
+// 若 patch 未带 Outline 且 volume/arc 与现有 current 相同，保留已有 outline。
 func (s *WorldStore) SaveStyleRulesCurrent(current domain.StyleRulesCurrent) error {
 	return s.io.WithWriteLock(func() error {
 		compass, err := s.loadStyleRulesCompassUnlocked()
@@ -403,6 +406,11 @@ func (s *WorldStore) SaveStyleRulesCurrent(current domain.StyleRulesCurrent) err
 		}
 		if compass == nil {
 			compass = &domain.WritingStyleRulesCompass{}
+		}
+		if current.Outline == nil && compass.Current != nil &&
+			compass.Current.Volume == current.Volume && compass.Current.Arc == current.Arc &&
+			compass.Current.Outline.HasContent() {
+			current.Outline = compass.Current.Outline
 		}
 		compass.Current = &current
 		return s.io.WriteJSONUnlocked("meta/style_rules.json", compass)
@@ -440,6 +448,9 @@ func (s *WorldStore) SaveStyleRulesLong(long domain.StyleRulesLong, reason strin
 		}
 		if len(long.Taboos) > 0 {
 			compass.Long.Taboos = long.Taboos
+		}
+		if long.Outline != nil && long.Outline.HasContent() {
+			compass.Long.Outline = long.Outline
 		}
 		// 审计元数据：总是更新
 		compass.Long.Reason = reason
