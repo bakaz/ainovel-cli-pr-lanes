@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/ainovel-cli/internal/rules"
 )
 
 func TestExtractJSON_StripsCodeFences(t *testing.T) {
@@ -38,9 +39,9 @@ func TestCoerceUncertain_HandlesAllDriftForms(t *testing.T) {
 		want int // 期望条目数（>0 即可，验证不丢）
 	}{
 		{"array_of_string", `["少用比喻：无阈值"]`, 1},
-		{"plain_string", `"字数要求太模糊未提升"`, 1},
+		{"plain_string", `"chapter_words 太模糊未提升"`, 1},
 		{"array_of_object", `[{"item":"少用比喻","reason":"无明确阈值"}]`, 1},
-		{"array_of_field_object", `[{"field":"fatigue_words.仿佛","reason":"未给阈值"}]`, 1},
+		{"array_of_field_object", `[{"field":"chapter_words.min","reason":"未给下限"}]`, 1},
 		{"empty_array", `[]`, 0},
 		{"empty_string", `""`, 0},
 	}
@@ -56,25 +57,42 @@ func TestCoerceUncertain_HandlesAllDriftForms(t *testing.T) {
 
 func TestParseNormalizerJSON_FullOutput(t *testing.T) {
 	raw := "```json\n" + `{
-  "structured": {"genre": "都市", "forbidden_phrases": ["某种程度上"]},
+  "structured": {"chapter_words": {"min": 1200, "max": 1600}, "forbidden_phrases": ["某种程度上"]},
   "preferences": "主角冷静克制",
+  "scope": "writer",
   "uncertain": [{"item": "少用比喻", "reason": "无阈值"}]
 }` + "\n```"
 	out, ok := parseNormalizerJSON(raw)
 	if !ok {
 		t.Fatal("应解析成功")
 	}
-	if out.Structured.Genre != "都市" {
-		t.Fatalf("genre 解析错误：%+v", out.Structured)
+	if out.Structured.ChapterWords == nil || out.Structured.ChapterWords.Min != 1200 {
+		t.Fatalf("chapter_words 解析错误：%+v", out.Structured.ChapterWords)
 	}
 	if len(out.Structured.ForbiddenPhrases) != 1 || out.Structured.ForbiddenPhrases[0] != "某种程度上" {
 		t.Fatalf("forbidden_phrases 解析错误：%v", out.Structured.ForbiddenPhrases)
 	}
-	if out.Preferences != "主角冷静克制" {
-		t.Fatalf("preferences 解析错误：%q", out.Preferences)
+	legacy, scoped := out.Preferences.values()
+	if legacy != "主角冷静克制" || len(scoped) != 0 {
+		t.Fatalf("legacy preferences 解析错误：%+v", out.Preferences)
+	}
+	if normalizedScope(out.Scope) != rules.ScopeWriter {
+		t.Fatalf("scope 解析错误：%q", out.Scope)
 	}
 	if got := coerceUncertain(out.Uncertain); len(got) != 1 {
 		t.Fatalf("uncertain 应有 1 条，得到 %v", got)
+	}
+}
+
+func TestParseNormalizerJSON_MultiplePreferenceBuckets(t *testing.T) {
+	raw := `{"structured":{},"preferences":{"default":"保持东方幻想定位","architect":"升级必须有代价","writer":"少用比喻","editor":"优先指出文风漂移"},"uncertain":[]}`
+	out, ok := parseNormalizerJSON(raw)
+	if !ok {
+		t.Fatal("应解析成功")
+	}
+	legacy, scoped := out.Preferences.values()
+	if legacy != "" || scoped[rules.ScopeArchitect] != "升级必须有代价" || scoped[rules.ScopeWriter] != "少用比喻" || scoped[rules.ScopeEditor] == "" || scoped[rules.ScopeDefault] == "" {
+		t.Fatalf("bucket parsing failed: legacy=%q scoped=%+v", legacy, scoped)
 	}
 }
 
@@ -97,7 +115,7 @@ func TestNormalize_NilModelDegrades(t *testing.T) {
 	if cand.Preferences == "" {
 		t.Fatal("降级应保留原文为 preferences")
 	}
-	if !cand.Structured.IsEmpty() {
+	if cand.Structured.ChapterWords != nil {
 		t.Fatal("降级不应产出 structured")
 	}
 }
@@ -140,16 +158,16 @@ func (m *scriptedModel) SupportsTools() bool { return false }
 func TestNormalize_FeedbackRetryRecovers(t *testing.T) {
 	model := &scriptedModel{replies: []string{
 		"这不是 JSON",
-		`{"structured":{"forbidden_phrases":["某种程度上"]},"preferences":"","uncertain":[]}`,
+		`{"structured":{"chapter_words":{"min":1200,"max":1600}},"preferences":"","uncertain":[]}`,
 	}}
 	n := NewNormalizer(model)
 
-	cand := n.Normalize(t.Context(), "startup_prompt", "不要出现某种程度上")
+	cand := n.Normalize(t.Context(), "startup_prompt", "每章1200到1600字")
 	if cand.Degraded {
 		t.Fatal("次轮已返回合法 JSON，不应降级")
 	}
-	if len(cand.Structured.ForbiddenPhrases) != 1 {
-		t.Fatalf("应解析出 forbidden_phrases，got %+v", cand.Structured)
+	if cand.Structured.ChapterWords == nil || cand.Structured.ChapterWords.Min != 1200 {
+		t.Fatalf("应解析出 chapter_words，got %+v", cand.Structured)
 	}
 	if model.calls != 2 {
 		t.Fatalf("应在第 2 次成功，实际调用 %d 次", model.calls)
@@ -169,14 +187,15 @@ func TestNormalize_FeedbackRetryRecovers(t *testing.T) {
 	}
 }
 
-// 归一化不覆盖模型的 thinking 默认；普通 chat 模型会拒绝显式 off。
-func TestNormalize_LeavesThinkingUnspecifiedAndReservesTokens(t *testing.T) {
+// 归一化是机械抽取：不传递 thinking 选项（由 provider 按自身默认策略处理），
+// 但 max_tokens 仍应为 normalizeMaxTokens 以保证 JSON 输出不截断。
+func TestNormalize_NoThinkingOverrideAndReservesTokens(t *testing.T) {
 	model := &scriptedModel{replies: []string{`{"preferences":"x"}`}}
 	n := NewNormalizer(model)
 
 	_ = n.Normalize(t.Context(), "startup_prompt", "随便一条规则")
-	if model.lastCfg.ThinkingLevel != agentcore.ThinkingAuto {
-		t.Errorf("不应发送 thinking 参数，got %q", model.lastCfg.ThinkingLevel)
+	if model.lastCfg.ThinkingLevel != "" {
+		t.Errorf("不应透传 thinking 选项，got %q，期望空串", model.lastCfg.ThinkingLevel)
 	}
 	if model.lastCfg.MaxTokens != normalizeMaxTokens {
 		t.Errorf("max_tokens 应为 %d，got %d", normalizeMaxTokens, model.lastCfg.MaxTokens)

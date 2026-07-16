@@ -299,21 +299,193 @@ func (s *WorldStore) LoadWorldRules() ([]domain.WorldRule, error) {
 
 // ── 风格规则 ──
 
-// SaveStyleRules 保存写作风格规则。
+// SaveStyleRules 保存写作风格规则（兼容旧调用方：以 compass 格式持久化，
+// 旧单体内容自动迁入 current 层）。读取改写语义：保留已有 long 层，
+// 仅写入 current 层。内部复用 SaveStyleRulesCurrent。
 func (s *WorldStore) SaveStyleRules(rules domain.WritingStyleRules) error {
-	return s.io.WriteJSON("meta/style_rules.json", rules)
+	current := domain.StyleRulesCurrent{
+		Volume:      rules.Volume,
+		Arc:         rules.Arc,
+		Prose:       rules.Prose,
+		Dialogue:    rules.Dialogue,
+		Taboos:      rules.Taboos,
+		LastUpdated: rules.UpdatedAt,
+	}
+	return s.SaveStyleRulesCurrent(current)
 }
 
-// LoadStyleRules 读取写作风格规则。
+// LoadStyleRules 读取写作风格规则（兼容旧格式：自动迁移到 compass，
+// 返回 long+current 合并视图：
+//   - prose/taboos: long 优先，current 的非重复规则追加其后
+//   - dialogue: 按角色合并（同角色 long 优先，current 独有角色追加）
+//   - volume/arc/last_updated: 来自 current
+// 至少 long-only 不会返回 nil。
 func (s *WorldStore) LoadStyleRules() (*domain.WritingStyleRules, error) {
-	var rules domain.WritingStyleRules
-	if err := s.io.ReadJSON("meta/style_rules.json", &rules); err != nil {
+	compass, err := s.LoadStyleRulesCompass()
+	if err != nil {
+		return nil, err
+	}
+	if compass == nil || !compass.HasContent() {
+		return nil, nil
+	}
+	result := &domain.WritingStyleRules{}
+	if compass.Current != nil {
+		result.Volume = compass.Current.Volume
+		result.Arc = compass.Current.Arc
+		result.UpdatedAt = compass.Current.LastUpdated
+	}
+	if compass.Long != nil {
+		result.Prose = append([]string(nil), compass.Long.Prose...)
+		result.Taboos = append([]string(nil), compass.Long.Taboos...)
+		result.Dialogue = append([]domain.CharacterVoice(nil), compass.Long.Dialogue...)
+	}
+	// current 补充：prose/taboos 的非重复规则追加，dialogue 按角色合并
+	if compass.Current != nil {
+		// prose: long 优先，追加 current 中不与 long 重复的条目
+		longProseSet := make(map[string]bool, len(result.Prose))
+		for _, p := range result.Prose {
+			longProseSet[p] = true
+		}
+		for _, p := range compass.Current.Prose {
+			if !longProseSet[p] {
+				result.Prose = append(result.Prose, p)
+			}
+		}
+		// taboos: 同上
+		longTabooSet := make(map[string]bool, len(result.Taboos))
+		for _, t := range result.Taboos {
+			longTabooSet[t] = true
+		}
+		for _, t := range compass.Current.Taboos {
+			if !longTabooSet[t] {
+				result.Taboos = append(result.Taboos, t)
+			}
+		}
+		// dialogue: 按角色合并（同角色 long 优先，current 独有角色追加）
+		longCharNames := make(map[string]int, len(result.Dialogue))
+		for i, v := range result.Dialogue {
+			longCharNames[v.Name] = i
+		}
+		for _, cv := range compass.Current.Dialogue {
+			if _, exists := longCharNames[cv.Name]; !exists {
+				result.Dialogue = append(result.Dialogue, cv)
+			}
+		}
+	}
+	return result, nil
+}
+
+// SaveStyleRulesCompass 以 compass 双层格式持久化风格规则。
+func (s *WorldStore) SaveStyleRulesCompass(compass domain.WritingStyleRulesCompass) error {
+	return s.io.WriteJSON("meta/style_rules.json", compass)
+}
+
+// LoadStyleRulesCompass 以 compass 双层格式加载风格规则。
+// 旧单体格式（volume/arc/prose 在顶层）自动迁移到 current 层。
+func (s *WorldStore) LoadStyleRulesCompass() (*domain.WritingStyleRulesCompass, error) {
+	var compass domain.WritingStyleRulesCompass
+	if err := s.io.ReadJSON("meta/style_rules.json", &compass); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &rules, nil
+	return &compass, nil
+}
+
+// SaveStyleRulesCurrent 仅更新 compass 的 current 层，保留 long 层不变。
+// 不做文本冲突拒绝（语义冲突由 long 优先的上下文合并保证）。
+func (s *WorldStore) SaveStyleRulesCurrent(current domain.StyleRulesCurrent) error {
+	return s.io.WithWriteLock(func() error {
+		compass, err := s.loadStyleRulesCompassUnlocked()
+		if err != nil {
+			return err
+		}
+		if compass == nil {
+			compass = &domain.WritingStyleRulesCompass{}
+		}
+		compass.Current = &current
+		return s.io.WriteJSONUnlocked("meta/style_rules.json", compass)
+	})
+}
+
+// SaveStyleRulesLong 更新 compass 的 long 层，保留 current 层不变。
+// reason 必须非空（审计元数据，持久化到 long.reason）。
+// 字段级合并：只替换 patch 中非空的 Prose/Dialogue/Taboos，未提供的字段保留现有值。
+// 更新前验证 long 规则不含禁止的局部实现细节，同时检查 dialogue 规则。
+func (s *WorldStore) SaveStyleRulesLong(long domain.StyleRulesLong, reason string) error {
+	if strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("更新 style_rules.long 必须提供非空 reason")
+	}
+	if err := long.Validate(); err != nil {
+		return err
+	}
+	return s.io.WithWriteLock(func() error {
+		compass, err := s.loadStyleRulesCompassUnlocked()
+		if err != nil {
+			return err
+		}
+		if compass == nil {
+			compass = &domain.WritingStyleRulesCompass{}
+		}
+		if compass.Long == nil {
+			compass.Long = &domain.StyleRulesLong{}
+		}
+		// 字段级合并：只替换非空的规则字段
+		if len(long.Prose) > 0 {
+			compass.Long.Prose = long.Prose
+		}
+		if len(long.Dialogue) > 0 {
+			compass.Long.Dialogue = long.Dialogue
+		}
+		if len(long.Taboos) > 0 {
+			compass.Long.Taboos = long.Taboos
+		}
+		// 审计元数据：总是更新
+		compass.Long.Reason = reason
+		compass.Long.LastUpdated = time.Now().Format(time.RFC3339)
+		return s.io.WriteJSONUnlocked("meta/style_rules.json", compass)
+	})
+}
+
+// RestoreStyleRulesCurrent 条件式恢复 current 层。
+// 仅在 compass 中当前 current 与 written 相等（未被并发修改）时，才恢复为 restoreTarget。
+// 保留最新 long 层不变。
+// restoreTarget 为 nil 时恢复为"无 current"状态；若此时 long 也为空，则删除文件。
+// 条件不满足时返回明确错误。
+func (s *WorldStore) RestoreStyleRulesCurrent(written, restoreTarget *domain.StyleRulesCurrent) error {
+	return s.io.WithWriteLock(func() error {
+		compass, err := s.loadStyleRulesCompassUnlocked()
+		if err != nil {
+			return fmt.Errorf("restore: load compass: %w", err)
+		}
+		if compass == nil {
+			// 文件不存在：若 written 非 nil 说明我们的写入已丢失，无需恢复
+			return nil
+		}
+		// 条件检查：当前 current 必须仍等于 written
+		if !domain.StyleRulesCurrentsEqual(compass.Current, written) {
+			return fmt.Errorf("restore: current was concurrently modified, refusing to overwrite")
+		}
+		// 执行恢复
+		compass.Current = restoreTarget // nil = 清除 current
+		if compass.Current == nil && !compass.Long.HasContent() {
+			return s.io.RemoveFileUnlocked("meta/style_rules.json")
+		}
+		return s.io.WriteJSONUnlocked("meta/style_rules.json", compass)
+	})
+}
+
+// loadStyleRulesCompassUnlocked 内部辅助（调用方需持有 io.mu）。
+func (s *WorldStore) loadStyleRulesCompassUnlocked() (*domain.WritingStyleRulesCompass, error) {
+	var compass domain.WritingStyleRulesCompass
+	if err := s.io.ReadJSONUnlocked("meta/style_rules.json", &compass); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &compass, nil
 }
 
 // ── 审阅 ──

@@ -414,7 +414,7 @@ func TestCommitChapterLayeredReopenRecompletesDespiteOpenThread(t *testing.T) {
 	}
 
 	// 模拟"返工扰动了长线"：compass 仍有未收束的 open thread
-	if err := s.Outline.SaveCompass(domain.StoryCompass{EndingDirection: "主角归乡", OpenThreads: []string{"宿敌未除"}}); err != nil {
+	if err := s.Outline.SaveCompass(domain.StoryCompass{Long: domain.LongCompass{EndingDirection: "主角归乡", OpenThreads: []string{"宿敌未除"}}}); err != nil {
 		t.Fatalf("SaveCompass: %v", err)
 	}
 
@@ -595,7 +595,7 @@ func TestCommitChapterLayeredAutoCompletesWhenDone(t *testing.T) {
 		t.Fatalf("Execute layered: %v", err)
 	}
 	// 指南针长线已收束（OpenThreads 空）
-	if err := s.Outline.SaveCompass(domain.StoryCompass{EndingDirection: "主角归乡"}); err != nil {
+	if err := s.Outline.SaveCompass(domain.StoryCompass{Long: domain.LongCompass{EndingDirection: "主角归乡"}}); err != nil {
 		t.Fatalf("SaveCompass: %v", err)
 	}
 	_ = s.Progress.UpdatePhase(domain.PhaseWriting)
@@ -695,7 +695,7 @@ func TestCommitChapterFinaleVolumeCompletesDespiteOpenThreads(t *testing.T) {
 	}
 
 	// 长线未收束（未宣告时这会阻止完结，见对照测试）
-	if err := s.Outline.SaveCompass(domain.StoryCompass{EndingDirection: "主角归乡", OpenThreads: []string{"宿敌未除"}}); err != nil {
+	if err := s.Outline.SaveCompass(domain.StoryCompass{Long: domain.LongCompass{EndingDirection: "主角归乡", OpenThreads: []string{"宿敌未除"}}}); err != nil {
 		t.Fatalf("SaveCompass: %v", err)
 	}
 	_ = s.Progress.UpdatePhase(domain.PhaseWriting)
@@ -788,7 +788,7 @@ func TestCommitChapterFinaleSkeletonArcBlocksCompletion(t *testing.T) {
 	if _, err := foundation.Execute(context.Background(), layeredArgs); err != nil {
 		t.Fatalf("Execute layered: %v", err)
 	}
-	if err := s.Outline.SaveCompass(domain.StoryCompass{EndingDirection: "归乡"}); err != nil {
+	if err := s.Outline.SaveCompass(domain.StoryCompass{Long: domain.LongCompass{EndingDirection: "归乡"}}); err != nil {
 		t.Fatalf("SaveCompass: %v", err)
 	}
 	_ = s.Progress.UpdatePhase(domain.PhaseWriting)
@@ -859,7 +859,7 @@ func TestCommitChapterLayeredNoAutoCompleteWithOpenThreads(t *testing.T) {
 		t.Fatalf("Execute layered: %v", err)
 	}
 	// 仍有未收束的活跃长线
-	if err := s.Outline.SaveCompass(domain.StoryCompass{EndingDirection: "主角归乡", OpenThreads: []string{"宿敌未除"}}); err != nil {
+	if err := s.Outline.SaveCompass(domain.StoryCompass{Long: domain.LongCompass{EndingDirection: "主角归乡", OpenThreads: []string{"宿敌未除"}}}); err != nil {
 		t.Fatalf("SaveCompass: %v", err)
 	}
 	_ = s.Progress.UpdatePhase(domain.PhaseWriting)

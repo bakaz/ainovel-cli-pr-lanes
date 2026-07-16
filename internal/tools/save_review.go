@@ -105,13 +105,36 @@ func (t *SaveReviewTool) Execute(_ context.Context, args json.RawMessage) (json.
 
 	affected := r.AffectedChapters
 	if finalVerdict == "rewrite" || finalVerdict == "polish" {
-		if len(affected) == 0 && r.Chapter > 0 {
-			affected = []int{r.Chapter}
+		if len(affected) == 0 {
+			return nil, fmt.Errorf("affected_chapters is required when final verdict=%s", finalVerdict)
 		}
 		if err := t.store.Progress.ValidatePendingRewrites(affected); err != nil {
 			return nil, fmt.Errorf("validate pending rewrites: %w", err)
 		}
 	}
+
+	// Capture submitted verdict before overwriting for response observability.
+	submittedVerdict := r.Verdict
+
+	// Prevalidate flow transition BEFORE any durable write so illegal
+	// transitions (e.g. rewriting↔polishing) leave no review artifact.
+	progress, _ := t.store.Progress.Load()
+	targetFlow := domain.FlowWriting
+	if finalVerdict == "rewrite" {
+		targetFlow = domain.FlowRewriting
+	} else if finalVerdict == "polish" {
+		targetFlow = domain.FlowPolishing
+	}
+	fromFlow := domain.FlowWriting
+	if progress != nil {
+		fromFlow = progress.Flow
+	}
+	if err := domain.ValidateFlowTransition(fromFlow, targetFlow); err != nil {
+		return nil, fmt.Errorf("set flow %s: %w", targetFlow, err)
+	}
+
+	// Persist with the final (possibly escalated) verdict
+	r.Verdict = finalVerdict
 
 	if err := t.store.World.SaveReview(r); err != nil {
 		return nil, fmt.Errorf("save review: %w", err)
@@ -120,17 +143,12 @@ func (t *SaveReviewTool) Execute(_ context.Context, args json.RawMessage) (json.
 	// 根据最终 verdict 更新 Progress。
 	// 写失败必须早返回——后续会 append review checkpoint，若此处吞 err，
 	// Engine 会在 Store 仍处于旧 Flow / 缺失 PendingRewrites 的中间态下继续。
-	progress, _ := t.store.Progress.Load()
 	if finalVerdict == "rewrite" || finalVerdict == "polish" {
-		flow := domain.FlowRewriting
-		if finalVerdict == "polish" {
-			flow = domain.FlowPolishing
-		}
 		// 先切 Flow 再写队列：若目标 Flow 与当前 Flow 构成非法迁移
 		// （如返工排空中途 rewriting↔polishing 互斥），提前返回，
 		// 避免脏写 PendingRewrites 留下"队列已改、Flow 未改"的部分状态。
-		if err := t.store.Progress.SetFlow(flow); err != nil {
-			return nil, fmt.Errorf("set flow %s: %w", flow, err)
+		if err := t.store.Progress.SetFlow(targetFlow); err != nil {
+			return nil, fmt.Errorf("set flow %s: %w", targetFlow, err)
 		}
 		if err := t.store.Progress.SetPendingRewrites(affected, r.Summary); err != nil {
 			return nil, fmt.Errorf("set pending rewrites: %w", err)
@@ -171,7 +189,7 @@ func (t *SaveReviewTool) Execute(_ context.Context, args json.RawMessage) (json.
 		"saved":             true,
 		"chapter":           r.Chapter,
 		"scope":             r.Scope,
-		"verdict":           r.Verdict,
+		"verdict":           submittedVerdict,
 		"final_verdict":     finalVerdict,
 		"escalation_reason": escalationReason,
 		"affected_chapters": affected,
