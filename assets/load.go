@@ -47,6 +47,7 @@ type Bundle struct {
 	Prompts    Prompts
 	Styles     map[string]string
 	Voice      string // 写作标准(文风层),已按三层覆盖组装;见 docs/voice-layer.md
+	Sources    map[string]ResourceSource
 }
 
 // LoadOptions 声明文风层的覆盖来源。空目录 = 跳过该层(eval 传零值以获得
@@ -74,12 +75,48 @@ func DefaultLoadOptions(outputDir string) LoadOptions {
 // Load 返回指定风格对应的资源集合。文风资产(voice / anti-ai-tone / styles /
 // 题材 style-references)按 opts 做三层覆盖:内置 < 全局 < 本书。
 func Load(style string, opts LoadOptions) Bundle {
-	return Bundle{
+	b := Bundle{
 		References: loadReferences(style, opts),
 		Prompts:    loadPrompts(),
 		Styles:     loadStyles(opts),
 		Voice:      resolveAppendable(mustRead(voiceFS, "voice.md"), "voice.md", opts),
+		Sources:    make(map[string]ResourceSource),
 	}
+	b.recordEmbeddedSources(style)
+	return b
+}
+
+// LoadProduction 是生产级资源加载入口。它从 Load(style, DefaultLoadOptions(outputDir))
+// 出发,再应用全局(~/.ainovel)、项目(<cwd>/.ainovel)和可选显式资源根的覆盖。
+// 覆盖按"内置 < 全局 < 项目 < 显式目录"优先级执行。
+// 返回加载后的 Bundle、覆盖报告及错误。
+// 当 explicitRoot 非空但不存在或不是目录时返回 error。
+func LoadProduction(style, outputDir, explicitRoot string) (Bundle, OverlayReport, error) {
+	explicitRoot = strings.TrimSpace(explicitRoot)
+	if explicitRoot != "" {
+		fi, err := os.Stat(explicitRoot)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return Bundle{}, OverlayReport{}, fmt.Errorf("prompts directory does not exist: %s", explicitRoot)
+			}
+			return Bundle{}, OverlayReport{}, fmt.Errorf("prompts directory stat error: %s: %w", explicitRoot, err)
+		}
+		if !fi.IsDir() {
+			return Bundle{}, OverlayReport{}, fmt.Errorf("prompts directory is not a directory: %s", explicitRoot)
+		}
+	}
+	bundle := Load(style, DefaultLoadOptions(outputDir))
+	var dirs []string
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		dirs = append(dirs, filepath.Join(home, ".ainovel"))
+	}
+	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+		dirs = append(dirs, filepath.Join(cwd, ".ainovel"))
+	}
+	if explicitRoot != "" {
+		dirs = append(dirs, explicitRoot)
+	}
+	return bundle, ApplyOverrides(&bundle, style, dirs), nil
 }
 
 // voicePlaceholder 是 writer 协议模板中文风段的原位插入点。
@@ -279,6 +316,44 @@ func overlayStyles(styles map[string]string, dir string) {
 			continue
 		}
 		styles[name] = string(data)
+	}
+}
+
+func (b *Bundle) recordEmbeddedSources(style string) {
+	record := func(path, value string) {
+		src := sourceFor("embedded", "embedded:"+path, []byte(value))
+		src.Key = path
+		b.Sources[path] = src
+	}
+	record("prompts/architect-short.md", b.Prompts.ArchitectShort)
+	record("prompts/architect-long.md", b.Prompts.ArchitectLong)
+	record("prompts/writer.md", b.Prompts.Writer)
+	record("prompts/editor.md", b.Prompts.Editor)
+	record("prompts/import-foundation.md", b.Prompts.ImportFoundation)
+	record("prompts/import-chapter-analyzer.md", b.Prompts.ImportAnalyzer)
+	record("prompts/simulation-source.md", b.Prompts.SimulationSource)
+	record("prompts/simulation-merge.md", b.Prompts.SimulationMerge)
+	refs := map[string]string{
+		"chapter-guide.md": b.References.ChapterGuide, "hook-techniques.md": b.References.HookTechniques,
+		"quality-checklist.md": b.References.QualityChecklist, "outline-template.md": b.References.OutlineTemplate,
+		"character-template.md": b.References.CharacterTemplate, "chapter-template.md": b.References.ChapterTemplate,
+		"consistency.md": b.References.Consistency, "content-expansion.md": b.References.ContentExpansion,
+		"dialogue-writing.md": b.References.DialogueWriting, "longform-planning.md": b.References.LongformPlanning,
+		"differentiation.md": b.References.Differentiation, "anti-ai-tone.md": b.References.AntiAITone,
+	}
+	for name, value := range refs {
+		record("references/"+name, value)
+	}
+	if style != "" && style != "default" {
+		if b.References.StyleReference != "" {
+			record("references/genres/"+style+"/style-references.md", b.References.StyleReference)
+		}
+		if b.References.ArcTemplates != "" {
+			record("references/genres/"+style+"/arc-templates.md", b.References.ArcTemplates)
+		}
+	}
+	for name, value := range b.Styles {
+		record("styles/"+name+".md", value)
 	}
 }
 

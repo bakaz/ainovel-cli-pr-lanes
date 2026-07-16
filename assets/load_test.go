@@ -142,3 +142,80 @@ func TestOverrideVoice_SharesAssemblyPath(t *testing.T) {
 		t.Fatal("协议模板不得被 voice 覆盖破坏")
 	}
 }
+
+// TestLoadProduction_MissingExplicitRoot 验证显式指定的 prompts-dir 不存在时返回 error。
+func TestLoadProduction_MissingExplicitRoot(t *testing.T) {
+	_, _, err := LoadProduction("default", "", filepath.Join(t.TempDir(), "nonexistent"))
+	if err == nil {
+		t.Fatal("expected error for missing explicit root, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+// TestLoadProduction_ExplicitRootIsFile 验证显式指定的 prompts-dir 是文件时返回 error。
+func TestLoadProduction_ExplicitRootIsFile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "afile")
+	if err := os.WriteFile(file, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadProduction("default", "", file)
+	if err == nil {
+		t.Fatal("expected error for file as explicit root, got nil")
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+// TestLoadProduction_Precedence 验证 LoadProduction 的覆盖优先顺序:
+// 内置 < 全局 ~/.ainovel < 项目 ./.ainovel < 显式目录。
+//
+// 注意:voice.md 通过 LoadOptions 的 HomeStyleDir/BookStyleDir 由 resolveAppendable
+// 做追加覆盖,不走 ApplyOverrides 的整文件替换路径,所以此测试使用 prompts/、styles/
+// 和 references/ 三类 overlay 资产验证优先级。
+func TestLoadProduction_Precedence(t *testing.T) {
+	home := t.TempDir()
+	cwdDir := t.TempDir()
+	explicit := t.TempDir()
+
+	// style 整文件替换:由 overlay 的 styles/ 目录处理
+	writeFile(t, filepath.Join(home, "styles", "fantasy.md"), "global fantasy")
+	writeFile(t, filepath.Join(cwdDir, "styles", "fantasy.md"), "project fantasy")
+	writeFile(t, filepath.Join(explicit, "styles", "fantasy.md"), "explicit fantasy")
+
+	// prompt 整文件替换:由 overlay 的 prompts/ 目录处理
+	writeFile(t, filepath.Join(home, "prompts", "editor.md"), "global editor")
+	writeFile(t, filepath.Join(cwdDir, "prompts", "editor.md"), "project editor")
+	writeFile(t, filepath.Join(explicit, "prompts", "editor.md"), "explicit editor")
+
+	// reference 整文件替换:由 overlay 的 references/ 目录处理
+	writeFile(t, filepath.Join(home, "references", "anti-ai-tone.md"), "global anti-ai")
+	writeFile(t, filepath.Join(cwdDir, "references", "anti-ai-tone.md"), "project anti-ai")
+	writeFile(t, filepath.Join(explicit, "references", "anti-ai-tone.md"), "explicit anti-ai")
+
+	bundle := Load("default", LoadOptions{})
+	dirs := []string{home, cwdDir, explicit}
+	report := ApplyOverrides(&bundle, "default", dirs)
+
+	// style 整文件替换:显式应最终胜出
+	if bundle.Styles["fantasy"] != "explicit fantasy" {
+		t.Fatalf("explicit style should win, got %q", bundle.Styles["fantasy"])
+	}
+
+	// prompt 整文件替换:显式应最终胜出
+	if !strings.HasPrefix(bundle.Prompts.Editor, "explicit editor") {
+		t.Fatalf("explicit prompt should win, got %q", bundle.Prompts.Editor)
+	}
+
+	// reference 整文件替换:显式应最终胜出
+	if bundle.References.AntiAITone != "explicit anti-ai" {
+		t.Fatalf("explicit reference should win, got %q", bundle.References.AntiAITone)
+	}
+
+	// 验证 report 中有 3 个 applied 覆盖(style, prompt, reference)
+	if len(report.Applied) < 3 {
+		t.Fatalf("expected at least 3 applied overrides, got %d", len(report.Applied))
+	}
+}
