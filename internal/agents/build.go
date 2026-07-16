@@ -102,6 +102,49 @@ func resolvedRoleThinking(model agentcore.ChatModel, cfg bootstrap.Config, role 
 	return resolved
 }
 
+// workerToolsets is the production tool composition for each Engine worker.
+// BuildWorkers and contract tests share this helper so lists cannot drift.
+type workerToolsets struct {
+	ArchitectShort []agentcore.Tool
+	ArchitectLong  []agentcore.Tool
+	Writer         []agentcore.Tool
+	Editor         []agentcore.Tool
+}
+
+func buildWorkerToolsets(store *store.Store, bundle assets.Bundle, style string) workerToolsets {
+	readChapter := tools.NewReadChapterTool(store)
+	architectCtx := tools.NewContextToolForRole(store, bundle.References, style, "architect")
+	writerCtx := tools.NewContextToolForRole(store, bundle.References, style, "writer")
+	editorCtx := tools.NewContextToolForRole(store, bundle.References, style, "editor")
+	return workerToolsets{
+		ArchitectShort: []agentcore.Tool{
+			architectCtx,
+			tools.NewSaveFoundationTool(store),
+		},
+		ArchitectLong: []agentcore.Tool{
+			architectCtx,
+			tools.NewSaveFoundationTool(store),
+			tools.NewReadPlanningReferenceTool(store),
+		},
+		Writer: []agentcore.Tool{
+			writerCtx,
+			readChapter,
+			tools.NewPlanChapterTool(store),
+			tools.NewDraftChapterTool(store),
+			tools.NewEditChapterTool(store),
+			tools.NewCheckConsistencyTool(store),
+			tools.NewCommitChapterTool(store),
+		},
+		Editor: []agentcore.Tool{
+			editorCtx,
+			readChapter,
+			tools.NewSaveReviewTool(store),
+			tools.NewSaveArcSummaryTool(store),
+			tools.NewSaveVolumeSummaryTool(store),
+		},
+	}
+}
+
 // BuildWorkers 组装三个 Worker(architect_short/long、writer、editor)为可程序化
 // 调用的 subagent.Tool——Engine 直接调用其 Run(类型化入口),无 LLM 中间层
 // (docs/engine-rfc.md §1)。
@@ -116,38 +159,12 @@ func BuildWorkers(
 	recordUsage UsageRecorder,
 	onGuardBlock guard.BlockHook,
 ) (*subagent.Tool, *tools.AskUserTool, *ctxpack.WriterRestorePack, ApplyThinking) {
-	// 角色定制上下文工具
-	architectCtx := tools.NewContextToolForRole(store, bundle.References, cfg.Style, "architect")
-	writerCtx := tools.NewContextToolForRole(store, bundle.References, cfg.Style, "writer")
-	editorCtx := tools.NewContextToolForRole(store, bundle.References, cfg.Style, "editor")
-	readChapter := tools.NewReadChapterTool(store)
 	askUser := tools.NewAskUserTool()
-
-	architectTools := []agentcore.Tool{
-		architectCtx,
-		tools.NewSaveFoundationTool(store),
-	}
-	architectLongTools := []agentcore.Tool{
-		architectCtx,
-		tools.NewSaveFoundationTool(store),
-		tools.NewReadPlanningReferenceTool(store),
-	}
-	writerTools := []agentcore.Tool{
-		writerCtx,
-		readChapter,
-		tools.NewPlanChapterTool(store),
-		tools.NewDraftChapterTool(store),
-		tools.NewEditChapterTool(store),
-		tools.NewCheckConsistencyTool(store),
-		tools.NewCommitChapterTool(store),
-	}
-	editorTools := []agentcore.Tool{
-		editorCtx,
-		readChapter,
-		tools.NewSaveReviewTool(store),
-		tools.NewSaveArcSummaryTool(store),
-		tools.NewSaveVolumeSummaryTool(store),
-	}
+	ts := buildWorkerToolsets(store, bundle, cfg.Style)
+	architectTools := ts.ArchitectShort
+	architectLongTools := ts.ArchitectLong
+	writerTools := ts.Writer
+	editorTools := ts.Editor
 
 	// Provider failover 只记日志,不通知宿主
 	reportFailover := func(ev bootstrap.FailoverEvent) {
