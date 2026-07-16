@@ -262,6 +262,12 @@ func buildLoadingSummary(result map[string]any, chapter int) string {
 	if _, ok := contextValue(result, "style_rules"); ok {
 		items = append(items, "风格规则:ok")
 	}
+	if _, ok := contextValue(result, "style_anchors_manual"); ok {
+		items = append(items, "手动锚点:ok")
+	}
+	if _, ok := contextValue(result, "style_anchors_auto"); ok {
+		items = append(items, "自动锚点:ok")
+	}
 	if related, ok := contextValue(result, "related_chapters"); ok {
 		if n := sliceLen(related); n > 0 {
 			items = append(items, fmt.Sprintf("相关章:%d", n))
@@ -585,13 +591,13 @@ func contextValue(result map[string]any, key string) (any, bool) {
 	return nil, false
 }
 
-// contextBudgetSize 只在预算测量视图中去掉 style_rules，
-// 真实 result 不变。
+// contextBudgetSize 只在预算测量视图中去掉 style_rules 和 style_anchors_manual，
+// 真实 result 不变。manual anchors 有 64 KiB 文件大小上限约束，不参与运行时软预算。
 // canonical 容器目前只有一层，因此浅复制容器即可避免昂贵的通用深拷贝。
 func contextBudgetSize(result map[string]any) (int, error) {
 	view := make(map[string]any, len(result))
 	for key, value := range result {
-		if key == "style_rules" {
+		if key == "style_rules" || key == "style_anchors_manual" {
 			continue
 		}
 		isContainer := false
@@ -612,7 +618,7 @@ func contextBudgetSize(result map[string]any) (int, error) {
 		}
 		sectionView := make(map[string]any, len(section))
 		for sectionKey, sectionValue := range section {
-			if sectionKey != "style_rules" {
+			if sectionKey != "style_rules" && sectionKey != "style_anchors_manual" {
 				sectionView[sectionKey] = sectionValue
 			}
 		}

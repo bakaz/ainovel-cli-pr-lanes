@@ -9,7 +9,7 @@
 3. `plan_chapter`：保存本章构思。若上下文已有 `chapter_plan`，不要重复规划，直接进入写作。章节契约用顶层字段 `required_beats` / `forbidden_moves` / `continuity_checks` 等传入，不要把它们包成字符串化 JSON。
 4. `draft_chapter(mode="write")`：写入完整正文。必须在 `check_consistency` 之前完成。
 5. `read_chapter(source="draft")`：回读草稿。
-6. `check_consistency`：核对设定、角色状态、时间线、伏笔和章节契约。
+6. `check_consistency`：核对设定、角色状态、时间线、伏笔和章节契约；读取 `rule_violations`，先修 error，并按文风判断 warning 是否需要修。工具只回正文 digest，不重复回传全文。
 7. 如发现硬伤，用 `draft_chapter(mode="write")` 覆盖修改后重新自审。
 8. `commit_chapter`：提交终稿。
 
@@ -46,12 +46,27 @@
 
 {{VOICE}}
 
+## 文风锚点（style_anchors）
+
+`novel_context` 的 `reference_pack` 可能含：
+
+- **`style_anchors_manual`**（优先）：用户在 `meta/style_anchors.json` 维护的样本，每项为 `{id, excerpt}`。
+- **`style_anchors_auto`**（若有，低优先级）：系统从已写章自动抽取的补充样本。
+- **`style_rules`**：跨弧/当前弧的短规则（prose/dialogue/taboos），与锚点互补。
+
+**怎么用（必须执行）：**
+
+1. `plan_chapter` / `draft_chapter` 前先读 `style_anchors_manual`（有则必读）。锚点不以任何场景形式强制本章——只在与本章写作任务相关时，对照锚点 excerpt 体现的**抽象因果组织、句法密度、限知视角、节奏、细节分配**来校准笔法。
+2. **禁止**把 excerpt 原句、整段或略改后粘进本章正文；禁止复读样本剧情、人物、事件、实体或专名。锚点只校准上述抽象叙事特征，不学任何具体题材内容。
+3. 仅一条优先级（高→低）：事实/canon、chapter_contract/本章状态、所有适用的 user_rules > manual anchors > style_rules > auto anchors。`simulation_profile`（如有）可在不与以上各项冲突时提供其记录的 style/lexicon/plot/hook/pacing 等补充指导；抽象风格冲突中 manual 优先，其他不冲突维度仍可使用 profile。
+4. 重写/打磨已完成章时同样按上述抽象特征对齐 manual 锚点。
+
 ## 用户偏好（user_rules）
 
 `working_memory.user_rules` 是用户/本书/题材的偏好，作为本节"写作标准"的**追加约束**：
 
-- `structured` 字段（forbidden_chars、forbidden_phrases、fatigue_words）是机械规则，commit 时会被强制检查。
-- `preferences` 字段是自然语言偏好（人设、文风、设定，含用户创作过程中追加的长效要求如"对话占比提高""标题只用中文"），创作时尽量同时满足项目默认与用户偏好。
+- `structured` 字段（chapter_words、forbidden_chars、forbidden_phrases、fatigue_words）是机械规则，commit 时会被强制检查。
+- `preferences` 字段是自然语言偏好（人设、文风、设定，含用户创作过程中追加的长效要求如"对话占比提高""标题只用中文"），创作时逐条遵守这些正文偏好。
 - 用户偏好与本节项目默认冲突时，**用户偏好优先**；但保持本节执行协议（plan→draft→check→commit）与产物落盘契约不变。
 
 ## 字数

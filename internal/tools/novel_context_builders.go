@@ -1,25 +1,32 @@
 package tools
 
 import (
+	"fmt"
 	"slices"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/rules"
+	"github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/stylestat"
 )
 
 type contextBuildState struct {
-	chapter         int
-	profile         domain.ContextProfile
-	progress        *domain.Progress
-	runMeta         *domain.RunMeta
-	currentEntry    *domain.OutlineEntry
-	chapterPlan     *domain.ChapterPlan
-	storyThreads    []domain.RecallItem
-	foreshadow      []domain.ForeshadowEntry
-	relationships   []domain.RelationshipEntry
-	allStateChanges []domain.StateChange
-	styleRules      *domain.WritingStyleRules
+	chapter          int
+	profile          domain.ContextProfile
+	progress         *domain.Progress
+	runMeta          *domain.RunMeta
+	currentEntry     *domain.OutlineEntry
+	chapterPlan      *domain.ChapterPlan
+	storyThreads     []domain.RecallItem
+	foreshadow       []domain.ForeshadowEntry
+	relationships    []domain.RelationshipEntry
+	allStateChanges  []domain.StateChange
+	styleRules       *domain.WritingStyleRules
+	styleRulesCompass *domain.WritingStyleRulesCompass // Compass 双层格式
+	styleAnchorsManual *domain.StyleAnchorsV1          // 归一化后的手动锚点（meta/style_anchors.json）
+	styleAnchorsAuto  []string                          // 自动提取的风格锚点（仅当无 manual 且无 style_rules 时 legacy 回退，或 include_auto=true）
+	manStatus         store.ManualFileStatus             // 手动文件状态
+	hasStyleRules     bool                               // 缓存是否存在 style_rules
 }
 
 type chapterContextEnvelope struct {
@@ -309,6 +316,64 @@ func (t *ContextTool) prepareChapterContext(chapter int, envelope *chapterContex
 	styleRules, styleErr := t.store.World.LoadStyleRules()
 	warn("style_rules", styleErr)
 	state.styleRules = styleRules
+	// 尝试加载 compass 双层格式（兼容旧单体）
+	styleRulesCompass, compassErr := t.store.World.LoadStyleRulesCompass()
+	if compassErr != nil {
+		warn("style_rules_compass", compassErr)
+	} else if styleRulesCompass != nil {
+		state.styleRulesCompass = styleRulesCompass
+	}
+
+	// 加载手动风格锚点（含旧格式兼容）
+	manRes := t.store.StyleAnchors.LoadManual()
+	if len(manRes.Warnings) > 0 {
+		for _, w := range manRes.Warnings {
+			warn("style_anchors", fmt.Errorf("%s", w))
+		}
+	}
+
+	state.hasStyleRules = (state.styleRulesCompass != nil && state.styleRulesCompass.HasContent()) || state.styleRules != nil
+	state.manStatus = manRes.Status
+
+	switch manRes.Status {
+	case store.StatusValid, store.StatusLegacyFormat:
+		// 有效手动文件（含旧格式转换后）
+		state.styleAnchorsManual = manRes.Anchors
+		// 仅当 include_auto=true 时加载 auto 锚点
+		if manRes.Anchors.IncludeAuto {
+			var maxCompleted int
+			if progress != nil {
+				maxCompleted = maxCompletedChapter(progress.CompletedChapters)
+			}
+			if anchors := t.store.Drafts.ExtractStyleAnchors(3, maxCompleted); len(anchors) > 0 {
+				state.styleAnchorsAuto = anchors
+			}
+		}
+
+	case store.StatusEmptyValid:
+		// 有效空文件：manual 存在但 anchors 为空 → 不触发任何 auto
+		state.styleAnchorsManual = manRes.Anchors
+
+	case store.StatusCorrupted:
+		// 损坏 → fail closed：绝不注入 manual 也绝不注入任何 auto（即使无 style_rules）
+		state.styleAnchorsManual = nil
+		state.styleAnchorsAuto = nil
+
+	case store.StatusNotExist:
+		// 无手动文件
+		state.styleAnchorsManual = nil
+		// 仅当无 style_rules 时保留 legacy 自动回退
+		if !state.hasStyleRules {
+			var maxCompleted int
+			if progress != nil {
+				maxCompleted = maxCompletedChapter(progress.CompletedChapters)
+			}
+			if anchors := t.store.Drafts.ExtractStyleAnchors(3, maxCompleted); len(anchors) > 0 {
+				state.styleAnchorsAuto = anchors
+			}
+		}
+	}
+
 	state.storyThreads = t.selectStoryThreads(state)
 	if len(state.storyThreads) > 0 && len(state.storyThreads) < storyThreadRecallMinSelected {
 		state.storyThreads = nil
@@ -525,15 +590,21 @@ func (t *ContextTool) buildChapterEpisodicMemory(envelope *chapterContextEnvelop
 }
 
 func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope, state contextBuildState) {
-	if state.styleRules != nil {
+	// ── 角色门控：所有 anchor 类字段（manual/auto/legacy）仅 Writer/Editor 可见 ──
+	isWriterOrEditor := t.role == "writer" || t.role == "editor"
+
+	// 1. style_rules（Compass）：维持既有语义不变（所有角色可见）
+	if state.styleRulesCompass != nil && state.styleRulesCompass.HasContent() {
+		injected := buildCompassInjectionView(state.styleRulesCompass)
+		envelope.References["style_rules"] = injected
+	} else if state.styleRules != nil {
 		envelope.References["style_rules"] = state.styleRules
-	} else {
-		var maxCompleted int
-		if state.progress != nil {
-			maxCompleted = maxCompletedChapter(state.progress.CompletedChapters)
-		}
-		if anchors := t.store.Drafts.ExtractStyleAnchors(3, maxCompleted); len(anchors) > 0 {
-			envelope.References["style_anchors"] = anchors
+	} else if isWriterOrEditor && state.manStatus == store.StatusNotExist {
+		// 无风格规则且无手动文件时回退到 legacy style_anchors / voice_samples
+		// 注意：auto 锚点已在 prepareChapterContext 中一次性提取至 state.styleAnchorsAuto，
+		// 此处不得再次调用 ExtractStyleAnchors。
+		if len(state.styleAnchorsAuto) > 0 {
+			envelope.References["style_anchors"] = state.styleAnchorsAuto
 		}
 
 		if state.currentEntry != nil {
@@ -543,7 +614,7 @@ func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope
 				if c.Tier == "secondary" || c.Tier == "decorative" {
 					continue
 				}
-				samples := t.store.Drafts.ExtractDialogue(c.Name, c.Aliases, 3, maxCompleted)
+				samples := t.store.Drafts.ExtractDialogue(c.Name, c.Aliases, 3, safeMaxCompleted(state.progress))
 				if len(samples) > 0 {
 					voiceSamples = append(voiceSamples, map[string]any{
 						"character": c.Name,
@@ -560,7 +631,112 @@ func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope
 		}
 	}
 
+	// 2. style_anchors_manual：仅 Writer/Editor，按当前章节过滤，只注入精简视图（id+excerpt）
+	if isWriterOrEditor && state.styleAnchorsManual != nil && len(state.styleAnchorsManual.Anchors) > 0 {
+		if injection := state.styleAnchorsManual.ToInjectionView(state.chapter); len(injection) > 0 {
+			envelope.References["style_anchors_manual"] = injection
+		}
+	}
+
+	// 3. style_anchors_auto：仅 Writer/Editor，仅当 include_auto=true 时低优先级注入
+	if isWriterOrEditor && len(state.styleAnchorsAuto) > 0 &&
+		state.styleAnchorsManual != nil && state.styleAnchorsManual.IncludeAuto {
+		envelope.References["style_anchors_auto"] = state.styleAnchorsAuto
+	}
+
 	envelope.References["references"] = t.writerReferences(state.chapter)
+}
+
+// buildCompassInjectionView 构建 compass 风格的上下文注入视图。
+// 注入结构：顶层含 long 和 current 两个子对象完整呈现，同时提供
+// 扁平合并视图（long 优先，current 补充 long 未定义的字段）。
+func buildCompassInjectionView(compass *domain.WritingStyleRulesCompass) map[string]any {
+	view := map[string]any{
+		"_compass": "双层风格规则。long（长期基线）优先，current（当前弧定制）补充",
+	}
+
+	hasLong := compass.Long != nil && (len(compass.Long.Prose) > 0 || len(compass.Long.Dialogue) > 0 || len(compass.Long.Taboos) > 0)
+	hasCurrent := compass.Current != nil && (len(compass.Current.Prose) > 0 || len(compass.Current.Dialogue) > 0 || len(compass.Current.Taboos) > 0)
+
+	// 1. long 子对象（完整呈现）
+	if hasLong {
+		view["long"] = map[string]any{
+			"prose":    compass.Long.Prose,
+			"dialogue": compass.Long.Dialogue,
+			"taboos":   compass.Long.Taboos,
+		}
+	}
+
+	// 2. current 子对象（完整呈现，含 volume/arc/last_updated）
+	if hasCurrent {
+		cur := map[string]any{
+			"volume": compass.Current.Volume,
+			"arc":    compass.Current.Arc,
+		}
+		if len(compass.Current.Prose) > 0 {
+			cur["prose"] = compass.Current.Prose
+		}
+		if len(compass.Current.Dialogue) > 0 {
+			cur["dialogue"] = compass.Current.Dialogue
+		}
+		if len(compass.Current.Taboos) > 0 {
+			cur["taboos"] = compass.Current.Taboos
+		}
+		if compass.Current.LastUpdated != "" {
+			cur["last_updated"] = compass.Current.LastUpdated
+		}
+		view["current"] = cur
+	}
+
+	// 3. 扁平合并视图（long 优先，current 补充）
+	// 用标记记住 long 已定义了哪些字段，避免 nil long 字段挡住 current
+	longHasProse := hasLong && len(compass.Long.Prose) > 0
+	longHasTaboos := hasLong && len(compass.Long.Taboos) > 0
+	longHasDialogue := hasLong && len(compass.Long.Dialogue) > 0
+
+	if longHasProse {
+		view["prose"] = compass.Long.Prose
+	}
+	if longHasTaboos {
+		view["taboos"] = compass.Long.Taboos
+	}
+	if longHasDialogue {
+		view["dialogue"] = compass.Long.Dialogue
+	}
+
+	if hasCurrent {
+		if !longHasProse && len(compass.Current.Prose) > 0 {
+			view["prose"] = compass.Current.Prose
+		}
+		if !longHasTaboos && len(compass.Current.Taboos) > 0 {
+			view["taboos"] = compass.Current.Taboos
+		}
+		// dialogue: 合并——long 中已有的角色不重复，补充 current 独有的角色
+		if len(compass.Current.Dialogue) > 0 {
+			if longHasDialogue {
+				existingVoices := compass.Long.Dialogue
+				existingNames := make(map[string]bool, len(existingVoices))
+				for _, v := range existingVoices {
+					existingNames[v.Name] = true
+				}
+				for _, v := range compass.Current.Dialogue {
+					if !existingNames[v.Name] {
+						existingVoices = append(existingVoices, v)
+					}
+				}
+				view["dialogue"] = existingVoices
+			} else {
+				view["dialogue"] = compass.Current.Dialogue
+			}
+		}
+		view["volume"] = compass.Current.Volume
+		view["arc"] = compass.Current.Arc
+		if compass.Current.LastUpdated != "" {
+			view["last_updated"] = compass.Current.LastUpdated
+		}
+	}
+
+	return view
 }
 
 func (t *ContextTool) buildArchitectContext(result map[string]any, warn func(string, error)) {
@@ -715,10 +891,19 @@ func (t *ContextTool) buildArchitectFoundation(envelope *architectContextEnvelop
 }
 
 func (t *ContextTool) buildArchitectReferences(envelope *architectContextEnvelope, warn func(string, error)) {
-	if styleRules, err := t.store.World.LoadStyleRules(); err == nil && styleRules != nil {
-		envelope.References["style_rules"] = styleRules
+	// Compass 双层优先
+	if compass, err := t.store.World.LoadStyleRulesCompass(); err == nil && compass != nil && compass.HasContent() {
+		envelope.References["style_rules"] = buildCompassInjectionView(compass)
 	} else {
-		warn("style_rules", err)
+		if err != nil {
+			warn("style_rules_compass", err)
+		}
+		// 回退到旧单体格式
+		if styleRules, err := t.store.World.LoadStyleRules(); err == nil && styleRules != nil {
+			envelope.References["style_rules"] = styleRules
+		} else if err != nil {
+			warn("style_rules", err)
+		}
 	}
 
 	envelope.References["references"] = t.architectReferences()
