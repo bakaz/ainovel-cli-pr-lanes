@@ -451,9 +451,9 @@ func (h *Host) Resume() (string, error) {
 	h.ensureUserRules()
 	h.refreshWriterRestore()
 	// 待处理干预(停机期留下的/裁定期崩溃残留的)必须先于引擎续跑裁定——
-	// 否则引擎可能抢在裁定前继续写出与干预相悖的章节。同步执行(阻塞数秒可接受,
-	// UI 已显示"恢复创作");doIntervention 成功后自行清除 PendingSteer 并按
-	// restart=true 拉起引擎。无待处理干预 → 直接续跑。
+	// 否则引擎可能抢在裁定前继续写出与干预相悖的章节。但恢复入口不应被
+	// Arbiter/网络阻塞：先返回项目界面，后台裁定；裁定完成后再按 restart=true
+	// 拉起引擎。无待处理干预 → 直接续跑。
 	meta, _ := h.store.RunMeta.Load()
 	pendingSteer := ""
 	if meta != nil {
@@ -471,15 +471,7 @@ func (h *Host) Resume() (string, error) {
 		slog.Info("已清除残留的纯继续指令", "module", "host")
 	}
 	if pendingSteer != "" {
-		h.doIntervention(pendingSteer, true)
-		// 裁定失败(已回显)时也要恢复续跑——书不能因一条无法理解的旧干预卡死。
-		if !h.engine.isRunning() {
-			if err := h.budget.Refuse(); err == nil {
-				if !h.startEngine(nil) {
-					return label, fmt.Errorf("Engine 正在完成上一轮停止，请稍后重试恢复")
-				}
-			}
-		}
+		h.resumePendingIntervention(pendingSteer)
 	} else {
 		// 只恢复事实,不恢复会话(RFC §6):Engine 从 store 重算路由续跑。
 		if !h.startEngine(nil) {
@@ -489,6 +481,26 @@ func (h *Host) Resume() (string, error) {
 	// lifecycle 由 startEngine / runEnded 管理,此处不再覆写——
 	// 引擎立即结束(完本等)时覆写会把终态改回 running。
 	return label, nil
+}
+
+func (h *Host) resumePendingIntervention(text string) {
+	go func() {
+		h.doIntervention(text, true)
+		// 裁定失败(已回显并清除 pending)时也要恢复续跑——书不能因一条
+		// 无法理解或模型临时失败的旧干预卡死在恢复入口。若动作持久化失败
+		// 保留了 pending，也仍沿用旧语义恢复，让用户进项目后能继续干预。
+		if !h.engine.isRunning() {
+			if err := h.budget.Refuse(); err == nil {
+				h.refreshWriterRestore()
+				if !h.startEngine(nil) {
+					h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Level: "warn",
+						Summary: "Engine 正在完成上一轮停止；干预已保存，请稍后继续"})
+				}
+			} else {
+				h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: err.Error(), Level: "warn"})
+			}
+		}
+	}()
 }
 
 // isPlainResumeSteer 只匹配不携带任何创作约束的控制词。保持白名单极窄，避免
