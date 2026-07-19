@@ -69,6 +69,7 @@ func (s *OutlineStore) GetChapterOutline(chapter int) (*domain.OutlineEntry, err
 // SaveLayeredOutline 保存分层大纲（长篇模式，原子写入）。
 func (s *OutlineStore) SaveLayeredOutline(volumes []domain.VolumeOutline) error {
 	return s.io.WithWriteLock(func() error {
+		normalizeLayeredChapterNumbers(volumes)
 		if err := s.io.WriteJSONUnlocked("layered_outline.json", volumes); err != nil {
 			return err
 		}
@@ -287,6 +288,7 @@ func (s *OutlineStore) expandArcUnlocked(volumeIdx, arcIdx int, expansion domain
 	if !found {
 		return nil, fmt.Errorf("arc not found: volume=%d, arc=%d", volumeIdx, arcIdx)
 	}
+	normalizeLayeredChapterNumbers(volumes)
 	if err := s.io.WriteJSONUnlocked("layered_outline.json", volumes); err != nil {
 		return nil, err
 	}
@@ -313,6 +315,7 @@ func (s *OutlineStore) appendVolumeUnlocked(vol domain.VolumeOutline) ([]domain.
 		return nil, err
 	}
 	volumes = append(volumes, vol)
+	normalizeLayeredChapterNumbers(volumes)
 	if err := s.io.WriteJSONUnlocked("layered_outline.json", volumes); err != nil {
 		return nil, err
 	}
@@ -327,6 +330,18 @@ func (s *OutlineStore) appendVolumeUnlocked(vol domain.VolumeOutline) ([]domain.
 		return nil, err
 	}
 	return volumes, nil
+}
+
+func normalizeLayeredChapterNumbers(volumes []domain.VolumeOutline) {
+	ch := 1
+	for vi := range volumes {
+		for ai := range volumes[vi].Arcs {
+			for ci := range volumes[vi].Arcs[ai].Chapters {
+				volumes[vi].Arcs[ai].Chapters[ci].Chapter = ch
+				ch++
+			}
+		}
+	}
 }
 
 func validateAppendVolume(existing []domain.VolumeOutline, vol domain.VolumeOutline) error {

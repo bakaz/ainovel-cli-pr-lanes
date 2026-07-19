@@ -1786,6 +1786,46 @@ func TestSaveFoundationV3_ExpandArcAcceptsStringVolumeArc(t *testing.T) {
 	}
 }
 
+func TestSaveFoundationV3_ExpandArcNormalizesMissingChapterNumber(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := st.Progress.Init("test", 5); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := st.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "选择",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "旧标题", Goal: "旧目标", EstimatedChapters: 1},
+		},
+	}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(st, projectprofile.NewSceneBeatV3Contract())
+	bad := v3SnapshotChapter(0, "zero")
+	args, _ := json.Marshal(map[string]any{
+		"type": "expand_arc", "volume": 1, "arc": 1,
+		"content": domain.ArcExpansion{
+			Title:    "新标题",
+			Goal:     "新目标",
+			Chapters: []domain.OutlineEntry{bad},
+		},
+	})
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("Execute expand_arc with missing chapter number: %v", err)
+	}
+	volumes, err := st.Outline.LoadLayeredOutline()
+	if err != nil {
+		t.Fatalf("LoadLayeredOutline: %v", err)
+	}
+	if got := volumes[0].Arcs[0].Chapters[0].Chapter; got != 1 {
+		t.Fatalf("chapter number should be normalized, got %d", got)
+	}
+}
+
 // TestSaveFoundationV3_ExpandArcMissingTitleRejected 验证 V3 下 expand_arc 缺 title 被拒。
 func TestSaveFoundationV3_ExpandArcMissingTitleRejected(t *testing.T) {
 	dir := t.TempDir()
