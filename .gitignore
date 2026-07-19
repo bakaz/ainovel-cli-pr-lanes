@@ -44,3 +44,10 @@ tasks
 refer/
 output*
 workspace/
+.go-tmp/
+.slim/worktrees.json
+.slim/worktrees/
+.slim/cache/
+.slim/deepwork/
+.tools/
+workspace_archived/

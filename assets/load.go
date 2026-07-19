@@ -46,7 +46,8 @@ type Bundle struct {
 	References tools.References
 	Prompts    Prompts
 	Styles     map[string]string
-	Voice      string // 写作标准(文风层),已按三层覆盖组装;见 docs/voice-layer.md
+	Voice      string                    // 写作标准(文风层),已按三层覆盖组装;见 docs/voice-layer.md
+	Sources    map[string]ResourceSource // 最终资源来源，供只读诊断和可复现审计
 }
 
 // LoadOptions 声明文风层的覆盖来源。空目录 = 跳过该层(eval 传零值以获得
@@ -74,12 +75,48 @@ func DefaultLoadOptions(outputDir string) LoadOptions {
 // Load 返回指定风格对应的资源集合。文风资产(voice / anti-ai-tone / styles /
 // 题材 style-references)按 opts 做三层覆盖:内置 < 全局 < 本书。
 func Load(style string, opts LoadOptions) Bundle {
-	return Bundle{
+	b := Bundle{
 		References: loadReferences(style, opts),
 		Prompts:    loadPrompts(),
 		Styles:     loadStyles(opts),
 		Voice:      resolveAppendable(mustRead(voiceFS, "voice.md"), "voice.md", opts),
+		Sources:    make(map[string]ResourceSource),
 	}
+	b.recordEmbeddedSources(style)
+	return b
+}
+
+// LoadProduction 是生产入口：先装载内置资源及随书 style 层，再按
+// 内置 < ~/.ainovel < <cwd>/.ainovel < explicitRoot 应用白名单覆盖。
+// explicitRoot 是资源根（其下可有 prompts/、references/、styles/），仅在显式
+// 提供时要求目录存在。生产 TUI/headless 与只读诊断必须共用此入口。
+func LoadProduction(style, outputDir, explicitRoot string) (Bundle, OverlayReport, error) {
+	explicitRoot = strings.TrimSpace(explicitRoot)
+	if explicitRoot != "" {
+		fi, err := os.Stat(explicitRoot)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return Bundle{}, OverlayReport{}, fmt.Errorf("prompts directory does not exist: %s", explicitRoot)
+			}
+			return Bundle{}, OverlayReport{}, fmt.Errorf("prompts directory stat error: %s: %w", explicitRoot, err)
+		}
+		if !fi.IsDir() {
+			return Bundle{}, OverlayReport{}, fmt.Errorf("prompts directory is not a directory: %s", explicitRoot)
+		}
+	}
+
+	bundle := Load(style, DefaultLoadOptions(outputDir))
+	var roots []string
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		roots = append(roots, filepath.Join(home, ".ainovel"))
+	}
+	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+		roots = append(roots, filepath.Join(cwd, ".ainovel"))
+	}
+	if explicitRoot != "" {
+		roots = append(roots, explicitRoot)
+	}
+	return bundle, ApplyOverrides(&bundle, style, roots), nil
 }
 
 // voicePlaceholder 是 writer 协议模板中文风段的原位插入点。

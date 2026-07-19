@@ -17,6 +17,7 @@ import (
 	"github.com/voocel/ainovel-cli/internal/agents/ctxpack"
 	"github.com/voocel/ainovel-cli/internal/agents/guard"
 	"github.com/voocel/ainovel-cli/internal/bootstrap"
+	"github.com/voocel/ainovel-cli/internal/projectprofile"
 	"github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/tools"
 )
@@ -111,26 +112,34 @@ type workerToolsets struct {
 	Editor         []agentcore.Tool
 }
 
-func buildWorkerToolsets(store *store.Store, bundle assets.Bundle, style string) workerToolsets {
+func buildWorkerToolsets(store *store.Store, bundle assets.Bundle, style string, contract *projectprofile.SceneBeatContract) workerToolsets {
+	return buildWorkerToolsetsWithApproval(store, bundle, style, contract, nil)
+}
+
+func buildWorkerToolsetsWithApproval(store *store.Store, bundle assets.Bundle, style string, contract *projectprofile.SceneBeatContract, askUser *tools.AskUserTool) workerToolsets {
 	readChapter := tools.NewReadChapterTool(store)
 	architectCtx := tools.NewContextToolForRole(store, bundle.References, style, "architect")
 	writerCtx := tools.NewContextToolForRole(store, bundle.References, style, "writer")
 	editorCtx := tools.NewContextToolForRole(store, bundle.References, style, "editor")
+	saveFoundation := tools.NewSaveFoundationTool(store, contract)
+	if askUser != nil {
+		saveFoundation.SetLongApproval(askUser, tools.DefaultLongApprovalTimeout)
+	}
 	return workerToolsets{
 		ArchitectShort: []agentcore.Tool{
 			architectCtx,
-			tools.NewSaveFoundationTool(store),
+			saveFoundation,
 		},
 		ArchitectLong: []agentcore.Tool{
 			architectCtx,
-			tools.NewSaveFoundationTool(store),
+			saveFoundation,
 			tools.NewReadPlanningReferenceTool(store),
 		},
 		Writer: []agentcore.Tool{
 			writerCtx,
 			readChapter,
-			tools.NewPlanChapterTool(store),
-			tools.NewDraftChapterTool(store),
+			tools.NewPlanChapterTool(store, contract),
+			tools.NewDraftChapterTool(store, contract),
 			tools.NewEditChapterTool(store),
 			tools.NewCheckConsistencyTool(store),
 			tools.NewCommitChapterTool(store),
@@ -143,6 +152,15 @@ func buildWorkerToolsets(store *store.Store, bundle assets.Bundle, style string)
 			tools.NewSaveVolumeSummaryTool(store),
 		},
 	}
+}
+
+// appendSceneGuidance 将场景节拍指导追加到系统提示词末尾。
+// 若 guidance 为空，返回原 prompt 不变。导出供测试验证。
+func appendSceneGuidance(prompt, guidance string) string {
+	if guidance == "" {
+		return prompt
+	}
+	return prompt + "\n\n" + guidance
 }
 
 // BuildWorkers 组装三个 Worker(architect_short/long、writer、editor)为可程序化
@@ -158,9 +176,10 @@ func BuildWorkers(
 	bundle assets.Bundle,
 	recordUsage UsageRecorder,
 	onGuardBlock guard.BlockHook,
+	contract *projectprofile.SceneBeatContract,
 ) (*subagent.Tool, *tools.AskUserTool, *ctxpack.WriterRestorePack, ApplyThinking) {
 	askUser := tools.NewAskUserTool()
-	ts := buildWorkerToolsets(store, bundle, cfg.Style)
+	ts := buildWorkerToolsetsWithApproval(store, bundle, cfg.Style, contract, askUser)
 	architectShortTools := ts.ArchitectShort
 	architectLongTools := ts.ArchitectLong
 	writerTools := ts.Writer
@@ -216,7 +235,7 @@ func BuildWorkers(
 		Name:               "architect_short",
 		Description:        "短篇规划师：为单卷、单冲突、高密度故事生成紧凑设定与扁平大纲",
 		Model:              architectModel,
-		SystemPrompt:       bundle.Prompts.ArchitectShort,
+		SystemPrompt:       appendSceneGuidance(bundle.Prompts.ArchitectShort, contract.GuidanceForRole("architect_short")),
 		Tools:              architectShortTools,
 		MaxTurns:           15,
 		MaxRetries:         subagentMaxRetries,
@@ -235,7 +254,7 @@ func BuildWorkers(
 		Name:                "architect_long",
 		Description:         "长篇规划师：为连载型、可持续升级的故事生成分层设定与卷弧大纲",
 		Model:               architectModel,
-		SystemPrompt:        bundle.Prompts.ArchitectLong,
+		SystemPrompt:        appendSceneGuidance(bundle.Prompts.ArchitectLong, contract.GuidanceForRole("architect_long")),
 		Tools:               architectLongTools,
 		MaxTurns:            20,
 		MaxRetries:          subagentMaxRetries,
@@ -251,6 +270,7 @@ func BuildWorkers(
 	// 唯一组装路径:协议模板 {{VOICE}} 原位回填文风段,再追加风格预设。
 	// eval 的 voice A/B 走同一函数,保证两臂等价(docs/voice-layer.md §3.2)。
 	writerPrompt := assets.BuildWriterPrompt(bundle.Prompts.Writer, bundle.Voice, bundle.Styles[cfg.Style])
+	writerPrompt = appendSceneGuidance(writerPrompt, contract.GuidanceForRole("writer"))
 
 	restore := &ctxpack.WriterRestorePack{}
 	restore.Refresh(store)
@@ -310,7 +330,7 @@ func BuildWorkers(
 		Name:               "editor",
 		Description:        "审阅者：阅读原文，从结构和审美两个层面发现问题",
 		Model:              editorModel,
-		SystemPrompt:       bundle.Prompts.Editor,
+		SystemPrompt:       appendSceneGuidance(bundle.Prompts.Editor, contract.GuidanceForRole("editor")),
 		Tools:              editorTools,
 		MaxTurns:           20,
 		MaxRetries:         subagentMaxRetries,

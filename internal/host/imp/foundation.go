@@ -8,6 +8,7 @@ import (
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/projectprofile"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -27,8 +28,8 @@ type LLMChat interface {
 }
 
 // ReverseFoundation 用一次 LLM 调用，从已切分的章节正文反推 foundation。
-// 不调用 save_foundation，纯函数；持久化由调用方决定。
-func ReverseFoundation(ctx context.Context, llm LLMChat, systemPrompt string, chapters []Chapter) (*FoundationResult, error) {
+// 传入 contract 可对 parse 结果进行契约校验（v3 拒绝 legacy/missing fields）。
+func ReverseFoundation(ctx context.Context, llm LLMChat, systemPrompt string, chapters []Chapter, contract *projectprofile.SceneBeatContract) (*FoundationResult, error) {
 	if len(chapters) == 0 {
 		return nil, fmt.Errorf("no chapters to analyze")
 	}
@@ -50,7 +51,19 @@ func ReverseFoundation(ctx context.Context, llm LLMChat, systemPrompt string, ch
 		return nil, fmt.Errorf("llm returned nil response")
 	}
 
-	return parseFoundationOutput(resp.Message.TextContent(), len(chapters))
+	fr, err := parseFoundationOutput(resp.Message.TextContent(), len(chapters))
+	if err != nil {
+		return nil, err
+	}
+
+	// 契约校验 parse 结果：使用同一 contract 实例
+	if contract != nil {
+		if err := ValidateFoundationResult(fr, contract); err != nil {
+			return nil, fmt.Errorf("parse foundation output: contract validation: %w", err)
+		}
+	}
+
+	return fr, nil
 }
 
 // buildFoundationUserPrompt 拼装用户提示：所有章节顺序拼接，附章号锚点便于 LLM 引用。
@@ -110,13 +123,70 @@ func parseFoundationOutput(text string, expectChapters int) (*FoundationResult, 
 		return nil, err
 	}
 
-	return &FoundationResult{
+	fr := &FoundationResult{
 		Premise:    premise,
 		Characters: characters,
 		WorldRules: worldRules,
 		Volumes:    volumes,
 		Compass:    &compass,
-	}, nil
+	}
+
+	// 校验完整结果（契约感知），确保 LLM 输出满足最低要求
+	if err := ValidateFoundationResult(fr, nil); err != nil {
+		return nil, fmt.Errorf("parse foundation output validation: %w", err)
+	}
+
+	return fr, nil
+}
+
+// ValidateFoundationResult 校验 FoundationResult 是否符合契约要求。
+// 对于 v3 契约，拒绝 legacy scenes，要求所有 7 字段、非空层级。
+// Core4 契约接受 legacy 和四字段。
+// 始终要求 Compass.ending_direction 非空，否则拒绝持久化。
+// 校验失败时返回错误，确保调用方不执行任何部分写入。
+func ValidateFoundationResult(fr *FoundationResult, contract *projectprofile.SceneBeatContract) error {
+	if fr == nil {
+		return fmt.Errorf("nil foundation result")
+	}
+	if fr.Compass == nil {
+		return fmt.Errorf("compass is nil")
+	}
+	if strings.TrimSpace(fr.Compass.Long.EndingDirection) == "" {
+		return fmt.Errorf("compass ending_direction is required")
+	}
+	if len(fr.Volumes) == 0 {
+		return fmt.Errorf("volumes array is empty")
+	}
+	for vi, vol := range fr.Volumes {
+		if len(vol.Arcs) == 0 {
+			return fmt.Errorf("volume %d has no arcs", vol.Index)
+		}
+		for ai, arc := range vol.Arcs {
+			if len(arc.Chapters) == 0 {
+				return fmt.Errorf("volume %d arc %d has no chapters", vol.Index, arc.Index)
+			}
+			for ci, ch := range arc.Chapters {
+				if len(ch.Scenes) == 0 {
+					return fmt.Errorf("volume %d arc %d chapter %d has no scenes", vol.Index, arc.Index, ci)
+				}
+				if contract != nil && contract.RejectLegacy() {
+					for si, sc := range ch.Scenes {
+						if err := contract.Validate(sc); err != nil {
+							return fmt.Errorf("volume[%d].arcs[%d].chapters[%d].scenes[%d]: %w", vi, ai, ci, si, err)
+						}
+					}
+				} else if contract != nil {
+					// Core4: validate non-legacy
+					for si, sc := range ch.Scenes {
+						if err := contract.Validate(sc); err != nil {
+							return fmt.Errorf("volume[%d].arcs[%d].chapters[%d].scenes[%d]: %w", vi, ai, ci, si, err)
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // PersistFoundation 把反推结果写入 Store，顺序与 Architect 长篇 prompt 一致：
@@ -125,10 +195,17 @@ func parseFoundationOutput(text string, expectChapters int) (*FoundationResult, 
 //
 // 不直接调 SaveFoundationTool 是因为这里是确定性回放，无需走 LLM 工具调度。
 // 但保持与 SaveFoundationTool 相同的副作用：phase 推进、checkpoint 追加。
-func PersistFoundation(ctx context.Context, st *store.Store, scale domain.PlanningTier, fr *FoundationResult) error {
+// contract 可选：非 nil 时在持久化前对 scene 执行契约校验，失败时任何部分都不落盘。
+func PersistFoundation(ctx context.Context, st *store.Store, scale domain.PlanningTier, fr *FoundationResult, contract *projectprofile.SceneBeatContract) error {
 	if fr == nil {
 		return fmt.Errorf("nil foundation result")
 	}
+
+	// 前置校验：共享的 ValidateFoundationResult 在入口处执行完整校验
+	if err := ValidateFoundationResult(fr, contract); err != nil {
+		return fmt.Errorf("import foundation: validation failed (zero partial writes): %w", err)
+	}
+
 	if err := st.RunMeta.SetPlanningTier(scale); err != nil {
 		return fmt.Errorf("save planning tier: %w", err)
 	}

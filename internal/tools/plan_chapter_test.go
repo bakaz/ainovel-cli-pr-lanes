@@ -55,7 +55,7 @@ func TestPlanChapterRejectsUnexpandedLayeredChapter(t *testing.T) {
 		t.Fatalf("SetLayered: %v", err)
 	}
 
-	tool := NewPlanChapterTool(st)
+	tool := NewPlanChapterTool(st, testContract)
 	if _, err := tool.Execute(context.Background(), planArgs(3)); err == nil || !strings.Contains(err.Error(), "expand_arc") {
 		t.Fatalf("expected unexpanded chapter rejection, got %v", err)
 	}
@@ -93,7 +93,7 @@ func TestPlanChapterAllowsExpandedLayeredChapter(t *testing.T) {
 		t.Fatalf("SetLayered: %v", err)
 	}
 
-	tool := NewPlanChapterTool(st)
+	tool := NewPlanChapterTool(st, testContract)
 	if _, err := tool.Execute(context.Background(), planArgs(2)); err != nil {
 		t.Fatalf("expected expanded chapter to plan, got %v", err)
 	}

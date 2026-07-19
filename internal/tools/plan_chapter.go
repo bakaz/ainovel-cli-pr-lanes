@@ -8,16 +8,18 @@ import (
 	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/errs"
+	"github.com/voocel/ainovel-cli/internal/projectprofile"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
 // PlanChapterTool 保存章节构思，Agent 自主决定规划粒度。
 type PlanChapterTool struct {
-	store *store.Store
+	store    *store.Store
+	contract *projectprofile.SceneBeatContract
 }
 
-func NewPlanChapterTool(store *store.Store) *PlanChapterTool {
-	return &PlanChapterTool{store: store}
+func NewPlanChapterTool(store *store.Store, contract *projectprofile.SceneBeatContract) *PlanChapterTool {
+	return &PlanChapterTool{store: store, contract: contract}
 }
 
 func (t *PlanChapterTool) Name() string { return "plan_chapter" }
@@ -26,7 +28,6 @@ func (t *PlanChapterTool) Description() string {
 }
 func (t *PlanChapterTool) Label() string { return "规划章节" }
 
-// 写工具，禁止并发。
 func (t *PlanChapterTool) ReadOnly(_ json.RawMessage) bool        { return false }
 func (t *PlanChapterTool) ConcurrencySafe(_ json.RawMessage) bool { return false }
 
@@ -49,6 +50,8 @@ func (t *PlanChapterTool) Schema() map[string]any {
 	)
 }
 
+// Execute 首先验证目标章的 outline entry 场景符合契约（v3 拒绝 legacy），
+// 验证通过后才进行任何写入。
 func (t *PlanChapterTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
 	plan, err := decodeChapterPlanArgs(args)
 	if err != nil {
@@ -57,6 +60,14 @@ func (t *PlanChapterTool) Execute(_ context.Context, args json.RawMessage) (json
 	if plan.Chapter <= 0 {
 		return nil, fmt.Errorf("chapter must be > 0: %w", errs.ErrToolArgs)
 	}
+
+	// 预检：验证 outline 中该章的场景是否符合契约
+	if t.contract != nil {
+		if err := t.validateOutlineChapter(plan.Chapter); err != nil {
+			return nil, err
+		}
+	}
+
 	if t.store.Progress.IsChapterCompleted(plan.Chapter) {
 		return json.Marshal(map[string]any{
 			"chapter":   plan.Chapter,
@@ -93,7 +104,16 @@ func (t *PlanChapterTool) Execute(_ context.Context, args json.RawMessage) (json
 	})
 }
 
+// validateOutlineChapter 使用共享 ValidateOutlineEntry 校验目标章场景。
+func (t *PlanChapterTool) validateOutlineChapter(chapter int) error {
+	if err := ValidateOutlineEntry(t.store, t.contract, chapter); err != nil {
+		return fmt.Errorf("plan_chapter: %w", err)
+	}
+	return nil
+}
+
 func decodeChapterPlanArgs(args json.RawMessage) (domain.ChapterPlan, error) {
+	args = normalizeIntegerStringFields(args, "chapter")
 	var a struct {
 		Chapter          int      `json:"chapter"`
 		Title            string   `json:"title"`

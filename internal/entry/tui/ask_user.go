@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/voocel/ainovel-cli/internal/tools"
@@ -11,6 +12,7 @@ import (
 )
 
 type askUserRequest struct {
+	id        uint64
 	questions []tools.Question
 	resultCh  chan askUserResult
 }
@@ -20,18 +22,27 @@ type askUserResult struct {
 	err  error
 }
 
+type askUserCancellation struct {
+	id       uint64
+	timedOut bool
+}
+
 type askUserBridge struct {
-	requests chan askUserRequest
+	requests      chan askUserRequest
+	cancellations chan askUserCancellation
+	nextID        atomic.Uint64
 }
 
 func newAskUserBridge() *askUserBridge {
 	return &askUserBridge{
-		requests: make(chan askUserRequest),
+		requests:      make(chan askUserRequest),
+		cancellations: make(chan askUserCancellation, 16),
 	}
 }
 
 func (b *askUserBridge) handler(ctx context.Context, questions []tools.Question) (*tools.AskUserResponse, error) {
 	req := askUserRequest{
+		id:        b.nextID.Add(1),
 		questions: questions,
 		resultCh:  make(chan askUserResult, 1),
 	}
@@ -45,6 +56,11 @@ func (b *askUserBridge) handler(ctx context.Context, questions []tools.Question)
 	case result := <-req.resultCh:
 		return result.resp, result.err
 	case <-ctx.Done():
+		// 通知 Bubble Tea 关闭仍显示中的审批/提问弹窗。
+		select {
+		case b.cancellations <- askUserCancellation{id: req.id, timedOut: ctx.Err() == context.DeadlineExceeded}:
+		default:
+		}
 		return nil, ctx.Err()
 	}
 }
@@ -197,6 +213,9 @@ func renderAskUserModal(width, height int, state *askUserState) string {
 
 	var b strings.Builder
 	title := fmt.Sprintf("需要补充信息 %d/%d", state.index+1, len(state.request.questions))
+	if q.Header == "长线更新审批" {
+		title = "compass.long 更新审批"
+	}
 	b.WriteString(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(title))
 	b.WriteString("\n\n")
 	if q.Header != "" {

@@ -144,7 +144,7 @@ func TestDraftChapterWrite(t *testing.T) {
 		t.Fatalf("InitProgress: %v", err)
 	}
 
-	tool := NewDraftChapterTool(store)
+	tool := NewDraftChapterTool(store, testContract)
 	args, _ := json.Marshal(map[string]any{
 		"chapter": 1,
 		"content": "这是整章的正文内容，一次写完。",
@@ -202,7 +202,7 @@ func TestDraftChapterAppend(t *testing.T) {
 		t.Fatalf("SaveDraft: %v", err)
 	}
 
-	tool := NewDraftChapterTool(store)
+	tool := NewDraftChapterTool(store, testContract)
 	args, _ := json.Marshal(map[string]any{
 		"chapter": 2,
 		"content": "后半部分。",
@@ -262,7 +262,7 @@ func TestPlanChapterMarksInProgress(t *testing.T) {
 		t.Fatalf("InitProgress: %v", err)
 	}
 
-	tool := NewPlanChapterTool(store)
+	tool := NewPlanChapterTool(store, testContract)
 	args, _ := json.Marshal(map[string]any{
 		"chapter":  1,
 		"title":    "起头",
@@ -299,7 +299,7 @@ func TestDraftChapterRejectsCompleted(t *testing.T) {
 	_ = s.Progress.StartChapter(1)
 	_ = s.Progress.MarkChapterComplete(1, 3000, "", "")
 
-	tool := NewDraftChapterTool(s)
+	tool := NewDraftChapterTool(s, testContract)
 	args, _ := json.Marshal(map[string]any{
 		"chapter": 1,
 		"content": "试图覆盖已提交的章节",

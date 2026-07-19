@@ -173,7 +173,7 @@ func TestRunner_ResumeFromSkipsFoundation(t *testing.T) {
 	_ = st.Progress.Init("resume-test", 0)
 	// 预置 foundation
 	fr, _ := parseFoundationOutput(validEnvelope, 2)
-	if err := PersistFoundation(context.Background(), st, "short", fr); err != nil {
+	if err := PersistFoundation(context.Background(), st, "short", fr, nil); err != nil {
 		t.Fatal(err)
 	}
 

@@ -10,17 +10,19 @@ import (
 	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/errs"
+	"github.com/voocel/ainovel-cli/internal/projectprofile"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
 // DraftChapterTool 写入整章草稿，替代旧的 write_scene + polish_chapter 流水线。
 // Agent 自主决定一次写完还是分批续写。
 type DraftChapterTool struct {
-	store *store.Store
+	store    *store.Store
+	contract *projectprofile.SceneBeatContract
 }
 
-func NewDraftChapterTool(store *store.Store) *DraftChapterTool {
-	return &DraftChapterTool{store: store}
+func NewDraftChapterTool(store *store.Store, contract *projectprofile.SceneBeatContract) *DraftChapterTool {
+	return &DraftChapterTool{store: store, contract: contract}
 }
 
 func (t *DraftChapterTool) Name() string { return "draft_chapter" }
@@ -29,14 +31,10 @@ func (t *DraftChapterTool) Description() string {
 }
 func (t *DraftChapterTool) Label() string { return "写入章节" }
 
-// 写工具，禁止并发（读-改-写竞态）。
 func (t *DraftChapterTool) ReadOnly(_ json.RawMessage) bool        { return false }
 func (t *DraftChapterTool) ConcurrencySafe(_ json.RawMessage) bool { return false }
 
 func (t *DraftChapterTool) Schema() map[string]any {
-	// mode 标 required 是为了兼容 OpenAI strict tool calling——strict 模式
-	// 要求所有 properties 都在 required 列表中。原来的"省略 mode 走 write
-	// 默认"行为现在需要模型显式传 mode="write"，Execute 的 default 分支不变。
 	return schema.Object(
 		schema.Property("chapter", schema.Int("章节号")).Required(),
 		schema.Property("content", schema.String("章节正文")).Required(),
@@ -44,14 +42,12 @@ func (t *DraftChapterTool) Schema() map[string]any {
 	)
 }
 
-// StrictSchema 启用 OpenAI 的 strict tool calling，让模型必须严格遵守
-// schema：所有 required 字段必填，arguments 不能"提前 EOT"出现空对象。
-// litellm 透传 strict 字段；OpenAI / xAI 等支持的后端会强制执行，其他后端
-// 按 HTTP/JSON 惯例忽略未知字段。Anthropic/Gemini/Bedrock 走各自的转换链路
-// 自然不会看到这个字段。
 func (t *DraftChapterTool) StrictSchema() bool { return true }
 
+// Execute 首先验证目标章的 outline entry 场景符合契约，
+// 验证通过后才进行任何写入。
 func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
+	args = normalizeIntegerStringFields(args, "chapter")
 	var a struct {
 		Chapter int    `json:"chapter"`
 		Content string `json:"content"`
@@ -66,6 +62,14 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 	if a.Content == "" {
 		return nil, fmt.Errorf("content must not be empty: %w", errs.ErrToolArgs)
 	}
+
+	// 预检：使用共享 ValidateOutlineEntry 验证目标章场景
+	if t.contract != nil {
+		if err := ValidateOutlineEntry(t.store, t.contract, a.Chapter); err != nil {
+			return nil, fmt.Errorf("draft_chapter: %w", err)
+		}
+	}
+
 	if err := t.store.Progress.ValidateChapterWork(a.Chapter); err != nil {
 		return nil, err
 	}
@@ -73,7 +77,6 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 		return nil, err
 	}
 	if t.store.Progress.IsChapterCompleted(a.Chapter) {
-		// 打磨/重写路径：章节虽已完成，但仍在 pending_rewrites 中，允许覆盖草稿
 		progress, _ := t.store.Progress.Load()
 		inRewriteQueue := progress != nil && slices.Contains(progress.PendingRewrites, a.Chapter)
 		if !inRewriteQueue {

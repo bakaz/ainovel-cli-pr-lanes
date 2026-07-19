@@ -25,6 +25,7 @@ import (
 	"github.com/voocel/ainovel-cli/internal/host/sim"
 	modelreg "github.com/voocel/ainovel-cli/internal/models"
 	"github.com/voocel/ainovel-cli/internal/notify"
+	"github.com/voocel/ainovel-cli/internal/projectprofile"
 	"github.com/voocel/ainovel-cli/internal/rules"
 	storepkg "github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/tools"
@@ -45,10 +46,13 @@ type Host struct {
 	userRules       *userrules.Service
 	observer        *observer
 	usage           *UsageTracker
-	usageCancel     context.CancelFunc  // 停掉 autoSaveLoop 并触发最后一次 flush
-	budget          *BudgetSentinel     // 预算政策；未启用为 nil（方法 nil 安全）
-	gate            *ChapterAdvanceGate // 章节许可与一次性暂停的统一政策组件
-	notifier        *notify.Notifier    // 无人值守告警；未启用为 nil（Send nil 安全）
+	usageCancel     context.CancelFunc                // 停掉 autoSaveLoop 并触发最后一次 flush
+	budget          *BudgetSentinel                   // 预算政策；未启用为 nil（方法 nil 安全）
+	gate            *ChapterAdvanceGate               // 章节许可与一次性暂停的统一政策组件
+	notifier        *notify.Notifier                  // 无人值守告警；未启用为 nil（Send nil 安全）
+	profile         projectprofile.ResolvedProfile    // 当前 workspace 项目档案（构造时解析一次）
+	contract        *projectprofile.SceneBeatContract // 唯一不可变契约指针，原样传 workers/engine/import
+	diagnosticOnly  bool                              // 只读诊断 Host（migration_required）；禁止所有 Provider 调用/文件写入
 
 	events   chan Event
 	streamCh chan string
@@ -77,14 +81,34 @@ const (
 )
 
 // New 创建 Host。
+// 重要：
+//  1. FillDefaults 后立即进行纯只读 profile preflight——即使 Provider config 损坏，
+//     migration-required 的 workspace 也能得到 diagnostics-only Host。
+//  2. ValidateBase 仅在 profile 不是 migration_required 时执行。
+//  3. migration_required 时返回只读诊断 Host（零 Provider 调度、零状态写入、不初始化模型/Worker）。
 func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 	cfg.FillDefaults()
+	slog.Info("启动", "module", "boot", "provider", cfg.Provider, "model", cfg.ModelName, "output", cfg.OutputDir)
+
+	// 第一步：纯只读 profile preflight —— 无 store.Init / model / goroutine / ValidateBase。
+	// 即使 ValidateBase 因 Provider 损坏而失败，migration-required 也要得到诊断 Host。
+	profile, profileErr := resolveProjectProfileEarly(cfg.OutputDir)
+	if profileErr != nil {
+		if IsMigrationRequired(profileErr) {
+			// 注意：resolveProjectProfileEarly 在 migration_required 时同时返回 profile 和 error。
+			// profile 此时已正确设置。
+			return newDiagnosticHost(cfg, bundle, cfg.OutputDir, profile), nil
+		}
+		return nil, fmt.Errorf("resolve project profile: %w", profileErr)
+	}
+	slog.Info("项目档案已解析", "module", "boot", "contract", profile.Contract, "status", profile.Status)
+
+	// 第二步：验证基础配置（只对非 migration-required 的普通项目执行）。
 	if err := cfg.ValidateBase(); err != nil {
 		return nil, err
 	}
-	slog.Info("启动", "module", "boot", "provider", cfg.Provider, "model", cfg.ModelName, "output", cfg.OutputDir)
 
-	// 起后台 goroutine 从 OpenRouter 刷新模型元数据（窗口/价格），磁盘缓存 24h。
+	// 第二步：正常初始化（此时 profile 保证不是 migration_required）
 	modelreg.StartPricingRefresh(modelreg.DefaultRegistry(), bootstrap.DefaultConfigDir())
 
 	store := storepkg.NewStore(cfg.OutputDir)
@@ -128,12 +152,13 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 
 	// onGuardBlock 前置声明:h 构造后才能挂事件浮出闭包。
 	var onGuardBlock func(agent, reason string, consecutive int32)
+	contract := projectprofile.ContractFor(profile.Contract)
 	workers, askUser, restore, applyThinking := agents.BuildWorkers(cfg, store, models, bundle, usage.Record,
 		func(agent, reason string, consecutive int32) {
 			if onGuardBlock != nil {
 				onGuardBlock(agent, reason, consecutive)
 			}
-		})
+		}, contract)
 	store.Signals.ClearStaleSignals()
 
 	h := &Host{
@@ -141,12 +166,14 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 		bundle:          bundle,
 		store:           store,
 		models:          models,
+		contract:        contract,
 		thinkingApplier: applyThinking,
 		askUser:         askUser,
 		writerRestore:   restore,
 		userRules:       userrules.NewService(store, models.Default, rules.DefaultOptions()),
 		usage:           usage,
 		usageCancel:     usageCancel,
+		profile:         profile,
 		events:          make(chan Event, 100),
 		streamCh:        make(chan string, 256),
 		done:            make(chan struct{}, 4),
@@ -210,10 +237,12 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 	h.engine = &engine{
 		store:           store,
 		workers:         workers,
+		contract:        contract,
 		arbiterModel:    newUsageTrackedModel(models.Default, usage.Record),
 		failurePrompt:   bundle.Prompts.ArbiterFailure,
 		planStartPrompt: bundle.Prompts.ArbiterPlanStart,
 		style:           cfg.Style,
+		migrationCheck:  h.checkMigrationGate, // 引擎循环边界迁移门
 		// 同步重询:阻塞引擎循环一次裁定(数秒),换取"干预先于后续创作生效"。
 		reconsult: h.handleIntervention,
 		observer:  h.observer,
@@ -241,6 +270,9 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 // 归一化失败只降级不报错（增强路径）；只有快照无法落盘才返回 error 中止开书——
 // 后续运行将没有稳定事实源（见设计 §失败与降级）。
 func (h *Host) PrepareUserRules(rawPrompt string) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
 	svc := userrules.NewService(h.store, h.models.Default, rules.DefaultOptions())
 	snap, err := svc.Build(context.Background(), rawPrompt)
 	if err != nil {
@@ -286,6 +318,9 @@ func logUserRulesSnapshot(snap *rules.Snapshot) {
 // 输入事实(StartPrompt)在裁定之前落盘:裁定失败时它是引擎补裁的依据,
 // 启动失败可从任何恢复入口(Resume/继续)自愈,不是死局。
 func (h *Host) StartPrepared(rawRequirement string) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
 	h.mu.Lock()
 	if h.lifecycle == lifecycleRunning {
 		h.mu.Unlock()
@@ -315,7 +350,6 @@ func (h *Host) StartPrepared(rawRequirement string) error {
 	if err := h.store.RunMeta.SetStartPrompt(rawRequirement); err != nil {
 		return fmt.Errorf("记录创作需求: %w", err)
 	}
-
 	// 启动裁定:失败显式报错中止(启动期用户在场,报错优于猜测)。
 	start := time.Now()
 	decision, derr := runObservedDecision(h.observer, "启动裁定", func() (arbiter.PlanStartDecision, error) {
@@ -358,6 +392,10 @@ func (h *Host) StartPrepared(rawRequirement string) error {
 // runEnded 会把 lifecycle 落到终态;若顺序颠倒,runEnded 先跑、这里再写 running,
 // UI 将永远显示"运行中"而引擎实际已停。
 func (h *Host) startEngine(initial *flow.Instruction) bool {
+	if err := h.checkMigrationGate(); err != nil {
+		slog.Warn("startEngine 被迁移门拦截", "module", "host", "err", err)
+		return false
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	// lifecycle 可能已经是 paused，但旧 Engine goroutine 仍在执行退出 defer。
@@ -378,6 +416,9 @@ func (h *Host) startEngine(initial *flow.Instruction) bool {
 
 // Resume 恢复模式：从 checkpoint + progress 生成 resume prompt 并启动。
 func (h *Host) Resume() (string, error) {
+	if err := h.checkMigrationGate(); err != nil {
+		return "", err
+	}
 	h.mu.Lock()
 	if h.lifecycle == lifecycleRunning {
 		h.mu.Unlock()
@@ -413,8 +454,24 @@ func (h *Host) Resume() (string, error) {
 	// 否则引擎可能抢在裁定前继续写出与干预相悖的章节。同步执行(阻塞数秒可接受,
 	// UI 已显示"恢复创作");doIntervention 成功后自行清除 PendingSteer 并按
 	// restart=true 拉起引擎。无待处理干预 → 直接续跑。
-	if meta, _ := h.store.RunMeta.Load(); meta != nil && meta.PendingSteer != "" {
-		h.doIntervention(meta.PendingSteer, true)
+	meta, _ := h.store.RunMeta.Load()
+	pendingSteer := ""
+	if meta != nil {
+		pendingSteer = meta.PendingSteer
+	}
+	// 纯“继续”只表达恢复意图，不包含需要 Arbiter 解释的事实。若它在退出/取消
+	// 竞态中残留，启动时再次送给 Arbiter 会让 TUI 卡在欢迎页等待模型重试，甚至
+	// 每次关闭后形成永久恢复循环。原子清掉它并直接恢复；任何有实际内容的干预
+	// 仍严格保留“先裁定、后续跑”的原语义。
+	if isPlainResumeSteer(pendingSteer) {
+		if err := h.store.ClearHandledSteer(); err != nil {
+			return label, fmt.Errorf("清除残留继续指令: %w", err)
+		}
+		pendingSteer = ""
+		slog.Info("已清除残留的纯继续指令", "module", "host")
+	}
+	if pendingSteer != "" {
+		h.doIntervention(pendingSteer, true)
 		// 裁定失败(已回显)时也要恢复续跑——书不能因一条无法理解的旧干预卡死。
 		if !h.engine.isRunning() {
 			if err := h.budget.Refuse(); err == nil {
@@ -432,6 +489,12 @@ func (h *Host) Resume() (string, error) {
 	// lifecycle 由 startEngine / runEnded 管理,此处不再覆写——
 	// 引擎立即结束(完本等)时覆写会把终态改回 running。
 	return label, nil
+}
+
+// isPlainResumeSteer 只匹配不携带任何创作约束的控制词。保持白名单极窄，避免
+// 把“继续，但……”一类真实干预误当成无信息指令而丢弃。
+func isPlainResumeSteer(text string) bool {
+	return strings.TrimSpace(text) == "继续"
 }
 
 // handleIntervention 用户干预的统一裁定路径:Collect → Decide → 执行。
@@ -568,6 +631,9 @@ func (h *Host) arbiterModel() agentcore.ChatModel {
 
 // Continue 停机后用户在输入框输入时调用:干预裁定 + 确保引擎重新运行。
 func (h *Host) Continue(text string) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return fmt.Errorf("text is required")
@@ -590,6 +656,9 @@ func (h *Host) Continue(text string) error {
 // SetAdvanceMode 确定性切换章节推进模式。它只写入用户运行意图，
 // 不调用 Arbiter，也不隐式启动已经暂停的 Engine。
 func (h *Host) SetAdvanceMode(mode domain.ChapterAdvanceMode) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
 	h.interMu.Lock()
 	defer h.interMu.Unlock()
 	if err := h.store.RunMeta.SetAdvanceMode(mode); err != nil {
@@ -612,6 +681,9 @@ func (h *Host) SetAdvanceMode(mode domain.ChapterAdvanceMode) error {
 
 // AdvanceOneChapter 在逐章验收模式下授权一个精确章节并启动 Engine。
 func (h *Host) AdvanceOneChapter() error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
 	h.interMu.Lock()
 	defer h.interMu.Unlock()
 
@@ -670,6 +742,11 @@ func (h *Host) AdvanceOneChapter() error {
 
 // Steer 提交用户干预(运行中随时可用;停机时裁定后视动作决定是否拉起引擎)。
 func (h *Host) Steer(text string) {
+	if err := h.checkMigrationGate(); err != nil {
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM",
+			Summary: "迁移未完成，无法执行干预: " + err.Error(), Level: "warn"})
+		return
+	}
 	h.emitEvent(Event{Time: time.Now(), Category: "USER", Summary: "[用户干预] " + text, Level: "info"})
 	go h.handleIntervention(text)
 }
@@ -705,11 +782,24 @@ func (h *Host) abortWithEvent(summary, level string) bool {
 // 再补一次同步 SaveNow 收尾。终止后 in-flight LLM 调用的最末几百 token
 // 丢失由下次启动时 session jsonl replay 自动补回。
 func (h *Host) Close() {
-	h.observer.setAborting(true)
+	if h.diagnosticOnly {
+		// 只读诊断 Host：绝不写入任何文件、不持久化 usage、不调用 engine/observer。
+		h.closeOnce.Do(func() {
+			close(h.done)
+			close(h.events)
+			close(h.streamCh)
+		})
+		return
+	}
+	if h.observer != nil {
+		h.observer.setAborting(true)
+	}
 	if h.runCancel != nil {
 		h.runCancel() // 中断在途的宿主侧裁定调用
 	}
-	h.engine.abort()
+	if h.engine != nil {
+		h.engine.abort()
+	}
 	if h.usageCancel != nil {
 		h.usageCancel()
 		h.usageCancel = nil
@@ -792,11 +882,21 @@ func (h *Host) runEndBody(novelName, summary string) string {
 // 不再用独立 clearCh —— 双通道无序导致 ✻ header 时常落到上一个 round 末尾。
 const StreamClearSentinel = "\x00\x00CLEAR\x00\x00"
 
-func (h *Host) Events() <-chan Event        { return h.events }
-func (h *Host) Stream() <-chan string       { return h.streamCh }
-func (h *Host) Done() <-chan struct{}       { return h.done }
-func (h *Host) Dir() string                 { return h.store.Dir() }
-func (h *Host) AskUser() *tools.AskUserTool { return h.askUser }
+func (h *Host) Events() <-chan Event  { return h.events }
+func (h *Host) Stream() <-chan string { return h.streamCh }
+func (h *Host) Done() <-chan struct{} { return h.done }
+func (h *Host) Dir() string           { return h.store.Dir() }
+func (h *Host) AskUser() *tools.AskUserTool {
+	// 诊断 Host 也返回非 nil AskUserTool（无 handler = 安全降级），
+	// 确保 TUI/CLI 入口的 SetHandler 调用不会 panic。
+	return h.askUser
+}
+
+// IsDiagnosticOnly 返回 Host 是否为只读诊断模式（migration_required）。
+// TUI/CLI 入口据此跳过文件日志创建等有副作用的初始化步骤。
+func (h *Host) IsDiagnosticOnly() bool {
+	return h.diagnosticOnly
+}
 
 // ── 事件发射 ──
 
@@ -864,7 +964,13 @@ func (h *Host) emitClear() {
 func (h *Host) Snapshot() UISnapshot {
 	h.mu.Lock()
 	state := h.lifecycle
-	provider, model, _ := h.models.CurrentSelection("default")
+	provider, model := "", ""
+	if h.models != nil {
+		provider, model, _ = h.models.CurrentSelection("default")
+	} else {
+		provider = h.cfg.Provider
+		model = h.cfg.ModelName
+	}
 	h.mu.Unlock()
 
 	// 动态解析当前模型的上下文窗口，/model 切换后下一次 Snapshot 自动反映
@@ -906,20 +1012,25 @@ func (h *Host) Snapshot() UISnapshot {
 	}
 
 	snap := UISnapshot{
-		Provider:               provider,
-		ModelName:              model,
-		ModelContextWindow:     modelWindow,
-		ThinkingLevel:          h.cfg.ResolveReasoningEffort("default"),
-		Style:                  h.cfg.Style,
-		RuntimeState:           string(state),
-		IsRunning:              state == lifecycleRunning,
-		TotalInputTokens:       tokIn,
-		TotalOutputTokens:      tokOut,
-		TotalCacheReadTokens:   cacheRead,
-		TotalCacheWriteTokens:  cacheWrite,
-		TotalCostUSD:           cost,
-		TotalSavedUSD:          saved,
-		BudgetLimitUSD:         h.budget.Limit(),
+		Provider:              provider,
+		ModelName:             model,
+		ModelContextWindow:    modelWindow,
+		ThinkingLevel:         h.cfg.ResolveReasoningEffort("default"),
+		Style:                 h.cfg.Style,
+		RuntimeState:          string(state),
+		IsRunning:             state == lifecycleRunning,
+		TotalInputTokens:      tokIn,
+		TotalOutputTokens:     tokOut,
+		TotalCacheReadTokens:  cacheRead,
+		TotalCacheWriteTokens: cacheWrite,
+		TotalCostUSD:          cost,
+		TotalSavedUSD:         saved,
+		BudgetLimitUSD: func() float64 {
+			if h.budget != nil {
+				return h.budget.Limit()
+			}
+			return 0
+		}(),
 		OverallCacheCapable:    overallCapable,
 		OverallRecentCacheRead: recentRead,
 		OverallRecentInput:     recentInput,
@@ -962,7 +1073,9 @@ func (h *Host) Snapshot() UISnapshot {
 		}
 	}
 
-	snap.Agents = h.observer.agentSnapshots()
+	if h.observer != nil {
+		snap.Agents = h.observer.agentSnapshots()
+	}
 	h.fillContextStatus(&snap)
 	snap.StatusLabel = deriveStatusLabel(snap)
 
@@ -1092,11 +1205,19 @@ func (h *Host) ConfiguredModels(provider string) []string {
 	return h.cfg.CandidateModels(provider)
 }
 
-func (h *Host) CurrentModelSelection(role string) (string, string, bool) {
-	return h.models.CurrentSelection(role)
+func (h *Host) CurrentModelSelection(role string) (provider, model string, ok bool) {
+	provider = h.cfg.Provider
+	model = h.cfg.ModelName
+	if h.models != nil {
+		provider, model, ok = h.models.CurrentSelection(role)
+	}
+	return
 }
 
 func (h *Host) SwitchModel(role, provider, model string) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if provider == "" || model == "" {
@@ -1156,6 +1277,9 @@ func (h *Host) CurrentThinking(role string) string {
 }
 
 func (h *Host) AvailableThinking(role string) []agentcore.ThinkingLevel {
+	if h.models == nil {
+		return nil
+	}
 	h.mu.Lock()
 	model := h.models.ForRole(strings.ToLower(strings.TrimSpace(role)))
 	h.mu.Unlock()
@@ -1215,6 +1339,9 @@ func (h *Host) applyThinkingLocked(role string) {
 // SetRoleThinking 设置某角色（或 default）的推理强度：校验→持久化→联动 live agent→事件。
 // 镜像 SwitchModel 的结构；与模型选择正交，可单独调整。level 为空 = 不覆盖（继承）。
 func (h *Host) SetRoleThinking(role, level string) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -1284,12 +1411,18 @@ func (h *Host) ReplayQueue(afterSeq int64) ([]domain.RuntimeQueueItem, error) {
 
 // CoCreateStream 冷启动共创：从零澄清需求，产出整本书的创作指令。
 func (h *Host) CoCreateStream(ctx context.Context, history []CoCreateMessage, onProgress func(kind, text string)) (CoCreateReply, error) {
+	if err := h.checkMigrationGate(); err != nil {
+		return CoCreateReply{}, err
+	}
 	return coCreateStream(ctx, h.models, h.store.Sessions, coCreateSystemPrompt, history, onProgress)
 }
 
 // StageCoCreateStream 阶段共创：在已写内容的基础上规划后续方向。
 // 系统提示 = 阶段 prompt + 当前故事状态摘要，让助手知道"已经写了什么"。
 func (h *Host) StageCoCreateStream(ctx context.Context, history []CoCreateMessage, onProgress func(kind, text string)) (CoCreateReply, error) {
+	if err := h.checkMigrationGate(); err != nil {
+		return CoCreateReply{}, err
+	}
 	return coCreateStream(ctx, h.models, h.store.Sessions, stageSystemPrompt(h.store), history, onProgress)
 }
 
@@ -1305,6 +1438,11 @@ const stagePlanPrefix = "[阶段规划] 我暂停创作，和共创助手一起�
 // 运行中暂停后 lifecycle=paused，现有 ==running 互斥失效，靠该标记补缺；
 // 已停止（idle/paused）也允许进入，规划完经 Continue 续跑。
 func (h *Host) PauseForCoCreate() bool {
+	if err := h.checkMigrationGate(); err != nil {
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM",
+			Summary: "迁移未完成，无法进入阶段共创: " + err.Error(), Level: "warn"})
+		return false
+	}
 	h.mu.Lock()
 	if h.cocreating || h.lifecycle == lifecycleCompleted {
 		h.mu.Unlock()
@@ -1329,6 +1467,9 @@ func (h *Host) PauseForCoCreate() bool {
 // 注：draft 为空时提前返回、不清标记是有意的（共创尚未结束）；TUI 侧 canStart() 守卫
 // 与此处用同一"非空"判据，保证该路径不可达，cocreating 不会因此泄漏。
 func (h *Host) ResumeFromCoCreate(draft string) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
 	draft = strings.TrimSpace(draft)
 	if draft == "" {
 		return fmt.Errorf("draft is required")
@@ -1383,6 +1524,9 @@ func truncate(s string, maxRunes int) string {
 // 与 Engine 运行互斥；导入完成后调用方可立即 Resume() 续写。
 // 返回的事件通道由 imp.Run 关闭，调用方负责消费（满则丢弃以防阻塞分析协程）。
 func (h *Host) ImportFrom(ctx context.Context, opts imp.Options) (<-chan imp.Event, error) {
+	if err := h.checkMigrationGate(); err != nil {
+		return nil, err
+	}
 	if err := h.guardExclusive("导入"); err != nil {
 		return nil, err
 	}
@@ -1395,12 +1539,16 @@ func (h *Host) ImportFrom(ctx context.Context, opts imp.Options) (<-chan imp.Eve
 			Foundation: h.bundle.Prompts.ImportFoundation,
 			Analyzer:   h.bundle.Prompts.ImportAnalyzer,
 		},
+		Contract: h.contract,
 	}
 	return imp.Run(ctx, deps, opts)
 }
 
 // Simulate 读取 simulate 目录并生成或增量更新仿写画像。
 func (h *Host) Simulate(ctx context.Context) (<-chan sim.Event, error) {
+	if err := h.checkMigrationGate(); err != nil {
+		return nil, err
+	}
 	if err := h.guardExclusive("生成仿写画像"); err != nil {
 		return nil, err
 	}
@@ -1422,6 +1570,9 @@ func (h *Host) Simulate(ctx context.Context) (<-chan sim.Event, error) {
 
 // ImportSimulationProfile 导入此前生成的仿写画像。
 func (h *Host) ImportSimulationProfile(ctx context.Context, path string) (<-chan sim.Event, error) {
+	if err := h.checkMigrationGate(); err != nil {
+		return nil, err
+	}
 	if err := h.guardExclusive("导入仿写画像"); err != nil {
 		return nil, err
 	}

@@ -31,7 +31,7 @@ func TestDraftChapterRejectsUnfinishedPendingRewrite(t *testing.T) {
 		t.Fatalf("Save corrupt progress: %v", err)
 	}
 
-	tool := NewDraftChapterTool(s)
+	tool := NewDraftChapterTool(s, testContract)
 	args, err := json.Marshal(map[string]any{
 		"chapter": 65,
 		"content": "错误写入未来章节。",
@@ -83,7 +83,7 @@ func TestDraftChapterRejectsUnexpandedLayeredChapter(t *testing.T) {
 		t.Fatalf("SetLayered: %v", err)
 	}
 
-	tool := NewDraftChapterTool(s)
+	tool := NewDraftChapterTool(s, testContract)
 	args, err := json.Marshal(map[string]any{
 		"chapter": 3,
 		"content": "越界正文。",

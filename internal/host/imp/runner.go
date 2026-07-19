@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/projectprofile"
 	"github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/tools"
 )
@@ -17,6 +18,7 @@ type Deps struct {
 	CommitTool *tools.CommitChapterTool
 	LLM        LLMChat // 同一模型即可，foundation/analyzer 都是结构化反推
 	Prompts    Prompts
+	Contract   *projectprofile.SceneBeatContract // v3 契约（可能为 nil，Core4 兼容）
 }
 
 // Prompts 是 imp 流程使用的两段提示词。
@@ -73,13 +75,18 @@ func Run(ctx context.Context, deps Deps, opts Options) (<-chan Event, error) {
 		// ── 2. Foundation 反推（已完整时跳过）──
 		if needsFoundation(deps.Store, opts) {
 			emit(StageFoundation, 0, total, "反推 Foundation 中（一次 LLM 调用）...", nil)
-			fr, err := ReverseFoundation(ctx, deps.LLM, deps.Prompts.Foundation, chapters)
+			// v3 契约：在 foundation prompt 后追加字段指导
+			foundationPrompt := deps.Prompts.Foundation
+			if deps.Contract != nil && deps.Contract.ImportGuidance() != "" {
+				foundationPrompt += "\n\n" + deps.Contract.ImportGuidance()
+			}
+			fr, err := ReverseFoundation(ctx, deps.LLM, foundationPrompt, chapters, deps.Contract)
 			if err != nil {
 				emit(StageError, 0, total, "Foundation 反推失败", err)
 				return
 			}
 			scale := pickScale(total)
-			if err := PersistFoundation(ctx, deps.Store, scale, fr); err != nil {
+			if err := PersistFoundation(ctx, deps.Store, scale, fr, deps.Contract); err != nil {
 				emit(StageError, 0, total, "Foundation 落盘失败", err)
 				return
 			}

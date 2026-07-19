@@ -443,10 +443,31 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 	case askUserMsg:
 		m.askState = newAskUserState(askUserRequest(msg))
 		m.textarea.Blur()
+		summary := "等待用户补充关键信息"
+		if len(m.askState.request.questions) > 0 && m.askState.request.questions[0].Header == "长线更新审批" {
+			summary = "等待用户批准 compass.long 更新（30 分钟内未批准将自动拒绝）"
+		}
 		m.applyEvent(host.Event{
-			Time: time.Now(), Category: "SYSTEM", Summary: "等待用户补充关键信息", Level: "info",
+			Time: time.Now(), Category: "SYSTEM", Summary: summary, Level: "info",
 		})
 		m.refreshEventViewport()
+		return m, listenAskUser(m.askBridge), true
+	case askUserCancelMsg:
+		cancellation := askUserCancellation(msg)
+		if m.askState != nil && m.askState.request.id == cancellation.id {
+			m.askState = nil
+			summary := "用户交互已取消"
+			level := "info"
+			if cancellation.timedOut {
+				summary = "用户审批已超时，已拒绝 compass.long 更新并继续"
+				level = "warn"
+			}
+			m.applyEvent(host.Event{
+				Time: time.Now(), Category: "SYSTEM", Summary: summary, Level: level,
+			})
+			m.refreshEventViewport()
+			return m, tea.Batch(listenAskUser(m.askBridge), m.textarea.Focus()), true
+		}
 		return m, listenAskUser(m.askBridge), true
 	case snapshotMsg:
 		m.snapshot = host.UISnapshot(msg)

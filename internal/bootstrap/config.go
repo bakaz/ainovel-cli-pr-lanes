@@ -11,6 +11,7 @@ import (
 	"github.com/voocel/ainovel-cli/internal/errs"
 	"github.com/voocel/ainovel-cli/internal/models"
 	"github.com/voocel/ainovel-cli/internal/notify"
+
 	"github.com/voocel/ainovel-cli/internal/utils"
 )
 
@@ -360,6 +361,7 @@ func (c *Config) FillDefaults() {
 	if c.Budget.Enabled() && c.Budget.WarnRatio == 0 {
 		c.Budget.WarnRatio = 0.8
 	}
+	// PromptsCfg 默认值由 resolved accessor 处理，不在此强制填充。
 }
 
 // ContextWindowSource 标记窗口取值的来源，供日志/诊断使用。

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -28,6 +29,11 @@ func main() {
 	// 子命令在常规 flag 解析之前拦截：eval 是离线评测 harness，参数体系独立。
 	if len(os.Args) > 1 && os.Args[1] == "eval" {
 		os.Exit(eval.Command(os.Args[2:]))
+	}
+	// inspect-customizations 是只读的生产装配诊断：它与 TUI/headless 共用
+	// LoadProduction，但不构造模型、不发 Provider 请求、不写小说状态。
+	if len(os.Args) > 1 && os.Args[1] == "inspect-customizations" {
+		os.Exit(inspectCustomizations(os.Args[2:]))
 	}
 
 	opts, args, err := parseCLIOptions(os.Args[1:])
@@ -106,7 +112,17 @@ func runWithConfig(cfg bootstrap.Config, opts cliOptions, args []string) {
 	// FillDefaults 必须先于资产加载:OutputDir 是运行时字段,默认值在此归一——
 	// 否则默认配置下 <书目录>/style/ 的本书级文风覆盖永远不会被加载。
 	cfg.FillDefaults()
-	bundle := assets.Load(cfg.Style, assets.DefaultLoadOptions(cfg.OutputDir))
+	bundle, report, err := assets.LoadProduction(cfg.Style, cfg.OutputDir, opts.PromptsDir)
+	if err != nil {
+		die("error: %v", err)
+	}
+	for _, warning := range report.Warnings {
+		fmt.Fprintln(os.Stderr, "warning:", warning)
+		slog.Warn("asset overlay warning", "warning", warning)
+	}
+	for _, applied := range report.Applied {
+		slog.Debug("asset overlay applied", "key", applied.Key, "kind", applied.Kind, "path", applied.Path, "sha256", applied.SHA256)
+	}
 	if opts.Headless {
 		prompt, err := loadPrompt(opts)
 		if err != nil {
@@ -130,6 +146,7 @@ type cliOptions struct {
 	Headless      bool
 	Prompt        string
 	PromptFile    string
+	PromptsDir    string
 	Version       bool
 	Update        bool
 	UpdateVersion string
@@ -183,6 +200,12 @@ func parseCLIOptions(argv []string) (cliOptions, []string, error) {
 			}
 			opts.PromptFile = argv[i+1]
 			i++
+		case "--prompts-dir":
+			if i+1 >= len(argv) {
+				return opts, nil, fmt.Errorf("--prompts-dir 缺少值")
+			}
+			opts.PromptsDir = argv[i+1]
+			i++
 		default:
 			args = append(args, argv[i])
 		}
@@ -190,10 +213,10 @@ func parseCLIOptions(argv []string) (cliOptions, []string, error) {
 	if opts.Prompt != "" && opts.PromptFile != "" {
 		return opts, nil, fmt.Errorf("--prompt 和 --prompt-file 不能同时使用")
 	}
-	if opts.Version && (opts.Update || opts.ConfigPath != "" || opts.Headless || opts.Prompt != "" || opts.PromptFile != "" || len(args) > 0) {
+	if opts.Version && (opts.Update || opts.ConfigPath != "" || opts.Headless || opts.Prompt != "" || opts.PromptFile != "" || opts.PromptsDir != "" || len(args) > 0) {
 		return opts, nil, fmt.Errorf("version 不能与其他启动参数混用")
 	}
-	if opts.Update && (opts.ConfigPath != "" || opts.Headless || opts.Prompt != "" || opts.PromptFile != "" || len(args) > 0) {
+	if opts.Update && (opts.ConfigPath != "" || opts.Headless || opts.Prompt != "" || opts.PromptFile != "" || opts.PromptsDir != "" || len(args) > 0) {
 		return opts, nil, fmt.Errorf("update 不能与其他启动参数混用")
 	}
 	return opts, args, nil

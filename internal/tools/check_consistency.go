@@ -40,6 +40,7 @@ func (t *CheckConsistencyTool) Schema() map[string]any {
 }
 
 func (t *CheckConsistencyTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
+	args = normalizeIntegerStringFields(args, "chapter")
 	var a struct {
 		Chapter int `json:"chapter"`
 	}

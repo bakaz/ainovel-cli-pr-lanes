@@ -108,7 +108,7 @@ func TestPersistChapter_FullPipeline(t *testing.T) {
 
 	// 准备 foundation：先用 ReverseFoundation+PersistFoundation 模拟 Phase 2 已完成
 	fr := mustParse(t, validEnvelope, 2)
-	if err := PersistFoundation(context.Background(), st, domain.PlanningTierShort, fr); err != nil {
+	if err := PersistFoundation(context.Background(), st, domain.PlanningTierShort, fr, nil); err != nil {
 		t.Fatal(err)
 	}
 

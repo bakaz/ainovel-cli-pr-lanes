@@ -93,6 +93,7 @@ func (t *CommitChapterTool) Schema() map[string]any {
 }
 
 func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
+	args = normalizeIntegerStringFields(args, "chapter")
 	var a struct {
 		Chapter             int                        `json:"chapter"`
 		Summary             string                     `json:"summary"`

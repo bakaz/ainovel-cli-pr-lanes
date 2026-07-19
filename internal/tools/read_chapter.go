@@ -41,6 +41,7 @@ func (t *ReadChapterTool) Schema() map[string]any {
 }
 
 func (t *ReadChapterTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
+	args = normalizeIntegerStringFields(args, "chapter", "from", "to", "max_runes")
 	var a struct {
 		Chapter   int    `json:"chapter"`
 		From      int    `json:"from"`

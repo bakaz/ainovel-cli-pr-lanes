@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -22,6 +24,8 @@ import (
 	"github.com/voocel/agentcore/subagent"
 	"github.com/voocel/ainovel-cli/internal/arbiter"
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/flow"
+	"github.com/voocel/ainovel-cli/internal/projectprofile"
 	storepkg "github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/tools"
 )
@@ -206,7 +210,7 @@ func TestEngine_ReviewPermitWritesExactlyOneNewChapter(t *testing.T) {
 	writer := subagent.Config{
 		Name: "writer", Description: "test writer", Model: scriptedWriterModel(), SystemPrompt: "test",
 		Tools: []agentcore.Tool{
-			tools.NewPlanChapterTool(st), tools.NewDraftChapterTool(st),
+			tools.NewPlanChapterTool(st, nil), tools.NewDraftChapterTool(st, nil),
 			tools.NewCheckConsistencyTool(st), tools.NewCommitChapterTool(st),
 		},
 		MaxTurns: 10, StopAfterTools: []string{"commit_chapter"},
@@ -293,8 +297,8 @@ func TestEngine_WritesBookToCompletion(t *testing.T) {
 		Model:        scriptedWriterModel(),
 		SystemPrompt: "test",
 		Tools: []agentcore.Tool{
-			tools.NewPlanChapterTool(st),
-			tools.NewDraftChapterTool(st),
+			tools.NewPlanChapterTool(st, nil),
+			tools.NewDraftChapterTool(st, nil),
 			tools.NewCheckConsistencyTool(st),
 			tools.NewCommitChapterTool(st),
 		},
@@ -715,8 +719,8 @@ func TestEngine_PauseWithEditorDispatchWaitsForRewriteQueue(t *testing.T) {
 		Name: "writer", Description: "test writer", Model: scriptedWriterModel(),
 		SystemPrompt: "test",
 		Tools: []agentcore.Tool{
-			tools.NewPlanChapterTool(st),
-			tools.NewDraftChapterTool(st),
+			tools.NewPlanChapterTool(st, nil),
+			tools.NewDraftChapterTool(st, nil),
 			tools.NewCheckConsistencyTool(st),
 			tools.NewCommitChapterTool(st),
 		},
@@ -783,8 +787,8 @@ func TestEngine_BoundaryHoldDoesNotDispatchAnotherWorker(t *testing.T) {
 		Name: "writer", Description: "test writer", Model: scriptedWriterModel(),
 		SystemPrompt: "test",
 		Tools: []agentcore.Tool{
-			tools.NewPlanChapterTool(st),
-			tools.NewDraftChapterTool(st),
+			tools.NewPlanChapterTool(st, nil),
+			tools.NewDraftChapterTool(st, nil),
 			tools.NewCheckConsistencyTool(st),
 			tools.NewCommitChapterTool(st),
 		},
@@ -864,5 +868,358 @@ func TestEngine_ExitRaceRestoresPendingDispatch(t *testing.T) {
 	}
 	if meta.AdvanceHold == nil {
 		t.Fatal("hold 事实动作应在退出清理中补执行")
+	}
+}
+
+// ── Architect / Writer precheck tests (Phase 2 acceptance blocker 2) ──
+
+// newMinimalEngineForPrecheck 创建一个带真实 store 和 V3 contract 的最小 engine，
+// 专用于 precheck 测试。observer 全 mock，验证零 provider/worker 调用。
+func newMinimalEngineForPrecheck(t *testing.T, st *storepkg.Store) *engine {
+	t.Helper()
+	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+		t.Fatalf("run meta init: %v", err)
+	}
+	contract := projectprofile.NewSceneBeatV3Contract()
+	var events []Event
+	e := &engine{
+		store:     st,
+		contract:  contract,
+		observer:  newObserver(st, func(ev Event) { events = append(events, ev) }, func(string) {}, func() {}),
+		emitEvent: func(ev Event) { events = append(events, ev) },
+		notify:    func(string, string, string, string) {},
+		onPause:   func(string) {},
+		onDone:    func() {},
+		refresh:   func() {},
+	}
+	e.gate = NewChapterAdvanceGate(st, func(string) { e.abort() }, func(string, string) {})
+	return e
+}
+
+// TestEnginePrecheck_Architect_AbsentTargetAllowed 验证 Architect preflight 在目标章
+// 不在 outline 中时允许通过（零 observer/worker/provider 调用）。
+// 构造方式：前 3 章已写完，NextChapter=4，但 outline 只有 1-3 → 4 不存在。
+func TestEnginePrecheck_Architect_AbsentTargetAllowed(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("test", 4); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	// 只展开 1-3 章，第 4 章不在 outline 中（骨架弧）
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "一", CoreEvent: "a", Scenes: []domain.SceneBeat{
+			{Goal: "g", Action: "a", Conflict: "c", Outcome: "o", BodyReaction: "b", EmotionReaction: "e", EroticCharge: "ec"},
+		}},
+		{Chapter: 2, Title: "二", CoreEvent: "b", Scenes: []domain.SceneBeat{
+			{Goal: "g", Action: "a", Conflict: "c", Outcome: "o", BodyReaction: "b", EmotionReaction: "e", EroticCharge: "ec"},
+		}},
+		{Chapter: 3, Title: "三", CoreEvent: "c", Scenes: []domain.SceneBeat{
+			{Goal: "g", Action: "a", Conflict: "c", Outcome: "o", BodyReaction: "b", EmotionReaction: "e", EroticCharge: "ec"},
+		}},
+	}); err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+	// 标记 1-3 已完成 → NextChapter=4
+	for ch := 1; ch <= 3; ch++ {
+		if err := st.Progress.MarkChapterComplete(ch, 1000, "", ""); err != nil {
+			t.Fatalf("mark ch%d: %v", ch, err)
+		}
+	}
+
+	e := newMinimalEngineForPrecheck(t, st)
+	inst := &flow.Instruction{Agent: "architect_long", Task: "展开第4章", Reason: "下一章骨架展开"}
+
+	replaced := e.precheck(inst)
+
+	// 第 4 章不在 outline 中 → Architect 应通过（允许创建）
+	if replaced != nil {
+		t.Fatalf("architect with absent target should pass precheck, got replaced=%+v", replaced)
+	}
+}
+
+// TestEnginePrecheck_Architect_ExistingInvalidTargetPauses 验证 Architect preflight
+// 在目标章已存在但场景不符合 V3 契约时暂停（零 provider/worker 调用）。
+func TestEnginePrecheck_Architect_ExistingInvalidTargetPauses(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("test", 3); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	// 用 scenes 为空模拟无效目标章（V3 拒绝空 scenes）
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "一", CoreEvent: "a"},
+		{Chapter: 2, Title: "二", CoreEvent: "b", Scenes: []domain.SceneBeat{
+			{Goal: "g", Action: "a", Conflict: "c", Outcome: "o", BodyReaction: "b", EmotionReaction: "e", EroticCharge: "ec"},
+		}},
+		{Chapter: 3, Title: "三", CoreEvent: "c", Scenes: []domain.SceneBeat{}}, // V3: empty scenes
+	}); err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+	// 标记第 2 章已完成，NextChapter 回到 3
+	if err := st.Progress.MarkChapterComplete(1, 1000, "", ""); err != nil {
+		t.Fatalf("mark ch1: %v", err)
+	}
+	if err := st.Progress.MarkChapterComplete(2, 1000, "", ""); err != nil {
+		t.Fatalf("mark ch2: %v", err)
+	}
+
+	e := newMinimalEngineForPrecheck(t, st)
+	inst := &flow.Instruction{Agent: "architect_long", Task: "处理第3章", Reason: "重写"}
+
+	replaced := e.precheck(inst)
+
+	// 应返回空 instruction（pause），因为第 3 章无 scenes
+	if replaced == nil {
+		t.Fatal("architect with existing invalid target should pause, got nil")
+	}
+	if replaced.Agent != "" || replaced.Task != "" {
+		t.Fatalf("pause should return empty instruction, got %+v", replaced)
+	}
+}
+
+// TestEnginePrecheck_Writer_AbsentTargetPauses 验证 Writer preflight 在目标章
+// 不在 outline 中时硬暂停（V3 要求所有目标章必须存在于 outline 中；
+// 零 provider/worker 调用）。
+func TestEnginePrecheck_Writer_AbsentTargetPauses(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("test", 2); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("phase: %v", err)
+	}
+	// Outline 无第 2 章（只有骨架弧预计 2 章但只展开 1）
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "一", CoreEvent: "a", Scenes: []domain.SceneBeat{
+			{Goal: "g", Action: "a", Conflict: "c", Outcome: "o", BodyReaction: "b", EmotionReaction: "e", EroticCharge: "ec"},
+		}},
+	}); err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 1000, "", ""); err != nil {
+		t.Fatalf("mark ch1: %v", err)
+	}
+
+	e := newMinimalEngineForPrecheck(t, st)
+	inst := &flow.Instruction{Agent: "writer", Task: "写第2章", Reason: "续写"}
+
+	replaced := e.precheck(inst)
+
+	// Writer 目标章不在 outline → V3 硬暂停（空 instr = pause）
+	if replaced == nil {
+		t.Fatal("writer with absent target in V3 should pause (got nil)")
+	}
+	if replaced.Agent != "" || replaced.Task != "" {
+		t.Fatalf("writer absent target should pause (empty instr), got %+v", replaced)
+	}
+	// 不消耗 observer/worker/provider
+}
+
+// TestEnginePrecheck_Writer_ExistingInvalidTargetPauses 验证 Writer preflight
+// 在目标章场景违反 V3 契约时暂停（零 provider/worker 调用）。
+func TestEnginePrecheck_Writer_ExistingInvalidTargetPauses(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("test", 3); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	// 第 1 章已写完，NextChapter=2；第 2 章只有空 scenes
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "一", CoreEvent: "a", Scenes: []domain.SceneBeat{
+			{Goal: "g", Action: "a", Conflict: "c", Outcome: "o", BodyReaction: "b", EmotionReaction: "e", EroticCharge: "ec"},
+		}},
+		{Chapter: 2, Title: "二", CoreEvent: "b", Scenes: []domain.SceneBeat{}}, // V3: empty scenes
+	}); err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 1000, "", ""); err != nil {
+		t.Fatalf("mark ch1: %v", err)
+	}
+
+	e := newMinimalEngineForPrecheck(t, st)
+	inst := &flow.Instruction{Agent: "writer", Task: "写第2章", Reason: "续写"}
+
+	replaced := e.precheck(inst)
+
+	if replaced == nil {
+		t.Fatal("writer with existing invalid target should pause, got nil")
+	}
+	if replaced.Agent != "" || replaced.Task != "" {
+		t.Fatalf("pause should return empty instruction, got %+v", replaced)
+	}
+}
+
+// TestEngineV3Writer_MissingTargetPausesNoDispatch 真实 run-loop 测试：
+// V3 契约下 Writer 目标章不在 outline 中时引擎立即暂停，零 dispatch/零 provider/零写。
+func TestEngineV3Writer_MissingTargetPausesNoDispatch(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("测试书", 2); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("phase: %v", err)
+	}
+	// Only chapter 1 in outline; chapter 2 is missing → Writer target absent
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "一", CoreEvent: "a", Scenes: []domain.SceneBeat{
+			{Goal: "g", Action: "a", Conflict: "c", Outcome: "o", BodyReaction: "b", EmotionReaction: "e", EroticCharge: "ec"},
+		}},
+	}); err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 1000, "", ""); err != nil {
+		t.Fatalf("mark ch1: %v", err)
+	}
+
+	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+		t.Fatalf("run meta: %v", err)
+	}
+
+	// V3 contract
+	contract := projectprofile.NewSceneBeatV3Contract()
+
+	// 无实际 worker（不应被调用）
+	noopWorker := subagent.Config{
+		Name: "writer", Description: "noop",
+		Model: &scriptedChatModel{fn: func(msgs []agentcore.Message) agentcore.Message {
+			t.Error("worker 不应被调用")
+			return testTextMsg("")
+		}},
+		SystemPrompt: "test", MaxTurns: 1,
+	}
+
+	var mu sync.Mutex
+	var events []Event
+	done := make(chan struct{}, 1)
+	abortFn := func() {}
+	e := &engine{
+		store:    st,
+		workers:  subagent.New(noopWorker),
+		contract: contract,
+		observer: newObserver(st, func(ev Event) {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		}, func(string) {}, func() {}),
+		emitEvent: func(ev Event) {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		},
+		notify:  func(string, string, string, string) {},
+		onPause: func(string) { abortFn() },
+		onDone: func() {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		},
+		refresh: func() {},
+	}
+	abortFn = func() { e.abort() }
+	e.gate = NewChapterAdvanceGate(st, func(string) { e.abort() }, func(string, string) {})
+
+	// Start engine
+	if !e.start(nil) {
+		t.Fatal("engine start")
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("engine did not pause in time")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// 断言零 DISPATCH 事件（无 worker 调用）
+	for _, ev := range events {
+		if ev.Category == "DISPATCH" {
+			t.Errorf("engine should not dispatch any worker when writer target missing, got DISPATCH: %+v", ev)
+		}
+	}
+
+	// 断言零新 checkpoint
+	if cps := st.Checkpoints.All(); len(cps) > 0 {
+		t.Errorf("zero checkpoints expected, got %d", len(cps))
+	}
+}
+
+// TestEnginePrecheck_Architect_ExistingExpandedOutlineValid 验证 Architect preflight
+// 在目标章已存在且场景符合 V3 契约时允许通过（零 pause）。
+func TestEnginePrecheck_Architect_ExistingExpandedOutlineValid(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("test", 3); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "一", CoreEvent: "a"},
+		{Chapter: 2, Title: "二", CoreEvent: "b", Scenes: []domain.SceneBeat{
+			{Goal: "g", Action: "a", Conflict: "c", Outcome: "o", BodyReaction: "b", EmotionReaction: "e", EroticCharge: "ec"},
+		}},
+		{Chapter: 3, Title: "三", CoreEvent: "c", Scenes: []domain.SceneBeat{
+			{Goal: "g3", Action: "a3", Conflict: "c3", Outcome: "o3", BodyReaction: "b3", EmotionReaction: "e3", EroticCharge: "ec3"},
+		}},
+	}); err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 1000, "", ""); err != nil {
+		t.Fatalf("mark ch1: %v", err)
+	}
+	if err := st.Progress.MarkChapterComplete(2, 1000, "", ""); err != nil {
+		t.Fatalf("mark ch2: %v", err)
+	}
+
+	e := newMinimalEngineForPrecheck(t, st)
+	// NextChapter=3, outline 有第3章且 scenes 符合 V3 → 应通过
+	inst := &flow.Instruction{Agent: "architect_long", Task: "展开弧", Reason: "测试"}
+
+	replaced := e.precheck(inst)
+
+	// 第3章在 outline 中且有合法 scenes → V3 应通过（nil = 不改写）
+	if replaced != nil {
+		t.Fatalf("architect with valid existing entry should pass precheck, got replaced=%+v", replaced)
+	}
+}
+
+func TestEnginePrecheckV3_TargetAgentsFailClosedOnMissingOrCorruptProgress(t *testing.T) {
+	for _, agent := range []string{"writer", "architect_long"} {
+		for _, state := range []string{"missing", "corrupt"} {
+			t.Run(agent+"/"+state, func(t *testing.T) {
+				dir := t.TempDir()
+				st := storepkg.NewStore(dir)
+				if err := st.Init(); err != nil {
+					t.Fatalf("init: %v", err)
+				}
+				e := newMinimalEngineForPrecheck(t, st)
+				if state == "corrupt" {
+					if err := os.WriteFile(filepath.Join(dir, "meta", "progress.json"), []byte(`{broken`), 0o644); err != nil {
+						t.Fatalf("write corrupt progress: %v", err)
+					}
+				}
+				before := takeStoreSnapshot(dir)
+
+				replaced := e.precheck(&flow.Instruction{Agent: agent, Task: "test"})
+				if replaced == nil || replaced.Agent != "" || replaced.Task != "" {
+					t.Fatalf("v3 %s with %s progress must hard pause, got %+v", agent, state, replaced)
+				}
+				assertSnapshotUnchanged(t, before, takeStoreSnapshot(dir))
+			})
+		}
 	}
 }

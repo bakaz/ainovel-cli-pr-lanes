@@ -30,6 +30,7 @@ type (
 		finishedAt time.Time
 	}
 	askUserMsg       askUserRequest
+	askUserCancelMsg askUserCancellation
 	startResultMsg   struct{ err error }
 	cocreateDeltaMsg struct {
 		reqID int
@@ -280,10 +281,14 @@ func listenStream(rt *host.Host) tea.Cmd {
 
 func listenAskUser(bridge *askUserBridge) tea.Cmd {
 	return func() tea.Msg {
-		req, ok := <-bridge.requests
-		if !ok {
-			return nil
+		select {
+		case req, ok := <-bridge.requests:
+			if !ok {
+				return nil
+			}
+			return askUserMsg(req)
+		case cancellation := <-bridge.cancellations:
+			return askUserCancelMsg(cancellation)
 		}
-		return askUserMsg(req)
 	}
 }

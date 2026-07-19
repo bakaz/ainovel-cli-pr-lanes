@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -270,5 +271,265 @@ func TestOutlineEntryMarshalUnmarshalScenes(t *testing.T) {
 	}
 	if decoded.Scenes[0].Goal != "建立世界观" || decoded.Scenes[1].Outcome != "主角受伤逃脱" {
 		t.Errorf("scenes content mismatch: %+v", decoded.Scenes)
+	}
+}
+
+func TestSceneBeatBodyReactionEmotionReactionRoundTrip(t *testing.T) {
+	// body_reaction / emotion_reaction 字段 round-trip 与 omitempty
+	entry := OutlineEntry{
+		Chapter:   1,
+		Title:     "开局",
+		CoreEvent: "开始",
+		Hook:      "悬念",
+		Scenes: SceneList{
+			{
+				Goal:            "揭示真相",
+				Action:          "质问",
+				Conflict:        "对方否认",
+				Outcome:         "发现新线索",
+				BodyReaction:    "握紧拳头，额角冒出冷汗",
+				EmotionReaction: "难以置信，继而愤怒",
+			},
+		},
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	// 验证 JSON 中包含新字段
+	if !strings.Contains(string(data), "body_reaction") {
+		t.Errorf("JSON should contain body_reaction, got: %s", data)
+	}
+	if !strings.Contains(string(data), "emotion_reaction") {
+		t.Errorf("JSON should contain emotion_reaction, got: %s", data)
+	}
+	var decoded OutlineEntry
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if decoded.Scenes[0].BodyReaction != "握紧拳头，额角冒出冷汗" {
+		t.Errorf("BodyReaction mismatch: %q", decoded.Scenes[0].BodyReaction)
+	}
+	if decoded.Scenes[0].EmotionReaction != "难以置信，继而愤怒" {
+		t.Errorf("EmotionReaction mismatch: %q", decoded.Scenes[0].EmotionReaction)
+	}
+}
+
+func TestSceneBeatNewFieldsOmitempty(t *testing.T) {
+	// 空的 body_reaction / emotion_reaction 不序列化
+	entry := OutlineEntry{
+		Chapter: 1,
+		Title:   "测试",
+		Scenes: SceneList{
+			{Goal: "g", Action: "a", Conflict: "c", Outcome: "o"},
+		},
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), "body_reaction") {
+		t.Errorf("empty body_reaction should be omitted, got: %s", data)
+	}
+	if strings.Contains(string(data), "emotion_reaction") {
+		t.Errorf("empty emotion_reaction should be omitted, got: %s", data)
+	}
+}
+
+func TestSceneBeatTextWithNewFields(t *testing.T) {
+	beat := SceneBeat{
+		Goal:            "g",
+		Action:          "a",
+		Conflict:        "c",
+		Outcome:         "o",
+		BodyReaction:    "br",
+		EmotionReaction: "er",
+	}
+	text := beat.Text()
+	if text != "g a c o br er" {
+		t.Errorf("Text() = %q, want %q", text, "g a c o br er")
+	}
+	// legacy 场景新字段不参与（legacy 只有 Action）
+	legacy := SceneBeat{Action: "旧场景", fromString: true}
+	if got := legacy.Text(); got != "旧场景" {
+		t.Errorf("legacy Text() = %q, want %q", got, "旧场景")
+	}
+	// 验证 NewFields 不改变 ValidateRequired
+	if err := beat.ValidateRequired(); err != nil {
+		t.Errorf("ValidateRequired 应通过: %v", err)
+	}
+}
+
+func TestSceneBeatNewFieldsInUnmarshalObject(t *testing.T) {
+	var list SceneList
+	err := json.Unmarshal([]byte(`[
+		{"goal":"g","action":"a","conflict":"c","outcome":"o","body_reaction":"br","emotion_reaction":"er"}
+	]`), &list)
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1, got %d", len(list))
+	}
+	if list[0].BodyReaction != "br" {
+		t.Errorf("BodyReaction = %q", list[0].BodyReaction)
+	}
+	if list[0].EmotionReaction != "er" {
+		t.Errorf("EmotionReaction = %q", list[0].EmotionReaction)
+	}
+	if list[0].IsLegacy() {
+		t.Errorf("object with new fields should not be legacy")
+	}
+}
+
+// ── EroticCharge Phase 1 tests ──
+
+func TestSceneBeatEroticChargeRoundTrip(t *testing.T) {
+	// EroticCharge field round-trip via JSON
+	entry := OutlineEntry{
+		Chapter: 1,
+		Title:   "亲密场景",
+		Scenes: SceneList{
+			{
+				Goal:            "推进情感",
+				Action:          "两人独处",
+				Conflict:        "内心挣扎",
+				Outcome:         "关系升温",
+				BodyReaction:    "呼吸急促",
+				EmotionReaction: "欲拒还迎",
+				EroticCharge:    "暧昧气氛逐渐升温，指尖轻触引发战栗",
+			},
+		},
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	// Verify erotic_charge in JSON
+	if !strings.Contains(string(data), "erotic_charge") {
+		t.Errorf("JSON should contain erotic_charge, got: %s", data)
+	}
+	// Round-trip
+	var decoded OutlineEntry
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if decoded.Scenes[0].EroticCharge != "暧昧气氛逐渐升温，指尖轻触引发战栗" {
+		t.Errorf("EroticCharge mismatch: %q", decoded.Scenes[0].EroticCharge)
+	}
+}
+
+func TestSceneBeatEroticChargeOmitempty(t *testing.T) {
+	// Empty erotic_charge should be omitted
+	entry := OutlineEntry{
+		Chapter: 1,
+		Title:   "普通场景",
+		Scenes: SceneList{
+			{Goal: "g", Action: "a", Conflict: "c", Outcome: "o"},
+		},
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), "erotic_charge") {
+		t.Errorf("empty erotic_charge should be omitted, got: %s", data)
+	}
+}
+
+func TestSceneBeatTextWithEroticCharge(t *testing.T) {
+	// Text() should include erotic_charge after emotion_reaction
+	beat := SceneBeat{
+		Goal:            "g",
+		Action:          "a",
+		Conflict:        "c",
+		Outcome:         "o",
+		BodyReaction:    "br",
+		EmotionReaction: "er",
+		EroticCharge:    "ec",
+	}
+	text := beat.Text()
+	if text != "g a c o br er ec" {
+		t.Errorf("Text() = %q, want %q", text, "g a c o br er ec")
+	}
+	// Legacy should not include erotic_charge
+	legacy := SceneBeat{Action: "旧场景", fromString: true}
+	if got := legacy.Text(); got != "旧场景" {
+		t.Errorf("legacy Text() = %q, want %q", got, "旧场景")
+	}
+	// Partial: only erotic_charge without body_reaction/emotion_reaction
+	partial := SceneBeat{
+		Goal:         "g",
+		Action:       "a",
+		Conflict:     "c",
+		Outcome:      "o",
+		EroticCharge: "ec",
+	}
+	partialText := partial.Text()
+	if partialText != "g a c o ec" {
+		t.Errorf("partial Text() = %q, want %q", partialText, "g a c o ec")
+	}
+}
+
+func TestSceneBeatEroticChargeUnmarshalObject(t *testing.T) {
+	var list SceneList
+	err := json.Unmarshal([]byte(`[
+		{"goal":"g","action":"a","conflict":"c","outcome":"o","body_reaction":"br","emotion_reaction":"er","erotic_charge":"充满张力"}
+	]`), &list)
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1, got %d", len(list))
+	}
+	if list[0].EroticCharge != "充满张力" {
+		t.Errorf("EroticCharge = %q", list[0].EroticCharge)
+	}
+	if list[0].IsLegacy() {
+		t.Errorf("object with erotic_charge should not be legacy")
+	}
+}
+
+func TestSceneBeatEroticChargeLegacyBytesUnchanged(t *testing.T) {
+	// Legacy string scenes must remain unchanged when marshaled
+	legacy := SceneList{
+		{Action: "经典场景描述", fromString: true},
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	// Legacy should still be a JSON string, not object
+	if string(data) != `["经典场景描述"]` {
+		t.Errorf("legacy marshal should keep raw string, got: %s", data)
+	}
+	// Round-trip: unmarshal should still be legacy
+	var roundTrip SceneList
+	if err := json.Unmarshal(data, &roundTrip); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(roundTrip) != 1 || !roundTrip[0].IsLegacy() || roundTrip[0].Action != "经典场景描述" {
+		t.Errorf("round-trip legacy broken: %+v", roundTrip)
+	}
+	// Adding EroticCharge to mixed list should not change legacy bytes
+	mixed := SceneList{
+		{Action: "旧场景", fromString: true},
+		{
+			Goal:         "g",
+			Action:       "a",
+			Conflict:     "c",
+			Outcome:      "o",
+			EroticCharge: "ec",
+		},
+	}
+	mixedData, err := json.Marshal(mixed)
+	if err != nil {
+		t.Fatalf("Marshal mixed: %v", err)
+	}
+	if !strings.Contains(string(mixedData), `"旧场景"`) {
+		t.Errorf("mixed marshal should keep legacy raw string: %s", mixedData)
+	}
+	if !strings.Contains(string(mixedData), "erotic_charge") {
+		t.Errorf("mixed marshal should include erotic_charge: %s", mixedData)
 	}
 }

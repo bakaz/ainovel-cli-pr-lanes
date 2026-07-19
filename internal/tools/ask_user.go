@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -20,6 +21,9 @@ type AskUserResponse struct {
 // AskUserHandler 阻塞等待用户回答，由 CLI 或 TUI 注入具体实现。
 type AskUserHandler func(ctx context.Context, questions []Question) (*AskUserResponse, error)
 
+// ErrInteractiveUnavailable 表示当前运行入口没有注入 TUI/终端交互处理器。
+var ErrInteractiveUnavailable = errors.New("interactive user approval unavailable")
+
 // Question 单个问题。
 type Question struct {
 	Question    string   `json:"question"`
@@ -36,8 +40,9 @@ type Option struct {
 
 // AskUserTool 让 LLM 向用户提出结构化问题。
 type AskUserTool struct {
-	mu      sync.RWMutex
-	handler AskUserHandler
+	mu                  sync.RWMutex
+	handler             AskUserHandler
+	longApprovalEnabled bool
 }
 
 func NewAskUserTool() *AskUserTool {
@@ -49,6 +54,40 @@ func (t *AskUserTool) SetHandler(h AskUserHandler) {
 	t.mu.Lock()
 	t.handler = h
 	t.mu.Unlock()
+}
+
+// EnableTUILongApproval 只由 TUI 入口调用。headless/eval 即使配置了普通问答
+// handler，也不会因此获得 compass.long 审批能力。
+func (t *AskUserTool) EnableTUILongApproval() {
+	t.mu.Lock()
+	t.longApprovalEnabled = true
+	t.mu.Unlock()
+}
+
+// Request 供宿主内的确定性审批流程复用同一个 TUI 交互桥。
+// 与 Execute 不同，它不会在无 handler 或超时时替调用方做语义降级。
+func (t *AskUserTool) Request(ctx context.Context, questions []Question) (*AskUserResponse, error) {
+	if err := validateQuestions(questions); err != nil {
+		return nil, err
+	}
+	t.mu.RLock()
+	h := t.handler
+	t.mu.RUnlock()
+	if h == nil {
+		return nil, ErrInteractiveUnavailable
+	}
+	return h(ctx, questions)
+}
+
+// RequestLongApproval 发起只允许在 TUI 中出现的长期基线审批。
+func (t *AskUserTool) RequestLongApproval(ctx context.Context, questions []Question) (*AskUserResponse, error) {
+	t.mu.RLock()
+	enabled := t.longApprovalEnabled
+	t.mu.RUnlock()
+	if !enabled {
+		return nil, ErrInteractiveUnavailable
+	}
+	return t.Request(ctx, questions)
 }
 
 func (t *AskUserTool) Name() string  { return "ask_user" }
@@ -90,15 +129,10 @@ func (t *AskUserTool) Execute(ctx context.Context, args json.RawMessage) (json.R
 		return json.Marshal(fmt.Sprintf("参数校验失败: %s", err))
 	}
 
-	t.mu.RLock()
-	h := t.handler
-	t.mu.RUnlock()
-
-	if h == nil {
+	resp, err := t.Request(ctx, a.Questions)
+	if errors.Is(err, ErrInteractiveUnavailable) {
 		return json.Marshal("当前环境不支持交互式询问，请根据你的判断自行决策并继续。")
 	}
-
-	resp, err := h(ctx, a.Questions)
 	if err != nil {
 		return json.Marshal(fmt.Sprintf("用户交互失败: %s。请根据你的判断自行决策并继续。", err))
 	}

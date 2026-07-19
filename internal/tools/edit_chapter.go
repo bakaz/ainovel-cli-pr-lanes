@@ -64,6 +64,7 @@ func (t *EditChapterTool) Schema() map[string]any {
 }
 
 func (t *EditChapterTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	args = normalizeIntegerStringFields(args, "chapter")
 	var a struct {
 		Chapter    int    `json:"chapter"`
 		OldString  string `json:"old_string"`

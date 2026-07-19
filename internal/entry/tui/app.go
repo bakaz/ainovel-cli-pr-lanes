@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"io"
+	"log/slog"
+
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/voocel/ainovel-cli/assets"
 	"github.com/voocel/ainovel-cli/internal/bootstrap"
@@ -20,8 +23,15 @@ func Run(cfg bootstrap.Config, bundle assets.Bundle, version string) error {
 	}
 	bridge := newAskUserBridge()
 	rt.AskUser().SetHandler(bridge.handler)
-	cleanup := logger.SetupFile(rt.Dir(), "tui.log", false)
-	defer cleanup()
+	rt.AskUser().EnableTUILongApproval()
+
+	// 只读诊断 Host：跳过文件日志创建（不写 logs/tui.log），使用 discard。
+	if rt.IsDiagnosticOnly() {
+		logger.Setup(io.Discard, slog.LevelInfo)
+	} else {
+		cleanup := logger.SetupFile(rt.Dir(), "tui.log", false)
+		defer cleanup()
+	}
 	defer rt.Close()
 
 	m := NewModel(rt, bridge, version)

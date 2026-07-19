@@ -61,6 +61,7 @@ func (t *SaveArcSummaryTool) Schema() map[string]any {
 }
 
 func (t *SaveArcSummaryTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
+	args = normalizeIntegerStringFields(args, "volume", "arc")
 	var a struct {
 		Volume             int                        `json:"volume"`
 		Arc                int                        `json:"arc"`

@@ -17,6 +17,7 @@ import (
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/flow"
 	"github.com/voocel/ainovel-cli/internal/notify"
+	"github.com/voocel/ainovel-cli/internal/projectprofile"
 	storepkg "github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/tools"
 )
@@ -32,6 +33,11 @@ type engine struct {
 	failurePrompt   string
 	planStartPrompt string // 启动裁定系统提示词:裁定从未完成时引擎据 StartPrompt 现场补裁
 	style           string // 风格名,补裁时传给 DecidePlanStart
+	// migrationCheck 在 run 循环开始时调用；非 nil 且返回非 nil 时引擎立即退出
+	// （不执行任何 Worker/Provider 调用）。由 host 在构造时注入。
+	migrationCheck func() error
+	// contract 是当前项目的 SceneBeatContract，用于验证 outline entries 和 scenes。
+	contract *projectprofile.SceneBeatContract
 	// reconsult 把过期干预送回 host 的完整裁定路径(持久化/审计/全量动作应用),
 	// 异步执行——engine 只丢弃过期派单,不自行做残缺的重新裁定。
 	reconsult func(text string)
@@ -159,6 +165,16 @@ func (e *engine) run(ctx context.Context) {
 		}
 		e.onDone()
 	}()
+
+	// 迁移门：migration_required 状态下引擎不执行任何 Worker/Provider 调用。
+	// 放在 defer 之后以确保退出时 running 正确复位。
+	if e.migrationCheck != nil {
+		if err := e.migrationCheck(); err != nil {
+			e.emitEvent(Event{Time: time.Now(), Category: "SYSTEM",
+				Summary: "迁移门拦截引擎启动: " + err.Error(), Level: "warn"})
+			return
+		}
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -308,25 +324,98 @@ func (e *engine) retryPlanStart(ctx context.Context, prompt string) *flow.Instru
 
 // precheck 是原 ToolGate 的确定性化身:不合法的派发直接改写,无需教学文案。
 func (e *engine) precheck(inst *flow.Instruction) *flow.Instruction {
-	progress, _ := e.store.Progress.Load()
+	progress, progressErr := e.store.Progress.Load()
 	if progress != nil && progress.Phase == domain.PhaseComplete {
-		// 完本期唯一合法出路是 reopen(干预动作),任何派发直接丢弃。
 		slog.Warn("完本期派发被丢弃", "module", "engine", "agent", inst.Agent)
-		return &flow.Instruction{} // 置空:下轮 Route 归 nil 自然停机
+		return &flow.Instruction{}
 	}
+	isV3 := e.contract != nil && e.contract.GetContract() == projectprofile.ContractSceneBeatV3
+	strictTargetAgent := inst.Agent == "writer" || inst.Agent == "architect_short" || inst.Agent == "architect_long"
+	if isV3 && strictTargetAgent {
+		if progressErr != nil {
+			e.pauseWithNotify("engine", "引擎预检: progress 加载失败 ("+progressErr.Error()+")")
+			return &flow.Instruction{}
+		}
+		if progress == nil {
+			e.pauseWithNotify("engine", "引擎预检: progress 未初始化")
+			return &flow.Instruction{}
+		}
+	}
+
 	if inst.Agent == "writer" {
-		if ch := writerTargetChapter(e.store); ch > 0 {
-			if err := tools.EnsureChapterExpanded(e.store, ch); err != nil {
-				// 目标章未展开 → 确定性改派 architect_long 展开(原 gate 的教学文案
-				// 是说给 LLM 的;Engine 直接做正确的事)。
-				return &flow.Instruction{
-					Agent:  "architect_long",
-					Task:   fmt.Sprintf("下一弧为骨架(%s)。调用 save_foundation(type=expand_arc) 展开下一弧;若当前卷已写完,改用 type=append_volume 追加并展开下一卷。", err),
-					Reason: "写作目标章未展开,先展开再续写",
+		var ch int
+		if isV3 {
+			if len(progress.PendingRewrites) > 0 {
+				ch = progress.PendingRewrites[0]
+			} else {
+				ch = progress.NextChapter()
+			}
+		} else {
+			ch = writerTargetChapter(e.store)
+		}
+		if ch > 0 {
+			if isV3 {
+				// V3: Writer 必须有一个有效展开的 outline entry。
+				// 缺失、无效或加载错误一律 hard pause，不允许回退到 Architect。
+				if err := tools.ValidateOutlineEntry(e.store, e.contract, ch); err != nil {
+					e.pauseWithNotify("engine", "引擎预检 Writer: "+err.Error())
+					return &flow.Instruction{}
+				}
+			} else {
+				// Core4: 向后兼容 — 目标章未展开时改派 architect_long
+				if err := tools.EnsureChapterExpanded(e.store, ch); err != nil {
+					return &flow.Instruction{
+						Agent:  "architect_long",
+						Task:   fmt.Sprintf("下一弧为骨架(%s)。调用 save_foundation(type=expand_arc) 展开下一弧;若当前卷已写完,改用 type=append_volume 追加并展开下一卷。", err),
+						Reason: "写作目标章未展开,先展开再续写",
+					}
+				}
+				if e.contract != nil {
+					if err := tools.ValidateOutlineEntry(e.store, e.contract, ch); err != nil {
+						e.pauseWithNotify("engine", "引擎预检 Writer: "+err.Error())
+						return &flow.Instruction{}
+					}
 				}
 			}
+		} else if isV3 {
+			e.pauseWithNotify("engine", "引擎预检 Writer: 无法确定目标章节")
+			return &flow.Instruction{}
 		}
 		e.refresh()
+	}
+	if (inst.Agent == "architect_short" || inst.Agent == "architect_long") && e.contract != nil {
+		var ch int
+		if isV3 {
+			ch = progress.NextChapter()
+		} else {
+			ch = architectTargetChapter(e.store)
+		}
+		if ch > 0 {
+			// Architect: 仅在 outline 成功加载且目标确实 absent 时允许通过。
+			// 加载失败或目标已存在但无效 → hard pause。
+			outline, loadErr := e.store.Outline.LoadOutline()
+			if loadErr != nil {
+				e.pauseWithNotify("engine", "引擎预检 Architect: outline 加载失败 ("+loadErr.Error()+")")
+				return &flow.Instruction{}
+			}
+			hasChapter := false
+			for _, entry := range outline {
+				if entry.Chapter == ch {
+					hasChapter = true
+					break
+				}
+			}
+			if hasChapter {
+				if err := tools.ValidateOutlineEntry(e.store, e.contract, ch); err != nil {
+					e.pauseWithNotify("engine", "引擎预检 Architect: "+err.Error())
+					return &flow.Instruction{}
+				}
+			}
+			// hasChapter=false → target absent → 允许通过
+		} else if isV3 {
+			e.pauseWithNotify("engine", "引擎预检 Architect: 无法确定目标章节")
+			return &flow.Instruction{}
+		}
 	}
 	return nil
 }
@@ -471,6 +560,15 @@ func contentFilterAdvice(werr error) string {
 		return ""
 	}
 	return "。这是服务商内容审核拦截(非本地错误),可选: /model 切到无审核层的服务商后输入「继续」;或修改本章草稿(drafts/)措辞后再继续;原样重试大概率仍被拦"
+}
+
+// architectTargetChapter 推导 architect 可能操作的章节（当前写作中的下一章）。
+func architectTargetChapter(st *storepkg.Store) int {
+	progress, err := st.Progress.Load()
+	if err != nil || progress == nil {
+		return 0
+	}
+	return progress.NextChapter()
 }
 
 // errInvalidWriteTarget 标记 runWorker 前置校验拦下的非法写作目标——引擎自身

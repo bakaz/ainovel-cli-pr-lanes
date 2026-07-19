@@ -15,11 +15,14 @@ type Novel struct {
 // SceneBeat 一个场景节拍的结构化描述。
 // 新模型输出完整对象；旧 string 格式兼容为仅 Action 有值，并用 fromString 标记来源。
 type SceneBeat struct {
-	Goal          string `json:"goal,omitempty"`
-	Action        string `json:"action,omitempty"`
-	Conflict      string `json:"conflict,omitempty"`
-	Outcome       string `json:"outcome,omitempty"`
-	SensoryAnchor string `json:"sensory_anchor,omitempty"`
+	Goal            string `json:"goal,omitempty"`
+	Action          string `json:"action,omitempty"`
+	Conflict        string `json:"conflict,omitempty"`
+	Outcome         string `json:"outcome,omitempty"`
+	SensoryAnchor   string `json:"sensory_anchor,omitempty"`
+	BodyReaction    string `json:"body_reaction,omitempty"`
+	EmotionReaction string `json:"emotion_reaction,omitempty"`
+	EroticCharge    string `json:"erotic_charge,omitempty"`
 	// fromString 为 true 表示 JSON 源是 string（遗留格式），不是残缺 object。
 	// 不序列化；仅用于 IsLegacy / 校验 / 写出策略。
 	fromString bool `json:"-"`
@@ -51,6 +54,15 @@ func (s SceneBeat) Text() string {
 	}
 	if s.SensoryAnchor != "" {
 		parts = append(parts, s.SensoryAnchor)
+	}
+	if s.BodyReaction != "" {
+		parts = append(parts, s.BodyReaction)
+	}
+	if s.EmotionReaction != "" {
+		parts = append(parts, s.EmotionReaction)
+	}
+	if s.EroticCharge != "" {
+		parts = append(parts, s.EroticCharge)
 	}
 	return strings.Join(parts, " ")
 }
@@ -131,11 +143,14 @@ func (s *SceneList) UnmarshalJSON(data []byte) error {
 
 // sceneBeatJSON 完整对象写出形状（不含 fromString）。
 type sceneBeatJSON struct {
-	Goal          string `json:"goal"`
-	Action        string `json:"action"`
-	Conflict      string `json:"conflict"`
-	Outcome       string `json:"outcome"`
-	SensoryAnchor string `json:"sensory_anchor,omitempty"`
+	Goal            string `json:"goal"`
+	Action          string `json:"action"`
+	Conflict        string `json:"conflict"`
+	Outcome         string `json:"outcome"`
+	SensoryAnchor   string `json:"sensory_anchor,omitempty"`
+	BodyReaction    string `json:"body_reaction,omitempty"`
+	EmotionReaction string `json:"emotion_reaction,omitempty"`
+	EroticCharge    string `json:"erotic_charge,omitempty"`
 }
 
 // MarshalJSON：legacy 写 string，完整对象写 object。
@@ -151,11 +166,14 @@ func (s SceneList) MarshalJSON() ([]byte, error) {
 			raw, err = json.Marshal(beat.Action)
 		} else {
 			raw, err = json.Marshal(sceneBeatJSON{
-				Goal:          beat.Goal,
-				Action:        beat.Action,
-				Conflict:      beat.Conflict,
-				Outcome:       beat.Outcome,
-				SensoryAnchor: beat.SensoryAnchor,
+				Goal:            beat.Goal,
+				Action:          beat.Action,
+				Conflict:        beat.Conflict,
+				Outcome:         beat.Outcome,
+				SensoryAnchor:   beat.SensoryAnchor,
+				BodyReaction:    beat.BodyReaction,
+				EmotionReaction: beat.EmotionReaction,
+				EroticCharge:    beat.EroticCharge,
 			})
 		}
 		if err != nil {

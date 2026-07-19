@@ -59,7 +59,9 @@
     "title": "章节标题",
     "core_event": "本章核心事件",
     "hook": "章末钩子",
-    "scenes": ["场景1", "场景2", "场景3"]
+    "scenes": [
+      {"goal": "目标", "action": "行动", "conflict": "冲突", "outcome": "结果", "sensory_anchor": "感官锚点（可选）", "body_reaction": "按运行时字段指导填写", "emotion_reaction": "按运行时字段指导填写"}
+    ]
   }
 ]
 ```
@@ -80,7 +82,7 @@
         "title": "第一弧（已展开）",
         "goal": "局部目标、阻力和转折",
         "chapters": [
-          {"chapter": 1, "title": "章节标题", "core_event": "核心事件", "hook": "章末钩子", "scenes": ["场景1", "场景2"]}
+          {"chapter": 1, "title": "章节标题", "core_event": "核心事件", "hook": "章末钩子", "scenes": [{"goal": "目标", "action": "行动", "conflict": "冲突", "outcome": "结果"}]}
         ]
       },
       {

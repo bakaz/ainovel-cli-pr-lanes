@@ -229,6 +229,9 @@ func (o *observer) updateAgent(name string, fn func(*agentState)) {
 }
 
 func (o *observer) agentSnapshots() []AgentSnapshot {
+	if o == nil {
+		return nil
+	}
 	o.agentMu.Lock()
 	defer o.agentMu.Unlock()
 	snaps := make([]AgentSnapshot, 0, len(o.agents))

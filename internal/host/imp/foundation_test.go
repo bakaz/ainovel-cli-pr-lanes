@@ -2,12 +2,18 @@ package imp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/projectprofile"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -104,7 +110,7 @@ func TestReverseFoundation_ParsesValid(t *testing.T) {
 		{Title: "初遇", Content: "林晚翻开匿名信..."},
 		{Title: "循迹", Content: "她敲响那栋旧宅的门..."},
 	}
-	got, err := ReverseFoundation(context.Background(), llm, "system prompt with ${chapter_count}", chapters)
+	got, err := ReverseFoundation(context.Background(), llm, "system prompt with ${chapter_count}", chapters, nil)
 	if err != nil {
 		t.Fatalf("ReverseFoundation: %v", err)
 	}
@@ -117,7 +123,7 @@ func TestReverseFoundation_ParsesValid(t *testing.T) {
 	if len(got.Volumes) != 1 || len(domain.FlattenOutline(got.Volumes)) != 2 {
 		t.Errorf("volumes wrong: %+v", got.Volumes)
 	}
-	if got.Compass == nil || len(got.Compass.OpenThreads) == 0 {
+	if got.Compass == nil || len(got.Compass.Long.OpenThreads) == 0 {
 		t.Errorf("compass should be parsed with open_threads: %+v", got.Compass)
 	}
 	if !strings.Contains(llm.got[0].TextContent(), "with 2") {
@@ -136,7 +142,7 @@ func TestReverseFoundation_RejectsLengthMismatch(t *testing.T) {
 		{Title: "ch2", Content: "..."},
 		{Title: "ch3", Content: "..."},
 	}
-	_, err := ReverseFoundation(context.Background(), llm, "x", chapters)
+	_, err := ReverseFoundation(context.Background(), llm, "x", chapters, nil)
 	if err == nil || !strings.Contains(err.Error(), "chapter count mismatch") {
 		t.Fatalf("want chapter-count-mismatch error, got %v", err)
 	}
@@ -145,9 +151,22 @@ func TestReverseFoundation_RejectsLengthMismatch(t *testing.T) {
 func TestReverseFoundation_MissingTagFails(t *testing.T) {
 	llm := &mockLLM{out: "=== PREMISE ===\n# x\n"}
 	_, err := ReverseFoundation(context.Background(), llm,
-		"x", []Chapter{{Title: "a", Content: "b"}})
+		"x", []Chapter{{Title: "a", Content: "b"}}, nil)
 	if err == nil || !strings.Contains(err.Error(), "missing required tags") {
 		t.Fatalf("want missing-tags error, got %v", err)
+	}
+}
+
+func TestReverseFoundationV3_RejectsTrueLegacyStringScenes(t *testing.T) {
+	llm := &mockLLM{out: validEnvelope} // envelope 中 scenes 是真实 JSON string 数组
+	chapters := []Chapter{
+		{Title: "初遇", Content: "林晚翻开匿名信..."},
+		{Title: "循迹", Content: "她敲响那栋旧宅的门..."},
+	}
+
+	_, err := ReverseFoundation(context.Background(), llm, "system", chapters, projectprofile.NewSceneBeatV3Contract())
+	if err == nil || !strings.Contains(err.Error(), "legacy string scene") {
+		t.Fatalf("v3 ReverseFoundation must reject parsed legacy string scenes, got %v", err)
 	}
 }
 
@@ -177,7 +196,7 @@ func TestPersistFoundation_PromotesPhaseToWriting(t *testing.T) {
 	}
 
 	fr := mustParse(t, validEnvelope, 2)
-	if err := PersistFoundation(context.Background(), st, domain.PlanningTierShort, fr); err != nil {
+	if err := PersistFoundation(context.Background(), st, domain.PlanningTierShort, fr, nil); err != nil {
 		t.Fatalf("PersistFoundation: %v", err)
 	}
 
@@ -212,4 +231,165 @@ func mustParse(t *testing.T, raw string, expect int) *FoundationResult {
 		t.Fatalf("parse helper: %v", err)
 	}
 	return fr
+}
+
+// ── V3 Import dual-boundary tests (Phase 2 terminal blocker 3) ──
+
+type fsSnapshot map[string]string
+
+func takeFSSnapshot(dir string) fsSnapshot {
+	snap := make(fsSnapshot)
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, path)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		h := sha256.Sum256(data)
+		snap[filepath.ToSlash(rel)] = fmt.Sprintf("%x", h)
+		return nil
+	})
+	return snap
+}
+
+func assertFSSnapshotUnchanged(t *testing.T, before, after fsSnapshot) {
+	t.Helper()
+	for p, hash := range before {
+		if after[p] != hash {
+			t.Errorf("file %q changed: before=%s after=%s", p, hash, after[p])
+		}
+	}
+	if len(after) > len(before) {
+		for p := range after {
+			if _, ok := before[p]; !ok {
+				t.Errorf("new file created: %s", p)
+			}
+		}
+	}
+}
+
+// validV3Scene 返回一个合法的 V3 SceneBeat（七字段非空）。
+func validV3Scene() domain.SceneBeat {
+	return domain.SceneBeat{
+		Goal: "g", Action: "a", Conflict: "c", Outcome: "o",
+		BodyReaction: "b", EmotionReaction: "e", EroticCharge: "ec",
+	}
+}
+
+// TestV3Import_ValidateFoundationResult 验证 V3 契约下 ValidateFoundationResult 的
+// parse 边界：legacy/missing/empty 均拒绝。
+func TestV3Import_ValidateFoundationResult(t *testing.T) {
+	v3 := projectprofile.NewSceneBeatV3Contract()
+
+	validFR := &FoundationResult{
+		Premise:    "# 书名\n\n正文",
+		Characters: []domain.Character{{Name: "主角", Role: "main"}},
+		WorldRules: []domain.WorldRule{{Category: "magic", Rule: "规则"}},
+		Volumes: []domain.VolumeOutline{{
+			Index: 1, Title: "第一卷", Theme: "主题",
+			Arcs: []domain.ArcOutline{{
+				Index: 1, Title: "弧", Goal: "目标",
+				Chapters: []domain.OutlineEntry{{
+					Chapter: 1, Title: "章", CoreEvent: "事件",
+					Scenes: []domain.SceneBeat{validV3Scene()},
+				}},
+			}},
+		}},
+		Compass: &domain.StoryCompass{Long: domain.LongCompass{EndingDirection: "终局"}},
+	}
+
+	// 正常 V3 通过
+	if err := ValidateFoundationResult(validFR, v3); err != nil {
+		t.Fatalf("valid V3 FR should pass: %v", err)
+	}
+
+	// legacy scene → 拒绝
+	legacyFR := copyFR(validFR)
+	legacyFR.Volumes[0].Arcs[0].Chapters[0].Scenes[0] = domain.SceneBeat{Action: "legacy"}
+	if err := ValidateFoundationResult(legacyFR, v3); err == nil {
+		t.Error("V3 should reject legacy scene")
+	}
+
+	// no ending_direction → 拒绝
+	noDirFR := copyFR(validFR)
+	noDirFR.Compass.Long.EndingDirection = ""
+	if err := ValidateFoundationResult(noDirFR, v3); err == nil {
+		t.Error("V3 should reject missing ending_direction")
+	}
+
+	// empty scenes → 拒绝（bypass: 有 arcs 但 chapter 无 scenes）
+	emptyScenesFR := copyFR(validFR)
+	emptyScenesFR.Volumes[0].Arcs[0].Chapters[0].Scenes = nil
+	if err := ValidateFoundationResult(emptyScenesFR, v3); err == nil {
+		t.Error("V3 should reject empty scenes")
+	}
+}
+
+// TestV3Import_PersistFoundation 验证 V3 契约下 PersistFoundation 的持久化边界：
+// legacy/missing/empty 均不落盘（snapshot 不变）。
+func TestV3Import_PersistFoundation(t *testing.T) {
+	v3 := projectprofile.NewSceneBeatV3Contract()
+	validFR := &FoundationResult{
+		Premise:    "# 书名\n\n正文",
+		Characters: []domain.Character{{Name: "主角", Role: "main"}},
+		WorldRules: []domain.WorldRule{{Category: "magic", Rule: "规则"}},
+		Volumes: []domain.VolumeOutline{{
+			Index: 1, Title: "第一卷", Theme: "主题",
+			Arcs: []domain.ArcOutline{{
+				Index: 1, Title: "弧", Goal: "目标",
+				Chapters: []domain.OutlineEntry{{
+					Chapter: 1, Title: "章", CoreEvent: "事件",
+					Scenes: []domain.SceneBeat{validV3Scene()},
+				}},
+			}},
+		}},
+		// 基线 Compass 必须合法，保证每个负例确实在 scene 边界被拒绝。
+		Compass: &domain.StoryCompass{Long: domain.LongCompass{EndingDirection: "终局"}},
+	}
+
+	tests := []struct {
+		name string
+		mut  func(*FoundationResult)
+	}{
+		{"legacy_scene", func(fr *FoundationResult) {
+			fr.Volumes[0].Arcs[0].Chapters[0].Scenes[0] = domain.SceneBeat{Action: "legacy"}
+		}},
+		{"missing_field", func(fr *FoundationResult) {
+			fr.Volumes[0].Arcs[0].Chapters[0].Scenes[0] = domain.SceneBeat{Goal: "g", Action: "a", Conflict: "c", Outcome: "o"}
+		}},
+		{"empty_scenes", func(fr *FoundationResult) {
+			fr.Volumes[0].Arcs[0].Chapters[0].Scenes = nil
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			st := store.NewStore(dir)
+			if err := st.Init(); err != nil {
+				t.Fatalf("init: %v", err)
+			}
+			if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+				t.Fatalf("run meta: %v", err)
+			}
+			fr := copyFR(validFR)
+			tc.mut(fr)
+
+			before := takeFSSnapshot(dir)
+			err := PersistFoundation(context.Background(), st, domain.PlanningTierShort, fr, v3)
+			if err == nil {
+				t.Fatal("V3 persist should fail for invalid FR")
+			}
+			assertFSSnapshotUnchanged(t, before, takeFSSnapshot(dir))
+		})
+	}
+}
+
+func copyFR(fr *FoundationResult) *FoundationResult {
+	data, _ := json.Marshal(fr)
+	var cp FoundationResult
+	_ = json.Unmarshal(data, &cp)
+	return &cp
 }
