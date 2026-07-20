@@ -67,8 +67,8 @@ JSON 数组，每条含：category、rule、boundary。
 长篇使用**指南针驱动 + 下一卷按需生成**。
 
 初始只包含 **2 卷**：
-- **卷 1**：完整弧结构（每弧有 title、goal、estimated_chapters），**第一弧含详细章节**
-- **卷 2**：所有弧都是骨架（title、goal、estimated_chapters）
+- **卷 1**：完整弧结构，**第一弧为详细弧**（含完整 chapters，省略 estimated_chapters），后续弧为骨架弧（仅 title/goal/estimated_chapters，省略 chapters）
+- **卷 2**：所有弧均为骨架弧（title、goal、estimated_chapters，省略 chapters）
 
 要求：
 - 两卷承担不同叙事功能，不是"换地图升级打怪"
@@ -76,9 +76,9 @@ JSON 数组，每条含：category、rule、boundary。
 - 第一弧每章服务于弧目标；钩子类型多样化
 - 每章剧情密度（core_event/scenes 多寡）匹配用户的字数意愿，据此决定弧拆几章（见下方"弧级节奏密度"）
 - 章节 title 用名词/动名词短语，**长短自然交错**，不要每章卡同一字数（第一弧的标题节奏会被后续弧沿用，开篇就别整齐划一）
-- estimated_chapters ≥ 8（太短无法展开节奏循环）
+- 骨架弧 estimated_chapters ≥ 8（太短无法展开节奏循环）
 - 角色调度与 characters 一致，弧目标受 world_rules 约束
-- **详细章节的 scenes** 为结构对象数组：每对象含 goal/action/conflict/outcome（必填）与 sensory_anchor（可选）；节拍形态参考 `style_rules` 中的 outline 规划规则（若有）
+- **详细章节的 scenes** 为结构对象数组：Core4 下每对象含 goal/action/conflict/outcome 四字段必填；V3 按运行时注入契约填齐七字段（goal/action/conflict/outcome/body_reaction/emotion_reaction/erotic_charge 必填）；sensory_anchor 可选。节拍形态参考 `style_rules` 中的 outline 规划规则（若有）
 
 调用 `save_foundation(type="layered_outline", scale="long", content=<JSON数组>)`。
 
@@ -130,8 +130,8 @@ JSON 数组，每条含：category、rule、boundary。
      "theme": "核心冲突/主题",
      "final": true,
      "arcs": [
-       {"index": 1, "title": "...", "goal": "...", "estimated_chapters": 12, "chapters": [...]},
-       {"index": 2, "title": "...", "goal": "...", "estimated_chapters": 10}
+        {"index": 1, "title": "...", "goal": "...", "chapters": [...]},
+        {"index": 2, "title": "...", "goal": "...", "estimated_chapters": 10}
      ]
    }
    ```
@@ -170,7 +170,7 @@ JSON 数组，每条含：category、rule、boundary。
 
    - 章节不需要 chapter 字段（系统自动编号）
    - 每章需要：title、core_event、hook、scenes
-   - scenes 是结构对象数组，每对象含 goal（必填）、action（必填）、conflict（必填）、outcome（必填）、sensory_anchor（可选）
+   - scenes 为结构对象数组：Core4 下每对象含 goal/action/conflict/outcome 四字段必填；V3 按运行时注入契约填齐七字段（goal/action/conflict/outcome/body_reaction/emotion_reaction/erotic_charge 必填）；sensory_anchor 可选
    - scenes 的节拍密度参考 style_rules 中的 outline 规划规则（若有）
 
 **title 格式硬约束**（违反即是整本书风格断裂）：
@@ -182,6 +182,8 @@ JSON 数组，每条含：category、rule、boundary。
 要求：参考前一弧的节奏和风格；延续前弧留下的伏笔和钩子；判断本弧适合回收哪些未回收伏笔。大纲服务于故事，不是约束已经发生事实的合同。
 
 **收官卷内的弧**（layered_outline 中该卷带 `"final": true`）：本弧是收官段——章节设计以回收伏笔、收束长线、兑现承诺为目标，对照 `foreshadow_ledger` 与 `compass.long.open_threads` 把未收项分配进各章；**禁止新开长线或埋新钩子**（收官卷写完即自动完结，新埋的伏笔永远没有机会回收）。若这是收官卷的最后一弧，末章要正面回答 `compass.long.ending_direction` 的核心命题。
+
+**版本说明**：V3 运行时的 `save_foundation(type="append_volume"/"expand_arc")` 调用不传递 scale 参数；Core4 按自身版本契约传递。本约束专为 V3 运行时设计，不构成对 Core4 的禁止——Core4 应遵循其版本约定。
 
 ## 增量修改模式
 
