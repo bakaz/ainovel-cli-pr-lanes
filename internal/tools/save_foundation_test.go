@@ -2826,6 +2826,164 @@ func TestSaveFoundationCore4_AppendVolumeSkeletonFirstArcRejectedBeforePlanningT
 	assertSnapshotUnchanged(t, before, takeStoreSnapshot(dir))
 }
 
+// ── Core4 零写入测试：错号 / 拓扑非法 / 已存在骨架卷扩展 → scale 不落盘 ──
+
+func TestSaveFoundationCore4_LayeredOutlineWrongNonZeroRejectedZeroWrites(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := st.Progress.Init("test", 0); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+
+	tool := NewSaveFoundationTool(st, testContract)
+	before := takeStoreSnapshot(dir)
+	// content 中 Chapter=7 与预期位置 1 不一致
+	args, _ := json.Marshal(map[string]any{
+		"type": "layered_outline",
+		"content": []map[string]any{{
+			"index": 1, "title": "卷", "theme": "t",
+			"arcs": []map[string]any{{
+				"index": 1, "title": "弧", "goal": "g",
+				"chapters": []map[string]any{
+					{"chapter": 7, "title": "错号章", "core_event": "事件"},
+				},
+			}},
+		}},
+		"scale": "long",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("Core4 layered_outline 错误章节编号应拒绝")
+	}
+	assertSnapshotUnchanged(t, before, takeStoreSnapshot(dir))
+}
+
+func TestSaveFoundationCore4_ExpandArcCrossesSkeletonFrontierRejectedZeroWrites(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := st.Progress.Init("test", 5); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	// 创建含骨架弧的大纲（expanded→skeleton），再跨骨架展开后方弧 → 应拒绝
+	if err := st.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "选择",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已展开", Goal: "g1", Chapters: []domain.OutlineEntry{{Title: "章1", CoreEvent: "e1"}}},
+			{Index: 2, Title: "骨架", Goal: "g2", EstimatedChapters: 3},
+			{Index: 3, Title: "后方弧", Goal: "g3", EstimatedChapters: 2},
+		},
+	}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	// 骨架弧后还有弧 3；但弧 3 是骨架，尝试展开弧 3 将跨越骨架弧 2 → 全书单一前沿拒绝
+	tool := NewSaveFoundationTool(st, testContract)
+	before := takeStoreSnapshot(dir)
+	args, _ := json.Marshal(map[string]any{
+		"type": "expand_arc", "volume": 1, "arc": 3,
+		"content": map[string]any{
+			"title": "新弧", "goal": "新目标",
+			"chapters": []map[string]any{
+				{"chapter": 0, "title": "新章", "core_event": "事件"},
+			},
+		},
+		"scale": "long",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("Core4 expand_arc 跨越骨架前沿应拒绝")
+	}
+	assertSnapshotUnchanged(t, before, takeStoreSnapshot(dir))
+}
+
+func TestSaveFoundationCore4_ExpandArcBadNumberRejectedZeroWrites(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := st.Progress.Init("test", 5); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := st.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "选择",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已展开", Goal: "g1", Chapters: []domain.OutlineEntry{{Title: "章1", CoreEvent: "e1"}}},
+			{Index: 2, Title: "待展开", Goal: "g2", EstimatedChapters: 2},
+		},
+	}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	tool := NewSaveFoundationTool(st, testContract)
+	before := takeStoreSnapshot(dir)
+	// Chapter=7 与预期位置 2 不一致
+	args, _ := json.Marshal(map[string]any{
+		"type": "expand_arc", "volume": 1, "arc": 2,
+		"content": map[string]any{
+			"title": "新弧", "goal": "新目标",
+			"chapters": []map[string]any{
+				{"chapter": 7, "title": "错号章", "core_event": "事件"},
+			},
+		},
+		"scale": "long",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("Core4 expand_arc 错误章节编号应拒绝")
+	}
+	assertSnapshotUnchanged(t, before, takeStoreSnapshot(dir))
+}
+
+func TestSaveFoundationCore4_AppendVolumeWithSkeletonFrontierRejectedZeroWrites(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := st.Progress.Init("test", 0); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	// 已有骨架弧
+	if err := st.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "第一卷", Theme: "选择",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已展开", Goal: "g1", Chapters: []domain.OutlineEntry{{Title: "章1", CoreEvent: "e1"}}},
+			{Index: 2, Title: "未展开", Goal: "g2", EstimatedChapters: 3},
+		},
+	}}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	if err := st.Progress.SetLayered(true); err != nil {
+		t.Fatalf("SetLayered: %v", err)
+	}
+	tool := NewSaveFoundationTool(st, testContract)
+	before := takeStoreSnapshot(dir)
+	args, _ := json.Marshal(map[string]any{
+		"type": "append_volume",
+		"content": map[string]any{
+			"index": 2, "title": "第二卷", "theme": "发展",
+			"arcs": []map[string]any{{
+				"index": 1, "title": "新展开弧", "goal": "g3",
+				"chapters": []map[string]any{
+					{"chapter": 0, "title": "新章", "core_event": "事件"},
+				},
+			}},
+		},
+		"reason": "测试",
+		"scale":  "long",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("Core4 append_volume 存在骨架弧时追加展开卷应拒绝")
+	}
+	assertSnapshotUnchanged(t, before, takeStoreSnapshot(dir))
+}
+
 func extractContentDesc(schema map[string]any) string {
 	props, _ := schema["properties"].(map[string]any)
 	content, _ := props["content"].(map[string]any)

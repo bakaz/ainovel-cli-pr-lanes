@@ -692,11 +692,11 @@ func makeFixtureBook(t *testing.T) (string, projectprofile.Fingerprint) {
 	volumes := []domain.VolumeOutline{
 		{Index: 1, Title: "第一卷", Theme: "卷主题一", Arcs: []domain.ArcOutline{
 			{Index: 1, Title: "展开弧一", Goal: "目标一", Chapters: chapters[:34]},
-			{Index: 2, Title: "骨架弧一", Goal: "骨架目标一", EstimatedChapters: 10, Chapters: nil},
 		}},
 		{Index: 2, Title: "第二卷", Theme: "卷主题二", Final: true, Arcs: []domain.ArcOutline{
 			{Index: 1, Title: "展开弧二", Goal: "目标二", Chapters: chapters[34:]},
-			{Index: 2, Title: "骨架弧二", Goal: "骨架目标二", EstimatedChapters: 12, Chapters: nil},
+			{Index: 2, Title: "骨架弧一", Goal: "骨架目标一", EstimatedChapters: 10, Chapters: nil},
+			{Index: 3, Title: "骨架弧二", Goal: "骨架目标二", EstimatedChapters: 12, Chapters: nil},
 		}},
 	}
 	outlineData, _ := marshalJSON(chapters)

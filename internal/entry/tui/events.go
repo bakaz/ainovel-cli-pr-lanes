@@ -5,6 +5,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/voocel/ainovel-cli/internal/backup"
 	"github.com/voocel/ainovel-cli/internal/diag"
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/entry/startup"
@@ -56,6 +57,10 @@ type (
 	streamClearMsg     struct{}  // 清空流式缓冲（新消息开始）
 	streamFlushTickMsg struct{}  // 60fps 节流刷新流式面板（合并 token 级 delta）
 	quitResetMsg       struct{}  // 双次 Ctrl+C 超时重置
+	restoreResultMsg   struct {
+		result *backup.RestoreResult
+		err    error
+	}
 )
 
 // --- Cmd 函数 ---
@@ -90,6 +95,13 @@ func tickSnapshot(rt *host.Host) tea.Cmd {
 func fetchSnapshot(rt *host.Host) tea.Cmd {
 	return func() tea.Msg {
 		return snapshotMsg(rt.Snapshot())
+	}
+}
+
+func restoreSnapshot(rt *host.Host, snapshotID string) tea.Cmd {
+	return func() tea.Msg {
+		result, err := rt.RestoreSnapshot(snapshotID, true)
+		return restoreResultMsg{result: result, err: err}
 	}
 }
 

@@ -51,9 +51,18 @@ type engine struct {
 	onPause   func(summary string) // 引擎自主暂停(僵局/失败裁定 abort):走 host 统一暂停语义(lifecycle=paused)
 	onDone    func()               // run 结束(任何原因);host 据 store 事实定终态
 
+	// 弧/卷边界备份回调。引擎在检测到弧/卷完结章后同步调用。
+	// 返回 error 时引擎必须停止循环（跳过 budget/gate 处理）。
+	backupArc    func(volume, arc int) error
+	backupVolume func(volume int) error
+
+	// beforeRunWorker 仅测试使用：在 runWorker 前调用，用于验证 worker 从未被调用。
+	beforeRunWorker func()
+
 	mu      sync.Mutex
 	cancel  context.CancelFunc
 	running bool
+	done    chan struct{} // close in run() defer after onDone, for true completion signal
 	pending []controlOp       // 干预的控制态动作,边界提交
 	next    *flow.Instruction // 下一轮优先执行的指令(plan_start / arbiter dispatch)
 	// deferGateForNext 只与 next 同生共灭：hold+dispatch 必须先运行配对的
@@ -96,6 +105,7 @@ func (e *engine) start(initial *flow.Instruction) bool {
 	ctx = agentcore.WithToolProgress(ctx, e.observer.workerProgress)
 	e.cancel = cancel
 	e.running = true
+	e.done = make(chan struct{})
 	// initial 为空时不覆盖 e.next——停机期干预可能已通过 applyControlOp 排入
 	// 裁定派单(如 editor 返工),start(nil) 抹掉它会让 Route 派 writer 续写,
 	// 与用户意图相反。
@@ -138,16 +148,13 @@ func (e *engine) enqueue(op controlOp) bool {
 
 func (e *engine) run(ctx context.Context) {
 	defer func() {
+		// 保持 running=true 贯穿所有清理工作及 onDone，
+		// 确保 Host.runEnded 在读取生命周期时 engine 仍标记为运行中。
 		e.mu.Lock()
-		e.running = false
-		e.cancel = nil
 		leftover := e.pending
 		e.pending = nil
 		e.mu.Unlock()
-		// 退出竞态:enqueue 与退出并发时残留的干预动作不得无声丢弃——
-		// hold/reopen 是幂等的事实写入,用独立 ctx 补执行;dispatch 无引擎可派,
-		// 恢复 PendingSteer 持久化(host 可能已按"入队成功"清除),下次
-		// Resume/Continue 重放整条干预。
+
 		for _, op := range leftover {
 			if op.dispatch != nil {
 				if op.text != "" {
@@ -163,7 +170,19 @@ func (e *engine) run(ctx context.Context) {
 				_ = e.applyControlOp(context.Background(), op)
 			}
 		}
+		// onDone 仍能看到 running=true
 		e.onDone()
+
+		// 原子清除 running + 通知等待方
+		e.mu.Lock()
+		e.running = false
+		e.cancel = nil
+		dch := e.done
+		e.done = nil
+		e.mu.Unlock()
+		if dch != nil {
+			close(dch)
+		}
 	}()
 
 	// 迁移门：migration_required 状态下引擎不执行任何 Worker/Provider 调用。
@@ -219,12 +238,27 @@ func (e *engine) run(ctx context.Context) {
 			continue // 僵局裁定要求重算路由
 		}
 
+		// 记录 Worker 启动前的最新已完成章；读错则暂停/停止，不执行 Worker。
+		before, beforeErr := e.latestCompletedChapter()
+		if beforeErr != nil {
+			e.pauseWithNotify("backup", "进度读取失败，已暂停: "+beforeErr.Error())
+			return
+		}
+
+		if e.beforeRunWorker != nil {
+			e.beforeRunWorker()
+		}
 		err := e.runWorker(ctx, inst)
 		if ctx.Err() != nil {
 			return
 		}
 		if err != nil {
 			if stop := e.handleWorkerError(ctx, inst, err); stop {
+				return
+			}
+		} else {
+			// Worker 成功——检测新完成的章节并检查弧/卷边界
+			if stop := e.handleCompletedChapters(ctx, before); stop {
 				return
 			}
 		}
@@ -739,6 +773,70 @@ func (e *engine) pauseWithNotify(kind, body string) {
 	}
 	e.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: body, Level: "warn"})
 	e.abort()
+}
+
+// latestCompletedChapter 返回进度中最新完成的章节号。
+// err 表示进度脏读（pause/stop）, 返回 0。
+func (e *engine) latestCompletedChapter() (int, error) {
+	p, err := e.store.Progress.Load()
+	if err != nil {
+		return 0, err
+	}
+	if p == nil || len(p.CompletedChapters) == 0 {
+		return 0, nil
+	}
+	return p.CompletedChapters[len(p.CompletedChapters)-1], nil
+}
+
+// handleCompletedChapters 在 Worker 成功后检测是否有新完成的章节。
+// 只在 after > before 时调用 CheckArcBoundary(after)；
+// 卷末仅创建卷快照（弧快照由卷涵盖）。边界检查或备份出错时
+// pauseWithNotify 并返回 true（跳过 budget/gate 处理）。
+func (e *engine) handleCompletedChapters(_ context.Context, before int) bool {
+	after, err := e.latestCompletedChapter()
+	if err != nil {
+		e.pauseWithNotify("backup", "进度读取失败，已暂停: "+err.Error())
+		return true
+	}
+	if after <= before || after == 0 {
+		return false
+	}
+
+	boundary, berr := e.store.Outline.CheckArcBoundary(after)
+	if berr != nil {
+		e.pauseWithNotify("backup", "弧边界检查失败，已暂停: "+berr.Error())
+		return true
+	}
+	if boundary == nil {
+		return false // 不在大纲中或不是弧末/卷末
+	}
+
+	if boundary.IsVolumeEnd {
+		if e.backupVolume != nil {
+			if berr := e.backupVolume(boundary.Volume); berr != nil {
+				e.pauseWithNotify("backup", "卷边界备份失败，已暂停: "+berr.Error())
+				return true
+			}
+		}
+		return false
+	}
+	if boundary.IsArcEnd {
+		if e.backupArc != nil {
+			if berr := e.backupArc(boundary.Volume, boundary.Arc); berr != nil {
+				e.pauseWithNotify("backup", "弧边界备份失败，已暂停: "+berr.Error())
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+// engineDone 返回引擎完成通知通道（nil 表示引擎未运行或已结束）。
+func (e *engine) engineDone() <-chan struct{} {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.done
 }
 
 // completionSummary 完本的确定性收尾报告(store 已有全部事实,不花 LLM 调用;RFC 末节)。

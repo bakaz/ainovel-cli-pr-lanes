@@ -112,6 +112,10 @@ func parseFoundationOutput(text string, expectChapters int) (*FoundationResult, 
 	if err := decodeJSON("layered_outline", env["LAYERED_OUTLINE"], &volumes); err != nil {
 		return nil, err
 	}
+	// 在 FlattenOutline 和所有持久化之前执行同一编号/拓扑校验
+	if err := store.ValidateVolumesLayeredOutline(volumes); err != nil {
+		return nil, fmt.Errorf("layered outline topology/numbering: %w", err)
+	}
 	// 导入大纲必须把全部 N 章实展开（FlattenOutline 只数真实章节，骨架弧不计），
 	// 否则逐章 commit 时会有章节落在大纲范围外、被越界守卫拒绝。
 	if got := len(domain.FlattenOutline(volumes)); got != expectChapters {
@@ -204,6 +208,11 @@ func PersistFoundation(ctx context.Context, st *store.Store, scale domain.Planni
 	// 前置校验：共享的 ValidateFoundationResult 在入口处执行完整校验
 	if err := ValidateFoundationResult(fr, contract); err != nil {
 		return fmt.Errorf("import foundation: validation failed (zero partial writes): %w", err)
+	}
+
+	// 大纲前瞻校验：在任意写入之前确保拓扑/编号合法
+	if err := st.Outline.ValidateLayeredOutline(fr.Volumes); err != nil {
+		return fmt.Errorf("import foundation: layered outline validation failed (zero partial writes): %w", err)
 	}
 
 	if err := st.RunMeta.SetPlanningTier(scale); err != nil {

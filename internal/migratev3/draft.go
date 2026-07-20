@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/store"
 )
 
 type providerExchange struct {
@@ -481,6 +482,9 @@ func validateCandidateAgainstSource(source *sourceBook, outline []domain.Outline
 				return fmt.Errorf("candidate ch-%02d/s-%02d: %w", chapter.Chapter, j+1, err)
 			}
 		}
+	}
+	if err := store.ValidateVolumesLayeredOutline(volumes); err != nil {
+		return fmt.Errorf("candidate volumes: %w", err)
 	}
 	flat := domain.FlattenOutline(volumes)
 	equal, err := jsonSemanticallyEqual(outline, flat)

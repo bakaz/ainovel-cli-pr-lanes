@@ -69,7 +69,9 @@ func (s *OutlineStore) GetChapterOutline(chapter int) (*domain.OutlineEntry, err
 // SaveLayeredOutline 保存分层大纲（长篇模式，原子写入）。
 func (s *OutlineStore) SaveLayeredOutline(volumes []domain.VolumeOutline) error {
 	return s.io.WithWriteLock(func() error {
-		normalizeLayeredChapterNumbers(volumes)
+		if err := validateAndNormalizeLayeredOutline(volumes); err != nil {
+			return err
+		}
 		if err := s.io.WriteJSONUnlocked("layered_outline.json", volumes); err != nil {
 			return err
 		}
@@ -77,7 +79,8 @@ func (s *OutlineStore) SaveLayeredOutline(volumes []domain.VolumeOutline) error 
 	})
 }
 
-// LoadLayeredOutline 读取分层大纲。
+// LoadLayeredOutline 读取分层大纲，并在内存中校验编号/拓扑契约后返回。
+// 持久化的 Chapter==0 会在内存补齐（不写盘）；非零错号和非法拓扑 fail-closed。
 func (s *OutlineStore) LoadLayeredOutline() ([]domain.VolumeOutline, error) {
 	var volumes []domain.VolumeOutline
 	if err := s.io.ReadJSON("layered_outline.json", &volumes); err != nil {
@@ -86,7 +89,37 @@ func (s *OutlineStore) LoadLayeredOutline() ([]domain.VolumeOutline, error) {
 		}
 		return nil, err
 	}
+	if err := checkLayeredOutline(volumes); err != nil {
+		return nil, fmt.Errorf("layered_outline 数据损坏：%w", err)
+	}
+	// 内存中补齐 Chapter==0（不下沉到磁盘）
+	ch := 1
+	for vi := range volumes {
+		for ai := range volumes[vi].Arcs {
+			if !volumes[vi].Arcs[ai].IsExpanded() {
+				continue
+			}
+			for ci := range volumes[vi].Arcs[ai].Chapters {
+				if volumes[vi].Arcs[ai].Chapters[ci].Chapter == 0 {
+					volumes[vi].Arcs[ai].Chapters[ci].Chapter = ch
+				}
+				ch++
+			}
+		}
+	}
 	return volumes, nil
+}
+
+// ValidateLayeredOutline 公开只读校验入口，供 save_foundation Phase 1 等外部路径
+// 在写入任何状态之前完成编号/拓扑验证。不修改传入数据。
+func (s *OutlineStore) ValidateLayeredOutline(volumes []domain.VolumeOutline) error {
+	return checkLayeredOutline(volumes)
+}
+
+// ValidateVolumesLayeredOutline 无需 Store 对象的全局拓扑/编号校验，复用同一规则集。
+// 供 migratev3、host/imp 等无 Store 实例的路径在持久化/计算前直接调用。
+func ValidateVolumesLayeredOutline(volumes []domain.VolumeOutline) error {
+	return checkLayeredOutline(volumes)
 }
 
 // ClearLayeredOutline 清理分层大纲文件。
@@ -288,7 +321,9 @@ func (s *OutlineStore) expandArcUnlocked(volumeIdx, arcIdx int, expansion domain
 	if !found {
 		return nil, fmt.Errorf("arc not found: volume=%d, arc=%d", volumeIdx, arcIdx)
 	}
-	normalizeLayeredChapterNumbers(volumes)
+	if err := validateAndNormalizeLayeredOutline(volumes); err != nil {
+		return nil, err
+	}
 	if err := s.io.WriteJSONUnlocked("layered_outline.json", volumes); err != nil {
 		return nil, err
 	}
@@ -315,7 +350,9 @@ func (s *OutlineStore) appendVolumeUnlocked(vol domain.VolumeOutline) ([]domain.
 		return nil, err
 	}
 	volumes = append(volumes, vol)
-	normalizeLayeredChapterNumbers(volumes)
+	if err := validateAndNormalizeLayeredOutline(volumes); err != nil {
+		return nil, err
+	}
 	if err := s.io.WriteJSONUnlocked("layered_outline.json", volumes); err != nil {
 		return nil, err
 	}
@@ -332,30 +369,91 @@ func (s *OutlineStore) appendVolumeUnlocked(vol domain.VolumeOutline) ([]domain.
 	return volumes, nil
 }
 
-func normalizeLayeredChapterNumbers(volumes []domain.VolumeOutline) {
+// validateAndNormalizeLayeredOutline 校验全书分层大纲拓扑与章节编号契约，
+// 并自动补齐零号章节。全书单一规划前沿：一旦出现骨架弧，之后任意卷的展开弧均拒绝。
+// 契约：
+//   - 已展开弧只能是前缀，按全书 volume→arc 顺序维持 sawSkeleton。
+//   - Chapter == 0 时自动补入按卷→弧→章顺序派生的结构位置（从 1 连续）。
+//   - Chapter != 0 且与预期结构位置不一致时拒绝整个保存，零写入。
+func validateAndNormalizeLayeredOutline(volumes []domain.VolumeOutline) error {
 	ch := 1
+	sawSkeleton := false
 	for vi := range volumes {
 		for ai := range volumes[vi].Arcs {
+			if !volumes[vi].Arcs[ai].IsExpanded() {
+				sawSkeleton = true
+				continue
+			}
+			if sawSkeleton {
+				return fmt.Errorf("卷 %d（索引 %d）弧 %d 已展开，但全书范围已有骨架弧在之前出现：已展开弧必须是全书前缀",
+					volumes[vi].Index, vi, volumes[vi].Arcs[ai].Index)
+			}
 			for ci := range volumes[vi].Arcs[ai].Chapters {
-				volumes[vi].Arcs[ai].Chapters[ci].Chapter = ch
+				got := volumes[vi].Arcs[ai].Chapters[ci].Chapter
+				if got == 0 {
+					volumes[vi].Arcs[ai].Chapters[ci].Chapter = ch
+				} else if got != ch {
+					return fmt.Errorf("卷 %d（索引 %d）弧 %d 第 %d 章编号 %d 与预期结构位置 %d 不一致，已拒绝保存",
+						volumes[vi].Index, vi, volumes[vi].Arcs[ai].Index, ci+1, got, ch)
+				}
 				ch++
 			}
 		}
 	}
+	return nil
+}
+
+// checkLayeredOutline 不修改数据的只读校验：验证全书拓扑合法性与章节编号正确性。
+// Chapter==0 接受（调用方自行决定写入前 Normalize）；非零错号和拓扑非法则返回错误。
+// 全书单一规划前沿：一旦出现骨架弧，之后任意卷的展开弧均拒绝。
+// 供读取路径和 save_foundation Phase 1 使用。
+func checkLayeredOutline(volumes []domain.VolumeOutline) error {
+	ch := 1
+	sawSkeleton := false
+	for vi := range volumes {
+		for ai := range volumes[vi].Arcs {
+			if !volumes[vi].Arcs[ai].IsExpanded() {
+				sawSkeleton = true
+				continue
+			}
+			if sawSkeleton {
+				return fmt.Errorf("卷 %d（索引 %d）弧 %d 已展开，但全书范围已有骨架弧在之前出现",
+					volumes[vi].Index, vi, volumes[vi].Arcs[ai].Index)
+			}
+			for ci := range volumes[vi].Arcs[ai].Chapters {
+				got := volumes[vi].Arcs[ai].Chapters[ci].Chapter
+				if got != 0 && got != ch {
+					return fmt.Errorf("卷 %d（索引 %d）弧 %d 第 %d 章编号 %d 与预期结构位置 %d 不一致",
+						volumes[vi].Index, vi, volumes[vi].Arcs[ai].Index, ci+1, got, ch)
+				}
+				ch++
+			}
+		}
+	}
+	return nil
 }
 
 func validateAppendVolume(existing []domain.VolumeOutline, vol domain.VolumeOutline) error {
-	if len(existing) > 0 {
-		maxIdx := existing[len(existing)-1].Index
-		if vol.Index <= maxIdx {
-			return fmt.Errorf("卷 Index %d 必须大于现有最大值 %d", vol.Index, maxIdx)
-		}
-	}
 	if len(vol.Arcs) == 0 {
 		return fmt.Errorf("新卷必须至少包含一个弧")
 	}
 	if !vol.Arcs[0].IsExpanded() {
 		return fmt.Errorf("新卷的首弧必须包含详细章节")
+	}
+	if len(existing) > 0 {
+		maxIdx := existing[len(existing)-1].Index
+		if vol.Index <= maxIdx {
+			return fmt.Errorf("卷 Index %d 必须大于现有最大值 %d", vol.Index, maxIdx)
+		}
+		// 全书单一规划前沿：存在骨架弧时只能追加骨架卷，不可追加展开卷
+		for _, v := range existing {
+			for _, a := range v.Arcs {
+				if !a.IsExpanded() {
+					return fmt.Errorf("已有骨架弧（卷 %d 弧 %d），不可追加包含展开弧的新卷。必须先展开所有骨架弧或追加骨架卷",
+						v.Index, a.Index)
+				}
+			}
+		}
 	}
 	return nil
 }

@@ -1,6 +1,11 @@
 package store
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
@@ -284,4 +289,612 @@ func TestOutlineFeedbackPool(t *testing.T) {
 	if err := s2.Outline.ClearOutlineFeedback(); err != nil {
 		t.Fatalf("clear idempotent: %v", err)
 	}
+}
+
+// ── 分层大纲章节编号契约测试 ──
+
+func TestLayeredOutlineChapterZeroAutoFill(t *testing.T) {
+	// Chapter==0 → 自动补齐为结构位置 1
+	s := setupLayered(t, []domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{{
+			Index: 1, Title: "弧", Goal: "g",
+			Chapters: []domain.OutlineEntry{
+				{Chapter: 0, Title: "第一章"},
+			},
+		}},
+	}})
+	volumes, err := s.Outline.LoadLayeredOutline()
+	if err != nil {
+		t.Fatalf("LoadLayeredOutline: %v", err)
+	}
+	if got := volumes[0].Arcs[0].Chapters[0].Chapter; got != 1 {
+		t.Fatalf("Chapter==0 应自动补齐为 1，实际 %d", got)
+	}
+	// 扁平化一致性（domain.FlattenOutline 直接在加载的 volumes 上验证）
+	flat := domain.FlattenOutline(volumes)
+	if len(flat) != 1 || flat[0].Chapter != 1 {
+		t.Fatalf("FlattenOutline 后 chapter 应为 1，实际 %+v", flat)
+	}
+}
+
+func TestLayeredOutlineCorrectNonZeroPreserved(t *testing.T) {
+	// Chapter==1 与预期一致 → 正常保存
+	s := setupLayered(t, []domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{{
+			Index: 1, Title: "弧", Goal: "g",
+			Chapters: []domain.OutlineEntry{
+				{Chapter: 1, Title: "第一章"},
+			},
+		}},
+	}})
+	volumes, err := s.Outline.LoadLayeredOutline()
+	if err != nil {
+		t.Fatalf("LoadLayeredOutline: %v", err)
+	}
+	if got := volumes[0].Arcs[0].Chapters[0].Chapter; got != 1 {
+		t.Fatalf("正确的非零 Chapter 应保留，实际被改为 %d", got)
+	}
+}
+
+func TestLayeredOutlineWrongNonZeroRejected(t *testing.T) {
+	// Chapter==7 与预期位置 1 不一致 → 拒绝且零写入
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{{
+			Index: 1, Title: "弧", Goal: "g",
+			Chapters: []domain.OutlineEntry{
+				{Chapter: 7, Title: "第七章"},
+			},
+		}},
+	}})
+	if err == nil {
+		t.Fatal("Chapter 7 != 预期位置 1 应拒绝保存")
+	}
+	checkNoOutlineFiles(t, dir)
+}
+
+func TestLayeredOutlineRejectsSkeletonThenExpandedTopology(t *testing.T) {
+	// 骨架弧后不能出现已展开弧
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "骨架", Goal: "g", EstimatedChapters: 3},
+			{Index: 2, Title: "已展开", Goal: "g",
+				Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "章"}}},
+		},
+	}})
+	if err == nil {
+		t.Fatal("骨架弧后出现已展开弧应拒绝")
+	}
+	checkNoOutlineFiles(t, dir)
+}
+
+func TestLayeredOutlineExpandedThenSkeletonAccepted(t *testing.T) {
+	// 已展开弧在前、骨架弧在后 → 合法拓扑
+	s := setupLayered(t, []domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已展开", Goal: "g",
+				Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "第一章"}}},
+			{Index: 2, Title: "骨架", Goal: "g2", EstimatedChapters: 5},
+		},
+	}})
+	volumes, err := s.Outline.LoadLayeredOutline()
+	if err != nil {
+		t.Fatalf("LoadLayeredOutline: %v", err)
+	}
+	if len(volumes) != 1 || len(volumes[0].Arcs) != 2 {
+		t.Fatalf("预期 1 卷 2 弧，实际 %+v", volumes)
+	}
+	if got := volumes[0].Arcs[0].Chapters[0].Chapter; got != 1 {
+		t.Fatalf("第一章编号应为 1，实际 %d", got)
+	}
+	// 扁平化一致性（domain.FlattenOutline 直接在加载的 volumes 上验证）
+	flat := domain.FlattenOutline(volumes)
+	if len(flat) != 1 || flat[0].Chapter != 1 {
+		t.Fatalf("FlattenOutline 后应为 1 章且编号 1，实际 %+v", flat)
+	}
+}
+
+func TestLayeredOutlineLocateAndGetChapterConsistent(t *testing.T) {
+	// 多卷多弧多章场景，定位/读取/扁平化编号一致
+	volumes := []domain.VolumeOutline{
+		{
+			Index: 1, Title: "卷一", Theme: "开始",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "弧一", Goal: "g1",
+					Chapters: []domain.OutlineEntry{
+						{Chapter: 0, Title: "开端"},
+						{Chapter: 0, Title: "冲突"},
+					}},
+				{Index: 2, Title: "弧二", Goal: "g2",
+					Chapters: []domain.OutlineEntry{
+						{Chapter: 0, Title: "转折"},
+					}},
+			},
+		},
+		{
+			Index: 2, Title: "卷二", Theme: "发展",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "弧三", Goal: "g3",
+					Chapters: []domain.OutlineEntry{
+						{Chapter: 0, Title: "深入"},
+					}},
+			},
+		},
+	}
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Outline.SaveLayeredOutline(volumes); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+
+	// 验证 LocateChapter
+	vol, arc, err := s.Outline.LocateChapter(1)
+	if err != nil || vol != 1 || arc != 1 {
+		t.Fatalf("LocateChapter(1) = vol=%d arc=%d err=%v", vol, arc, err)
+	}
+	vol, arc, err = s.Outline.LocateChapter(3)
+	if err != nil || vol != 1 || arc != 2 {
+		t.Fatalf("LocateChapter(3) = vol=%d arc=%d err=%v", vol, arc, err)
+	}
+	vol, arc, err = s.Outline.LocateChapter(4)
+	if err != nil || vol != 2 || arc != 1 {
+		t.Fatalf("LocateChapter(4) = vol=%d arc=%d err=%v", vol, arc, err)
+	}
+
+	// 验证 GetChapterFromLayered
+	entry, err := s.Outline.GetChapterFromLayered(2)
+	if err != nil || entry.Title != "冲突" {
+		t.Fatalf("GetChapterFromLayered(2) = %+v err=%v", entry, err)
+	}
+
+	// 验证 FlattenOutline（直接从加载的 volumes 上验证）
+	vols, err := s.Outline.LoadLayeredOutline()
+	if err != nil {
+		t.Fatalf("LoadLayeredOutline: %v", err)
+	}
+	flat := domain.FlattenOutline(vols)
+	if len(flat) != 4 {
+		t.Fatalf("扁平化应有 4 章，实际 %d", len(flat))
+	}
+	for i, e := range flat {
+		if e.Chapter != i+1 {
+			t.Fatalf("扁平化第 %d 项 Chapter=%d，预期 %d", i, e.Chapter, i+1)
+		}
+	}
+}
+
+// checkNoOutlineFiles 验证目录下不存在任何大纲文件（零写入）。
+func checkNoOutlineFiles(t *testing.T, dir string) {
+	t.Helper()
+	for _, name := range []string{"layered_outline.json", "layered_outline.md", "outline.json", "outline.md"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			t.Errorf("拒绝后不应存在文件 %s", name)
+		}
+	}
+}
+
+// ── 跨卷 / 读取路径 / 扩展/追加边界测试 ──
+
+func TestLayeredOutlineCrossVolumeRejectsSkeletonThenExpanded(t *testing.T) {
+	// 全书单一前沿：卷 1 已有骨架弧，卷 2 的展开弧必须拒绝
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	volumes := []domain.VolumeOutline{
+		{
+			Index: 1, Title: "V1", Theme: "t",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "已展开", Goal: "g",
+					Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "章1"}}},
+				{Index: 2, Title: "骨架", Goal: "g2", EstimatedChapters: 3},
+			},
+		},
+		{
+			Index: 2, Title: "V2", Theme: "t2",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "新展开", Goal: "g3",
+					Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "章2"}}},
+			},
+		},
+	}
+	err := s.Outline.SaveLayeredOutline(volumes)
+	if err == nil {
+		t.Fatal("全书已有骨架弧，跨卷展开弧应被拒绝")
+	}
+	checkNoOutlineFiles(t, dir)
+}
+
+func TestLayeredOutlineLoadRejectsCrossVolumeSkeletonThenExpanded(t *testing.T) {
+	// 直接写入跨卷坏拓扑数据到磁盘 → Load 拒绝
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	bad := []domain.VolumeOutline{
+		{
+			Index: 1, Title: "V1", Theme: "t",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "已展开", Goal: "g",
+					Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "章1"}}},
+				{Index: 2, Title: "骨架", Goal: "g2", EstimatedChapters: 3},
+			},
+		},
+		{
+			Index: 2, Title: "V2", Theme: "t2",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "新展开", Goal: "g3",
+					Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "章2"}}},
+			},
+		},
+	}
+	data, _ := json.Marshal(bad)
+	if err := os.WriteFile(filepath.Join(dir, "layered_outline.json"), data, 0o644); err != nil {
+		t.Fatalf("write bad data: %v", err)
+	}
+	if _, err := s.Outline.LoadLayeredOutline(); err == nil {
+		t.Fatal("Load 应拒绝跨卷骨架弧后出现展开弧")
+	}
+}
+
+func TestLayeredOutlineLoadRejectsWrongNumber(t *testing.T) {
+	// 手动写入错误编号的数据，验证 LoadLayeredOutline 拒绝
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	// 直接写入无效 JSON（Chapter=7 但预期是 1）
+	bad := []domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{{
+			Index: 1, Title: "弧", Goal: "g",
+			Chapters: []domain.OutlineEntry{{Chapter: 7, Title: "错号"}},
+		}},
+	}}
+	data, _ := json.Marshal(bad)
+	if err := os.WriteFile(filepath.Join(dir, "layered_outline.json"), data, 0o644); err != nil {
+		t.Fatalf("write bad data: %v", err)
+	}
+	if _, err := s.Outline.LoadLayeredOutline(); err == nil {
+		t.Fatal("LoadLayeredOutline 应拒绝错误编号数据")
+	}
+}
+
+func TestLayeredOutlineLoadAcceptsZero(t *testing.T) {
+	// Chapter==0 在内存中自动补齐，不写盘
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	// 写入带 Chapter=0 的数据
+	zeroData := []domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{{
+			Index: 1, Title: "弧", Goal: "g",
+			Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "章"}},
+		}},
+	}}
+	data, _ := json.Marshal(zeroData)
+	if err := os.WriteFile(filepath.Join(dir, "layered_outline.json"), data, 0o644); err != nil {
+		t.Fatalf("write zero data: %v", err)
+	}
+	loaded, err := s.Outline.LoadLayeredOutline()
+	if err != nil {
+		t.Fatalf("LoadLayeredOutline 应接受 Chapter=0: %v", err)
+	}
+	if loaded[0].Arcs[0].Chapters[0].Chapter != 1 {
+		t.Fatalf("Chapter=0 应在内存补齐为 1，实际 %d", loaded[0].Arcs[0].Chapters[0].Chapter)
+	}
+	// 文件应保留原始 Chapter=0（不写盘）
+	rawData, err := os.ReadFile(filepath.Join(dir, "layered_outline.json"))
+	if err != nil {
+		t.Fatalf("read raw file: %v", err)
+	}
+	var raw []domain.VolumeOutline
+	if err := json.Unmarshal(rawData, &raw); err != nil {
+		t.Fatalf("unmarshal raw: %v", err)
+	}
+	if raw[0].Arcs[0].Chapters[0].Chapter != 0 {
+		t.Fatal("磁盘上的 Chapter=0 不应被修改")
+	}
+}
+
+func TestLayeredOutlineLoadRejectsBadTopology(t *testing.T) {
+	// 骨架弧在后有展开弧 → 拒绝
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	bad := []domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "骨架", Goal: "g", EstimatedChapters: 3},
+			{Index: 2, Title: "展开", Goal: "g",
+				Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "章"}}},
+		},
+	}}
+	data, _ := json.Marshal(bad)
+	if err := os.WriteFile(filepath.Join(dir, "layered_outline.json"), data, 0o644); err != nil {
+		t.Fatalf("write bad data: %v", err)
+	}
+	if _, err := s.Outline.LoadLayeredOutline(); err == nil {
+		t.Fatal("LoadLayeredOutline 应拒绝骨架弧在后有展开弧")
+	}
+}
+
+func TestExpandArcRejectsBadNumberExpansion(t *testing.T) {
+	// 展开一个骨架弧，但 expansion 中的 chapter 使用了错误编号 → 拒绝
+	s := setupLayered(t, []domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已展开", Goal: "g",
+				Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "已写章"}}},
+			{Index: 2, Title: "待展开", Goal: "g2", EstimatedChapters: 2},
+		},
+	}})
+	// 第 2 章预期编号为 2（因为第 1 章占用了 1），传入 Chapter=7 应拒绝
+	badExp := domain.ArcExpansion{
+		Title: "展开", Goal: "新目标",
+		Chapters: []domain.OutlineEntry{
+			{Chapter: 7, Title: "错号章", CoreEvent: "事件"},
+		},
+	}
+	if err := s.ExpandArc(1, 2, badExp); err == nil {
+		t.Fatal("ExpandArc 应拒绝 expansion 中错误编号的 chapter")
+	}
+}
+
+func TestExpandArcAcceptsZeroNumberExpansion(t *testing.T) {
+	// Chapter==0 的 expansion 应正常通过并被自动补齐
+	s := setupLayered(t, []domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已展开", Goal: "g",
+				Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "已写章"}}},
+			{Index: 2, Title: "待展开", Goal: "g2", EstimatedChapters: 2},
+		},
+	}})
+	goodExp := domain.ArcExpansion{
+		Title: "展开", Goal: "新目标",
+		Chapters: []domain.OutlineEntry{
+			{Chapter: 0, Title: "新章", CoreEvent: "事件"},
+		},
+	}
+	if err := s.ExpandArc(1, 2, goodExp); err != nil {
+		t.Fatalf("Chapter==0 的 expansion 应通过: %v", err)
+	}
+	vols, err := s.Outline.LoadLayeredOutline()
+	if err != nil {
+		t.Fatalf("LoadLayeredOutline: %v", err)
+	}
+	if len(vols) != 1 || len(vols[0].Arcs) != 2 {
+		t.Fatalf("预期 1 卷 2 弧，实际 %+v", vols)
+	}
+	if len(vols[0].Arcs[1].Chapters) != 1 || vols[0].Arcs[1].Chapters[0].Chapter != 2 {
+		t.Fatalf("新章节编号应为 2，实际 %d", vols[0].Arcs[1].Chapters[0].Chapter)
+	}
+}
+
+func TestAppendVolumeRejectsWhenPriorVolHasSkeleton(t *testing.T) {
+	// 全书单一前沿：已有骨架弧，不可追加展开卷
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	// 先用 SaveLayeredOutline 创建含骨架弧的数据
+	vols := []domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已展开", Goal: "g",
+				Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "章"}}},
+			{Index: 2, Title: "骨架", Goal: "g2", EstimatedChapters: 5},
+		},
+	}}
+	if err := s.Outline.SaveLayeredOutline(vols); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	if err := s.Outline.SaveOutline(domain.FlattenOutline(vols)); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	// 记录当前状态快照用于零持久化校验
+	snapLayered, _ := s.Outline.LoadLayeredOutline()
+	snapFlat, _ := s.Outline.LoadOutline()
+
+	newVol := domain.VolumeOutline{
+		Index: 2, Title: "新卷", Theme: "t2",
+		Arcs: []domain.ArcOutline{{
+			Index: 1, Title: "展开弧", Goal: "g3",
+			Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "新章"}},
+		}},
+	}
+	err := s.AppendVolume(newVol)
+	if err == nil {
+		t.Fatal("已有骨架弧时追加展开卷应拒绝")
+	}
+	// 验证零持久化：layered/flat 不变
+	afterLayered, _ := s.Outline.LoadLayeredOutline()
+	afterFlat, _ := s.Outline.LoadOutline()
+	if len(snapLayered) != len(afterLayered) || len(snapFlat) != len(afterFlat) {
+		t.Fatal("拒绝后大纲应不变")
+	}
+}
+
+func TestAppendVolumeAcceptsAllExpanded(t *testing.T) {
+	// 所有既有弧已展开 → 可正常追加展开卷
+	s := setupLayered(t, []domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{{
+			Index: 1, Title: "已展开", Goal: "g",
+			Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "章"}},
+		}},
+	}})
+	newVol := domain.VolumeOutline{
+		Index: 2, Title: "新卷", Theme: "t2",
+		Arcs: []domain.ArcOutline{{
+			Index: 1, Title: "展开弧", Goal: "g3",
+			Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "新章"}},
+		}},
+	}
+	if err := s.AppendVolume(newVol); err != nil {
+		t.Fatalf("所有弧已展开时应可追加: %v", err)
+	}
+	vols, err := s.Outline.LoadLayeredOutline()
+	if err != nil {
+		t.Fatalf("LoadLayeredOutline: %v", err)
+	}
+	if len(vols) != 2 {
+		t.Fatalf("预期 2 卷，实际 %d", len(vols))
+	}
+}
+
+func TestExpandArcRejectsCrossVolumeRearward(t *testing.T) {
+	// 跨卷后方 ExpandArc：卷 2 在卷 1 骨架弧之后，不可展开
+	s := setupLayered(t, []domain.VolumeOutline{
+		{
+			Index: 1, Title: "V1", Theme: "t",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "已展开", Goal: "g",
+					Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "章1"}}},
+				{Index: 2, Title: "骨架", Goal: "g2", EstimatedChapters: 3},
+			},
+		},
+		{
+			Index: 2, Title: "V2", Theme: "t2",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "待展开", Goal: "g3", EstimatedChapters: 2},
+			},
+		},
+	})
+	// 记录快照
+	snapLayered, _ := s.Outline.LoadLayeredOutline()
+	snapFlat, _ := s.Outline.LoadOutline()
+	snapProgress, _ := s.Progress.Load()
+
+	exp := domain.ArcExpansion{
+		Title: "新弧", Goal: "新目标",
+		Chapters: []domain.OutlineEntry{
+			{Chapter: 0, Title: "新章", CoreEvent: "事件"},
+		},
+	}
+	err := s.ExpandArc(2, 1, exp)
+	if err == nil {
+		t.Fatal("跨卷后方展开弧（骨架弧之后）应拒绝")
+	}
+	// 验证完整状态不变：layered/flat/progress 均应不变
+	afterLayered, _ := s.Outline.LoadLayeredOutline()
+	afterFlat, _ := s.Outline.LoadOutline()
+	afterProgress, _ := s.Progress.Load()
+	if len(snapLayered) != len(afterLayered) || len(snapFlat) != len(afterFlat) {
+		t.Fatal("拒绝后大纲文件应不变")
+	}
+	if snapProgress.TotalChapters != afterProgress.TotalChapters {
+		t.Fatalf("Progress.TotalChapters 不应变: before=%d after=%d", snapProgress.TotalChapters, afterProgress.TotalChapters)
+	}
+}
+
+func TestAppendVolumeRejectStrengthened(t *testing.T) {
+	// 增强版：已有骨架弧 → AppendVolume 拒绝且完整文件/Progress 不变
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 0); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	vols := []domain.VolumeOutline{{
+		Index: 1, Title: "卷", Theme: "t",
+		Arcs: []domain.ArcOutline{
+			{Index: 1, Title: "已展开", Goal: "g",
+				Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "章"}}},
+			{Index: 2, Title: "骨架", Goal: "g2", EstimatedChapters: 5},
+		},
+	}}
+	if err := s.Outline.SaveLayeredOutline(vols); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	if err := s.Outline.SaveOutline(domain.FlattenOutline(vols)); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	snapLayered, _ := s.Outline.LoadLayeredOutline()
+	snapFlat, _ := s.Outline.LoadOutline()
+	snapProgress, _ := s.Progress.Load()
+	snapFiles := takeOutlineFileHashes(t, dir)
+
+	newVol := domain.VolumeOutline{
+		Index: 2, Title: "新卷", Theme: "t2",
+		Arcs: []domain.ArcOutline{{
+			Index: 1, Title: "展开弧", Goal: "g3",
+			Chapters: []domain.OutlineEntry{{Chapter: 0, Title: "新章"}},
+		}},
+	}
+	err := s.AppendVolume(newVol)
+	if err == nil {
+		t.Fatal("已有骨架弧时追加展开卷应拒绝")
+	}
+
+	afterLayered, _ := s.Outline.LoadLayeredOutline()
+	afterFlat, _ := s.Outline.LoadOutline()
+	afterProgress, _ := s.Progress.Load()
+	if len(snapLayered) != len(afterLayered) || len(snapFlat) != len(afterFlat) {
+		t.Fatal("拒绝后大纲应不变")
+	}
+	if snapProgress.TotalChapters != afterProgress.TotalChapters {
+		t.Fatalf("Progress.TotalChapters 不应变: before=%d after=%d", snapProgress.TotalChapters, afterProgress.TotalChapters)
+	}
+	if !compareOutlineFileHashes(t, dir, snapFiles) {
+		t.Fatal("拒绝后大纲文件哈希应不变")
+	}
+}
+
+// takeOutlineFileHashes 返回大纲相关文件的 SHA256 哈希快照。
+func takeOutlineFileHashes(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	hashes := map[string]string{}
+	names := []string{"layered_outline.json", "layered_outline.md", "outline.json", "outline.md"}
+	for _, name := range names {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			hashes[name] = "" // 不存在
+			continue
+		}
+		h := sha256.Sum256(data)
+		hashes[name] = fmt.Sprintf("%x", h)
+	}
+	return hashes
+}
+
+func compareOutlineFileHashes(t *testing.T, dir string, before map[string]string) bool {
+	t.Helper()
+	after := takeOutlineFileHashes(t, dir)
+	for name, hash := range before {
+		if after[name] != hash {
+			t.Errorf("文件 %s 哈希变化: before=%s after=%s", name, hash, after[name])
+			return false
+		}
+	}
+	return true
 }

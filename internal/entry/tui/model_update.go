@@ -550,6 +550,10 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		}
 		m.refreshEventViewport()
 		return m, nil, true
+	case restoreResultMsg:
+		m.applyRestoreResult(msg)
+		m.refreshEventViewport()
+		return m, fetchSnapshot(m.runtime), true
 	case startResultMsg:
 		next, cmd := m.handleStartResultMsg(msg)
 		return next, cmd, true

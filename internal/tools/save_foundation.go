@@ -498,6 +498,10 @@ func (t *SaveFoundationTool) Execute(ctx context.Context, args json.RawMessage) 
 				}
 			}
 		}
+		// 在任意写入前完成编号/拓扑校验
+		if err := t.store.Outline.ValidateLayeredOutline(volumes); err != nil {
+			return nil, fmt.Errorf("layered_outline: %w: %w", err, errs.ErrToolArgs)
+		}
 		cmd.Payload = volumes
 	case "expand_arc":
 		if cmd.Volume <= 0 || cmd.Arc <= 0 {
@@ -548,6 +552,30 @@ func (t *SaveFoundationTool) Execute(ctx context.Context, args json.RawMessage) 
 			if !reflect.DeepEqual(current, expansion) {
 				return nil, fmt.Errorf("expand_arc: volume %d arc %d already expanded with different content: %w", cmd.Volume, cmd.Arc, errs.ErrToolPrecondition)
 			}
+		}
+		// 在任意写入前做前瞻性拓扑/编号校验：深拷贝 priorVols、应用 expansion、校验
+		prospective := deepCopyVolumes(priorVols)
+		applied := false
+		for vi := range prospective {
+			if prospective[vi].Index != cmd.Volume {
+				continue
+			}
+			for ai := range prospective[vi].Arcs {
+				if prospective[vi].Arcs[ai].Index == cmd.Arc {
+					prospective[vi].Arcs[ai].Title = expansion.Title
+					prospective[vi].Arcs[ai].Goal = expansion.Goal
+					prospective[vi].Arcs[ai].Chapters = expansion.Chapters
+					prospective[vi].Arcs[ai].EstimatedChapters = 0
+					applied = true
+					break
+				}
+			}
+			if applied {
+				break
+			}
+		}
+		if err := t.store.Outline.ValidateLayeredOutline(prospective); err != nil {
+			return nil, fmt.Errorf("expand_arc: 展开后拓扑/编号非法: %w: %w", err, errs.ErrToolPrecondition)
 		}
 		cmd.Payload = expansion
 	case "append_volume":
@@ -600,6 +628,11 @@ func (t *SaveFoundationTool) Execute(ctx context.Context, args json.RawMessage) 
 		if len(priorVols) > 0 && vol.Index <= priorVols[len(priorVols)-1].Index {
 			return nil, fmt.Errorf("append_volume: volume index %d must be greater than last existing volume %d: %w",
 				vol.Index, priorVols[len(priorVols)-1].Index, errs.ErrToolArgs)
+		}
+		// 在任意写入前做前瞻性拓扑/编号校验：构造完整 combined 卷集并校验
+		prospective := append(deepCopyVolumes(priorVols), vol)
+		if err := t.store.Outline.ValidateLayeredOutline(prospective); err != nil {
+			return nil, fmt.Errorf("append_volume: 追加后拓扑/编号非法: %w: %w", err, errs.ErrToolPrecondition)
 		}
 		cmd.Payload = appendVolumePayload{Volume: vol, PriorFinale: domain.FinaleVolume(priorVols)}
 		cmd.VolumeEndFacts = makeVolumeEndFacts(progress)
@@ -1436,4 +1469,12 @@ func countChapters(arcs []domain.ArcOutline) int {
 		n += len(a.Chapters)
 	}
 	return n
+}
+
+// deepCopyVolumes 通过 JSON 往返深拷贝 VolumeOutline 切片。
+func deepCopyVolumes(src []domain.VolumeOutline) []domain.VolumeOutline {
+	data, _ := json.Marshal(src)
+	var dst []domain.VolumeOutline
+	json.Unmarshal(data, &dst)
+	return dst
 }

@@ -68,6 +68,9 @@ type UsageTracker struct {
 	// buffered=1：连续多次 Record 折叠为一次落盘信号；满了直接丢，下个 tick 一并写。
 	saveCh chan struct{}
 
+	// autoSaveWg 跟踪 autoSaveLoop goroutine 存活性；StopAutoSave 等待其退出。
+	autoSaveWg sync.WaitGroup
+
 	// onCost 在每次记账后于锁外携带最新累计成本调用（BudgetSentinel 越线检测）。
 	// 必须在并发 Record 开始前通过 SetOnCost 设置，之后只读。
 	onCost func(total float64)
@@ -488,7 +491,23 @@ func (t *UsageTracker) StartAutoSave(ctx context.Context) {
 	if t == nil || t.store == nil {
 		return
 	}
-	go t.autoSaveLoop(ctx)
+	t.autoSaveWg.Add(1)
+	go func() {
+		defer t.autoSaveWg.Done()
+		t.autoSaveLoop(ctx)
+	}()
+}
+
+// StopAutoSave 取消上下文并等待 autoSaveLoop goroutine 真退出（含最后一次 flush）。
+// 必须在 StartAutoSave 之后调用。
+func (t *UsageTracker) StopAutoSave(cancel context.CancelFunc) {
+	if t == nil {
+		return
+	}
+	if cancel != nil {
+		cancel()
+	}
+	t.autoSaveWg.Wait()
 }
 
 // autoSaveLoop 把高频 dirty 信号节流为 500ms 一次的落盘。

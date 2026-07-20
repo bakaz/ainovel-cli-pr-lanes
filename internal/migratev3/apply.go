@@ -13,6 +13,7 @@ import (
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/projectprofile"
+	"github.com/voocel/ainovel-cli/internal/store"
 )
 
 const ApplyProtocolVersion = "scene-beat-v3-apply/v1"
@@ -375,6 +376,9 @@ func VerifyApplied(bookDir, receiptDir string, expectedEnrolled ...*projectprofi
 	if data, err := readPlainFileWithin(bookAbs, "layered_outline.json"); err != nil || strictJSON(data, &volumes) != nil || len(volumes) != 1 {
 		return VerifyApplyResult{}, fmt.Errorf("applied layered outline is invalid")
 	}
+	if err := store.ValidateVolumesLayeredOutline(volumes); err != nil {
+		return VerifyApplyResult{}, fmt.Errorf("applied volumes: %w", err)
+	}
 	flat := domain.FlattenOutline(volumes)
 	equal, err = jsonSemanticallyEqual(outline, flat)
 	if err != nil || !equal {
@@ -513,6 +517,9 @@ func truncateReviewedProposal(source *sourceBook, proposed []domain.OutlineEntry
 			copyVolume.Final = false
 			volumes = append(volumes, copyVolume)
 		}
+	}
+	if err := store.ValidateVolumesLayeredOutline(volumes); err != nil {
+		return nil, nil, nil, 0, fmt.Errorf("truncated volumes: %w", err)
 	}
 	flat := domain.FlattenOutline(volumes)
 	equal, err := jsonSemanticallyEqual(outline, flat)

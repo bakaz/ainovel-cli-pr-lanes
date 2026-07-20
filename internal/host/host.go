@@ -17,6 +17,7 @@ import (
 	"github.com/voocel/ainovel-cli/internal/agents"
 	"github.com/voocel/ainovel-cli/internal/agents/ctxpack"
 	"github.com/voocel/ainovel-cli/internal/arbiter"
+	"github.com/voocel/ainovel-cli/internal/backup"
 	"github.com/voocel/ainovel-cli/internal/bootstrap"
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/flow"
@@ -30,6 +31,27 @@ import (
 	storepkg "github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/tools"
 	"github.com/voocel/ainovel-cli/internal/userrules"
+)
+
+// ── 测试钩子（零值时无操作，生产代码不设置） ──
+
+var (
+	// testBeforeArbiter 在 doIntervention 调用 Arbiter 前调用。
+	// 返回 error 时会暂停引擎并跳过 Arbiter 调用。
+	testBeforeArbiter func() error
+
+	// testBeforeAsyncOp 在 trackSimOp/trackImpOp 读取异步操作通道前调用。
+	testBeforeAsyncOp func() error
+
+	// testBeforeImpRun 替换 ImportFrom 内部的 imp.Run 调用。
+	// 非 nil 时跳过真实导入流程，返回提供的通道和 error。
+	// 仅测试使用，生产代码不设置。
+	testBeforeImpRun func(ctx context.Context) (<-chan imp.Event, error)
+
+	// testBeforeSimRun 替换 Simulate/ImportSimulationProfile 内部的 sim.Run/sim.RunImport 调用。
+	// 非 nil 时跳过真实仿写流程，返回提供的通道和 error。
+	// 仅测试使用，生产代码不设置。
+	testBeforeSimRun func(ctx context.Context) (<-chan sim.Event, error)
 )
 
 // Host 是运行时外壳:生命周期/干预入口/事件投影/模型管理。
@@ -46,6 +68,7 @@ type Host struct {
 	userRules       *userrules.Service
 	observer        *observer
 	usage           *UsageTracker
+	usageCtx        context.Context                   // autoSaveLoop 运行上下文（用于 stop-and-wait）
 	usageCancel     context.CancelFunc                // 停掉 autoSaveLoop 并触发最后一次 flush
 	budget          *BudgetSentinel                   // 预算政策；未启用为 nil（方法 nil 安全）
 	gate            *ChapterAdvanceGate               // 章节许可与一次性暂停的统一政策组件
@@ -61,6 +84,8 @@ type Host struct {
 	mu         sync.Mutex
 	lifecycle  lifecycle
 	cocreating bool // 阶段共创占用：paused 窗口内堵住 import/simulate/continue 的并发介入
+	restoring  bool // restore in progress; blocks startEngine/Resume/intervention
+	activeOps  sync.WaitGroup // async import/simulation in-flight; Restore waits
 	closeOnce  sync.Once
 
 	interMu sync.Mutex // 干预裁定 FIFO 串行(同一时刻至多一次在途咨询)
@@ -172,6 +197,7 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 		writerRestore:   restore,
 		userRules:       userrules.NewService(store, models.Default, rules.DefaultOptions()),
 		usage:           usage,
+		usageCtx:        usageCtx,
 		usageCancel:     usageCancel,
 		profile:         profile,
 		events:          make(chan Event, 100),
@@ -255,6 +281,18 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 		},
 		onPause: func(summary string) { h.abortWithEvent(summary, "warn") },
 		onDone:  h.runEnded,
+		backupArc: func(volume, arc int) error {
+			slog.Info("弧边界备份", "module", "host", "volume", volume, "arc", arc)
+			source := h.store.Dir()
+			_, berr := backup.Backup(source, h.projectID(), backup.KindArc, volume, arc)
+			return berr
+		},
+		backupVolume: func(volume int) error {
+			slog.Info("卷边界备份", "module", "host", "volume", volume)
+			source := h.store.Dir()
+			_, berr := backup.Backup(source, h.projectID(), backup.KindVolume, volume, 0)
+			return berr
+		},
 	}
 
 	return h, nil
@@ -272,6 +310,11 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 func (h *Host) PrepareUserRules(rawPrompt string) error {
 	if err := h.checkMigrationGate(); err != nil {
 		return err
+	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+	if h.isRestoring() {
+		return fmt.Errorf("恢复操作进行中")
 	}
 	svc := userrules.NewService(h.store, h.models.Default, rules.DefaultOptions())
 	snap, err := svc.Build(context.Background(), rawPrompt)
@@ -321,6 +364,8 @@ func (h *Host) StartPrepared(rawRequirement string) error {
 	if err := h.checkMigrationGate(); err != nil {
 		return err
 	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
 	h.mu.Lock()
 	if h.lifecycle == lifecycleRunning {
 		h.mu.Unlock()
@@ -329,6 +374,10 @@ func (h *Host) StartPrepared(rawRequirement string) error {
 	if h.cocreating {
 		h.mu.Unlock()
 		return fmt.Errorf("阶段共创进行中，请先结束共创")
+	}
+	if h.restoring {
+		h.mu.Unlock()
+		return fmt.Errorf("恢复操作进行中")
 	}
 	h.mu.Unlock()
 
@@ -381,27 +430,41 @@ func (h *Host) StartPrepared(rawRequirement string) error {
 	slog.Info("开始创作", "module", "host", "planner", decision.Planner)
 	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM",
 		Summary: fmt.Sprintf("开始创作（规划师: %s——%s）", decision.Planner, decision.Reason), Level: "info"})
-	if !h.startEngine(&flow.Instruction{Agent: decision.Planner, Task: decision.Task, Reason: decision.Reason}) {
+	if !h.startEngineLocked(&flow.Instruction{Agent: decision.Planner, Task: decision.Task, Reason: decision.Reason}) {
 		return fmt.Errorf("Engine 已在运行或正在停止，无法启动新书")
 	}
 	return nil
 }
 
-// startEngine 统一的引擎启动入口(Start/Resume/Continue/干预重启共用)。
-// lifecycle 必须先于 goroutine 启动置为 running:引擎可能立即结束(完本/无路由),
-// runEnded 会把 lifecycle 落到终态;若顺序颠倒,runEnded 先跑、这里再写 running,
-// UI 将永远显示"运行中"而引擎实际已停。
+// startEngine 为未持 interMu 的调用方提供互斥保护后调用 startEngineLocked。
+// Resume/Continue/StartPrepared/AdvanceOneChapter 等已持 interMu 的调用方
+// 直接调 startEngineLocked。
 func (h *Host) startEngine(initial *flow.Instruction) bool {
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+	return h.startEngineLocked(initial)
+}
+
+// startEngineLocked 假设 interMu 已持有，直接检查恢复/运行/共创并启动引擎引擎。
+func (h *Host) startEngineLocked(initial *flow.Instruction) bool {
 	if err := h.checkMigrationGate(); err != nil {
 		slog.Warn("startEngine 被迁移门拦截", "module", "host", "err", err)
 		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	// lifecycle 可能已经是 paused，但旧 Engine goroutine 仍在执行退出 defer。
-	// 必须同时核对 Engine 真状态；否则会把 lifecycle 改回 running，而 start
-	// 实际 no-op，随后旧 runEnded 又把它落成 idle。
+	if h.restoring {
+		slog.Warn("startEngine 被恢复操作拦截", "module", "host")
+		return false
+	}
+	if h.cocreating {
+		slog.Warn("startEngine 被共创占用拦截", "module", "host")
+		return false
+	}
 	if h.engine.isRunning() {
+		return false
+	}
+	if h.lifecycle == lifecycleCompleted {
 		return false
 	}
 	h.observer.setAborting(false)
@@ -419,6 +482,8 @@ func (h *Host) Resume() (string, error) {
 	if err := h.checkMigrationGate(); err != nil {
 		return "", err
 	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
 	h.mu.Lock()
 	if h.lifecycle == lifecycleRunning {
 		h.mu.Unlock()
@@ -427,6 +492,10 @@ func (h *Host) Resume() (string, error) {
 	if h.cocreating {
 		h.mu.Unlock()
 		return "", fmt.Errorf("阶段共创进行中，请先结束共创")
+	}
+	if h.restoring {
+		h.mu.Unlock()
+		return "", fmt.Errorf("恢复操作进行中，请稍后再试")
 	}
 	h.mu.Unlock()
 
@@ -474,7 +543,7 @@ func (h *Host) Resume() (string, error) {
 		h.resumePendingIntervention(pendingSteer)
 	} else {
 		// 只恢复事实,不恢复会话(RFC §6):Engine 从 store 重算路由续跑。
-		if !h.startEngine(nil) {
+		if !h.startEngineLocked(nil) {
 			return label, fmt.Errorf("Engine 正在完成上一轮停止，请稍后重试恢复")
 		}
 	}
@@ -529,6 +598,16 @@ func (h *Host) doIntervention(text string, restart bool) {
 	clearPending := func() {
 		if err := h.store.ClearHandledSteer(); err != nil {
 			slog.Warn("清除已处理干预失败", "module", "host", "err", err)
+		}
+	}
+
+	// 测试钩子：在 Arbiter 调用前阻塞，用于验证 restore 互斥
+	if testBeforeArbiter != nil {
+		if err := testBeforeArbiter(); err != nil {
+			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Level: "warn",
+				Summary: "干预跳过 (test hook): " + err.Error()})
+			clearPending()
+			return
 		}
 	}
 
@@ -616,7 +695,7 @@ func (h *Host) doIntervention(text string, restart bool) {
 			return
 		}
 		h.refreshWriterRestore()
-		if !h.startEngine(nil) {
+		if !h.startEngineLocked(nil) {
 			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Level: "warn",
 				Summary: "Engine 正在完成上一轮停止；干预已保存，请稍后继续"})
 		}
@@ -655,6 +734,10 @@ func (h *Host) Continue(text string) error {
 		h.mu.Unlock()
 		return fmt.Errorf("阶段共创进行中，请先结束共创")
 	}
+	if h.restoring {
+		h.mu.Unlock()
+		return fmt.Errorf("恢复操作进行中，请稍后再试")
+	}
 	h.mu.Unlock()
 	if err := h.budget.Refuse(); err != nil {
 		return err
@@ -673,6 +756,9 @@ func (h *Host) SetAdvanceMode(mode domain.ChapterAdvanceMode) error {
 	}
 	h.interMu.Lock()
 	defer h.interMu.Unlock()
+	if h.isRestoring() {
+		return fmt.Errorf("恢复操作进行中，无法切换推进模式")
+	}
 	if err := h.store.RunMeta.SetAdvanceMode(mode); err != nil {
 		return err
 	}
@@ -707,6 +793,9 @@ func (h *Host) AdvanceOneChapter() error {
 	}
 	if cocreating {
 		return fmt.Errorf("阶段共创进行中，请先结束共创")
+	}
+	if h.isRestoring() {
+		return fmt.Errorf("恢复操作进行中，请稍后再执行 /next")
 	}
 	meta, err := h.store.RunMeta.Load()
 	if err != nil {
@@ -745,7 +834,7 @@ func (h *Host) AdvanceOneChapter() error {
 	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM",
 		Summary: fmt.Sprintf("已放行第 %d 章；该章提交后会先完成必要的评审与弧/卷结构维护，再次等待放行", target), Level: "info"})
 	h.refreshWriterRestore()
-	if !h.startEngine(nil) {
+	if !h.startEngineLocked(nil) {
 		// 许可按章节号持久化且同目标幂等，调用方稍后重试不会重复授权。
 		return fmt.Errorf("章节许可已保存，但 Engine 仍在完成上一轮停止；请稍后重试 /next")
 	}
@@ -759,6 +848,11 @@ func (h *Host) Steer(text string) {
 			Summary: "迁移未完成，无法执行干预: " + err.Error(), Level: "warn"})
 		return
 	}
+	if h.isRestoring() {
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM",
+			Summary: "恢复操作进行中，无法执行干预", Level: "warn"})
+		return
+	}
 	h.emitEvent(Event{Time: time.Now(), Category: "USER", Summary: "[用户干预] " + text, Level: "info"})
 	go h.handleIntervention(text)
 }
@@ -770,6 +864,21 @@ func (h *Host) Abort() bool {
 
 // abortWithEvent 以指定原因事件执行暂停。预算停机与手动暂停共用同一停机机制，
 // 仅事件文案不同（预算停机=用户预先签署的 Abort 指令，语义等同手动暂停）。
+// isRestoring 检查恢复操作是否正在进行中（受 h.mu 保护）。
+func (h *Host) isRestoring() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.restoring
+}
+
+// waitEngineCompletion 等待引擎 goroutine 完全退出（包括 deferred cleanup/onDone）。
+// 阻塞等待 engine.done channel 关闭；channel 不存在等价于已结束。
+func (h *Host) waitEngineCompletion() {
+	if done := h.engine.engineDone(); done != nil {
+		<-done
+	}
+}
+
 func (h *Host) abortWithEvent(summary, level string) bool {
 	h.mu.Lock()
 	running := h.lifecycle == lifecycleRunning
@@ -812,10 +921,9 @@ func (h *Host) Close() {
 	if h.engine != nil {
 		h.engine.abort()
 	}
-	if h.usageCancel != nil {
-		h.usageCancel()
-		h.usageCancel = nil
-	}
+	h.usage.StopAutoSave(h.usageCancel)
+	h.usageCancel = nil
+	h.usageCtx = nil
 	if err := h.usage.SaveNow(); err != nil {
 		slog.Warn("usage 退出前落盘失败", "module", "usage", "err", err)
 	}
@@ -1426,6 +1534,11 @@ func (h *Host) CoCreateStream(ctx context.Context, history []CoCreateMessage, on
 	if err := h.checkMigrationGate(); err != nil {
 		return CoCreateReply{}, err
 	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+	if h.isRestoring() {
+		return CoCreateReply{}, fmt.Errorf("恢复操作进行中")
+	}
 	return coCreateStream(ctx, h.models, h.store.Sessions, coCreateSystemPrompt, history, onProgress)
 }
 
@@ -1434,6 +1547,11 @@ func (h *Host) CoCreateStream(ctx context.Context, history []CoCreateMessage, on
 func (h *Host) StageCoCreateStream(ctx context.Context, history []CoCreateMessage, onProgress func(kind, text string)) (CoCreateReply, error) {
 	if err := h.checkMigrationGate(); err != nil {
 		return CoCreateReply{}, err
+	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+	if h.isRestoring() {
+		return CoCreateReply{}, fmt.Errorf("恢复操作进行中")
 	}
 	return coCreateStream(ctx, h.models, h.store.Sessions, stageSystemPrompt(h.store), history, onProgress)
 }
@@ -1458,6 +1576,12 @@ func (h *Host) PauseForCoCreate() bool {
 	h.mu.Lock()
 	if h.cocreating || h.lifecycle == lifecycleCompleted {
 		h.mu.Unlock()
+		return false
+	}
+	if h.restoring {
+		h.mu.Unlock()
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM",
+			Summary: "恢复操作进行中，无法进入阶段共创", Level: "warn"})
 		return false
 	}
 	h.cocreating = true
@@ -1539,8 +1663,21 @@ func (h *Host) ImportFrom(ctx context.Context, opts imp.Options) (<-chan imp.Eve
 	if err := h.checkMigrationGate(); err != nil {
 		return nil, err
 	}
+	h.interMu.Lock()
 	if err := h.guardExclusive("导入"); err != nil {
+		h.interMu.Unlock()
 		return nil, err
+	}
+	h.activeOps.Add(1)
+	h.interMu.Unlock()
+
+	if testBeforeImpRun != nil {
+		ch, err := testBeforeImpRun(ctx)
+		if err != nil {
+			h.activeOps.Done()
+			return nil, err
+		}
+		return h.trackImpOp(ch), nil
 	}
 
 	deps := imp.Deps{
@@ -1553,7 +1690,12 @@ func (h *Host) ImportFrom(ctx context.Context, opts imp.Options) (<-chan imp.Eve
 		},
 		Contract: h.contract,
 	}
-	return imp.Run(ctx, deps, opts)
+	ch, err := imp.Run(ctx, deps, opts)
+	if err != nil {
+		h.activeOps.Done()
+		return nil, err
+	}
+	return h.trackImpOp(ch), nil
 }
 
 // Simulate 读取 simulate 目录并生成或增量更新仿写画像。
@@ -1561,12 +1703,26 @@ func (h *Host) Simulate(ctx context.Context) (<-chan sim.Event, error) {
 	if err := h.checkMigrationGate(); err != nil {
 		return nil, err
 	}
+	h.interMu.Lock()
 	if err := h.guardExclusive("生成仿写画像"); err != nil {
+		h.interMu.Unlock()
 		return nil, err
+	}
+	h.activeOps.Add(1)
+	h.interMu.Unlock()
+
+	if testBeforeSimRun != nil {
+		ch, err := testBeforeSimRun(ctx)
+		if err != nil {
+			h.activeOps.Done()
+			return nil, err
+		}
+		return h.trackSimOp(ch), nil
 	}
 
 	wd, err := os.Getwd()
 	if err != nil {
+		h.activeOps.Done()
 		return nil, fmt.Errorf("get working dir: %w", err)
 	}
 	deps := sim.Deps{
@@ -1577,7 +1733,12 @@ func (h *Host) Simulate(ctx context.Context) (<-chan sim.Event, error) {
 			Merge:  h.bundle.Prompts.SimulationMerge,
 		},
 	}
-	return sim.Run(ctx, deps, sim.Options{SourceDir: filepath.Join(wd, "simulate")})
+	ch, err := sim.Run(ctx, deps, sim.Options{SourceDir: filepath.Join(wd, "simulate")})
+	if err != nil {
+		h.activeOps.Done()
+		return nil, err
+	}
+	return h.trackSimOp(ch), nil
 }
 
 // ImportSimulationProfile 导入此前生成的仿写画像。
@@ -1585,10 +1746,62 @@ func (h *Host) ImportSimulationProfile(ctx context.Context, path string) (<-chan
 	if err := h.checkMigrationGate(); err != nil {
 		return nil, err
 	}
+	h.interMu.Lock()
 	if err := h.guardExclusive("导入仿写画像"); err != nil {
+		h.interMu.Unlock()
 		return nil, err
 	}
-	return sim.RunImport(ctx, h.store, path)
+	h.activeOps.Add(1)
+	h.interMu.Unlock()
+
+	if testBeforeSimRun != nil {
+		ch, err := testBeforeSimRun(ctx)
+		if err != nil {
+			h.activeOps.Done()
+			return nil, err
+		}
+		return h.trackSimOp(ch), nil
+	}
+
+	ch, err := sim.RunImport(ctx, h.store, path)
+	if err != nil {
+		h.activeOps.Done()
+		return nil, err
+	}
+	return h.trackSimOp(ch), nil
+}
+
+// trackSimOp wraps a sim.Event channel to track the operation's lifetime
+// via h.activeOps. Add(1) must already have been called under interMu.
+func (h *Host) trackSimOp(in <-chan sim.Event) <-chan sim.Event {
+	out := make(chan sim.Event)
+	go func() {
+		defer h.activeOps.Done()
+		if testBeforeAsyncOp != nil {
+			testBeforeAsyncOp()
+		}
+		for ev := range in {
+			out <- ev
+		}
+		close(out)
+	}()
+	return out
+}
+
+// trackImpOp wraps an imp.Event channel (same pattern as trackSimOp).
+func (h *Host) trackImpOp(in <-chan imp.Event) <-chan imp.Event {
+	out := make(chan imp.Event)
+	go func() {
+		defer h.activeOps.Done()
+		if testBeforeAsyncOp != nil {
+			testBeforeAsyncOp()
+		}
+		for ev := range in {
+			out <- ev
+		}
+		close(out)
+	}()
+	return out
 }
 
 // guardExclusive 检查独占占用：Engine 运行中或阶段共创窗口内时拒绝会改写状态的入口
@@ -1601,6 +1814,8 @@ func (h *Host) guardExclusive(action string) error {
 		return fmt.Errorf("创作引擎运行中，请先暂停后再%s", action)
 	case h.cocreating:
 		return fmt.Errorf("阶段共创进行中，请先结束共创后再%s", action)
+	case h.restoring:
+		return fmt.Errorf("恢复操作进行中，请稍后再%s", action)
 	}
 	return nil
 }
@@ -1612,4 +1827,258 @@ func (h *Host) guardExclusive(action string) error {
 // 只读到 Progress.CompletedChapters + 章节终稿 + 大纲 + premise 的一致快照。
 func (h *Host) Export(ctx context.Context, opts exp.Options) (*exp.Result, error) {
 	return exp.Run(ctx, exp.Deps{Store: h.store}, opts)
+}
+
+// ── 快照与恢复 API（供 TUI/CLI 调用） ──
+
+// projectID 返回用于备份元数据的项目标识。
+func (h *Host) projectID() string {
+	return "proj-" + filepath.Base(h.store.Dir())
+}
+
+// ListSnapshots 返回所有正常（非救援）快照，按创建时间最新优先排列。
+// 隐藏的救援备份（.rescue/）不会被返回。
+func (h *Host) ListSnapshots() ([]backup.Manifest, error) {
+	if h.diagnosticOnly {
+		return nil, nil
+	}
+	snaps, err := backup.List(h.store.Dir())
+	if err != nil {
+		return nil, err
+	}
+	return snaps, nil
+}
+
+// IsEngineQuiescent 返回引擎是否已停止（无写入）。恢复操作要求引擎停稳。
+// 诊断 Host（migration_required）没有引擎，始终返回 true。
+func (h *Host) IsEngineQuiescent() bool {
+	if h.diagnosticOnly || h.engine == nil {
+		return true
+	}
+	return !h.engine.isRunning()
+}
+
+// backupBoundary 加载进度并校验最新完成章是否与请求的 V/A 匹配。
+// Arc 必须 !IsVolumeEnd；Volume 必须 IsVolumeEnd。严格模式：progress/chapter/boundary
+// 任何读取错误均 fail closed。
+func (h *Host) backupBoundary(kind backup.SnapshotKind, volume, arc int) error {
+	p, err := h.store.Progress.Load()
+	if err != nil {
+		return fmt.Errorf("progress load: %w", err)
+	}
+	if p == nil || len(p.CompletedChapters) == 0 {
+		return fmt.Errorf("no completed chapters; cannot validate boundary")
+	}
+	lastCh := p.CompletedChapters[len(p.CompletedChapters)-1]
+	b, berr := h.store.Outline.CheckArcBoundary(lastCh)
+	if berr != nil {
+		return fmt.Errorf("boundary check: %w", berr)
+	}
+	if b == nil {
+		return fmt.Errorf("chapter %d is not a boundary", lastCh)
+	}
+	if b.Volume != volume {
+		return fmt.Errorf("chapter %d volume %d != requested volume %d", lastCh, b.Volume, volume)
+	}
+	switch kind {
+	case backup.KindArc:
+		if b.IsVolumeEnd {
+			return fmt.Errorf("arc %d of volume %d is a volume end; use BackupVolume instead", arc, volume)
+		}
+		if !b.IsArcEnd {
+			return fmt.Errorf("chapter %d is not an arc end", lastCh)
+		}
+		if b.Arc != arc {
+			return fmt.Errorf("chapter %d arc %d != requested arc %d", lastCh, b.Arc, arc)
+		}
+	case backup.KindVolume:
+		if !b.IsVolumeEnd {
+			return fmt.Errorf("chapter %d is not a volume end", lastCh)
+		}
+	}
+	return nil
+}
+
+// BackupArc 在当前弧边界创建一个弧快照。
+// 持有 interMu→h.mu 独占 Host 预约：迁移门 → 诊断 → 恢复中/engine.isRunning
+// → backupBoundary → backup.Backup 均在一个预约内完成。边界验证严格 fail closed。
+func (h *Host) BackupArc(volume, arc int) (*backup.Manifest, error) {
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+
+	if err := h.checkMigrationGate(); err != nil {
+		return nil, err
+	}
+	if h.diagnosticOnly {
+		return nil, fmt.Errorf("diagnostic host does not support backup")
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.restoring {
+		return nil, fmt.Errorf("restore in progress")
+	}
+	if h.engine.isRunning() {
+		return nil, fmt.Errorf("engine is running; pause before backup")
+	}
+	if err := h.backupBoundary(backup.KindArc, volume, arc); err != nil {
+		return nil, err
+	}
+	source := h.store.Dir()
+	m, err := backup.Backup(source, h.projectID(), backup.KindArc, volume, arc)
+	if err != nil {
+		return nil, fmt.Errorf("arc backup: %w", err)
+	}
+	return m, nil
+}
+
+// BackupVolume 在当前卷边界创建一个卷快照。
+// 持有 interMu→h.mu 独占 Host 预约。边界验证要求最新完成章必须在卷末。
+func (h *Host) BackupVolume(volume int) (*backup.Manifest, error) {
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+
+	if err := h.checkMigrationGate(); err != nil {
+		return nil, err
+	}
+	if h.diagnosticOnly {
+		return nil, fmt.Errorf("diagnostic host does not support backup")
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.restoring {
+		return nil, fmt.Errorf("restore in progress")
+	}
+	if h.engine.isRunning() {
+		return nil, fmt.Errorf("engine is running; pause before backup")
+	}
+	if err := h.backupBoundary(backup.KindVolume, volume, 0); err != nil {
+		return nil, err
+	}
+	source := h.store.Dir()
+	m, err := backup.Backup(source, h.projectID(), backup.KindVolume, volume, 0)
+	if err != nil {
+		return nil, fmt.Errorf("volume backup: %w", err)
+	}
+	return m, nil
+}
+
+// RestoreSnapshot 从指定快照恢复到项目目录。
+//
+// 调用者必须传递 confirmed=true 以确认该操作。执行前生命周期无条件暂停；
+// 恢复期间阻止所有引擎/provider/tool 写入以及 mutating 入口。
+//
+// 成功（RestoreResult.FinalVerify=true）后刷新 WriterRestorePack 并保持暂停态。
+// 部分失败（非零 FileErrors）同样保持暂停态，返回结构化结果。
+func (h *Host) RestoreSnapshot(snapshotID string, confirmed bool) (rr *backup.RestoreResult, rerr error) {
+	if !confirmed {
+		return nil, fmt.Errorf("restore requires explicit confirmation")
+	}
+	if err := h.checkMigrationGate(); err != nil {
+		return nil, err
+	}
+	if h.diagnosticOnly {
+		return nil, fmt.Errorf("diagnostic host does not support restore")
+	}
+
+	// ── 独占门：互斥恢复 + 检查共创 ──
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+
+	h.mu.Lock()
+	if h.cocreating {
+		h.mu.Unlock()
+		return nil, fmt.Errorf("阶段共创进行中，无法执行恢复")
+	}
+	if h.restoring {
+		h.mu.Unlock()
+		return nil, fmt.Errorf("restore already in progress")
+	}
+	h.restoring = true
+	// 生命周期无条件暂停，并在引擎完成后再次确认暂停态
+	h.lifecycle = lifecyclePaused
+	h.mu.Unlock()
+
+	defer func() {
+		h.mu.Lock()
+		h.restoring = false
+		h.mu.Unlock()
+	}()
+
+	// ── 等待异步操作（import/simulation）完成 ──
+	h.activeOps.Wait()
+
+	// ── 停引擎（如运行中）并等待 deferred cleanup + onDone ──
+	if h.engine.isRunning() {
+		h.observer.setAborting(true)
+		h.engine.abort()
+		h.waitEngineCompletion()
+		// 引擎完成后再次确认 paused（runEnded 可能改为 idle/completed）
+		h.mu.Lock()
+		h.lifecycle = lifecyclePaused
+		h.mu.Unlock()
+	}
+
+	// ── quiesce UsageTracker 自动保存（stop-and-wait + 持久化） ──
+	// 在 StopAutoSave 之后立即 defer 重启 autosave，确保所有路径均会重启。
+	h.usage.StopAutoSave(h.usageCancel)
+	h.usageCancel = nil
+	h.usageCtx = nil
+	defer func() {
+		uc, ucancel := context.WithCancel(context.Background())
+		h.usageCtx = uc
+		h.usageCancel = ucancel
+		h.usage.StartAutoSave(uc)
+	}()
+
+	if err := h.usage.SaveNow(); err != nil {
+		// 预存失败 —— 中止恢复，不写 active tree
+		return nil, fmt.Errorf("usage save before restore failed: %w", err)
+	}
+
+	// ── 执行恢复 ──
+	rr, rerr = backup.Restore(h.store.Dir(), snapshotID)
+
+	// ── 恢复后：persist 当前内存 usage（保留单调累计） ──
+	// post SaveNow 失败时不发正常成功事件，但保留 WRP 刷新（creative 恢复已生效）。
+	postErr := h.usage.SaveNow()
+	if postErr != nil {
+		slog.Warn("restore: usage save after restore failed", "module", "host", "err", postErr)
+	}
+
+	// ── 处理结果 ──
+	creativeOK := rerr == nil && rr != nil && rr.FinalVerify && rr.Failed == 0
+	if creativeOK {
+		h.refreshWriterRestore()
+	}
+
+	switch {
+	case postErr != nil && creativeOK:
+		// creative 成功但 usage 持久化失败 —— 仍发 paused 事件
+		summary := fmt.Sprintf("从快照 %s 恢复成功（%d/%d 文件），usage 落盘失败",
+			snapshotID, rr.Succeeded, rr.Attempted)
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: summary, Level: "warn"})
+		slog.Warn(summary, "module", "host")
+		return rr, fmt.Errorf("usage save after restore failed: %v", postErr)
+
+	case creativeOK:
+		summary := fmt.Sprintf("从快照 %s 恢复成功（%d/%d 文件，最终验证通过）",
+			snapshotID, rr.Succeeded, rr.Attempted)
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: summary, Level: "success"})
+		slog.Info(summary, "module", "host", "rescue_id", rr.RescueID)
+
+	case rerr != nil:
+		summary := "从快照恢复失败"
+		if rr != nil {
+			summary = fmt.Sprintf("从快照 %s 恢复失败（%d/%d 文件成功）", snapshotID, rr.Succeeded, rr.Attempted)
+		}
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: summary, Level: "error"})
+		slog.Warn(summary, "module", "host")
+	}
+
+	if rerr != nil {
+		return rr, rerr
+	}
+	return rr, nil
 }

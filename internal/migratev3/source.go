@@ -14,6 +14,7 @@ import (
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/projectprofile"
+	"github.com/voocel/ainovel-cli/internal/store"
 )
 
 type sourceBook struct {
@@ -107,6 +108,9 @@ func loadSource(bookDir string, expected *projectprofile.Fingerprint) (*sourceBo
 				return nil, fmt.Errorf("chapter %d scene %d is not a valid structured v2 scene: %w", ch.Chapter, sceneIndex+1, err)
 			}
 		}
+	}
+	if err := store.ValidateVolumesLayeredOutline(volumes); err != nil {
+		return nil, fmt.Errorf("source volumes: %w", err)
 	}
 	flat := domain.FlattenOutline(volumes)
 	equal, err := jsonSemanticallyEqual(outline, flat)

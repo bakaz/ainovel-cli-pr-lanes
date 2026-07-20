@@ -65,6 +65,8 @@ type Model struct {
 	importSeq      int
 	simulator      *simulationState
 	simSeq         int
+	restoreStaged  string // snapshot selected by /restore; execution needs a separate confirmation
+	restoreInFlight bool  // true while a restore is executing; rejects additional stage/confirm
 	compItems      []commandPaletteItem
 	compIdx        int
 	compActive     bool

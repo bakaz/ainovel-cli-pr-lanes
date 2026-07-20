@@ -65,6 +65,28 @@ func commandRegistryInstance() commandRegistry {
 			},
 		},
 		{
+			Name:        "snapshots",
+			Group:       "system",
+			Usage:       "/snapshots",
+			Description: "列出可恢复的 Arc/Volume 快照",
+			AutoExecute: true,
+			Run: func(m Model, args []string) (tea.Model, tea.Cmd) {
+				if len(args) != 0 {
+					return restoreCommandError(m, "Usage: /snapshots")
+				}
+				return m.listSnapshots()
+			},
+		},
+		{
+			Name:        "restore",
+			Group:       "system",
+			Usage:       "/restore <snapshot-id> | confirm | cancel",
+			Description: "恢复快照（需明确确认）",
+			Run: func(m Model, args []string) (tea.Model, tea.Cmd) {
+				return m.handleRestoreCommand(args)
+			},
+		},
+		{
 			Name:        "model",
 			Group:       "system",
 			Usage:       "/model [role]",
