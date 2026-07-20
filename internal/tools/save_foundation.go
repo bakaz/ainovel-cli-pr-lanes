@@ -101,7 +101,7 @@ func sceneBeatSchema(v3 bool) map[string]any {
 	}
 }
 
-func chapterOutlineSchema(v3 bool) map[string]any {
+func chapterOutlineSchema(v3 bool, chapterReq bool) map[string]any {
 	var scenesSchema map[string]any
 	if v3 {
 		scenesSchema = map[string]any{
@@ -120,14 +120,17 @@ func chapterOutlineSchema(v3 bool) map[string]any {
 			},
 		}
 	}
-	reqd := []string{"chapter", "title", "core_event"}
+	reqd := []string{"title", "core_event"}
 	if v3 {
 		reqd = append(reqd, "scenes")
+	}
+	if chapterReq {
+		reqd = append(reqd, "chapter")
 	}
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"chapter":    scenePropInt("章节序号"),
+			"chapter":    scenePropInt("章节序号（flat outline 必填；planning 路径可省略/0/显式值）"),
 			"title":      scenePropString("章节标题"),
 			"core_event": scenePropString("核心事件"),
 			"hook":       scenePropString("章末钩子"),
@@ -139,21 +142,76 @@ func chapterOutlineSchema(v3 bool) map[string]any {
 }
 
 func arcOutlineSchema(v3 bool) map[string]any {
-	ch := chapterOutlineSchema(v3)
-	chapters := map[string]any{"type": "array", "description": "章节数组", "items": ch}
+	chPlanning := chapterOutlineSchema(v3, false)
 	if v3 {
-		chapters["minItems"] = 1
+		return map[string]any{
+			"anyOf": []any{
+				// detailed arc: must have non-empty chapters
+				map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"index":              scenePropInt("卷内弧序号"),
+						"title":              scenePropString("弧标题"),
+						"goal":               scenePropString("弧目标（起承转合）"),
+						"estimated_chapters": map[string]any{"type": "integer", "description": "预估章数（详细弧在转换前归零）"},
+						"chapters":           map[string]any{"type": "array", "description": "章节数组", "items": chPlanning, "minItems": 1},
+					},
+					"required":             []string{"index", "title", "goal", "chapters"},
+					"additionalProperties": false,
+				},
+				// skeleton arc: estimated_chapters >= 1, chapters omitted/null/[]
+				map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"index":              scenePropInt("卷内弧序号"),
+						"title":              scenePropString("弧标题"),
+						"goal":               scenePropString("弧目标（起承转合）"),
+						"estimated_chapters": map[string]any{"type": "integer", "description": "预估章数", "minimum": 1},
+						"chapters": map[string]any{
+							"anyOf": []any{
+								map[string]any{"type": "null"},
+								map[string]any{"type": "array", "maxItems": 0},
+							},
+						},
+					},
+					"required":             []string{"index", "title", "goal", "estimated_chapters"},
+					"additionalProperties": false,
+				},
+			},
+		}
 	}
+	// Core4: also use anyOf for detailed/skeleton (not a single generic passage)
 	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"index":    scenePropInt("卷内弧序号"),
-			"title":    scenePropString("弧标题"),
-			"goal":     scenePropString("弧目标（起承转合）"),
-			"chapters": chapters,
+		"anyOf": []any{
+			map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"index":    scenePropInt("卷内弧序号"),
+					"title":    scenePropString("弧标题"),
+					"goal":     scenePropString("弧目标（起承转合）"),
+					"chapters": map[string]any{"type": "array", "description": "章节数组（含 non-empty chapters）", "items": chPlanning},
+				},
+				"required":             []string{"index", "title", "goal", "chapters"},
+				"additionalProperties": false,
+			},
+			map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"index":              scenePropInt("卷内弧序号"),
+					"title":              scenePropString("弧标题"),
+					"goal":               scenePropString("弧目标（起承转合）"),
+					"estimated_chapters": map[string]any{"type": "integer", "description": "预估章数", "minimum": 1},
+					"chapters": map[string]any{
+						"anyOf": []any{
+							map[string]any{"type": "null"},
+							map[string]any{"type": "array", "maxItems": 0},
+						},
+					},
+				},
+				"required":             []string{"index", "title", "goal", "estimated_chapters"},
+				"additionalProperties": false,
+			},
 		},
-		"required":             []string{"index", "title", "goal", "chapters"},
-		"additionalProperties": false,
 	}
 }
 
@@ -238,20 +296,21 @@ func (t *SaveFoundationTool) v3BranchReq(typeName string, contentSchema map[stri
 }
 
 func (t *SaveFoundationTool) v3Schema() map[string]any {
-	ch := chapterOutlineSchema(true)
+	chReq := chapterOutlineSchema(true, true)  // flat outline: chapter required
+	chOpt := chapterOutlineSchema(true, false) // planning paths: chapter optional
 	vol := volumeOutlineSchema(true)
 	scaleEnum := map[string]any{"type": "string", "enum": []string{"short", "mid", "long"}}
 	return map[string]any{
 		"anyOf": []any{
 			t.v3Branch("premise", map[string]any{"type": "string", "description": "premise 前提（Markdown 字符串）"}, map[string]map[string]any{"scale": scaleEnum}),
-			t.v3Branch("outline", map[string]any{"type": "array", "description": "outline: Chapter 对象数组", "items": ch, "minItems": 1}, map[string]map[string]any{"scale": scaleEnum}),
+			t.v3Branch("outline", map[string]any{"type": "array", "description": "outline: Chapter 对象数组", "items": chReq, "minItems": 1}, map[string]map[string]any{"scale": scaleEnum}),
 			t.v3Branch("layered_outline", map[string]any{"type": "array", "description": "layered_outline: Volume 对象数组", "items": vol, "minItems": 1}, map[string]map[string]any{"scale": scaleEnum}),
 			t.v3BranchReq("expand_arc", map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"title":    map[string]any{"type": "string", "description": "弧标题"},
 					"goal":     map[string]any{"type": "string", "description": "弧目标"},
-					"chapters": map[string]any{"type": "array", "description": "章节数组", "items": ch, "minItems": 1},
+					"chapters": map[string]any{"type": "array", "description": "章节数组", "items": chOpt, "minItems": 1},
 				},
 				"required": []string{"title", "goal", "chapters"}, "additionalProperties": false,
 			}, map[string]map[string]any{
@@ -286,21 +345,23 @@ func (t *SaveFoundationTool) v3Schema() map[string]any {
 }
 
 func (t *SaveFoundationTool) core4Schema() map[string]any {
-	ch := chapterOutlineSchema(false)
+	chReq := chapterOutlineSchema(false, true)  // flat outline: chapter required
+	chOpt := chapterOutlineSchema(false, false) // planning paths: chapter optional
+	_ = chOpt                                   // used implicitly through vol → arcOutlineSchema → chapterOutlineSchema(false, false)
 	vol := volumeOutlineSchema(false)
 	return schema.Object(
 		schema.Property("type", schema.Enum("设定类型", "premise", "outline", "layered_outline", "characters", "world_rules", "expand_arc", "append_volume", "update_compass", "complete_book")).Required(),
 		schema.Property("content", map[string]any{
 			"anyOf": []any{
 				map[string]any{"type": "string", "description": "premise 前提（Markdown 字符串）"},
-				map[string]any{"type": "array", "items": ch, "description": "outline: Chapter 对象数组"},
+				map[string]any{"type": "array", "items": chReq, "description": "outline: Chapter 对象数组"},
 				map[string]any{"type": "array", "items": vol, "description": "layered_outline: Volume 对象数组"},
 				map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"title":    scenePropString("弧标题"),
 						"goal":     scenePropString("弧目标"),
-						"chapters": map[string]any{"type": "array", "items": ch, "description": "章节数组"},
+						"chapters": map[string]any{"type": "array", "items": chOpt, "description": "章节数组"},
 					},
 					"required": []string{"title", "goal"},
 				},
@@ -469,34 +530,76 @@ func (t *SaveFoundationTool) Execute(ctx context.Context, args json.RawMessage) 
 		if isV3 && len(entries) == 0 {
 			return nil, fmt.Errorf("outline: chapters array is empty: %w", errs.ErrToolArgs)
 		}
+		if isV3 {
+			for i, e := range entries {
+				if e.Chapter <= 0 {
+					return nil, fmt.Errorf("outline: chapters[%d].chapter must be > 0: %w", i, errs.ErrToolArgs)
+				}
+			}
+		}
 		if err := t.validateChapterScenes(entries); err != nil {
 			return nil, err
 		}
 		cmd.Payload = entries
 	case "layered_outline":
-		var volumes []domain.VolumeOutline
-		if err := decodeFoundationJSON("layered_outline", cmd.Content, &volumes); err != nil {
+		var planVolumes []PlanningVolumeInput
+		if err := decodeFoundationJSON("layered_outline", cmd.Content, &planVolumes); err != nil {
 			return nil, err
 		}
-		if isV3 {
-			if len(volumes) == 0 {
-				return nil, fmt.Errorf("layered_outline: volumes array is empty: %w", errs.ErrToolArgs)
+		if isV3 && len(planVolumes) == 0 {
+			return nil, fmt.Errorf("layered_outline: volumes array is empty: %w", errs.ErrToolArgs)
+		}
+		var semErrors planValidationErrors
+		for vi, pv := range planVolumes {
+			vPath := fmt.Sprintf("volumes[%d]", vi)
+			if pv.Index <= 0 {
+				semErrors.addErrorf(vPath, "INVALID_INDEX",
+					"volume index %d must be positive", pv.Index)
+			}
+			if len(pv.Arcs) == 0 {
+				if isV3 {
+					return nil, fmt.Errorf("layered_outline: volume %d has no arcs: %w", pv.Index, errs.ErrToolArgs)
+				}
+				semErrors.addErrorf(vPath, "EMPTY_VOLUME",
+					"volume %d has no arcs", pv.Index)
+				continue
+			}
+			// 第一条全局弧（全书第一个弧）必须 detailed
+			if vi == 0 && !pv.Arcs[0].IsDetailed() {
+				return nil, fmt.Errorf("layered_outline: first volume's first arc must be detailed (non-empty chapters): %w", errs.ErrToolArgs)
+			}
+			for ai, a := range pv.Arcs {
+				aPath := fmt.Sprintf("%s.arcs[%d]", vPath, ai)
+				if a.Index <= 0 {
+					semErrors.addErrorf(aPath, "INVALID_INDEX",
+						"arc %d index must be positive", a.Index)
+				}
+				if a.IsSkeleton() {
+					// skeleton arc: skip scene validation
+					continue
+				}
+				if !a.IsDetailed() {
+					semErrors.addErrorf(aPath, "EMPTY_ARC",
+						"volume %d arc %d: must have non-empty chapters or estimated_chapters>0", pv.Index, a.Index)
+					continue
+				}
+				// detailed arc: aggregate scene validation errors
+				chs := make([]domain.OutlineEntry, len(a.Chapters))
+				for ci, c := range a.Chapters {
+					chs[ci] = c.toDomain()
+				}
+				for _, sceneErr := range t.validateChapterScenesAggregated(chs) {
+					semErrors.addError(aPath+".chapters", "INVALID_SCENE", sceneErr.Error())
+				}
 			}
 		}
-		for _, vol := range volumes {
-			if isV3 && len(vol.Arcs) == 0 {
-				return nil, fmt.Errorf("layered_outline: volume %d has no arcs: %w", vol.Index, errs.ErrToolArgs)
-			}
-			for _, arc := range vol.Arcs {
-				if isV3 && len(arc.Chapters) == 0 {
-					return nil, fmt.Errorf("layered_outline: volume %d arc %d has no chapters: %w", vol.Index, arc.Index, errs.ErrToolArgs)
-				}
-				if len(arc.Chapters) > 0 {
-					if err := t.validateChapterScenes(arc.Chapters); err != nil {
-						return nil, err
-					}
-				}
-			}
+		if len(semErrors) > 0 {
+			return nil, fmt.Errorf("layered_outline: %w: %w", semErrors, errs.ErrToolArgs)
+		}
+		// 转换为 domain 模型
+		volumes := make([]domain.VolumeOutline, len(planVolumes))
+		for i, pv := range planVolumes {
+			volumes[i] = pv.toDomain()
 		}
 		// 在任意写入前完成编号/拓扑校验
 		if err := t.store.Outline.ValidateLayeredOutline(volumes); err != nil {
@@ -582,29 +685,47 @@ func (t *SaveFoundationTool) Execute(ctx context.Context, args json.RawMessage) 
 		if strings.TrimSpace(cmd.Reason) == "" {
 			return nil, fmt.Errorf("append_volume 必须带 reason 参数: %w", errs.ErrToolArgs)
 		}
-		var vol domain.VolumeOutline
-		if err := decodeFoundationJSON("append_volume", cmd.Content, &vol); err != nil {
+		var planVol PlanningVolumeInput
+		if err := decodeFoundationJSON("append_volume", cmd.Content, &planVol); err != nil {
 			return nil, err
 		}
-		if vol.Index <= 0 {
+		if planVol.Index <= 0 {
 			return nil, fmt.Errorf("append_volume: volume index must be positive: %w", errs.ErrToolArgs)
 		}
-		if len(vol.Arcs) == 0 {
+		if len(planVol.Arcs) == 0 {
 			return nil, fmt.Errorf("append_volume: volume has no arcs: %w", errs.ErrToolArgs)
 		}
-		for _, a := range vol.Arcs {
-			if isV3 && len(a.Chapters) == 0 {
-				return nil, fmt.Errorf("append_volume: arc has empty chapters: %w", errs.ErrToolArgs)
-			}
-			if len(a.Chapters) > 0 {
-				if err := t.validateChapterScenes(a.Chapters); err != nil {
-					return nil, err
-				}
-			}
-		}
-		if !vol.Arcs[0].IsExpanded() {
+		// 新卷首弧必须 detailed
+		if !planVol.Arcs[0].IsDetailed() {
 			return nil, fmt.Errorf("append_volume: first arc must contain expanded chapters: %w", errs.ErrToolArgs)
 		}
+		var semErrors planValidationErrors
+		for ai, a := range planVol.Arcs {
+			aPath := fmt.Sprintf("arcs[%d]", ai)
+			if a.Index <= 0 {
+				semErrors.addErrorf(aPath, "INVALID_INDEX",
+					"arc %d index must be positive", a.Index)
+			}
+			if a.IsSkeleton() {
+				continue
+			}
+			if !a.IsDetailed() {
+				semErrors.addErrorf(aPath, "EMPTY_ARC",
+					"arc %d: must have non-empty chapters or estimated_chapters>0", a.Index)
+				continue
+			}
+			chs := make([]domain.OutlineEntry, len(a.Chapters))
+			for ci, c := range a.Chapters {
+				chs[ci] = c.toDomain()
+			}
+			for _, sceneErr := range t.validateChapterScenesAggregated(chs) {
+				semErrors.addError(aPath+".chapters", "INVALID_SCENE", sceneErr.Error())
+			}
+		}
+		if len(semErrors) > 0 {
+			return nil, fmt.Errorf("append_volume: %w: %w", semErrors, errs.ErrToolArgs)
+		}
+		vol := planVol.toDomain()
 		progress, err := t.store.Progress.Load()
 		if err != nil {
 			return nil, fmt.Errorf("append_volume: load progress: %w: %w", errs.ErrStoreRead, err)
@@ -897,134 +1018,6 @@ func validateV3ArgumentKeys(typeName string, keys map[string]json.RawMessage) er
 	for key := range keys {
 		if !allowed[key] {
 			return fmt.Errorf("%s: field %q is not allowed for this command: %w", typeName, key, errs.ErrToolArgs)
-		}
-	}
-	return nil
-}
-
-func (t *SaveFoundationTool) validateV3Content(typeName, content string, dec func(string, any) error, volume, arc int, reason string) error {
-	switch typeName {
-	case "outline":
-		var entries []domain.OutlineEntry
-		if err := dec("outline", &entries); err != nil {
-			return err
-		}
-		if len(entries) == 0 {
-			return fmt.Errorf("outline: chapters array is empty: %w", errs.ErrToolArgs)
-		}
-		if err := t.validateChapterScenes(entries); err != nil {
-			return err
-		}
-	case "layered_outline":
-		var volumes []domain.VolumeOutline
-		if err := dec("layered_outline", &volumes); err != nil {
-			return err
-		}
-		if len(volumes) == 0 {
-			return fmt.Errorf("layered_outline: volumes array is empty: %w", errs.ErrToolArgs)
-		}
-		for vi, vol := range volumes {
-			if len(vol.Arcs) == 0 {
-				return fmt.Errorf("layered_outline: volume %d has no arcs: %w", vol.Index, errs.ErrToolArgs)
-			}
-			for _, arc := range vol.Arcs {
-				if len(arc.Chapters) == 0 {
-					return fmt.Errorf("layered_outline: volume %d arc %d has no chapters: %w", vol.Index, arc.Index, errs.ErrToolArgs)
-				}
-				if err := t.validateChapterScenes(arc.Chapters); err != nil {
-					return err
-				}
-			}
-			_ = vi
-		}
-	case "expand_arc":
-		if volume <= 0 || arc <= 0 {
-			return fmt.Errorf("expand_arc requires volume and arc parameters: %w", errs.ErrToolArgs)
-		}
-		var expansion domain.ArcExpansion
-		if err := dec("expand_arc", &expansion); err != nil {
-			return err
-		}
-		if len(expansion.Chapters) == 0 {
-			return fmt.Errorf("expand_arc: chapters array is empty: %w", errs.ErrToolArgs)
-		}
-		if err := t.validateChapterScenes(expansion.Chapters); err != nil {
-			return err
-		}
-	case "append_volume":
-		if strings.TrimSpace(reason) == "" {
-			return fmt.Errorf("append_volume 必须带 reason 参数: %w", errs.ErrToolArgs)
-		}
-		var vol domain.VolumeOutline
-		if err := dec("append_volume", &vol); err != nil {
-			return err
-		}
-		if len(vol.Arcs) == 0 {
-			return fmt.Errorf("append_volume: volume has no arcs: %w", errs.ErrToolArgs)
-		}
-		for _, a := range vol.Arcs {
-			if len(a.Chapters) == 0 {
-				return fmt.Errorf("append_volume: arc has empty chapters: %w", errs.ErrToolArgs)
-			}
-			if err := t.validateChapterScenes(a.Chapters); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (t *SaveFoundationTool) validateCore4Content(typeName, content string, dec func(string, any) error, volume, arc int, reason string) error {
-	switch typeName {
-	case "outline":
-		var entries []domain.OutlineEntry
-		if err := dec("outline", &entries); err != nil {
-			return err
-		}
-		if err := t.validateChapterScenes(entries); err != nil {
-			return err
-		}
-	case "layered_outline":
-		var volumes []domain.VolumeOutline
-		if err := dec("layered_outline", &volumes); err != nil {
-			return err
-		}
-		for _, vol := range volumes {
-			for _, a := range vol.Arcs {
-				if len(a.Chapters) > 0 {
-					if err := t.validateChapterScenes(a.Chapters); err != nil {
-						return err
-					}
-				}
-			}
-		}
-	case "expand_arc":
-		if volume <= 0 || arc <= 0 {
-			return fmt.Errorf("expand_arc requires volume and arc parameters: %w", errs.ErrToolArgs)
-		}
-		var expansion domain.ArcExpansion
-		if err := dec("expand_arc", &expansion); err != nil {
-			return err
-		}
-		if err := t.validateChapterScenes(expansion.Chapters); err != nil {
-			return err
-		}
-	case "append_volume", "complete_book":
-		if strings.TrimSpace(reason) == "" {
-			return fmt.Errorf("%s 必须带 reason 参数: %w", typeName, errs.ErrToolArgs)
-		}
-		if typeName == "append_volume" {
-			var vol domain.VolumeOutline
-			if err := dec("append_volume", &vol); err != nil {
-				return err
-			}
-			for _, a := range vol.Arcs {
-				if len(a.Chapters) > 0 {
-					if err := t.validateChapterScenes(a.Chapters); err != nil {
-						return err
-					}
-				}
-			}
 		}
 	}
 	return nil
@@ -1461,6 +1454,28 @@ func (t *SaveFoundationTool) validateChapterScenes(chapters []domain.OutlineEntr
 		}
 	}
 	return nil
+}
+
+// validateChapterScenesAggregated 遍历所有章节的所有场景，返回全部语义错误；nil 表示全部通过。
+// 仅用于 layered_outline/append_volume 的 Phase 1 聚合；expand_arc 仍使用 fail-fast 的 validateChapterScenes。
+func (t *SaveFoundationTool) validateChapterScenesAggregated(chapters []domain.OutlineEntry) []error {
+	isV3 := t.contract != nil && t.contract.GetContract() == projectprofile.ContractSceneBeatV3
+	var errs []error
+	for i, ch := range chapters {
+		if isV3 && len(ch.Scenes) == 0 {
+			errs = append(errs, fmt.Errorf("chapters[%d].scenes: v3 requires non-empty scenes array", i))
+			continue
+		}
+		for j, sc := range ch.Scenes {
+			if err := t.contract.Validate(sc); err != nil {
+				errs = append(errs, fmt.Errorf("chapters[%d].scenes[%d].%w", i, j, err))
+			}
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return errs
 }
 
 func countChapters(arcs []domain.ArcOutline) int {

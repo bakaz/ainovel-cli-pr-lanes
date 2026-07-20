@@ -60,15 +60,17 @@
     "core_event": "本章核心事件",
     "hook": "章末钩子",
     "scenes": [
-      {"goal": "目标", "action": "行动", "conflict": "冲突", "outcome": "结果", "sensory_anchor": "感官锚点（可选）", "body_reaction": "按运行时字段指导填写", "emotion_reaction": "按运行时字段指导填写"}
+      {"goal": "目标", "action": "行动", "conflict": "冲突", "outcome": "结果"}
     ]
   }
 ]
 ```
 
+> **版本说明**：Core4 下 scene 使用四字段结构对象（goal/action/conflict/outcome）；V3 按运行时注入契约填齐七字段（goal/action/conflict/outcome/body_reaction/emotion_reaction/erotic_charge 必填）；sensory_anchor 可选。
+
 ## 分层大纲模板（长篇 - 卷弧双层滚动展开）
 
-初始规划采用双层滚动：前 2 卷有弧骨架，其余卷为骨架卷；第一弧有详细章节。
+初始规划采用双层滚动：前 2 卷有弧骨架，其余卷为骨架卷；第一弧为详细弧（含章节），其余为骨架弧（仅 estimated_chapters，省略 chapters）。
 
 ```json
 [
@@ -89,8 +91,7 @@
         "index": 2,
         "title": "第二弧（骨架弧）",
         "goal": "这一弧的目标概述",
-        "estimated_chapters": 12,
-        "chapters": []
+        "estimated_chapters": 12
       }
     ]
   },
@@ -99,16 +100,9 @@
     "title": "第二卷标题",
     "theme": "第二卷主题",
     "arcs": [
-      {"index": 1, "title": "弧标题", "goal": "弧目标", "estimated_chapters": 15, "chapters": []},
-      {"index": 2, "title": "弧标题", "goal": "弧目标", "estimated_chapters": 10, "chapters": []}
+      {"index": 1, "title": "弧标题", "goal": "弧目标", "estimated_chapters": 15},
+      {"index": 2, "title": "弧标题", "goal": "弧目标", "estimated_chapters": 10}
     ]
-  },
-  {
-    "index": 3,
-    "title": "第三卷标题（骨架卷）",
-    "theme": "第三卷主题方向",
-    "estimated_chapters": 60,
-    "arcs": []
   }
 ]
 ```
