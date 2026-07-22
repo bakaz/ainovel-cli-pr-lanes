@@ -2124,6 +2124,319 @@ func TestAnchor_NilProgressLegacyPath(t *testing.T) {
 // TestContextToolInjectsRuleViolations 违规事实管道契约(第五轮评审):
 // commit 落盘的机械违规必须经 novel_context(chapter=N) 真实注入——
 // editor.md §机械检查映射消费的就是这个字段,管道断了 prompt 就成空头支票。
+// ── archive_refs 投影 ──
+
+func TestContextToolArchitectArchiveRefsProjection(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.Init("test", 6); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.UpdateVolumeArc(1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{
+		{Index: 1, Title: "第一卷", Theme: "启程",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "开端", Goal: "建立", Chapters: []domain.OutlineEntry{{Chapter: 1}}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 设置 compass 带 open_threads，部分带 marker
+	if err := s.Outline.SaveCompass(domain.StoryCompass{
+		Long: domain.LongCompass{
+			EndingDirection: "终局",
+			OpenThreads: []string{
+				"探索上古遗迹 [room:ancient_temple]",
+				"寻找失落神器 [room:artifact_hall]",
+				"普通线索（无 marker）",
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 创建 planning archive，只有部分匹配的条目
+	if err := s.PlanningArchive.UpsertEntry("room", "ancient_temple", json.RawMessage(`{"name":"上古神殿"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "architect")
+	args, _ := json.Marshal(map[string]any{})
+	result, err := tool.Execute(t.Context(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatal(err)
+	}
+
+	planning, ok := payload["planning_memory"].(map[string]any)
+	if !ok {
+		t.Fatal("expected planning_memory")
+	}
+	ar, ok := planning["archive_refs"].(map[string]any)
+	if !ok {
+		t.Fatal("expected planning_memory.archive_refs")
+	}
+
+	// 检查 projection 字段
+	if status, exists := ar["archive_status"]; !exists {
+		t.Fatal("expected archive_refs.archive_status")
+	} else if status != "available" {
+		t.Fatalf("expected archive_status=available, got %v", status)
+	}
+
+	marked, ok := ar["marked_threads"].([]any)
+	if !ok || len(marked) != 3 {
+		t.Fatalf("expected 3 marked_threads, got %d", len(marked))
+	}
+
+	parsed, ok := ar["parsed_refs"].([]any)
+	if !ok || len(parsed) != 2 {
+		t.Fatalf("expected 2 parsed_refs, got %d", len(parsed))
+	}
+
+	available, ok := ar["available_refs"].([]any)
+	if !ok || len(available) != 1 {
+		t.Fatalf("expected 1 available_ref, got %d", len(available))
+	}
+
+	missing, ok := ar["missing_refs"].([]any)
+	if !ok || len(missing) != 1 {
+		t.Fatalf("expected 1 missing_ref, got %d", len(missing))
+	}
+
+	if _, exists := ar["reader_hint"]; !exists {
+		t.Fatal("expected reader_hint in archive_refs")
+	}
+}
+
+func TestContextToolArchitectArchiveRefsAbsent(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.Init("test", 6); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.UpdateVolumeArc(1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{
+		{Index: 1, Title: "第一卷", Theme: "启程",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "开端", Goal: "建立", Chapters: []domain.OutlineEntry{{Chapter: 1}}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 有 open_threads 但无 planning archive
+	if err := s.Outline.SaveCompass(domain.StoryCompass{
+		Long: domain.LongCompass{
+			EndingDirection: "终局",
+			OpenThreads:     []string{"探索遗迹 [room:some_room]"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "architect")
+	args, _ := json.Marshal(map[string]any{})
+	result, err := tool.Execute(t.Context(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatal(err)
+	}
+
+	planning, ok := payload["planning_memory"].(map[string]any)
+	if !ok {
+		t.Fatal("expected planning_memory")
+	}
+	ar, ok := planning["archive_refs"].(map[string]any)
+	if !ok {
+		t.Fatal("expected planning_memory.archive_refs")
+	}
+
+	if status, exists := ar["archive_status"]; !exists {
+		t.Fatal("expected archive_refs.archive_status")
+	} else if status != "absent" {
+		t.Fatalf("expected archive_status=absent, got %v", status)
+	}
+
+	// 无 archive 时不应有 available/missing_refs
+	if _, exists := ar["available_refs"]; exists {
+		t.Fatal("unexpected available_refs when archive absent")
+	}
+	if _, exists := ar["missing_refs"]; exists {
+		t.Fatal("unexpected missing_refs when archive absent")
+	}
+}
+
+func TestContextToolArchitectArchiveRefsNoMarkers(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.Init("test", 6); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.UpdateVolumeArc(1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{
+		{Index: 1, Title: "第一卷", Theme: "启程",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "开端", Goal: "建立", Chapters: []domain.OutlineEntry{{Chapter: 1}}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// open_threads 不含 marker
+	if err := s.Outline.SaveCompass(domain.StoryCompass{
+		Long: domain.LongCompass{
+			EndingDirection: "终局",
+			OpenThreads:     []string{"普通线索一", "普通线索二"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "architect")
+	args, _ := json.Marshal(map[string]any{})
+	result, err := tool.Execute(t.Context(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatal(err)
+	}
+
+	planning, ok := payload["planning_memory"].(map[string]any)
+	if !ok {
+		t.Fatal("expected planning_memory")
+	}
+	// 无 marker 时不注入 archive_refs
+	if _, exists := planning["archive_refs"]; exists {
+		t.Fatal("archive_refs should not be injected when no markers present")
+	}
+}
+
+// TestArchiveRefsProjection_CollisionFreeKey verifies that (kind="room/foo", id="bar")
+// and (kind="room", id="foo/bar") do NOT collide in available/missing tracking.
+func TestArchiveRefsProjection_CollisionFreeKey(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.Init("test", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.UpdateVolumeArc(1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{
+		{Index: 1, Title: "V1", Theme: "T",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "A1", Goal: "G", Chapters: []domain.OutlineEntry{{Chapter: 1}}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// open_threads: one ref with id="foo/bar" (slash in ID) and one with id="bar"
+	if err := s.Outline.SaveCompass(domain.StoryCompass{
+		Long: domain.LongCompass{
+			EndingDirection: "终局",
+			OpenThreads: []string{
+				"线索A[room:foo/bar]",
+				"线索B[room:bar]",
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Archive has kind="room/foo", id="bar" — NOT kind="room", id="foo/bar"
+	// archiveEntryKey("room/foo", "bar") = "room/foo\x00bar"
+	// archiveEntryKey("room", "foo/bar") = "room\x00foo/bar"
+	// These are different — no collision.
+	if err := s.PlanningArchive.UpsertEntry("room/foo", "bar", json.RawMessage(`{"x":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	// Also create kind="room", id="bar" which SHOULD match the second thread
+	if err := s.PlanningArchive.UpsertEntry("room", "bar", json.RawMessage(`{"y":2}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "architect")
+	args, _ := json.Marshal(map[string]any{})
+	result, err := tool.Execute(t.Context(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	planning := payload["planning_memory"].(map[string]any)
+	ar := planning["archive_refs"].(map[string]any)
+
+	refs := ar["parsed_refs"].([]any)
+	if len(refs) != 2 {
+		t.Fatalf("expected 2 refs, got %d", len(refs))
+	}
+
+	// First ref: kind="room", id="foo/bar" — should be MISSING (no matching archive entry)
+	// Second ref: kind="room", id="bar" — should be AVAILABLE
+	miss := ar["missing_refs"].([]any)
+	if len(miss) != 1 {
+		t.Fatalf("expected 1 missing_ref (foo/bar not found), got %d", len(miss))
+	}
+	avail := ar["available_refs"].([]any)
+	if len(avail) != 1 {
+		t.Fatalf("expected 1 available_ref (bar found), got %d", len(avail))
+	}
+}
+
 func TestContextToolInjectsRuleViolations(t *testing.T) {
 	dir := t.TempDir()
 	st := store.NewStore(dir)

@@ -35,6 +35,12 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "inspect-customizations" {
 		os.Exit(inspectCustomizations(os.Args[2:]))
 	}
+	// migrate-legacy-rooms 是一次性迁移工具：加载配置、创建 Store、调用
+	// Store.MigrateLegacyRooms()，打印状态后退出。不在 TUI/Host 启动时运行，
+	// 不触发 long 审批。
+	if len(os.Args) > 1 && os.Args[1] == "migrate-legacy-rooms" {
+		os.Exit(migrateLegacyRooms(os.Args[2:]))
+	}
 
 	opts, args, err := parseCLIOptions(os.Args[1:])
 	if err != nil {

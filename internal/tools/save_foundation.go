@@ -928,6 +928,12 @@ func (t *SaveFoundationTool) Execute(ctx context.Context, args json.RawMessage) 
 				if latest == nil || !reflect.DeepEqual(latest.Long, payload.Proposal.Base) {
 					outcome = longApprovalStale
 				}
+				if outcome == longApprovalApproved {
+					// 审批等待期间可能已有 room 被删除，重新验证 marker targets
+					if err := t.revalidateMarkerTargets(compass.Long.OpenThreads); err != nil {
+						return nil, err
+					}
+				}
 			}
 			t.recordLongCompassApproval(*payload.Proposal, outcome)
 			result["long_proposal_id"] = payload.Proposal.ID
@@ -954,7 +960,23 @@ func (t *SaveFoundationTool) Execute(ctx context.Context, args json.RawMessage) 
 				}
 			}
 		}
-		if err := t.store.Outline.SaveCompass(compass); err != nil {
+		// 全部 long compass 保存都走临界区路径（LockPlanningAndOutline），确保
+		// marker 校验与 compass 保存原子化，防止并发 DeleteArchiveEntrySafe 在
+		// 校验与保存之间制造 dangling marker。锁顺序与 delete 一致。
+		if err := t.store.SaveCompassWithMarkerCheck(compass, func(c domain.StoryCompass, archive *domain.PlanningArchiveV1) error {
+			// 只对含有 [room:...] marker 的 long open_threads 做重校验
+			hasMarkers := false
+			for _, t := range c.Long.OpenThreads {
+				if strings.Contains(t, "[room:") {
+					hasMarkers = true
+					break
+				}
+			}
+			if !hasMarkers {
+				return nil
+			}
+			return t.revalidateMarkerTargetsLocked(c.Long.OpenThreads, archive, c.Long.Reference)
+		}); err != nil {
 			return nil, fmt.Errorf("save compass: %w: %w", errs.ErrStoreWrite, err)
 		}
 		result["section"] = cmd.Section
@@ -1155,7 +1177,15 @@ func (t *SaveFoundationTool) mergeCompassUpdate(content, section, reason string)
 			compass.Long.EndingDirection = strings.TrimSpace(*longPatch.EndingDirection)
 		}
 		if longPatch.OpenThreads != nil {
-			compass.Long.OpenThreads = append([]string(nil), (*longPatch.OpenThreads)...)
+			newThreads := append([]string(nil), (*longPatch.OpenThreads)...)
+			// 对新设 open_threads 做 marker 校验（只校验新增/改写线程）：
+			//   - 带 [room:<id>] 的线程须有非空自然语言摘要
+			//   - 无畸形/重复 marker（ParseOpenThreadMarkers 保证）
+			//   - 目标 room 在 archive 或 legacy 中存在
+			if err := t.validateOpenThreadMarkers(newThreads, baseLong.OpenThreads); err != nil {
+				return compassUpdatePayload{}, err
+			}
+			compass.Long.OpenThreads = newThreads
 		}
 		if longPatch.EstimatedScale != nil {
 			compass.Long.EstimatedScale = strings.TrimSpace(*longPatch.EstimatedScale)
@@ -1183,6 +1213,147 @@ func (t *SaveFoundationTool) mergeCompassUpdate(content, section, reason string)
 		payload.Proposal = &proposal
 	}
 	return payload, nil
+}
+
+// checkRoomExists 检查指定 roomID 在 planning archive 中存在，或在 archive
+// 不存在时从 legacy compass.long.reference 中可解析（复用 domain 的 ExtractLegacyRoomsFromReference）。
+func (t *SaveFoundationTool) checkRoomExists(roomID string) error {
+	archive, err := t.store.PlanningArchive.Load()
+	if err != nil {
+		return fmt.Errorf("load planning archive: %w", err)
+	}
+	return t.roomExistsLockedFallback(roomID, archive)
+}
+
+// checkRoomExistsInArchiveOrLegacy 是 checkRoomExists 的非加锁变体，用于已持锁的临界区。
+// 注意：在 LockPlanningAndOutline 内不能调用此方法（Outline 锁已持有会导致死锁），
+// 应使用 revalidateMarkerTargetsLocked 代替。
+func (t *SaveFoundationTool) checkRoomExistsInArchiveOrLegacy(roomID string, archive *domain.PlanningArchiveV1) error {
+	return t.roomExistsLocked(roomID, archive, nil)
+}
+
+// roomExistsLockedFallback 辅助 checkRoomExists（非临界区版本）：若 archive 不存在，
+// 加载 compass 获取 reference 并查询 legacy。
+func (t *SaveFoundationTool) roomExistsLockedFallback(roomID string, archive *domain.PlanningArchiveV1) error {
+	if archive != nil {
+		for _, e := range archive.Entries {
+			if e.Kind == "room" && e.ID == roomID {
+				return nil
+			}
+		}
+		return fmt.Errorf("在 archive 中未找到")
+	}
+	compass, cerr := t.store.Outline.LoadCompass()
+	if cerr != nil {
+		return fmt.Errorf("load compass: %w", cerr)
+	}
+	if compass == nil {
+		return fmt.Errorf("archive 不存在且 legacy reference 不可用")
+	}
+	return t.roomExistsLocked(roomID, nil, compass.Long.Reference)
+}
+
+// validateOpenThreadMarkers 校验 compass.long.open_threads 中新增/改写的 marker。
+//
+// 只校验相对 baseThreads 有变化（新增或文本不同）的线程；旧 malformed 线程
+// 原样保留时不阻断完整数组更新。
+//
+// 规则：
+//   - 带 [room:<id>] 的线程必须能通过 ParseOpenThreadMarkers 严格解析
+//   - 带 [room:<id>] 的线程必须有非空自然语言摘要
+//   - marker 指向的 room 须在 planning archive 中存在；archive 不存在时
+//     尝试 legacy compass.long.reference 回退；都不存在时拒绝。
+//   - 无 marker 的普通线程永远允许。
+func (t *SaveFoundationTool) validateOpenThreadMarkers(threads []string, baseThreads []string) error {
+	// 建立 base 集合供快速比较
+	baseSet := make(map[string]int, len(baseThreads))
+	for _, bt := range baseThreads {
+		baseSet[bt]++
+	}
+	isNewOrChanged := func(thread string) bool {
+		if baseSet[thread] > 0 {
+			baseSet[thread]--
+			return false
+		}
+		return true
+	}
+
+	for _, thread := range threads {
+		if !isNewOrChanged(thread) {
+			continue // 未改写的旧线程，跳过校验（即使 malformed）
+		}
+		parsed, err := ParseOpenThreadMarkers(thread)
+		if err != nil {
+			return fmt.Errorf("open_threads 条目 %q 解析失败: %w: %w", thread, err, errs.ErrToolArgs)
+		}
+		if len(parsed.RoomIDs) == 0 {
+			continue // 无 marker，永远允许
+		}
+		// 有 marker 的线程必须有非空摘要
+		if strings.TrimSpace(parsed.NaturalSummary) == "" {
+			return fmt.Errorf("open_threads 条目 %q 存在 room marker 但缺少非空自然语言摘要: %w", thread, errs.ErrToolArgs)
+		}
+		// 校验 marker 指向的 room 在 archive 或 legacy 中存在
+		for _, roomID := range parsed.RoomIDs {
+			if err := t.checkRoomExists(roomID); err != nil {
+				return fmt.Errorf("open_threads 条目 %q 引用的 room %q 不存在: %w: %w", thread, roomID, err, errs.ErrToolArgs)
+			}
+		}
+	}
+	return nil
+}
+
+// revalidateMarkerTargets 在 long approval 批准后、写入 compass 前重新验证
+// marker targets 仍然存在（防止审批等待期间 room 被删除导致 dangling marker）。
+// 非临界区版本：加载 archive + compass。
+func (t *SaveFoundationTool) revalidateMarkerTargets(openThreads []string) error {
+	archive, _ := t.store.PlanningArchive.Load()
+	compass, _ := t.store.Outline.LoadCompass()
+	var ref json.RawMessage
+	if compass != nil {
+		ref = compass.Long.Reference
+	}
+	return t.revalidateMarkerTargetsLocked(openThreads, archive, ref)
+}
+
+// revalidateMarkerTargetsLocked 使用预加载的 archive + compassRef 做校验（不额外获取锁）。
+// 在 LockPlanningAndOutline 临界区内调用。
+func (t *SaveFoundationTool) revalidateMarkerTargetsLocked(openThreads []string, archive *domain.PlanningArchiveV1, compassRef json.RawMessage) error {
+	for _, thread := range openThreads {
+		parsed, err := ParseOpenThreadMarkers(thread)
+		if err != nil {
+			continue
+		}
+		for _, roomID := range parsed.RoomIDs {
+			if err := t.roomExistsLocked(roomID, archive, compassRef); err != nil {
+				return fmt.Errorf("marker 指向的 room %q 在审批期间已不存在，请重新规划: %w", roomID, errs.ErrToolPrecondition)
+			}
+		}
+	}
+	return nil
+}
+
+// roomExistsLocked 检查 room 在 archive 或 legacy Reference 中存在（不加锁）。
+func (t *SaveFoundationTool) roomExistsLocked(roomID string, archive *domain.PlanningArchiveV1, compassRef json.RawMessage) error {
+	if archive != nil {
+		for _, e := range archive.Entries {
+			if e.Kind == "room" && e.ID == roomID {
+				return nil
+			}
+		}
+		return fmt.Errorf("在 archive 中未找到")
+	}
+	// archive 不存在：走 legacy
+	rooms, _, found, err := domain.ExtractLegacyRoomsFromReference(compassRef)
+	if err != nil || !found || len(rooms) == 0 {
+		return fmt.Errorf("archive 不存在且 legacy reference 中无 room 数据")
+	}
+	for _, r := range rooms {
+		if r.ID == roomID {
+			return nil
+		}
+	}
+	return fmt.Errorf("archive 不存在且在 legacy reference 中也未找到")
 }
 
 func cloneLongCompass(in domain.LongCompass) domain.LongCompass {
