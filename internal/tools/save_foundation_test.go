@@ -2990,3 +2990,268 @@ func extractContentDesc(schema map[string]any) string {
 	desc, _ := content["description"].(string)
 	return desc
 }
+
+// ── Compass marker validation tests ──
+
+// TestSaveFoundationUpdateCompass_MarkerValidWithArchive 带 [room:x] marker 且
+// archive 中存在该 room → 通过。
+func TestSaveFoundationUpdateCompass_MarkerValidWithArchive(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	// 先建一条 archive 条目
+	if err := s.PlanningArchive.UpsertEntry("room", "ancient_temple", json.RawMessage(`{"name":"上古神殿"}`)); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewSaveFoundationTool(s, testContract)
+	args, _ := json.Marshal(map[string]any{
+		"type":    "update_compass",
+		"section": "long",
+		"reason":  "初始建立终局",
+		"content": map[string]any{
+			"ending_direction": "终局",
+			"open_threads":     []string{"探索遗迹 [room:ancient_temple]"},
+		},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("valid marker with archive entry should pass: %v", err)
+	}
+	compass, _ := s.Outline.LoadCompass()
+	if compass == nil || len(compass.Long.OpenThreads) != 1 {
+		t.Fatalf("unexpected compass: %+v", compass)
+	}
+	if compass.Long.OpenThreads[0] != "探索遗迹 [room:ancient_temple]" {
+		t.Fatalf("open_threads not preserved: %q", compass.Long.OpenThreads[0])
+	}
+}
+
+// TestSaveFoundationUpdateCompass_MarkerEmptySummary 带 marker 但摘要为空 → 拒绝。
+func TestSaveFoundationUpdateCompass_MarkerEmptySummary(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PlanningArchive.UpsertEntry("room", "empty_room", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewSaveFoundationTool(s, testContract)
+	args, _ := json.Marshal(map[string]any{
+		"type":    "update_compass",
+		"section": "long",
+		"reason":  "初始建立",
+		"content": map[string]any{
+			"ending_direction": "终局",
+			"open_threads":     []string{"[room:empty_room]"},
+		},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("expected error for marker with empty natural summary")
+	}
+	if !strings.Contains(err.Error(), "缺少非空自然语言摘要") {
+		t.Fatalf("unexpected error msg: %v", err)
+	}
+}
+
+// TestSaveFoundationUpdateCompass_MalformedMarkerRejected 畸形 marker → 拒绝。
+func TestSaveFoundationUpdateCompass_MalformedMarkerRejected(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewSaveFoundationTool(s, testContract)
+	// 中间出现 marker
+	args, _ := json.Marshal(map[string]any{
+		"type":    "update_compass",
+		"section": "long",
+		"reason":  "初始",
+		"content": map[string]any{
+			"ending_direction": "终局",
+			"open_threads":     []string{"中间有 [room:bad] marker"},
+		},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("expected error for malformed marker")
+	}
+	if !strings.Contains(err.Error(), "解析失败") {
+		t.Fatalf("unexpected error msg: %v", err)
+	}
+}
+
+// TestSaveFoundationUpdateCompass_NoMarkerThreadAlwaysAllowed 无 marker 的普通线程
+// 即使 archive 不存在也永远允许。
+func TestSaveFoundationUpdateCompass_NoMarkerThreadAlwaysAllowed(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	// 不创建 archive
+	tool := NewSaveFoundationTool(s, testContract)
+	args, _ := json.Marshal(map[string]any{
+		"type":    "update_compass",
+		"section": "long",
+		"reason":  "初始",
+		"content": map[string]any{
+			"ending_direction": "终局",
+			"open_threads":     []string{"普通线程", "另一条线程"},
+		},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("no-marker threads should always be allowed: %v", err)
+	}
+}
+
+// TestSaveFoundationUpdateCompass_MarkerRefMissingArchive 带 marker 但 room 不在 archive
+// 且没有 legacy fallback → 拒绝。
+func TestSaveFoundationUpdateCompass_MarkerRefMissingArchive(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	// archive 存在但不含该 room
+	if err := s.PlanningArchive.UpsertEntry("room", "other_room", json.RawMessage(`{"name":"其他房间"}`)); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewSaveFoundationTool(s, testContract)
+	args, _ := json.Marshal(map[string]any{
+		"type":    "update_compass",
+		"section": "long",
+		"reason":  "初始",
+		"content": map[string]any{
+			"ending_direction": "终局",
+			"open_threads":     []string{"探索遗迹 [room:ghost_room]"},
+		},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("expected error for marker referencing non-existent room")
+	}
+	if !strings.Contains(err.Error(), "不存在") {
+		t.Fatalf("unexpected error msg: %v", err)
+	}
+}
+
+// TestSaveFoundationUpdateCompass_MarkerRefLegacyFallback archive 不存在但 legacy
+// Reference 中有该 room → 允许。
+func TestSaveFoundationUpdateCompass_MarkerRefLegacyFallback(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	// 通过 save_foundation 建立初始 compass（含 legacy Reference）
+	initArgs, _ := json.Marshal(map[string]any{
+		"type":    "update_compass",
+		"section": "long",
+		"reason":  "初始",
+		"content": map[string]any{
+			"ending_direction": "终局",
+			"open_threads":     []string{},
+		},
+	})
+	initTool := NewSaveFoundationTool(s, testContract)
+	if _, err := initTool.Execute(context.Background(), initArgs); err != nil {
+		t.Fatal(err)
+	}
+	// 在 compass 中注入 legacy Reference（使用 real detailed_plan.long_rooms[].room 格式）
+	compass, _ := s.Outline.LoadCompass()
+	compass.Long.Reference = json.RawMessage(`{"detailed_plan":{"long_rooms":[{"room":"legacy_room","name":"旧房间"}]}}`)
+	if err := s.Outline.SaveCompass(*compass); err != nil {
+		t.Fatal(err)
+	}
+	// 现在不创建 archive，用新 tool 添加带 marker 的线程
+	tool := NewSaveFoundationTool(s, testContract)
+	setTestLongApproval(tool, "批准", time.Second)
+	args, _ := json.Marshal(map[string]any{
+		"type":    "update_compass",
+		"section": "long",
+		"reason":  "添加新线程",
+		"content": map[string]any{
+			"open_threads": []string{"探索遗迹 [room:legacy_room]", "普通线程"},
+		},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("legacy fallback should allow existing room ref: %v", err)
+	}
+	compass, _ = s.Outline.LoadCompass()
+	if len(compass.Long.OpenThreads) != 2 {
+		t.Fatalf("expected 2 open_threads, got %d", len(compass.Long.OpenThreads))
+	}
+	if compass.Long.OpenThreads[0] != "探索遗迹 [room:legacy_room]" {
+		t.Fatalf("unexpected thread: %q", compass.Long.OpenThreads[0])
+	}
+}
+
+// TestSaveFoundationUpdateCompass_MarkerRefNoArchiveNoLegacy archive 不存在且 legacy
+// Reference 也不可用 → 拒绝。
+func TestSaveFoundationUpdateCompass_MarkerRefNoArchiveNoLegacy(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	// 没有任何 archive 或 legacy Reference
+	tool := NewSaveFoundationTool(s, testContract)
+	args, _ := json.Marshal(map[string]any{
+		"type":    "update_compass",
+		"section": "long",
+		"reason":  "初始",
+		"content": map[string]any{
+			"ending_direction": "终局",
+			"open_threads":     []string{"探索遗迹 [room:new_room]"},
+		},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("expected error when archive absent and no legacy reference")
+	}
+	if !strings.Contains(err.Error(), "不存在") && !strings.Contains(err.Error(), "不可用") {
+		t.Fatalf("unexpected error msg: %v", err)
+	}
+}
+
+// TestSaveFoundationUpdateCompass_MarkerUnchangedNotBlockedByOldMalformed
+// 旧磁盘中有畸形 marker 未改写时不应阻断本次无关更新（只改 ending_direction）。
+func TestSaveFoundationUpdateCompass_MarkerUnchangedNotBlockedByOldMalformed(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PlanningArchive.UpsertEntry("room", "valid_room", json.RawMessage(`{"name":"有效"}`)); err != nil {
+		t.Fatal(err)
+	}
+	// 建立已有 compass，其中包含畸形 marker
+	if err := s.Outline.SaveCompass(domain.StoryCompass{
+		Long: domain.LongCompass{
+			EndingDirection: "原终局",
+			OpenThreads:     []string{"中间有 [room:bad] 标记"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewSaveFoundationTool(s, testContract)
+	setTestLongApproval(tool, "批准", time.Second)
+	// 只更新 ending_direction，不碰 open_threads
+	args, _ := json.Marshal(map[string]any{
+		"type":    "update_compass",
+		"section": "long",
+		"reason":  "更新终局方向",
+		"content": map[string]any{
+			"ending_direction": "更新后的终局",
+		},
+	})
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("updating unrelated field should not be blocked by old malformed marker: %v", err)
+	}
+	compass, _ := s.Outline.LoadCompass()
+	if compass.Long.EndingDirection != "更新后的终局" {
+		t.Fatalf("expected updated ending_direction, got %q", compass.Long.EndingDirection)
+	}
+	// 旧畸形 marker 应当保留不变
+	if len(compass.Long.OpenThreads) != 1 || compass.Long.OpenThreads[0] != "中间有 [room:bad] 标记" {
+		t.Fatalf("old malformed marker should be preserved: %+v", compass.Long.OpenThreads)
+	}
+}

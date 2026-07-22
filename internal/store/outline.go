@@ -468,14 +468,28 @@ func (s *OutlineStore) SaveCompass(compass domain.StoryCompass) error {
 
 // LoadCompass 读取终局方向指南针。
 func (s *OutlineStore) LoadCompass() (*domain.StoryCompass, error) {
+	s.io.mu.RLock()
+	defer s.io.mu.RUnlock()
+	return s.loadCompassUnlocked()
+}
+
+func (s *OutlineStore) loadCompassUnlocked() (*domain.StoryCompass, error) {
 	var c domain.StoryCompass
-	if err := s.io.ReadJSON("meta/compass.json", &c); err != nil {
+	if err := s.io.ReadJSONUnlocked("meta/compass.json", &c); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
 	return &c, nil
+}
+
+// SaveCompassUnlocked 在已持有 io.mu 写锁时保存 compass。
+func (s *OutlineStore) SaveCompassUnlocked(compass domain.StoryCompass) error {
+	if strings.TrimSpace(compass.Long.EndingDirection) == "" {
+		return fmt.Errorf("long.ending_direction 不能为空")
+	}
+	return s.io.WriteJSONUnlocked("meta/compass.json", compass)
 }
 
 func renderLayeredOutline(volumes []domain.VolumeOutline) string {

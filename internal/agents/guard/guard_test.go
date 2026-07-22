@@ -223,3 +223,70 @@ func TestEditorStopGuard_TaskAware(t *testing.T) {
 		}
 	})
 }
+
+// ── ArchitectStopGuard regression tests ──
+
+// TestArchitectStopGuard_ArchiveOnlyCheckpointDoesNotSatisfy 验证仅凭
+// planning_archive_upsert/delete checkpoint 不能满足 architect guard——
+// archive 写入只是辅助操作，不能替代 save_foundation 产出的核心规划工件。
+func TestArchitectStopGuard_ArchiveOnlyCheckpointDoesNotSatisfy(t *testing.T) {
+	normalStop := agentcore.StopInfo{TurnIndex: 1, Message: agentcore.Message{StopReason: agentcore.StopReasonStop}}
+
+	t.Run("planning_archive_upsert alone must not satisfy", func(t *testing.T) {
+		s := newTestStore(t)
+		guard := NewArchitectStopGuard(s, nil)
+		if _, err := s.Checkpoints.Append(domain.GlobalScope(), "planning_archive_upsert", "archive.json", "d1"); err != nil {
+			t.Fatalf("append archive checkpoint: %v", err)
+		}
+		if d := guard(context.Background(), normalStop); d.Allow {
+			t.Fatal("archive-only checkpoint must NOT satisfy architect stop guard")
+		}
+	})
+
+	t.Run("planning_archive_delete alone must not satisfy", func(t *testing.T) {
+		s := newTestStore(t)
+		guard := NewArchitectStopGuard(s, nil)
+		if _, err := s.Checkpoints.Append(domain.GlobalScope(), "planning_archive_delete", "archive.json", "d1"); err != nil {
+			t.Fatalf("append archive checkpoint: %v", err)
+		}
+		if d := guard(context.Background(), normalStop); d.Allow {
+			t.Fatal("archive-only checkpoint must NOT satisfy architect stop guard")
+		}
+	})
+
+	t.Run("archive checkpoint + archive delete combined must not satisfy", func(t *testing.T) {
+		s := newTestStore(t)
+		guard := NewArchitectStopGuard(s, nil)
+		if _, err := s.Checkpoints.Append(domain.GlobalScope(), "planning_archive_upsert", "archive.json", "d1"); err != nil {
+			t.Fatalf("append archive upsert: %v", err)
+		}
+		if _, err := s.Checkpoints.Append(domain.GlobalScope(), "planning_archive_delete", "archive.json", "d2"); err != nil {
+			t.Fatalf("append archive delete: %v", err)
+		}
+		if d := guard(context.Background(), normalStop); d.Allow {
+			t.Fatal("multiple archive-only checkpoints must NOT satisfy architect stop guard")
+		}
+	})
+}
+
+// TestArchitectStopGuard_SaveFoundationCheckpointSatisfies 验证传统 save_foundation
+// 产物仍然能正常满足 guard（回归基线）。
+func TestArchitectStopGuard_SaveFoundationCheckpointSatisfies(t *testing.T) {
+	normalStop := agentcore.StopInfo{TurnIndex: 1, Message: agentcore.Message{StopReason: agentcore.StopReasonStop}}
+	requiredSteps := []string{
+		"premise", "outline", "layered_outline", "characters", "world_rules",
+		"expand_arc", "append_volume", "update_compass", "update_compass_rejected", "complete_book",
+	}
+	for _, step := range requiredSteps {
+		t.Run(step, func(t *testing.T) {
+			s := newTestStore(t)
+			guard := NewArchitectStopGuard(s, nil)
+			if _, err := s.Checkpoints.Append(domain.GlobalScope(), step, "test.json", "d1"); err != nil {
+				t.Fatalf("append %s: %v", step, err)
+			}
+			if d := guard(context.Background(), normalStop); !d.Allow {
+				t.Fatalf("save_foundation step %q must satisfy architect stop guard", step)
+			}
+		})
+	}
+}

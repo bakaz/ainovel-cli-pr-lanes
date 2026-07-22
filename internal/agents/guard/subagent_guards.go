@@ -145,6 +145,13 @@ func writerBlockMsg(seen map[string]struct{}) string {
 }
 
 // NewArchitectStopGuard 要求 architect 本轮至少落盘一次 save_foundation。
+// NewArchitectStopGuard 要求 architect 本轮至少落盘一次规划产出。
+//
+// 注意：archive 维护步骤（planning_archive_upsert/delete）不在此列，因为仅凭
+// archive checkpoint 不能令 expand_arc / append_volume / complete_book 这类
+// 规划任务完结——archive 写入只是辅助操作，真正的核心产物必须通过 save_foundation
+// 落盘。如果将来需要为纯 archive 维护任务放宽 guard，应走 NewEditorStopGuard 那
+// 样的任务感知模式（接受 task 参数按需切换 requiredSteps）。
 func NewArchitectStopGuard(st *store.Store, onBlock BlockHook) agentcore.StopGuard {
 	return newCheckpointDeltaGuard(st, "architect",
 		[]string{

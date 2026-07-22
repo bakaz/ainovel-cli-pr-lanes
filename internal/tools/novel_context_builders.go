@@ -29,7 +29,6 @@ type contextBuildState struct {
 	manStatus         store.ManualFileStatus             // 手动文件状态
 	hasStyleRules     bool                               // 缓存是否存在 style_rules
 }
-
 type chapterContextEnvelope struct {
 	Working    map[string]any
 	Episodic   map[string]any
@@ -714,7 +713,6 @@ func buildCompassProseInjectionView(compass *domain.WritingStyleRulesCompass) ma
 	}
 	return view
 }
-
 // buildCompassOutlineInjectionView Architect：仅 outline 规划规则（无 prose/dialogue/taboos）。
 func buildCompassOutlineInjectionView(compass *domain.WritingStyleRulesCompass) map[string]any {
 	if compass == nil || !compass.HasOutlineContent() {
@@ -822,6 +820,12 @@ func (t *ContextTool) buildArchitectPlanning(envelope *architectContextEnvelope,
 	if runMeta != nil && runMeta.PlanningTier != "" {
 		envelope.Planning["planning_tier"] = runMeta.PlanningTier
 	}
+
+	// ── archive_refs 投影 ──
+	// 从 compass.long.open_threads 解析末尾 [room:<id>] marker，生成轻量索引，
+	// 供 ArchitectLong 判断何时调用 read_planning_archive 工具。
+	// 所有异常只写 warning，不使 novel_context 失败。
+	t.buildArchiveRefsProjection(envelope, warn)
 
 	var layered []domain.VolumeOutline
 	if l, err := t.store.Outline.LoadLayeredOutline(); err == nil && len(l) > 0 {
@@ -1101,4 +1105,112 @@ func safeMaxCompleted(progress *domain.Progress) int {
 		return 0
 	}
 	return maxCompletedChapter(progress.CompletedChapters)
+}
+
+// buildArchiveRefsProjection 解析 compass.long.open_threads 中的 [room:<id>] markers，
+// 在 planning_memory.archive_refs 中生成轻量投影，供 ArchitectLong 判断何时调用
+// read_planning_archive 工具。所有异常只写 warning，不使上下文失败。
+func (t *ContextTool) buildArchiveRefsProjection(envelope *architectContextEnvelope, warn func(string, error)) {
+	if t.role != "architect" {
+		return
+	}
+
+	compass, err := t.store.Outline.LoadCompass()
+	if err != nil {
+		warn("compass_for_archive_refs", err)
+		return
+	}
+	if compass == nil || len(compass.Long.OpenThreads) == 0 {
+		return
+	}
+
+	refs, parsed, parseErrs := ExtractPlanningRefsWithErrors(compass.Long.OpenThreads)
+	if len(refs) == 0 && len(parseErrs) > 0 {
+		// 全部解析失败：写 warning，投影仍在（含原始线程摘要）
+		for _, pe := range parseErrs {
+			warn("malformed_open_thread", fmt.Errorf("thread[%d]: %s (text: %q)", pe.Index, pe.Err, pe.Text))
+		}
+	}
+	if len(refs) == 0 && len(parseErrs) == 0 {
+		return
+	}
+
+	// 收集 warning：为每个解析失败的条目写一条
+	var warnings []string
+	for _, pe := range parseErrs {
+		warnings = append(warnings, fmt.Sprintf("thread[%d] 解析失败: %s", pe.Index, pe.Err))
+	}
+
+	// 检查 archive 是否存在（不做深度校验——archive 不可用时仅影响可用性标记）
+	archiveStatus := "unknown"
+	archive, loadErr := t.store.PlanningArchive.Load()
+	if loadErr != nil {
+		archiveStatus = "error"
+		warn("planning_archive_for_refs", loadErr)
+	} else if archive == nil {
+		archiveStatus = "absent"
+	} else if archive.Schema != "ainovel.planning-archive" || archive.Version != 1 {
+		archiveStatus = "unsupported"
+	} else if err := archive.Validate(); err != nil {
+		archiveStatus = "invalid"
+		warn("planning_archive_validation", fmt.Errorf("archive 校验失败: %w", err))
+	} else {
+		archiveStatus = "available"
+	}
+
+	// 检查已请求的 ref 在 archive 中的可用性（仅标记存在性，不注入 entry data）
+	// 使用 archiveEntryKey（NUL 分隔）防止 (room/foo,bar) 与 (room,foo/bar) 碰撞
+	var availableRefs, missingRefs []PlanningRef
+	if archiveStatus == "available" && archive != nil {
+		index := make(map[string]bool, len(archive.Entries))
+		for _, e := range archive.Entries {
+			index[archiveEntryKey(e.Kind, e.ID)] = true
+		}
+		for _, r := range refs {
+			if index[archiveEntryKey(r.Kind, r.ID)] {
+				availableRefs = append(availableRefs, r)
+			} else {
+				missingRefs = append(missingRefs, r)
+			}
+		}
+	}
+
+	projection := map[string]any{
+		"archive_status": archiveStatus,
+		"marked_threads": buildMarkedThreadsView(parsed),
+	}
+	if len(refs) > 0 {
+		projection["parsed_refs"] = refs
+	}
+	if len(availableRefs) > 0 {
+		projection["available_refs"] = availableRefs
+	}
+	if len(missingRefs) > 0 {
+		projection["missing_refs"] = missingRefs
+	}
+	if len(warnings) > 0 {
+		projection["_warnings"] = warnings
+	}
+	projection["reader_hint"] = "使用 read_planning_archive 工具按 kind+id 读取上述 refs 的存档数据；一次最多请求 8 条"
+
+	envelope.Planning["archive_refs"] = projection
+}
+
+// buildMarkedThreadsView 将已解析的 open_threads 转为可读的线程摘要列表。
+// 绝不注入 archive entry data（仅展示摘要与 room refs）。
+func buildMarkedThreadsView(parsed []ParsedOpenThread) []map[string]any {
+	view := make([]map[string]any, 0, len(parsed))
+	for _, p := range parsed {
+		item := map[string]any{
+			"summary": p.NaturalSummary,
+		}
+		if p.ParseError != "" {
+			item["parse_error"] = p.ParseError
+		}
+		if len(p.RoomIDs) > 0 {
+			item["room_refs"] = p.RoomIDs
+		}
+		view = append(view, item)
+	}
+	return view
 }

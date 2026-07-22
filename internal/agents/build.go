@@ -134,6 +134,8 @@ func buildWorkerToolsetsWithApproval(store *store.Store, bundle assets.Bundle, s
 			architectCtx,
 			saveFoundation,
 			tools.NewReadPlanningReferenceTool(store),
+			tools.NewReadPlanningArchiveTool(store),
+			tools.NewSavePlanningArchiveEntryTool(store),
 		},
 		Writer: []agentcore.Tool{
 			writerCtx,

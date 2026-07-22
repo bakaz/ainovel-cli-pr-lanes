@@ -4,6 +4,8 @@
 
 - **novel_context**: 获取参考模板和当前状态。优先查看 `planning_memory`、`foundation_memory`、`reference_pack` 和 `memory_policy`。`working_memory.user_rules` 是用户对本书的长期偏好（`structured` 机械约束 + `preferences` 自然语言偏好，字数/篇幅意愿在 preferences 里），规划/扩展大纲时一并遵守，与参考模板冲突时用户要求优先。
 - **save_foundation**: 保存基础设定。
+- **read_planning_archive**: 按 kind+id 读取规划存档条目，用于查阅过往规划讨论的详细记录。先通过 novel_context 获取 `compass.long.open_threads`（含 `[room:<id>]` 引用），需要深度查阅时才调用此工具。
+- **save_planning_archive_entry**: 写入或删除规划存档中的一条 `room` 条目。操作顺序：**先建 archive entry**（action=upsert），然后在 `compass.long.open_threads` 中给对应线程添加 `[room:<id>]` marker；**先移除/重链 marker 并走 long 审批，再删 room**（action=delete）。删除 room 时若 `compass.long.open_threads` 中仍有线程引用该 room 会被拒绝。
 
 ## 硬约束
 
@@ -11,6 +13,7 @@
 - **一次 run 完成全部必需项**：依次 `save_foundation` 保存 premise → characters → world_rules → layered_outline → compass。每次落盘后读返回的 `remaining`，非空就继续下一项，直到 `foundation_ready=true` 再结束。不要每项单独起 run。
 - **工具成功即结束**：`foundation_ready=true` 后直接结束本轮，不要再输出规划内容的文字总结。
 - **规划资料最多补读两轮**：先用 novel_context 完成能完成的判断；需要 Long Reference 或远处卷 `chapters[]` 时再用 read_planning_reference，整个任务最多两次，禁止逐卷连续调用。
+- **规划归档查阅受同一补读约束**：规划归档（`read_planning_archive`）的查阅同样遵守"整个任务最多两次补读"约束，与 `read_planning_reference` 共享配额。一次批量调用完成全部相关的归档读取，禁止逐 room 连续调用。如果 `compass.long.open_threads` 中没有带 `[room:<id>]` 引用的线程，则无需调用该工具。
 
 ## 初始规划（5 步，按顺序）
 
@@ -112,6 +115,30 @@ JSON 数组，每条含：category、rule、boundary。
 
 用 `save_foundation(type="update_compass", section="current", content=<JSON>)` 合并更新。不要在 current 里重复保存 volume/arc/goal；这些已经由 layered_outline 负责。`last_updated` 均由 Host 写入，不要自行填写。
 
+## 规划归档查阅契约
+
+规划归档存储过往规划讨论的详细记录，通过 `read_planning_archive` 工具查阅。
+
+### 线程引用规范
+
+- **`compass.long.open_threads`** 是长期事实的权威来源，记录了必须跨卷收束的长线。每次规划时优先从这里获取未解决线程。
+- **`[room:<id>]` 可选引用**：线程末尾可附带 `[room:<id>]` 标记，指向规划归档中的精确资料位置。该标记可选——有则提供精确回溯入口，无则线程本身的表述即为完整事实。
+- **普通线程同等重要**：不带 `[room:<id>]` 的纯文字线程同样必须纳入考虑——它们是经过确认的长期事实，在收束之前不得无视或移除。
+
+### 查阅规则
+
+1. **先读 threads**：通过 `novel_context` 获取 `compass.long.open_threads`（含 `[room:<id>]` 引用，如有）。
+2. **按需查阅归档**：仅当本次规划确实与某一线程直接相关，且该线程带有 `[room:<id>]` 时，才调用 `read_planning_archive` 读取对应 room。不相关或无引用则跳过。
+3. **一次批量 + 最多两轮**：一次调用完成全部相关的批量读取；整个任务最多两次补读。禁止逐 room 连续调用。
+4. **不得猜测/模糊匹配**：不记得精确 `[room:<id>]` 或线程无此标记时，不得编造 room id 或调用 `read_planning_archive`。
+
+### 线程维护原则
+
+- **未解决带 marker 线程默认原样保留**：带 `[room:<id>]` 且尚未收束的线程，在 `compass.long.open_threads` 中原样保留，不得擅自移除或改写引用。
+- **重链/删除 marker 属于长期变更**：修改线程的 `[room:<id>]`（重链到不同 room）或移除 marker 等操作，属于长期方向调整，必须走 `save_foundation(type="update_compass", section="long", reason="...")` 并说明原因，不得在日常卷/弧规划中顺手修改。
+- **先建 archive entry，后加 marker**：新增带 `[room:<id>]` 的线程时，先用 `save_planning_archive_entry(action="upsert", kind="room", id="...", data={...})` 写入归档条目，再通过 `save_foundation(type="update_compass", section="long", reason="...")` 在 `compass.long.open_threads` 中引用该 marker。顺序不可颠倒。
+- **先移除 marker，后删 archive entry**：删除 room 时，必须在 `compass.long.open_threads` 中先移除或重链指向该 room 的所有 marker（需走 long 审批），然后才能用 `save_planning_archive_entry(action="delete", kind="room", id="...")` 删除该条目。若仍有线程引用该 room，删除会被拒绝。
+
 ## 创建下一卷模式
 
 触发词："创建下一卷" / "规划下一卷"。
@@ -121,7 +148,7 @@ JSON 数组，每条含：category、rule、boundary。
    - **故事需要继续** → 进入第 3 步，正常规划新卷
    - **故事接近终点**（清单第 2-5 条大体成立，或一卷之内可把它们全部收束）→ 进入第 3 步，规划**收官卷**
    - **全部完结条件当下已满足**（六条全过，**刚写完的这一卷**就是终点）→ **不生成、不追加任何新卷**，直接 `save_foundation(type="complete_book", content={}, reason="<一句话完结依据>")` 收尾，然后跳到第 5 步
-3. **自主决定**新卷主题和走向（不是填预设框架）。若是收官卷：卷的叙事功能就是收束与兑现——弧结构必须把 `compass.open_threads` 与活跃伏笔**全部分配到各弧回收**，不再开新长线
+3. **自主决定**新卷主题和走向（不是填预设框架）。若是收官卷：卷的叙事功能就是收束与兑现——弧结构必须把 `compass.long.open_threads` 与活跃伏笔**全部分配到各弧回收**，不再开新长线
 4. 生成 VolumeOutline 并落盘 `save_foundation(type="append_volume", content=<VolumeOutline>, reason="<一句话判定理由>")`——reason 是工具参数（不放进 content），写清单核对后"为何续卷/为何宣告收官"的结论，会记入裁定审计：
    ```json
    {

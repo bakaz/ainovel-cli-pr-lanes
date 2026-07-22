@@ -26,14 +26,20 @@ func TestBuildWorkers_ToolComposition(t *testing.T) {
 	contract := projectprofile.NewCore4Contract()
 	ts := buildWorkerToolsets(st, bundle, "default", contract)
 
-	// ── architect_short 不应有 read_planning_reference ──
+	// ── architect_short 不应有 read_planning_reference / read_planning_archive ──
 	if toolInList(ts.ArchitectShort, "read_planning_reference") {
 		t.Error("architect_short should NOT have read_planning_reference")
 	}
+	if toolInList(ts.ArchitectShort, "read_planning_archive") {
+		t.Error("architect_short should NOT have read_planning_archive")
+	}
 
-	// ── architect_long 必须有 read_planning_reference ──
+	// ── architect_long 必须有 read_planning_reference 和 read_planning_archive ──
 	if !toolInList(ts.ArchitectLong, "read_planning_reference") {
 		t.Error("architect_long MUST have read_planning_reference")
+	}
+	if !toolInList(ts.ArchitectLong, "read_planning_archive") {
+		t.Error("architect_long MUST have read_planning_archive")
 	}
 
 	// 两种 architect 工具列表必须不同

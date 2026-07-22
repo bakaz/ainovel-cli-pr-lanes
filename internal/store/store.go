@@ -27,9 +27,10 @@ type Store struct {
 	Sessions       *SessionStore
 	Usage          *UsageStore
 	Simulation     *SimulationStore
-	StyleAnchors   *StyleAnchorsStore
-	Decisions      *DecisionStore
-	ProjectProfile *ProjectProfileStore
+	StyleAnchors    *StyleAnchorsStore
+	Decisions       *DecisionStore
+	ProjectProfile  *ProjectProfileStore
+	PlanningArchive *PlanningArchiveStore
 
 	crossMu sync.Mutex // 保护跨域原子操作
 }
@@ -56,8 +57,9 @@ func NewStore(dir string) *Store {
 		Usage:          NewUsageStore(newIO(dir)),
 		Simulation:     NewSimulationStore(newIO(dir)),
 		StyleAnchors:   NewStyleAnchorsStore(newIO(dir)),
-		Decisions:      NewDecisionStore(newIO(dir)),
-		ProjectProfile: NewProjectProfileStore(newIO(dir)),
+		Decisions:       NewDecisionStore(newIO(dir)),
+		ProjectProfile:  NewProjectProfileStore(newIO(dir)),
+		PlanningArchive: NewPlanningArchiveStore(newIO(dir)),
 	}
 }
 
@@ -138,6 +140,43 @@ func (s *Store) Init() error {
 
 // ── 跨域协调方法 ──
 
+// LockPlanningAndOutline 以固定锁顺序（crossMu → Outline.io.mu → PlanningArchive.io.mu）
+// 执行 fn。用于跨 PlanningArchive 和 Outline（compass）的原子操作。
+// 调用方不可在 fn 内部再获取任何 mu（已持有）。
+// 设计用于后续"最终 marker 校验 + Compass 保存"场景。
+func (s *Store) LockPlanningAndOutline(fn func() error) error {
+	s.crossMu.Lock()
+	defer s.crossMu.Unlock()
+
+	s.Outline.io.mu.Lock()
+	defer s.Outline.io.mu.Unlock()
+
+	s.PlanningArchive.io.mu.Lock()
+	defer s.PlanningArchive.io.mu.Unlock()
+
+	return fn()
+}
+
+// SaveCompassWithMarkerCheck 在 LockPlanningAndOutline 临界区内执行 marker
+// target 重校验 + SaveCompass，避免与 DeleteArchiveEntrySafe 的锁顺序冲突。
+// markerCheck 在持有锁时对已加载的 open_threads 做 final validation。
+// markerCheck 接收 compass + archive（均已加载，不再需要获取锁）。
+// 仅当 markerCheck 通过后才写入。
+func (s *Store) SaveCompassWithMarkerCheck(compass domain.StoryCompass, markerCheck func(c domain.StoryCompass, archive *domain.PlanningArchiveV1) error) error {
+	return s.LockPlanningAndOutline(func() error {
+		// 在锁内加载 archive（不再获取锁）；loadUnlocked 已含 Validate，
+		// 加载失败时必须传播错误，不可忽略。
+		archive, err := s.PlanningArchive.loadUnlocked()
+		if err != nil {
+			return fmt.Errorf("planning archive: load in SaveCompassWithMarkerCheck: %w", err)
+		}
+		if err := markerCheck(compass, archive); err != nil {
+			return err
+		}
+		return s.Outline.SaveCompassUnlocked(compass)
+	})
+}
+
 // ExpandArc 将骨架弧校准并展开为详细章节（Outline + Progress 联动）。
 func (s *Store) ExpandArc(volumeIdx, arcIdx int, expansion domain.ArcExpansion) error {
 	s.crossMu.Lock()
@@ -190,6 +229,30 @@ func (s *Store) AppendVolume(vol domain.VolumeOutline) error {
 	}
 	p.TotalChapters = domain.TotalChapters(volumes)
 	return s.Progress.saveUnlocked(p)
+}
+
+// DeleteArchiveEntrySafe 跨域原子操作：在 crossMu → Outline.io.mu → PlanningArchive.io.mu
+// 锁顺序下检查 compass.long.open_threads（通过 checkRef 回调）并删除 archive 条目。
+// checkRef 接收 open_threads 切片，返回 nil 表示可删除，非 nil 表示拒绝。
+// 工具层应传入使用 ParseOpenThreadMarkers 严格解析的检查函数。
+func (s *Store) DeleteArchiveEntrySafe(kind, id string, checkRef func(threads []string) error) error {
+	if kind == "" || id == "" {
+		return fmt.Errorf("kind and id must not be empty")
+	}
+	return s.LockPlanningAndOutline(func() error {
+		// 加载 compass 检查 open_threads（回调使用 tools.ParseOpenThreadMarkers）
+		compass, err := s.Outline.loadCompassUnlocked()
+		if err != nil {
+			return fmt.Errorf("load compass: %w", err)
+		}
+		if compass != nil && len(compass.Long.OpenThreads) > 0 {
+			if err := checkRef(compass.Long.OpenThreads); err != nil {
+				return err
+			}
+		}
+		// 删除 archive 条目
+		return s.PlanningArchive.deleteEntryUnlocked(kind, id)
+	})
 }
 
 // ClearHandledSteer 原子性清除 PendingSteer 并重置 FlowSteering 状态
