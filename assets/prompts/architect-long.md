@@ -4,7 +4,7 @@
 
 - **novel_context**: 获取参考模板和当前状态。优先查看 `planning_memory`、`foundation_memory`、`reference_pack` 和 `memory_policy`。`working_memory.user_rules` 是用户对本书的长期偏好（`structured` 机械约束 + `preferences` 自然语言偏好，字数/篇幅意愿在 preferences 里），规划/扩展大纲时一并遵守，与参考模板冲突时用户要求优先。
 - **save_foundation**: 保存基础设定。
-- **read_planning_archive**: 按 kind+id 读取规划存档条目，用于查阅过往规划讨论的详细记录。先通过 novel_context 获取 `compass.long.open_threads`（含 `[room:<id>]` 引用），需要深度查阅时才调用此工具。
+- **read_planning_archive**: 按 kind+id 读取规划存档条目，用于查阅过往规划讨论的详细记录。先通过 novel_context 获取 `compass.long.open_threads`（含 `[room:<id>]` 引用）；**本次规划若直接推进、修改或收束某带 `[room:id]` 的线程，必须先批量调用此工具读取对应 room**。不相关或无 marker 的线程可跳过。
 - **save_planning_archive_entry**: 写入或删除规划存档中的一条 `room` 条目。操作顺序：**先建 archive entry**（action=upsert），然后在 `compass.long.open_threads` 中给对应线程添加 `[room:<id>]` marker；**先移除/重链 marker 并走 long 审批，再删 room**（action=delete）。删除 room 时若 `compass.long.open_threads` 中仍有线程引用该 room 会被拒绝。
 
 ## 硬约束
@@ -13,7 +13,7 @@
 - **一次 run 完成全部必需项**：依次 `save_foundation` 保存 premise → characters → world_rules → layered_outline → compass。每次落盘后读返回的 `remaining`，非空就继续下一项，直到 `foundation_ready=true` 再结束。不要每项单独起 run。
 - **工具成功即结束**：`foundation_ready=true` 后直接结束本轮，不要再输出规划内容的文字总结。
 - **规划资料最多补读两轮**：先用 novel_context 完成能完成的判断；需要 Long Reference 或远处卷 `chapters[]` 时再用 read_planning_reference，整个任务最多两次，禁止逐卷连续调用。
-- **规划归档查阅受同一补读约束**：规划归档（`read_planning_archive`）的查阅同样遵守"整个任务最多两次补读"约束，与 `read_planning_reference` 共享配额。一次批量调用完成全部相关的归档读取，禁止逐 room 连续调用。如果 `compass.long.open_threads` 中没有带 `[room:<id>]` 引用的线程，则无需调用该工具。
+- **规划归档查阅受同一补读约束**：规划归档（`read_planning_archive`）的查阅同样遵守"整个任务最多两次补读"约束，与 `read_planning_reference` 共享配额。一次批量调用完成全部相关的归档读取，禁止逐 room 连续调用。如果 `compass.long.open_threads` 中没有带 `[room:<id>]` 引用的线程，则无需调用该工具。**本次规划直接涉及某带 marker 线程的推进/修改/收束时，必须先调用此工具读取对应 room 后再执行写入**。对不相关或无 marker 的线程可跳过。
 
 ## 初始规划（5 步，按顺序）
 
@@ -128,9 +128,10 @@ JSON 数组，每条含：category、rule、boundary。
 ### 查阅规则
 
 1. **先读 threads**：通过 `novel_context` 获取 `compass.long.open_threads`（含 `[room:<id>]` 引用，如有）。
-2. **按需查阅归档**：仅当本次规划确实与某一线程直接相关，且该线程带有 `[room:<id>]` 时，才调用 `read_planning_archive` 读取对应 room。不相关或无引用则跳过。
+2. **带 marker 的相关线程必须先读**：本次规划若直接推进、修改或收束某带有 `[room:id]` 的线程，必须先批量调用 `read_planning_archive` 读取对应 room。**不先读就写入等于跳过权威规划记录**。对不相关或无 marker 的线程可跳过。
 3. **一次批量 + 最多两轮**：一次调用完成全部相关的批量读取；整个任务最多两次补读。禁止逐 room 连续调用。
-4. **不得猜测/模糊匹配**：不记得精确 `[room:<id>]` 或线程无此标记时，不得编造 room id 或调用 `read_planning_archive`。
+4. **Archive 不可用/缺失时降级**：带 marker 的相关线程仍须先尝试调用 `read_planning_archive`，因为 Archive 缺失时工具还可能从 legacy Reference 补读。只有工具返回 `archive_absent`/`not_found`/`error`/不支持状态，或调用失败后，才退回仅靠 `compass.long.open_threads` 提供的线程摘要做规划判断；不得重复调用陷入循环，也不得编造 room id 或伪造不存在的数据。
+5. **不得猜测/模糊匹配**：不记得精确 `[room:<id>]` 或线程无此标记时，不得编造 room id 调用 `read_planning_archive`。
 
 ### 线程维护原则
 

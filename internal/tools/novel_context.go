@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -217,7 +218,23 @@ func buildLoadingSummary(result map[string]any, chapter int) string {
 		items = append(items, fmt.Sprintf("情节记忆:%d", len(episodic)))
 	}
 	if planning, ok := result["planning_memory"].(map[string]any); ok && len(planning) > 0 {
-		items = append(items, fmt.Sprintf("规划记忆:%d", len(planning)))
+		label := fmt.Sprintf("规划记忆:%d", len(planning))
+		// 当 archive_refs 含有效 parsed/available refs 时附加醒目标识
+		if ar, ok := planning["archive_refs"].(map[string]any); ok {
+			count := 0
+			if pref, ok := ar["parsed_refs"]; ok {
+				count = genericSliceLen(pref)
+			}
+			if count == 0 {
+				if aref, ok := ar["available_refs"]; ok {
+					count = genericSliceLen(aref)
+				}
+			}
+			if count > 0 {
+				label += fmt.Sprintf(" 存档引用:%d", count)
+			}
+		}
+		items = append(items, label)
 	}
 	if foundation, ok := result["foundation_memory"].(map[string]any); ok && len(foundation) > 0 {
 		items = append(items, fmt.Sprintf("基础记忆:%d", len(foundation)))
@@ -308,6 +325,25 @@ func buildLoadingSummary(result map[string]any, chapter int) string {
 }
 
 // sliceLen 对 any 类型尝试取 slice 长度。
+// genericSliceLen 返回任意 slice 类型的长度。用于 buildLoadingSummary 中
+// 处理 interface 包装的 typed slice（如 []PlanningRef 无法直接断言为 []any）。
+func genericSliceLen(v any) int {
+	if v == nil {
+		return 0
+	}
+	switch s := v.(type) {
+	case []any:
+		return len(s)
+	default:
+		// 通过 reflect 获取长度
+		rv := reflect.ValueOf(v)
+		if rv.Kind() == reflect.Slice {
+			return rv.Len()
+		}
+		return 0
+	}
+}
+
 func sliceLen(v any) int {
 	switch s := v.(type) {
 	case []domain.ChapterSummary:

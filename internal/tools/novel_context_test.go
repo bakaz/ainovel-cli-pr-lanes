@@ -2222,6 +2222,20 @@ func TestContextToolArchitectArchiveRefsProjection(t *testing.T) {
 	if _, exists := ar["reader_hint"]; !exists {
 		t.Fatal("expected reader_hint in archive_refs")
 	}
+
+	// 验证加载摘要包含存档引用计数（2 个 parsed_refs）
+	summary, ok := payload["_loading_summary"].(string)
+	if !ok {
+		t.Fatal("expected _loading_summary")
+	}
+	var pkeys []string
+	for k := range planning {
+		pkeys = append(pkeys, k)
+	}
+	t.Logf("planning_memory keys: %v (count=%d)", pkeys, len(planning))
+	if !strings.Contains(summary, "存档引用:2") {
+		t.Fatalf("expected loading summary to include 存档引用:2, got %q (planning keys: %v)", summary, pkeys)
+	}
 }
 
 func TestContextToolArchitectArchiveRefsAbsent(t *testing.T) {
@@ -2477,5 +2491,123 @@ func TestContextToolInjectsRuleViolations(t *testing.T) {
 	_ = json.Unmarshal(raw3, &result3)
 	if _, has := result3["rule_violations"]; has {
 		t.Fatal("无违规章节不应带 rule_violations 字段")
+	}
+}
+
+// TestContextToolLoadingSummaryShowsArchiveRefs verifies that _loading_summary
+// contains "存档引用:N" when archive_refs has valid parsed_refs.
+func TestContextToolLoadingSummaryShowsArchiveRefs(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.Init("test", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.UpdateVolumeArc(1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{
+		{Index: 1, Title: "V1", Theme: "T",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "A1", Goal: "G", Chapters: []domain.OutlineEntry{{Chapter: 1}}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Set up open_threads with a marker
+	if err := s.Outline.SaveCompass(domain.StoryCompass{
+		Long: domain.LongCompass{
+			EndingDirection: "终局",
+			OpenThreads:     []string{"线索[room:test_room]"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Create matching archive entry
+	if err := s.PlanningArchive.UpsertEntry("room", "test_room", json.RawMessage(`{"name":"测试"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "architect")
+	args, _ := json.Marshal(map[string]any{})
+	result, err := tool.Execute(t.Context(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payload struct {
+		Summary string `json:"_loading_summary"`
+	}
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(payload.Summary, "存档引用:") {
+		t.Fatalf("expected loading summary to contain '存档引用:', got %q", payload.Summary)
+	}
+}
+
+// TestContextToolLoadingSummaryNoArchiveRefs verifies that "存档引用:" does NOT
+// appear when there are no markers / no archive_refs.
+func TestContextToolLoadingSummaryNoArchiveRefs(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.Init("test", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Progress.UpdateVolumeArc(1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{
+		{Index: 1, Title: "V1", Theme: "T",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "A1", Goal: "G", Chapters: []domain.OutlineEntry{{Chapter: 1}}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Compass with no markers
+	if err := s.Outline.SaveCompass(domain.StoryCompass{
+		Long: domain.LongCompass{
+			EndingDirection: "终局",
+			OpenThreads:     []string{"普通线程（无 marker）"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "architect")
+	args, _ := json.Marshal(map[string]any{})
+	result, err := tool.Execute(t.Context(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payload struct {
+		Summary string `json:"_loading_summary"`
+	}
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(payload.Summary, "存档引用:") {
+		t.Fatalf("expected no '存档引用:' in loading summary without markers, got %q", payload.Summary)
 	}
 }
