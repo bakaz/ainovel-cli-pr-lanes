@@ -45,6 +45,7 @@ type RuntimeCapture struct {
 	Tail          []SkelEvent // 末 N 条骨架（看顺序）
 	RedactedTexts int         // 打码文本块总数（脱敏自检）
 	Sources       []string    // 实际读到的源（自检）
+	ErrObs        []ErrObs    // 脱敏错误观测聚合，自会话文件提取
 }
 
 // RoleModel 记录某会话实际用的 provider/model。
@@ -115,12 +116,15 @@ func captureSessions(dir string, rc *RuntimeCapture) {
 	repeats := map[string]int{}
 	dups := map[string]int{}
 	models := map[string]RoleModel{}
+	var allErrObs []ErrObs
 
 	for _, f := range files {
-		evs := scanSession(filepath.Join(sessDir, f.path), f.agent, rc, models)
+		evs, rawMsgs := scanSessionWithMsgs(filepath.Join(sessDir, f.path), f.agent, rc, models)
 		// 聚合只看近端窗口：长跑里 subagent/novel_context 累计上百次是正常推进，
 		// 不是循环；真死循环是近端高度集中。
 		aggregateRepeats(f.agent, tailEvents(evs, repeatWindow), repeats, dups)
+		// 从完整消息中提取脱敏错误观测
+		allErrObs = append(allErrObs, extractSessionErrors(f.agent, rawMsgs)...)
 		// files 按活跃时间降序；取第一个非空会话作为当前现场。
 		if len(rc.Tail) == 0 && len(evs) > 0 {
 			rc.Tail = tailEvents(evs, sessionTail)
@@ -131,6 +135,7 @@ func captureSessions(dir string, rc *RuntimeCapture) {
 	rc.Repeats = topRepeats(repeats)
 	rc.DupContent = topDups(dups)
 	rc.Models = sortedModels(models)
+	rc.ErrObs = aggregateErrObs(allErrObs)
 }
 
 type sessionFile struct {
@@ -173,13 +178,21 @@ func sessionFiles(sessDir string) []sessionFile {
 // scanSession 读一个会话文件，逐行脱敏，收集事件序列与 per-agent 模型。
 // 重复/同段聚合不在这里做——交给 aggregateRepeats 在近端窗口上算。
 func scanSession(path, agent string, rc *RuntimeCapture, models map[string]RoleModel) []SkelEvent {
+	evs, _ := scanSessionWithMsgs(path, agent, rc, models)
+	return evs
+}
+
+// scanSessionWithMsgs 是 scanSession 的扩展版，额外返回原始消息列表供
+// extractSessionErrors 使用。内部统一实现，scanSession 委托给此函数。
+func scanSessionWithMsgs(path, agent string, rc *RuntimeCapture, models map[string]RoleModel) ([]SkelEvent, []agentcore.Message) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	defer f.Close()
 
 	var evs []SkelEvent
+	var rawMsgs []agentcore.Message
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
 	for sc.Scan() {
@@ -189,12 +202,16 @@ func scanSession(path, agent string, rc *RuntimeCapture, models map[string]RoleM
 		}
 		ev := redactMessage(agent, sl.Message)
 		evs = append(evs, ev)
+		// Keep a copy of raw messages for error observation extraction.
+		// These are used only for structural fields (agent, tool, stop reason,
+		// args byte length/hash); body text is never exported.
+		rawMsgs = append(rawMsgs, sl.Message)
 		rc.RedactedTexts += ev.Redacted
 		if sl.Meta != nil && (sl.Meta.Provider != "" || sl.Meta.Model != "") {
 			models[agent] = RoleModel{Agent: agent, Provider: sl.Meta.Provider, Model: sl.Meta.Model}
 		}
 	}
-	return evs
+	return evs, rawMsgs
 }
 
 // aggregateRepeats 在给定事件窗口上累计重复签名与同段文本。

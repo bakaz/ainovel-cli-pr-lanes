@@ -131,8 +131,29 @@ func RenderExport(rep Report, rc RuntimeCapture) []byte {
 		b.WriteString("```\n")
 	}
 
-	// 5. 脱敏自检
-	b.WriteString("\n## 5. 脱敏自检\n\n")
+	// 5. 脱敏错误观测
+	if len(rc.ErrObs) > 0 {
+		b.WriteString("\n## 5. 脱敏错误观测\n\n")
+		b.WriteString("| Agent | Tool | 类别 | 次数 | 详情 |\n")
+		b.WriteString("|-------|------|------|------|------|\n")
+		for _, o := range rc.ErrObs {
+			detail := fmt.Sprintf("turn=%d", o.Turn)
+			if o.ArgsHash != "" {
+				detail += fmt.Sprintf(" args=#%s(%d)", o.ArgsHash, o.ArgsBytes)
+			}
+			if o.SchemaPath != "" {
+				detail += fmt.Sprintf(" path=%s exp=%s got=%s", o.SchemaPath, o.Expected, o.Received)
+			}
+			if o.FinishReason != "" {
+				detail += fmt.Sprintf(" stop=%s", o.FinishReason)
+			}
+			fmt.Fprintf(&b, "| %s | %s | %s | %d | %s |\n",
+				orDash(o.Agent), orDash(o.Tool), o.Category, o.Count, detail)
+		}
+	}
+
+	// 6. 脱敏自检
+	b.WriteString("\n## 6. 脱敏自检\n\n")
 	fmt.Fprintf(&b, "- 打码文本块 %d 处 · 正文出包 0 处\n", rc.RedactedTexts)
 	if len(rc.Sources) > 0 {
 		fmt.Fprintf(&b, "- 数据源：%s\n", strings.Join(rc.Sources, " · "))
