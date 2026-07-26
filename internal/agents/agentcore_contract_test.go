@@ -60,24 +60,6 @@ func (m *contractModel) GenerateStream(_ context.Context, msgs []agentcore.Messa
 
 func (m *contractModel) SupportsTools() bool { return true }
 
-func assistantText(text string, stop agentcore.StopReason) agentcore.Message {
-	return agentcore.Message{
-		Role:       agentcore.RoleAssistant,
-		Content:    []agentcore.ContentBlock{agentcore.TextBlock(text)},
-		StopReason: stop,
-	}
-}
-
-func assistantToolCall(name string, args string) agentcore.Message {
-	return agentcore.Message{
-		Role: agentcore.RoleAssistant,
-		Content: []agentcore.ContentBlock{agentcore.ToolCallBlock(agentcore.ToolCall{
-			ID: "tc-" + name, Name: name, Args: json.RawMessage(args),
-		})},
-		StopReason: agentcore.StopReasonToolUse,
-	}
-}
-
 func okTool(name string) agentcore.Tool {
 	return agentcore.NewFuncTool(name, "contract test tool", map[string]any{"type": "object"},
 		func(context.Context, json.RawMessage) (json.RawMessage, error) {
