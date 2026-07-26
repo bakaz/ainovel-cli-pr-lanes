@@ -10,7 +10,7 @@ import (
 //
 // 对于 TOOL / DISPATCH / DECISION 三类调用事件，同一次调用的开始与结束共用一个 ID：
 // 开始时先发 FinishedAt 为零值的事件（TUI 渲染为"进行中"样式）；
-// 结束时再发一条同 ID 的事件，填入 FinishedAt + Duration（+ Failed），
+// 结束时再发一条同 ID 的事件，填入 FinishedAt + Duration（+ Failed / Discarded），
 // TUI 按 ID 定位原行原地更新，避免"开始一行、完成又一行"的冗余。
 //
 // SYSTEM / ERROR / CONTEXT 等非调用类事件 ID 为空，每条独立追加。
@@ -19,6 +19,7 @@ type Event struct {
 	Time       time.Time // 首次发出时间（开始时刻）
 	FinishedAt time.Time // 零值 = 进行中；非零 = 已完成
 	Failed     bool      // 已完成但失败（仅完成态有意义）
+	Discarded  bool      // 已完成但因 retry 丢弃，不是执行失败（仅完成态有意义）
 	Category   string    // DISPATCH / TOOL / DECISION / SYSTEM / REVIEW / CHECK / ERROR / CONTEXT
 	Agent      string    // 产生事件的 agent
 	Summary    string
@@ -31,8 +32,9 @@ type Event struct {
 
 // Running 返回事件是否处于进行中。
 // 仅调用类事件（有 ID 的 TOOL / DISPATCH / DECISION）可能进行中；其它类型总是返回 false。
+// Discarded 事件虽然 FinishedAt 非零不满足 Running，但语义独立追加检查保底。
 func (e Event) Running() bool {
-	return e.ID != "" && e.FinishedAt.IsZero()
+	return e.ID != "" && e.FinishedAt.IsZero() && !e.Discarded
 }
 
 // UISnapshot 是 TUI 渲染所需的聚合状态快照。

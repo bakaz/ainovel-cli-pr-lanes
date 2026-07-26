@@ -25,6 +25,7 @@ func (o *observer) handleSubagentDelta(p *agentcore.ProgressPayload) {
 	o.ensureSubagentToolStarted(p.Agent, p.Tool)
 	o.updateToolCallSummaryFromDelta(p.Agent, p.Tool, p.Delta)
 
+	o.mapMu.Lock()
 	cur, ok := o.streamExtractors[p.Agent]
 	// 同工具调用 args 已闭合（顶层 } 命中）后，仍可能收到 trailing delta：
 	// 某些 provider（deepseek-v4-flash 实测）会把单次 args 拆成多个 chunk，
@@ -32,6 +33,7 @@ func (o *observer) handleSubagentDelta(p *agentcore.ProgressPayload) {
 	// Done 即重建"处理，新 extractor 又会 emit 一次 ✻ header 并把尾段 token
 	// 当作新 args 解析。这些 delta 是冗余尾巴，丢弃即可。
 	if ok && cur.tool == p.Tool && cur.ext.Done() {
+		o.mapMu.Unlock()
 		return
 	}
 	// 工具名变了或还没建过：新建。
@@ -39,11 +41,13 @@ func (o *observer) handleSubagentDelta(p *agentcore.ProgressPayload) {
 		ext := newToolExtractor(p.Tool)
 		if ext == nil {
 			delete(o.streamExtractors, p.Agent)
+			o.mapMu.Unlock()
 			return
 		}
 		cur = &agentExtractor{tool: p.Tool, ext: ext}
 		o.streamExtractors[p.Agent] = cur
 	}
+	o.mapMu.Unlock()
 	if emitted := cur.ext.Feed(p.Delta); emitted != "" {
 		if !cur.emittedAny {
 			cur.emittedAny = true
@@ -57,7 +61,9 @@ func (o *observer) handleSubagentDelta(p *agentcore.ProgressPayload) {
 			// 来时会新建 extractor，从 args 中段开始解析（在嵌套对象的 `{` 处
 			// 才进入 psBeforeKey），把 timeline_events.time / foreshadow_updates.id
 			// 等当成顶层字段，TUI 上重复出现 ✻ header。
+			o.mapMu.Lock()
 			o.streamExtractors[p.Agent] = cur
+			o.mapMu.Unlock()
 		}
 		o.emitStreamDelta(emitted, false)
 	}
@@ -67,13 +73,20 @@ func (o *observer) emitStreamDelta(delta string, thinking bool) {
 	if delta == "" {
 		return
 	}
-	if thinking != o.streamThinking {
-		o.emitD(utils.ThinkingSep)
+	o.mapMu.Lock()
+	wantSep := thinking != o.streamThinking
+	if wantSep {
 		o.streamThinking = thinking
 	}
+	o.mapMu.Unlock()
+	if wantSep {
+		o.emitD(utils.ThinkingSep)
+	}
 	o.emitD(delta)
+	o.mapMu.Lock()
 	o.streamHasContent = true
 	o.streamLastByte = delta[len(delta)-1]
+	o.mapMu.Unlock()
 }
 
 // ensureSubagentToolStarted 在流式识别到 tool_call 首次出现时，提前为该 agent
@@ -84,7 +97,9 @@ func (o *observer) ensureSubagentToolStarted(agent, tool string) {
 	if agent == "" || tool == "" {
 		return
 	}
+	o.mapMu.Lock()
 	if _, ok := o.toolStarts[agent]; ok {
+		o.mapMu.Unlock()
 		return // 已有进行中调用，幂等
 	}
 	o.resetStreamArgLabel(agent, tool)
@@ -95,6 +110,8 @@ func (o *observer) ensureSubagentToolStarted(agent, tool string) {
 		summary: tool, // 先用纯工具名，ProgressToolStart 到来时可能更新为 tool(第N章)
 		depth:   1,
 	}
+	o.streamOwner = agent
+	o.mapMu.Unlock()
 	o.emitAndLog(Event{
 		ID:       id,
 		Time:     time.Now(),
@@ -111,6 +128,8 @@ func (o *observer) ensureSubagentToolStarted(agent, tool string) {
 	o.emitFallbackStreamHeader(tool)
 }
 
+// resetStreamArgLabel 清空指定 agent/tool 的流式 arg 缓存。
+// 调用方必须持有 o.mapMu 锁。
 func (o *observer) resetStreamArgLabel(agent, tool string) {
 	key := streamArgKey(agent, tool)
 	delete(o.streamArgPrefixes, key)
@@ -154,8 +173,12 @@ func streamHeaderFallback(tool string) string {
 // 不应该再插入 ThinkingSep。否则 fallback header（如 ✻ 读章节）会被 \x02
 // 抢先占头，renderStreamContent 的 HasPrefix("✻") 失配，整段落到正文路径
 // 再被 ThinkingSep 切分为思考段，title 颜色被画成思考色。
+//
+// streamOwner 在此不清空：dispatchFinish 等明确的所有权交接点另行处理。
+// extractor 首次 emit 也会调用 streamClear（开新 round），此时应保持同一 owner。
 func (o *observer) streamClear() {
 	o.emitC()
+	o.mapMu.Lock()
 	o.streamHasContent = false
 	o.streamLastByte = 0
 	o.streamThinking = false
@@ -163,4 +186,5 @@ func (o *observer) streamClear() {
 	if len(o.streamExtractors) > 0 {
 		o.streamExtractors = make(map[string]*agentExtractor)
 	}
+	o.mapMu.Unlock()
 }

@@ -11,15 +11,23 @@ import (
 	"log/slog"
 )
 
-func retryPrefix(attempt, maxRetries int, delay time.Duration) string {
-	if text := formatRetryDelay(delay); text != "" {
+func retryPrefix(attempt, maxRetries int, delay time.Duration, explicitZero bool) string {
+	if text := formatRetryDelay(delay, explicitZero); text != "" {
 		return fmt.Sprintf("重试 (%d/%d，%s后): ", attempt, maxRetries, text)
 	}
 	return fmt.Sprintf("重试 (%d/%d): ", attempt, maxRetries)
 }
 
-func formatRetryDelay(delay time.Duration) string {
-	if delay <= 0 {
+// formatRetryDelay 格式化等待时长文字。
+// explicitZero 为 true 表示上游明确设置了 0 delay（即时重试），显示"即时"而非空字符串。
+func formatRetryDelay(delay time.Duration, explicitZero bool) string {
+	if delay < 0 {
+		return ""
+	}
+	if delay == 0 {
+		if explicitZero {
+			return "即时"
+		}
 		return ""
 	}
 	seconds := int64(delay / time.Second)
@@ -39,12 +47,16 @@ func (o *observer) handleThinkingProgress(ev agentcore.Event) {
 		return
 	}
 
+	o.mapMu.Lock()
 	prev := o.lastThinkingByAgent[agent]
-	delta := thinking
+	var delta string
 	if strings.HasPrefix(thinking, prev) {
 		delta = thinking[len(prev):]
+	} else {
+		delta = thinking
 	}
 	o.lastThinkingByAgent[agent] = thinking
+	o.mapMu.Unlock()
 	if delta == "" {
 		return
 	}

@@ -11,6 +11,11 @@ import (
 
 // handleToolUpdate 处理 Worker 的进度中继(ProgressPayload):TOOL 行、流式正文、
 // thinking、retry、context。Engine 经 observer.workerProgress 喂入。
+//
+// 并发安全：此函数可能从 engine goroutine 与 Arbiter goroutine 两处进入
+// （Arbiter 的 generateWithRetry 经 ctx ToolProgress 回调进入），因此所有
+// map 访问必须持 mapMu。channel 输出（emitEv/emitD/emitC/persistEvent）在
+// 解锁后发送，避免持锁期间发生 channel 阻塞反向依赖。
 func (o *observer) handleToolUpdate(ev agentcore.Event) {
 	if ev.Progress == nil {
 		return
@@ -28,7 +33,10 @@ func (o *observer) handleToolUpdate(ev agentcore.Event) {
 			break
 		}
 		toolName := displayToolName(ev.Progress.Tool, ev.Progress.Args)
-		if _, ok := o.toolStarts[ev.Progress.Agent]; ok {
+		o.mapMu.Lock()
+		_, alreadyStarted := o.toolStarts[ev.Progress.Agent]
+		if alreadyStarted {
+			o.mapMu.Unlock()
 			o.updateToolCallSummary(ev.Progress.Agent, ev.Progress.Tool, toolName)
 			o.updateAgent(ev.Progress.Agent, func(a *agentState) {
 				a.state = "working"
@@ -43,6 +51,8 @@ func (o *observer) handleToolUpdate(ev agentcore.Event) {
 		// 无 extractor 的工具流式面板上就没有 ✻ 头部，紧贴前面思考一段。）
 		id := nextEventID()
 		o.toolStarts[ev.Progress.Agent] = &activeCall{id: id, start: time.Now(), summary: toolName, depth: 1}
+		o.streamOwner = ev.Progress.Agent
+		o.mapMu.Unlock()
 		o.emitAndLog(Event{
 			ID:       id,
 			Time:     time.Now(),
@@ -59,15 +69,20 @@ func (o *observer) handleToolUpdate(ev agentcore.Event) {
 		})
 		o.emitFallbackStreamHeader(ev.Progress.Tool)
 	case agentcore.ProgressToolEnd:
+		o.mapMu.Lock()
 		delete(o.streamExtractors, ev.Progress.Agent)
+		o.mapMu.Unlock()
 		if ev.Progress.Agent == "" {
 			return
 		}
+		o.mapMu.Lock()
 		call, ok := o.toolStarts[ev.Progress.Agent]
 		if !ok {
+			o.mapMu.Unlock()
 			return
 		}
 		delete(o.toolStarts, ev.Progress.Agent)
+		o.mapMu.Unlock()
 		// 同 ID 更新事件：TUI 按 ID 定位原 TOOL 行，回填 FinishedAt / Duration。
 		// Summary / Depth 也带上，保证 runtime queue replay 时能还原完整行。
 		finishEv := Event{
@@ -86,15 +101,94 @@ func (o *observer) handleToolUpdate(ev agentcore.Event) {
 	case agentcore.ProgressThinking:
 		o.handleThinkingProgress(ev)
 	case agentcore.ProgressRetry:
+		agent := ev.Progress.Agent
+
+		// ── EventRetry 契约：当前未提交 model attempt 已丢弃 ──
+		//
+		// 1) 把该 agent 进行中的 TOOL 行以同 Event.ID 更新为终态 discarded
+		//   （不是执行失败，只是模型输出被放弃）
+		// 2) 清空该 agent 的流式残留：toolStarts、streamExtractors、
+		//    streamArgPrefixes/labels、thinking、stream text round
+		// 3) 仅当 retry agent 是当前 stream round 的 owner 时才 CLEAR/reset
+		//    全局 stream 状态，避免 Arbiter retry 截断 Writer 正在输出的流式内容
+		// 4) 清理 agent 侧栏状态
+
+		o.mapMu.Lock()
+
+		// ── agent 级清理（持锁执行） ──
+		var discardID string
+		var discardStart time.Time
+		var discardSummary string
+		var discardDepth int
+		if call, ok := o.toolStarts[agent]; ok {
+			discardID = call.id
+			discardStart = call.start
+			discardSummary = call.summary
+			discardDepth = call.depth
+			delete(o.toolStarts, agent)
+		}
+		delete(o.lastThinkingByAgent, agent)
+		delete(o.streamExtractors, agent)
+		for key := range o.streamArgPrefixes {
+			if strings.HasPrefix(key, agent+"\x00") {
+				delete(o.streamArgPrefixes, key)
+			}
+		}
+		for key := range o.streamArgLabels {
+			if strings.HasPrefix(key, agent+"\x00") {
+				delete(o.streamArgLabels, key)
+			}
+		}
+
+		// ── 全局 stream CLEAR：只有 retry agent 是 stream owner 才执行 ──
+		mayClear := o.streamOwner == agent
+		o.mapMu.Unlock()
+
+		// 发射丢弃事件（持锁完成后释放，不在锁内做 channel 操作）
+		if discardID != "" {
+			discardEv := Event{
+				ID:         discardID,
+				Time:       discardStart,
+				FinishedAt: time.Now(),
+				Discarded:  true,
+				Category:   "TOOL",
+				Agent:      agent,
+				Summary:    discardSummary,
+				Level:      "info",
+				Depth:      discardDepth,
+				Duration:   time.Since(discardStart),
+			}
+			o.emitEv(discardEv)
+			o.persistEvent(discardEv)
+		}
+
+		// 清理 agent 侧栏状态（把 agent 标记为空闲）
+		o.updateAgent(agent, func(a *agentState) {
+			a.state = "idle"
+			a.tool = ""
+		})
+
+		// 仅 owner 发 CLEAR 重置全局 stream 状态
+		if mayClear {
+			o.emitC()
+			o.mapMu.Lock()
+			o.streamHasContent = false
+			o.streamLastByte = 0
+			o.streamThinking = false
+			o.streamOwner = ""
+			o.mapMu.Unlock()
+		}
+
+		// ── 原有的 retry SYSTEM 行发射逻辑 ──
 		// Arbiter 在 Meta 里保留实际 Retry-After；旧 Worker relay 尚未携带 Delay，
 		// 对它按 agentcore 的标准指数退避还原展示值。
-		delay := retryProgressDelay(ev.Progress)
-		prefix := retryPrefix(ev.Progress.Attempt, ev.Progress.MaxRetries, delay)
+		delay, explicitZero := retryProgressDelay(ev.Progress)
+		prefix := retryPrefix(ev.Progress.Attempt, ev.Progress.MaxRetries, delay, explicitZero)
 		retryEv := Event{
-			ID:       o.retryEventID(ev.Progress.Agent, ev.Progress.Attempt),
+			ID:       o.retryEventID(agent, ev.Progress.Attempt),
 			Time:     time.Now(),
 			Category: "SYSTEM",
-			Agent:    ev.Progress.Agent,
+			Agent:    agent,
 			Summary:  prefix + truncate(ev.Progress.Message, 80),
 			Detail:   prefix + ev.Progress.Message,
 			Kind:     errorKind(nil, ev.Progress.Message),
@@ -104,14 +198,19 @@ func (o *observer) handleToolUpdate(ev agentcore.Event) {
 		o.emitEv(retryEv)
 		o.persistEvent(retryEv)
 	case agentcore.ProgressToolError:
+		o.mapMu.Lock()
 		delete(o.streamExtractors, ev.Progress.Agent)
+		call, hasTool := o.toolStarts[ev.Progress.Agent]
+		if hasTool {
+			delete(o.toolStarts, ev.Progress.Agent)
+		}
+		o.mapMu.Unlock()
 		msg := ev.Progress.Message
 		if msg == "" {
 			msg = "unknown error"
 		}
 		// 如果有进行中的 TOOL 行，原地标记为失败；否则独立追加 ERROR 行。
-		if call, ok := o.toolStarts[ev.Progress.Agent]; ok {
-			delete(o.toolStarts, ev.Progress.Agent)
+		if hasTool {
 			finishEv := Event{
 				ID:         call.id,
 				Time:       call.start,
@@ -145,19 +244,32 @@ func (o *observer) handleToolUpdate(ev agentcore.Event) {
 	}
 }
 
-func retryProgressDelay(p *agentcore.ProgressPayload) time.Duration {
+// retryProgressDelay 解析 retry 事件中的等待时长。
+// 返回 (delay, explicitZero)：
+//   - 当 payload.Meta 中有 "retry_delay_ms" 字段时，explicitZero=true 且 delay 为该字段值（允许 0）；
+//   - 无该字段时 explicitZero=false，按 attempt 指数退避（首 attempt 返回 1s）。
+//
+// explicitZero 由调用方用于 UI 展示：上游显式声明 0 delay 时显示"即时重试"而非 fallback 1s。
+func retryProgressDelay(p *agentcore.ProgressPayload) (delay time.Duration, explicitZero bool) {
 	if p == nil {
-		return 0
+		return 0, false
 	}
 	if len(p.Meta) > 0 {
-		var meta struct {
-			DelayMS int64 `json:"retry_delay_ms"`
-		}
-		if json.Unmarshal(p.Meta, &meta) == nil && meta.DelayMS > 0 {
-			return time.Duration(meta.DelayMS) * time.Millisecond
+		var raw map[string]json.RawMessage
+		if json.Unmarshal(p.Meta, &raw) == nil {
+			if rawMS, ok := raw["retry_delay_ms"]; ok {
+				var ms int64
+				if json.Unmarshal(rawMS, &ms) == nil {
+					return time.Duration(ms) * time.Millisecond, true
+				}
+			}
 		}
 	}
-	attempt := p.Attempt
+	return retryFallbackDelay(p.Attempt), false
+}
+
+// retryFallbackDelay 当上游未携带 retry_delay_ms 时，按 attempt 做指数退避。
+func retryFallbackDelay(attempt int) time.Duration {
 	if attempt <= 0 {
 		return 0
 	}
@@ -189,11 +301,14 @@ func (o *observer) updateToolCallSummary(agent, tool, summary string) {
 	if agent == "" || summary == "" {
 		return
 	}
+	o.mapMu.Lock()
 	call, ok := o.toolStarts[agent]
 	if !ok || call.summary == summary {
+		o.mapMu.Unlock()
 		return
 	}
 	call.summary = summary
+	o.mapMu.Unlock()
 	o.emitEv(Event{
 		ID:       call.id,
 		Time:     call.start,
@@ -211,6 +326,7 @@ func (o *observer) updateToolCallSummary(agent, tool, summary string) {
 }
 
 func (o *observer) updateToolCallSummaryFromDelta(agent, tool, delta string) {
+	o.mapMu.Lock()
 	key := streamArgKey(agent, tool)
 	prefix := o.streamArgPrefixes[key] + delta
 	if len(prefix) > 512 {
@@ -220,12 +336,15 @@ func (o *observer) updateToolCallSummaryFromDelta(agent, tool, delta string) {
 
 	summary := streamedToolLabel(tool, prefix)
 	if summary == "" {
+		o.mapMu.Unlock()
 		return
 	}
 	if o.streamArgLabels[key] == summary {
+		o.mapMu.Unlock()
 		return
 	}
 	o.streamArgLabels[key] = summary
+	o.mapMu.Unlock()
 	o.updateToolCallSummary(agent, tool, summary)
 }
 

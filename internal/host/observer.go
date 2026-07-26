@@ -9,6 +9,7 @@ import (
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/errclass"
 	storepkg "github.com/voocel/ainovel-cli/internal/store"
 	"sync/atomic"
 )
@@ -19,12 +20,37 @@ import (
 // err is the live error chain (may be nil after JSON serialization); msg is
 // the rendered string fallback used when the chain has been flattened
 // (e.g. inside sub-agent JSON results).
+//
+// Classification priority:
+//  1. Exact error chain match (errors.Is) — but args-malformed overrides
+//     ErrToolValidation when msg indicates a JSON parse failure.
+//  2. Message pattern match (errclass.ClassifyMsg).
+//
+// Provider-level sentinel checks (ErrProviderStreamIdle) live here because they
+// rely on agentcore types that errclass does not import.
 func errorKind(err error, msg string) string {
-	if err != nil && errors.Is(err, agentcore.ErrProviderStreamIdle) {
-		return "stream_idle"
+	// ---- Exact error chain match (most reliable) ----
+	if err != nil {
+		switch {
+		case errors.Is(err, agentcore.ErrMaxTurns):
+			return errclass.CatMaxTurns
+		case errors.Is(err, agentcore.ErrToolValidation):
+			// ErrToolValidation wraps both schema violations and JSON parse
+			// failures. When msg indicates args-malformed, prefer that category
+			// so malformed args are never generalized as schema validation.
+			if msg != "" {
+				if cat := errclass.ClassifyMsg(msg); cat == errclass.CatToolArgsMalformed {
+					return cat
+				}
+			}
+			return errclass.CatToolSchemaValidation
+		case errors.Is(err, agentcore.ErrProviderStreamIdle):
+			return errclass.CatStreamIdle
+		}
 	}
-	if msg != "" && agentcore.IsStreamIdleMessage(msg) {
-		return "stream_idle"
+	// ---- Fall back to shared message pattern matching ----
+	if msg != "" {
+		return errclass.ClassifyMsg(msg)
 	}
 	return ""
 }
@@ -47,6 +73,10 @@ type activeCall struct {
 
 // observer 把 Engine 派发与 Worker 进度投影到 Host 的输出通道。
 // 它是纯观察者,不参与任何控制决策。
+//
+// 并发安全：agentMu 保护 agents 快照（TUI 侧栏），mapMu 保护以下所有 map 以及
+// stream 原子状态。handleToolUpdate 从 engine goroutine 与 Arbiter goroutine
+// 两处进入，因此所有 map 访问必须持 mapMu。
 type observer struct {
 	emitEv  func(Event)
 	emitD   func(string)
@@ -54,6 +84,9 @@ type observer struct {
 	store   *storepkg.Store // 用于 runtime queue 持久化（ReplayQueue 消费）
 	agents  map[string]*agentState
 	agentMu sync.Mutex
+
+	// mapMu 保护以下所有 map 字段及 stream 原子状态。
+	mapMu sync.Mutex
 
 	// aborting 由 Host 在 Abort()/Close() 入口置位、Start/Resume/Continue 清位。
 	// 置位期间所有 context-cancel 衍生的错误事件被抑制（既是用户期望，也避免与
@@ -70,6 +103,11 @@ type observer struct {
 	retryEvents         map[string]string          // retry scope → event ID，用同一行原地更新 (2/7)
 	streamHasContent    bool                       // 当前 streamRound 是否已输出过内容（判断是否需要段落分隔）
 	streamLastByte      byte                       // 最近一次流式输出的末字节（用于精确补齐换行）
+
+	// streamOwner 记录当前 stream round 属于哪个 agent。
+	// retry 只有 owner 才允许 CLEAR/reset 全局 stream，避免 Arbiter retry
+	// 截断 Worker 正在输出的流式内容。
+	streamOwner string
 }
 
 // agentExtractor 记录某个 agent 当前正在抽取的工具名与抽取器实例。
@@ -124,7 +162,10 @@ func (o *observer) dispatchStart(agent, task string) {
 		a.summary = fmt.Sprintf("engine → %s", summary)
 	})
 	id := nextEventID()
+	o.mapMu.Lock()
 	o.dispatchStarts[agent] = &activeCall{id: id, start: time.Now(), summary: summary}
+	o.streamOwner = agent
+	o.mapMu.Unlock()
 	o.emitAndLog(Event{
 		ID:       id,
 		Time:     time.Now(),
@@ -137,20 +178,32 @@ func (o *observer) dispatchStart(agent, task string) {
 
 // dispatchFinish 把 DISPATCH 行落成完成态并复位 Worker 状态;
 // 清理该 Worker 名下的孤儿 TOOL 行(abort/错误路径 ProgressToolEnd 可能缺席)。
+// 放弃 streamOwner（dispatch 结束后不再属于任何 agent）。
 func (o *observer) dispatchFinish(agent string, failed bool) {
 	o.updateAgent(agent, func(a *agentState) {
 		a.state = "idle"
 		a.tool = ""
 	})
+	o.mapMu.Lock()
 	delete(o.lastThinkingByAgent, agent)
-	if call, ok := o.toolStarts[agent]; ok {
+	call, hasTool := o.toolStarts[agent]
+	if hasTool {
 		delete(o.toolStarts, agent)
 		delete(o.streamExtractors, agent)
+	}
+	dispatchCall, hasDispatch := o.dispatchStarts[agent]
+	if hasDispatch {
+		delete(o.dispatchStarts, agent)
+	}
+	if o.streamOwner == agent {
+		o.streamOwner = ""
+	}
+	o.mapMu.Unlock()
+	if hasTool {
 		o.emitCallFinish(call, "TOOL", agent, failed)
 	}
-	if call, ok := o.dispatchStarts[agent]; ok {
-		delete(o.dispatchStarts, agent)
-		o.emitCallFinish(call, "DISPATCH", agent, failed)
+	if hasDispatch {
+		o.emitCallFinish(dispatchCall, "DISPATCH", agent, failed)
 	}
 	o.streamClear()
 }
@@ -178,6 +231,8 @@ func (o *observer) retryEventID(scope string, attempt int) string {
 	if strings.TrimSpace(scope) == "" {
 		scope = "engine"
 	}
+	o.mapMu.Lock()
+	defer o.mapMu.Unlock()
 	if o.retryEvents == nil {
 		o.retryEvents = make(map[string]string)
 	}
