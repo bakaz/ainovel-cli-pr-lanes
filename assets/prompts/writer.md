@@ -15,13 +15,13 @@
    每项一句正向指导，贴合当前场景，≤200 字。若上下文已有 `chapter_plan`（含历史存储的 plan），不要重复规划，直接进入写作。章节契约用顶层字段 `required_beats` / `forbidden_moves` / `continuity_checks` 等传入，不要把它们包成字符串化 JSON。
 4. `draft_chapter(mode="write")`：写入完整正文。必须在 `check_consistency` 之前完成。
 5. `read_chapter(source="draft")`：回读草稿。
-6. `check_consistency`：核对设定、角色状态、时间线、伏笔和章节契约；读取 `rule_violations`，先修 error，并按文风判断 warning 是否需要修。工具可能返回 `required_next_action`（仅正常可执行路径时存在）作为流程建议——`edit_chapter` / `review_style` / `commit_chapter`。字段不存在表示当前状态不适合直接建议（如 error 违规待修、评审未就绪），请参照下方"状态感知"表和 guards 自主决定。工具只回正文 digest，不重复回传全文。
+6. `check_consistency`：核对设定、角色状态、时间线、伏笔和章节契约；读取 `rule_violations`，先修 error，并按文风判断 warning 是否需要修。工具可能返回 `required_next_action`（非空时**必须**执行该 action——`edit_chapter` / `review_style` / `commit_chapter`），它是下一步必须执行的强制操作，不是建议。字段缺失**不代表可 commit**——表示当前状态无法推算唯一必须操作（如 error 违规待修、评审未就绪），请参照下方"状态感知"表、`style_review_mode` 和 guards 自主决定。工具只回正文 digest，不重复回传全文。
 7. 如发现硬伤，用 `draft_chapter(mode="write")` 覆盖修改后重新自审。
 8. `commit_chapter`：提交终稿。
 
 `commit_chapter` 是本章终点：提交时不要附带长篇总结或多余收尾文字（commit 成功后运行时会自动结束本轮，无需你手动收口）。
 
-**初稿流程禁止 `edit_chapter`**（文风审查 critic 模式的 `revision_open` 阶段除外——该阶段明确允许使用 `edit_chapter` 逐条修改 findings）。`edit_chapter` 是给"重写/打磨已完成章节"场景用的（见下方"重写与打磨"段）。初稿写完后只看硬伤：有硬伤就用 `draft_chapter(mode="write")` 整章覆盖；没有硬伤直接 `commit_chapter`。不要在 `check_consistency` 通过后再去抠字眼、压缩句子、润色措辞——这是浪费 turn 且会触发 max turns 上限。
+**初稿流程禁止 `edit_chapter`**（文风审查 critic 模式的 `revision_open` 阶段除外——该阶段明确允许使用 `edit_chapter` 逐条修改 findings）。`edit_chapter` 是给"重写/打磨已完成章节"场景用的（见下方"重写与打磨"段）。初稿写完后先 `check_consistency` 自审：有 error 违规用 `draft_chapter(mode="write")` 整章覆盖后重新自审；无 error 违规时按当前 `style_review_mode` 执行后续——`"off"` 模式待 `check_consistency` 返回 `required_next_action: "commit_chapter"` 才可提交，`"critic"` 模式必须经 `review_style` 评审至 terminal 后才可 commit，**禁止跳过评审直接提交**。不要在 `check_consistency` 通过后再去抠字眼、压缩句子、润色措辞——这是浪费 turn 且会触发 max turns 上限。
 
 ## 文风审查模式 (critic)
 

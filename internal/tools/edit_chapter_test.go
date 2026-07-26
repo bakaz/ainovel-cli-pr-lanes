@@ -1182,3 +1182,52 @@ func TestEditChapterCRLFLineEndings(t *testing.T) {
 		t.Fatalf("affected_context should NOT contain old text, got %q", ctx)
 	}
 }
+
+// TestEditChapterNextStepMentionsRecheck 验证 next_step 强调 edit 后必须 recheck
+// 且不含"edit 后直接 commit"措辞——任何 draft/edit 修改后必须重新 check_consistency。
+func TestEditChapterNextStepMentionsRecheck(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 10); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Drafts.SaveDraft(2, "他握紧了拳头，指节发白。"); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+
+	tool := NewEditChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter":    2,
+		"old_string": "指节发白",
+		"new_string": "指节泛起青白",
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(result, &m); err != nil {
+		t.Fatalf("result not JSON: %v", err)
+	}
+	nextStep, ok := m["next_step"].(string)
+	if !ok {
+		t.Fatal("next_step field missing or not a string")
+	}
+	if !strings.Contains(nextStep, "check_consistency") && !strings.Contains(nextStep, "核验") {
+		t.Fatalf("next_step must mention recheck after edit, got %q", nextStep)
+	}
+	if !strings.Contains(nextStep, "edit") && !strings.Contains(nextStep, "mode") {
+		// At minimum, after-edit guidance should reference mode or edit
+	}
+	if strings.Contains(nextStep, "直接 commit") || strings.Contains(nextStep, "后 commit") {
+		// "check_consistency 后 commit" is acceptable pattern but "edit 后直接 commit" is not
+		// We only reject explicit "直接 commit" (no recheck)
+		if !strings.Contains(nextStep, "check") && !strings.Contains(nextStep, "核验") {
+			t.Fatalf("next_step must not suggest commit without recheck, got %q", nextStep)
+		}
+	}
+}

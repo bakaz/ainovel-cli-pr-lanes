@@ -127,13 +127,16 @@ func TestWriterStopGuard_StageAwareBlockMessage(t *testing.T) {
 		t.Fatalf("draft-only message should point to check_consistency, got %q", d.InjectMessage)
 	}
 
-	// 草稿+一致性检查已完成：只差提交，且要为 commit 报错场景留出路。
+	// 草稿+一致性检查已完成：应提示按 mode 决定后续（非无条件催 commit）。
 	if _, err := s.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "meta/checks/01.json", "c1"); err != nil {
 		t.Fatalf("append consistency_check: %v", err)
 	}
 	d = guard(context.Background(), normalStop)
-	if !strings.Contains(d.InjectMessage, "commit_chapter") || !strings.Contains(d.InjectMessage, "错误") {
-		t.Fatalf("ready-to-commit message should mention commit and error handling, got %q", d.InjectMessage)
+	if !strings.Contains(d.InjectMessage, "commit_chapter") || !strings.Contains(d.InjectMessage, "check_consistency") {
+		t.Fatalf("ready-to-commit message should mention commit and recheck, got %q", d.InjectMessage)
+	}
+	if strings.Contains(d.InjectMessage, "只差") {
+		t.Fatalf("ready-to-commit message must not contain '只差' (unconditional commit framing), got %q", d.InjectMessage)
 	}
 }
 

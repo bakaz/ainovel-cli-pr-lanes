@@ -172,7 +172,7 @@ func (t *EditChapterTool) Execute(ctx context.Context, args json.RawMessage) (js
 		"chapter_word_count":           chapterWordCount,
 		"word_count_delta":             wordCountDelta,
 		"requires_consistency_recheck": true,
-		"next_step":                    "edit 已落盘。仍有硬伤可再次 edit_chapter；否则 check_consistency 后 commit_chapter",
+		"next_step":                    "edit 已落盘。每次 edit 后**必须**调 check_consistency 重新核验；通过后按 mode 执行（off 模式 check→commit，critic 模式需 review_style→terminal→commit）",
 	}
 	// replace_all 时变更范围是整体包络，只能提供单一保守上下文
 	if a.ReplaceAll {

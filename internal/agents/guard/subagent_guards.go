@@ -168,7 +168,7 @@ func writerBlockMsg(seen map[string]struct{}) string {
 	case !hasCheck:
 		return "禁止结束：正文已落盘但未收尾。请先调 check_consistency 核对一致性，再调 commit_chapter 提交本章。draft_chapter / edit_chapter 只是保存草稿，不算完成。"
 	default:
-		return "禁止结束：本章只差 commit_chapter 提交。请立即调用 commit_chapter；若它返回错误，先按错误信息处理（核对章节号、按提示补齐前置动作）再重试提交，不要在未提交的状态下结束。"
+		return "禁止结束：本章尚未完成提交。请先调 check_consistency 确认 required_next_action——若为 commit_chapter 则调 commit_chapter 提交；若为 review_style 则先完成评审（critic 模式必须 terminal 后才可 commit）。若 commit_chapter 返回错误，先按错误信息处理（核对章节号、按提示补齐前置动作）再重试，不要在未提交的状态下结束。"
 	}
 }
 

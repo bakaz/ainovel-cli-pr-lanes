@@ -295,3 +295,45 @@ func TestOverrideVoice_SharesAssemblyPath(t *testing.T) {
 		t.Fatal("协议模板不得被 voice 覆盖破坏")
 	}
 }
+
+// TestWriterPrompt_NoUnconditionalDirectCommit 验证 writer.md 不含"没有硬伤直接 commit"
+// 类无条件提交措辞——协议必须按 mode 决定 commit 时机（Gate 2 Oracle：
+// off 模式待 check→commit 才可提交，critic 模式必须经 review_style→terminal 后才可 commit）。
+func TestWriterPrompt_NoUnconditionalDirectCommit(t *testing.T) {
+	protocol := mustRead(promptsFS, "prompts/writer.md")
+	forbidden := []string{
+		"没有硬伤直接 commit_chapter",
+		"没有硬伤直接 `commit_chapter`",
+	}
+	for _, phrase := range forbidden {
+		if strings.Contains(protocol, phrase) {
+			t.Errorf("writer.md 禁止出现无条件提交措辞: %q", phrase)
+		}
+	}
+	// 必须包含 mode 感知的提交指引
+	if !strings.Contains(protocol, "required_next_action: \"commit_chapter\"") &&
+		!strings.Contains(protocol, "required_next_action: `commit_chapter`") {
+		t.Error("writer.md 必须引用 required_next_action 作为 commit 的准入条件")
+	}
+	if !strings.Contains(protocol, "review_style") || !strings.Contains(protocol, "terminal") {
+		t.Error("writer.md critic 模式指引必须要求 review_style→terminal→commit")
+	}
+}
+
+// TestWriterPrompt_RequiredNextActionIsMandatory 验证 required_next_action 被描述为
+// 强制操作而非建议（Gate 2 Oracle：非空时下一次工具调用必须执行该 action）。
+func TestWriterPrompt_RequiredNextActionIsMandatory(t *testing.T) {
+	protocol := mustRead(promptsFS, "prompts/writer.md")
+	// 不得再用"建议"来描述 required_next_action
+	if strings.Contains(protocol, "作为流程建议") {
+		t.Error("required_next_action 不应再描述为'流程建议'")
+	}
+	// 必须包含"必须执行"语义
+	if !strings.Contains(protocol, "必须执行") {
+		t.Error("required_next_action 必须明确'必须执行'语义")
+	}
+	// 必须说明缺失不代表可 commit
+	if !strings.Contains(protocol, "不代表可 commit") && !strings.Contains(protocol, "不代表可") {
+		t.Error("required_next_action 字段缺失说明必须声明'不代表可 commit'")
+	}
+}
