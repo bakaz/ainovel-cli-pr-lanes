@@ -2,7 +2,7 @@ package agents
 
 // agentcore 契约测试：把本项目依赖的框架行为钉成可执行断言。
 // 每条测试标注依赖方；bump agentcore 前必须全绿——注释会过时，测试不会。
-// 全部经 subagent.Tool.Run 驱动——这是 Engine 的实际派发通道。
+// 全部经 subagent.Runner.Run 驱动——这是 Engine 的实际派发通道。
 //
 // 已钉死的契约：
 //  1. StopAfterTools/StopAfterToolResult 终态退出会经过 StopGuard（StopTriggerAfterTool），
@@ -15,7 +15,7 @@ package agents
 //  4. StopGuard 返回 InjectMessage 后模型获得新一轮；返回 Escalate 立即终止，
 //     且错误链可被 errors.Is(err, agentcore.ErrStopGuard) 匹配 ——
 //     guard/stop_guard.go 的"物理不可停机"与超限升级依赖此语义。
-//  5. Tool.Run 的错误保持类型化链：未注册 agent 匹配 subagent.ErrUnknownAgent ——
+//  5. Runner.Run 的错误保持类型化链：未注册 agent 匹配 subagent.ErrUnknownAgent ——
 //     host/engine.go 的 isDeterministicWorkerError 依赖此分类而非错误文案。
 
 import (
@@ -85,12 +85,12 @@ func okTool(name string) agentcore.Tool {
 		})
 }
 
-// runSubagent 用给定配置经 Tool.Run（Engine 的派发通道）跑一次单派发。
+// runSubagent 用给定配置经 Runner.Run（Engine 的派发通道）跑一次单派发。
 // 返回执行错误——StopGuard 升级终止会以 error 形式浮出（这本身也是契约），
 // 期望正常结束的用例自行断言 nil。
 func runSubagent(t *testing.T, cfg subagent.Config) error {
 	t.Helper()
-	_, err := subagent.New(cfg).Run(context.Background(), cfg.Name, "contract")
+	_, err := subagent.NewRunner(cfg).Run(context.Background(), cfg.Name, "contract")
 	return err
 }
 
@@ -241,18 +241,18 @@ func TestContract_StopGuardInjectContinuesEscalateTerminates(t *testing.T) {
 	}
 }
 
-// 契约 5：Tool.Run 的错误保持类型化链——未注册 agent 以 subagent.ErrUnknownAgent
+// 契约 5：Runner.Run 的错误保持类型化链——未注册 agent 以 subagent.ErrUnknownAgent
 // 浮出。依赖方：host/engine.go 的 isDeterministicWorkerError（"重试必然同错→
 // 直接暂停"的分类依赖 errors.Is,而非错误文案匹配）。
 func TestContract_RunUnknownAgentIsTyped(t *testing.T) {
-	tool := subagent.New(subagent.Config{
+	runner := subagent.NewRunner(subagent.Config{
 		Name: "writer", Description: "contract",
 		Model: &contractModel{fn: func(int, []agentcore.Message) (*agentcore.LLMResponse, error) {
 			return &agentcore.LLMResponse{Message: assistantText("ok", agentcore.StopReasonStop)}, nil
 		}},
 		SystemPrompt: "test", MaxTurns: 3,
 	})
-	_, err := tool.Run(context.Background(), "ghost", "contract")
+	_, err := runner.Run(context.Background(), "ghost", "contract")
 	if !errors.Is(err, subagent.ErrUnknownAgent) {
 		t.Fatalf("未注册 agent 应匹配 subagent.ErrUnknownAgent，got %v", err)
 	}

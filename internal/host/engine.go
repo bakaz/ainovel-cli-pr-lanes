@@ -27,7 +27,7 @@ import (
 // (docs/engine-rfc.md)。单 goroutine 串行,控制状态只在循环边界变更。
 type engine struct {
 	store   *storepkg.Store
-	workers *subagent.Tool
+	workers *subagent.Runner
 
 	arbiterModel    agentcore.ChatModel
 	failurePrompt   string
@@ -62,7 +62,7 @@ type engine struct {
 	mu      sync.Mutex
 	cancel  context.CancelFunc
 	running bool
-	done    chan struct{} // close in run() defer after onDone, for true completion signal
+	done    chan struct{}     // close in run() defer after onDone, for true completion signal
 	pending []controlOp       // 干预的控制态动作,边界提交
 	next    *flow.Instruction // 下一轮优先执行的指令(plan_start / arbiter dispatch)
 	// deferGateForNext 只与 next 同生共灭：hold+dispatch 必须先运行配对的

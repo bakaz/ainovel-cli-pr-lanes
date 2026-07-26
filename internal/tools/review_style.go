@@ -28,12 +28,12 @@ const maxCriticRunes = 12000
 // 非 ReadOnly，非 ConcurrencySafe。Writer 可调用。
 type ReviewStyleTool struct {
 	store            *store.Store
-	critic           *subagent.Tool
+	criticRunner     *subagent.Runner
 	criticPromptHash string // sha256 前缀：实际批评者提示词内容的可溯源标识
 }
 
-func NewReviewStyleTool(s *store.Store, critic *subagent.Tool, criticPromptHash string) *ReviewStyleTool {
-	return &ReviewStyleTool{store: s, critic: critic, criticPromptHash: criticPromptHash}
+func NewReviewStyleTool(s *store.Store, criticRunner *subagent.Runner, criticPromptHash string) *ReviewStyleTool {
+	return &ReviewStyleTool{store: s, criticRunner: criticRunner, criticPromptHash: criticPromptHash}
 }
 
 func (t *ReviewStyleTool) Name() string { return "review_style" }
@@ -382,7 +382,7 @@ func (t *ReviewStyleTool) callCritic(ctx context.Context, chapter int, content s
 请严格按样式批评者提示词中定义的 JSON 格式输出（含 mandatory strength.evidence）。`,
 		chapter, wordCount, truncNote, draftForCritic, basisPayload)
 
-	runResult, err := t.critic.Run(ctx, "style_critic", taskText)
+	runResult, err := t.criticRunner.Run(ctx, "style_critic", taskText)
 	if err != nil {
 		return nil, fmt.Errorf("critic call failed: %w", err)
 	}
@@ -675,7 +675,7 @@ func ComputeBasisDigest(st *store.Store, chapter int, criticPromptHash string) s
 // ── Model identity ───────────────────────────────────────────────────
 
 func (t *ReviewStyleTool) loadCriticModelName() string {
-	cfg, ok := t.critic.AgentConfig("style_critic")
+	cfg, ok := t.criticRunner.AgentConfig("style_critic")
 	if !ok {
 		return "unknown"
 	}

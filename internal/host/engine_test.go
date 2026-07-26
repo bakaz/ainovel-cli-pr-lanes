@@ -141,7 +141,7 @@ func scriptedWriterModel() *scriptedChatModel {
 }
 
 // newTestEngine 组装带真实 store/observer 的引擎;返回引擎、事件采集与完成信号。
-func newTestEngine(t *testing.T, st *storepkg.Store, workers *subagent.Tool, arbiterModel agentcore.ChatModel) (*engine, *[]Event, chan struct{}) {
+func newTestEngine(t *testing.T, st *storepkg.Store, workers *subagent.Runner, arbiterModel agentcore.ChatModel) (*engine, *[]Event, chan struct{}) {
 	t.Helper()
 	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
 		t.Fatalf("init run meta: %v", err)
@@ -215,7 +215,7 @@ func TestEngine_ReviewPermitWritesExactlyOneNewChapter(t *testing.T) {
 		},
 		MaxTurns: 10, StopAfterTools: []string{"commit_chapter"},
 	}
-	e, _, done := newTestEngine(t, st, subagent.New(writer), nil)
+	e, _, done := newTestEngine(t, st, subagent.NewRunner(writer), nil)
 	if err := st.RunMeta.SetAdvanceMode(domain.ChapterAdvanceReview); err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestEngine_StalePairedDispatchDoesNotBypassHold(t *testing.T) {
 	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
 		t.Fatal(err)
 	}
-	e, _, _ := newTestEngine(t, st, subagent.New(), nil)
+	e, _, _ := newTestEngine(t, st, subagent.NewRunner(), nil)
 	e.pending = []controlOp{{
 		hold:     &arbiter.AdvanceHoldOp{After: domain.AdvanceHoldAtBoundary, Reason: "先停下"},
 		dispatch: &arbiter.DispatchOp{Agent: "editor", Task: "过期任务"},
@@ -305,7 +305,7 @@ func TestEngine_WritesBookToCompletion(t *testing.T) {
 		MaxTurns:       10,
 		StopAfterTools: []string{"commit_chapter"},
 	}
-	e, events, done := newTestEngine(t, st, subagent.New(writer), nil)
+	e, events, done := newTestEngine(t, st, subagent.NewRunner(writer), nil)
 
 	if !e.start(nil) {
 		t.Fatal("engine start")
@@ -374,7 +374,7 @@ func TestEngine_WorkerFailureConsultsArbiterAndAborts(t *testing.T) {
 	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
 		return testTextMsg(`{"action":"abort","reason":"writer 反复空转,建议人工检查模型配置"}`)
 	}}
-	e, _, done := newTestEngine(t, st, subagent.New(writer), arb)
+	e, _, done := newTestEngine(t, st, subagent.NewRunner(writer), arb)
 
 	if !e.start(nil) {
 		t.Fatal("engine start")
@@ -441,7 +441,7 @@ func TestEngine_RetriesUnfinishedPlanStart(t *testing.T) {
 		}},
 		SystemPrompt: "test", MaxTurns: 3,
 	}
-	e, events, done := newTestEngine(t, st, subagent.New(architect), arb)
+	e, events, done := newTestEngine(t, st, subagent.NewRunner(architect), arb)
 
 	if !e.start(nil) {
 		t.Fatal("engine start")
@@ -499,7 +499,7 @@ func TestEngine_PlanStartRetryFailurePauses(t *testing.T) {
 	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
 		return testTextMsg("这不是 JSON")
 	}}
-	e, events, done := newTestEngine(t, st, subagent.New(), arb)
+	e, events, done := newTestEngine(t, st, subagent.NewRunner(), arb)
 
 	if !e.start(nil) {
 		t.Fatal("engine start")
@@ -561,7 +561,7 @@ func TestEngine_DeadlockConsultsArbiter(t *testing.T) {
 	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
 		return testTextMsg(`{"action":"abort","reason":"规划师反复无产出"}`)
 	}}
-	e, _, done := newTestEngine(t, st, subagent.New(architect), arb)
+	e, _, done := newTestEngine(t, st, subagent.NewRunner(architect), arb)
 
 	if !e.start(nil) {
 		t.Fatal("engine start")
@@ -616,7 +616,7 @@ func TestEngine_IntermediateCheckpointsDoNotMaskDeadlock(t *testing.T) {
 	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
 		return testTextMsg(`{"action":"retry","reason":"继续重试"}`)
 	}}
-	e, _, done := newTestEngine(t, st, subagent.New(writer), arb)
+	e, _, done := newTestEngine(t, st, subagent.NewRunner(writer), arb)
 
 	if !e.start(nil) {
 		t.Fatal("engine start")
@@ -702,7 +702,7 @@ func TestEngine_PauseWithEditorDispatchWaitsForRewriteQueue(t *testing.T) {
 					{"dimension": "hook", "score": 85, "comment": "达标(引用:原文)"},
 					{"dimension": "aesthetic", "score": 55, "comment": "语气不符(引用:原文第一段)"},
 				},
-				"issues":  []map[string]any{{"severity": "major", "description": "语气", "evidence": "原文", "suggestion": "改冷"}},
+				"issues":  []map[string]any{{"type": "aesthetic", "severity": "error", "description": "语气", "evidence": "原文", "suggestion": "改冷"}},
 				"verdict": "rewrite", "summary": "第1章语气需重写",
 				"affected_chapters": []int{1},
 			})
@@ -727,7 +727,7 @@ func TestEngine_PauseWithEditorDispatchWaitsForRewriteQueue(t *testing.T) {
 		MaxTurns: 10, StopAfterTools: []string{"commit_chapter"},
 	}
 
-	e, _, done := newTestEngine(t, st, subagent.New(editor, writer), nil)
+	e, _, done := newTestEngine(t, st, subagent.NewRunner(editor, writer), nil)
 	// 模拟 Arbiter 返工裁定:hold + dispatch editor(引擎未运行 → 立即应用)。
 	e.applyControlOp(context.Background(), controlOp{
 		hold:     &arbiter.AdvanceHoldOp{After: domain.AdvanceHoldAfterRewritesDrained, Reason: "重写第1章语气,改完暂停验收"},
@@ -794,7 +794,7 @@ func TestEngine_BoundaryHoldDoesNotDispatchAnotherWorker(t *testing.T) {
 		},
 		MaxTurns: 10, StopAfterTools: []string{"commit_chapter"},
 	}
-	e, _, done := newTestEngine(t, st, subagent.New(writer), nil)
+	e, _, done := newTestEngine(t, st, subagent.NewRunner(writer), nil)
 	if !e.start(nil) {
 		t.Fatal("engine start")
 	}
@@ -844,7 +844,7 @@ func TestEngine_ExitRaceRestoresPendingDispatch(t *testing.T) {
 	if err := st.Outline.SaveOutline([]domain.OutlineEntry{{Chapter: 1, Title: "一", CoreEvent: "a"}, {Chapter: 2, Title: "二", CoreEvent: "b"}}); err != nil {
 		t.Fatalf("outline: %v", err)
 	}
-	e, _, done := newTestEngine(t, st, subagent.New(writer), nil)
+	e, _, done := newTestEngine(t, st, subagent.NewRunner(writer), nil)
 
 	if !e.start(nil) {
 		t.Fatal("engine start")
@@ -1106,7 +1106,7 @@ func TestEngineV3Writer_MissingTargetPausesNoDispatch(t *testing.T) {
 	abortFn := func() {}
 	e := &engine{
 		store:    st,
-		workers:  subagent.New(noopWorker),
+		workers:  subagent.NewRunner(noopWorker),
 		contract: contract,
 		observer: newObserver(st, func(ev Event) {
 			mu.Lock()

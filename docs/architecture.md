@@ -59,7 +59,7 @@ UI、诊断、事件日志都是从事件流 / 只读工件投影出来的被动
 
 **铁律一：工具只返事实，不返跨调度指令**。`commit_chapter` 返回 `arc_end` / `needs_expansion` 等结构化字段；不夹带 `[系统]` 类指令字符串。子代理内的 `next_step` 字段是事实陈述的内联指引（"我刚保存了 plan，下一步是 draft"），不算违反——见 §6.3。
 
-**铁律二：流程路由由 Flow Router 承担，执行由 Engine 承担**。`internal/flow/router.go` 的 `Route(state) → *Instruction` 是纯函数（万级组合穷举规格测试钉死）；Engine 每轮从 store 读事实、Route 推导指令、**直接程序化运行 Worker**（`subagent.Tool.Run`，类型化入参/结果/错误链），无 LLM 转发层。返回 nil 表示语义场景（完本收尾/等待干预）或自然停机。**僵局有显式限界**（RFC §5）：上一轮后 Route 仍产生同一 `Agent+Task`，即路由后置条件未满足；3 次咨询 Arbiter、5 次硬熔断暂停。Worker 内部中间 checkpoint 不重置计数，确定性 Engine 不允许无限空转。
+**铁律二：流程路由由 Flow Router 承担，执行由 Engine 承担**。`internal/flow/router.go` 的 `Route(state) → *Instruction` 是纯函数（万级组合穷举规格测试钉死）；Engine 每轮从 store 读事实、Route 推导指令、**直接程序化运行 Worker**（`subagent.Runner.Run`，类型化入参/结果/错误链），无 LLM 工具转发层。返回 nil 表示语义场景（完本收尾/等待干预）或自然停机。**僵局有显式限界**（RFC §5）：上一轮后 Route 仍产生同一 `Agent+Task`，即路由后置条件未满足；3 次咨询 Arbiter、5 次硬熔断暂停。Worker 内部中间 checkpoint 不重置计数，确定性 Engine 不允许无限空转。
 
 **铁律三：语义裁定走 Arbiter，每次裁定落盘**。启动选规划师、用户干预分诊、失败/僵局出路由 `internal/arbiter` 的逐场景 Decide 函数裁定：事实进、结构化决策出、机械校验兜底、decisions.jsonl 审计（可离线重放回归）。三个 Worker 保留各自的 `CheckpointDeltaGuard`（事实护栏：产物未落盘不得收工）。
 
@@ -77,7 +77,7 @@ UI、诊断、事件日志都是从事件流 / 只读工件投影出来的被动
    ├── engine              确定性循环：LoadState → Route → 前置校验 → 运行 Worker → 哨兵边界
    ├── 干预路径             Steer/Continue → Arbiter 裁定 → 动作执行(即时/边界提交)
    └── usage / 预算 / 停靠点 / 模型管理
-        │ 程序化调用 subagent.Tool.Run（进度经 ctx ToolProgress 中继）
+        │ 程序化调用 subagent.Runner.Run（进度经 ctx ToolProgress 中继）
 [architect_short/long · writer · editor]（各自独立 run + context + 模型）
         │ 工具调用
 [Tools]  novel_context · read_chapter · plan_chapter · draft_chapter · edit_chapter
@@ -221,12 +221,12 @@ Artifact 在 `store/outline.go` `drafts.go` `summaries.go` `characters.go` `worl
 
 ### 6.1 装配与运行
 
-`agents.BuildWorkers`（`internal/agents/build.go`）把三类 Worker 装配为一个可程序化调用的 `subagent.Tool`：Engine 直接调用其 `Execute({agent, task})`，每次调用是一个完整的 `agentcore.AgentLoop`（独立 context、独立模型、独立重试）。全部装配一次生效：角色模型 + failover、prompt cache key（每 spawn 自增 #seq）、ThinkingLevel、UsageRecorder/SessionLogger（OnMessage）、Writer ContextManagerFactory（窗口随 /model 切换自动重建）、RestorePack、StopGuardFactory、StopAfterTools。
+`agents.BuildWorkers`（`internal/agents/build.go`）把三类 Worker 装配为一个 `subagent.Runner`：Engine 直接调用 `Run(agent, task)`，每次调用是一个完整的 `agentcore.AgentLoop`（独立 context、独立模型、独立重试）。全部装配一次生效：角色模型 + failover、prompt cache key（每 spawn 自增 #seq）、ThinkingLevel、UsageRecorder/SessionLogger（OnMessage）、Writer ContextManagerFactory（窗口随 /model 切换自动重建）、RestorePack、StopGuardFactory、StopAfterTools。
 
-Worker 进度中继走 **ctx 的 ToolProgress 回调**：Engine 以 `agentcore.WithToolProgress(ctx, relay)` 调 Execute，子代理的工具调用/流式正文/thinking/retry/context 事件经 relay 进入 observer——与 Coordinator 时代同一 ProgressPayload 形态，观察层复用。
+Worker 进度中继走 **ctx 的 ToolProgress 回调**：Engine 以 `agentcore.WithToolProgress(ctx, relay)` 调 `Runner.Run`，子代理的工具调用/流式正文/thinking/retry/context 事件经 relay 进入 observer——与 Coordinator 时代同一 ProgressPayload 形态，观察层复用。
 
 ```
-Engine ── Execute({agent, task}) ──▶ architect_short/long · writer · editor
+Engine ── Runner.Run(agent, task) ──▶ architect_short/long · writer · editor
                                           │ 工具调用
                                         Store（协作媒介，Worker 之间不直接通信）
 ```
@@ -260,11 +260,11 @@ writer.md 只承担：执行协议、断点续跑认知模型、章节契约解�
 
 ### 6.4 agentcore 依赖
 
-`../agentcore` 是本项目自有的通用 Agent 库（go.work 关联）。Engine 用到的原语：`subagent.Tool.Run`（程序化直调，类型化结果与错误链——`errors.Is(err, subagent.ErrUnknownAgent)` 等分类不依赖错误文案）、`SetEventObserver` / ctx `ToolProgress`（事件中继）、`SubAgentConfig` 全家、`StopGuard`/`StopAfterTools`。
+`../agentcore` 是本项目自有的通用 Agent 库（go.work 关联）。Engine 用到的原语：`subagent.Runner.Run`（程序化直调，类型化结果与错误链——`errors.Is(err, subagent.ErrUnknownAgent)` 等分类不依赖错误文案）、ctx `ToolProgress`（事件中继）、`subagent.Config`、`StopGuard`/`StopAfterTools`。`subagent.Tool` 只供需要把 Runner 暴露给模型的宿主通过 `Runner.AsTool()` 使用，AINovel 不经过这层。
 
 **修改边界**：可进 agentcore——新 ContextManager 策略、新 provider 适配、新事件类型；不进 agentcore——业务模型与业务工具。判断准则：假设 agentcore 未来会被 coding agent / 客服 agent 引入，新能力在那个场景仍有意义才允许进。**禁止在应用层写兜底补丁**——缺能力直接改上游。
 
-**契约测试**（`internal/agents/agentcore_contract_test.go`，5 条，全部经 `Tool.Run` 驱动）：把本项目依赖的框架行为钉成可执行断言（终态退出咨询 StopGuard、Error/Aborted 不触达 guard、Escalate 错误链可 `errors.Is` 匹配、`Run` 的类型化 `ErrUnknownAgent` 等）。**bump agentcore 前必须全绿**——注释会过时，测试不会（这条纪律已经抓到过一次失效假设并省下一个 workaround）。
+**契约测试**（`internal/agents/agentcore_contract_test.go`，5 条，全部经 `Runner.Run` 驱动）：把本项目依赖的框架行为钉成可执行断言（终态退出咨询 StopGuard、Error/Aborted 不触达 guard、Escalate 错误链可 `errors.Is` 匹配、`Run` 的类型化 `ErrUnknownAgent` 等）。**bump agentcore 前必须全绿**——注释会过时，测试不会（这条纪律已经抓到过一次失效假设并省下一个 workaround）。
 
 ### 6.5 提示词缓存
 
@@ -294,7 +294,7 @@ for {
                                   // writer 目标章未展开 → 改派 architect 展开
     advanceGate.Allow(inst)       // 仅阻断未获许可的正向新章
     trackDeadlock(inst)           // 同一 Agent+Task 连续重现:3 次问 Arbiter,5 次熔断
-    runWorker(inst)               // subagent.Tool.Run + 进度中继 + DISPATCH 事件
+    runWorker(inst)               // subagent.Runner.Run + 进度中继 + DISPATCH 事件
     错误分类:确定性错误→暂停;首败重试一次;再败→Arbiter(retry/reroute/abort)
     政策边界:budget → advanceGate
 }
@@ -391,7 +391,7 @@ internal/
                   + pause.go (停靠点裁定)
   arbiter/        语义裁定层（LLM-as-function）：plan_start / intervention / failure(deadlock)
                   逐场景 Collect/Decide 函数对 + 逐场景 Decision 类型 + 机械校验
-  agents/         build.go 装配三个 Worker(subagent.Tool,Engine 程序化直调)；ctxpack/ Writer 上下文压缩策略
+  agents/         build.go 装配三个 Worker(subagent.Runner,Engine 程序化直调)；ctxpack/ Writer 上下文压缩策略
     guard/        subagent_guards.go (CheckpointDeltaGuard ×3,Worker 事实护栏)
   host/           host.go (生命周期/干预编排) + engine.go (确定性执行循环) + observer*.go
                   + events.go + usage*.go + budget.go + advance_gate.go + resume.go + cocreate.go
@@ -457,7 +457,7 @@ assets/
 | 层 | 资产 | 覆盖 |
 |---|---|---|
 | 控制面规格 | `flow/router_exhaustive_test.go` | Route 决策表 12 万组合穷举 + 纯函数/确定性/守恒性质 |
-| 框架契约 | `agents/agentcore_contract_test.go` | 5 条 agentcore 行为假设，经 `Tool.Run` 驱动（升级前必跑） |
+| 框架契约 | `agents/agentcore_contract_test.go` | 5 条 agentcore 行为假设，经 `Runner.Run` 驱动（升级前必跑） |
 | 引擎端到端 | `host/engine_test.go` | fake 模型 + 真实工具:写完整书 / 失败裁定 / 僵局裁定 / 返工验收时序 / boundary hold 即停 / 退出竞态保全 / 单许可单章节 |
 | 裁定 | `arbiter/arbiter_test.go` | 解析/反馈重试/逐场景校验矩阵/事实采集 |
 | 事实管道契约 | store/tools 测试 | 反馈池跨重启、违规记录 latest-wins/重写清除/novel_context 注入、PlanStart 跨 Init 保留 |

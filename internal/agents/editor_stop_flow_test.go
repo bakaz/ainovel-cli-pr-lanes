@@ -54,9 +54,9 @@ func runEditorLike(t *testing.T, st *store.Store, task string, model agentcore.C
 			return guard.NewEditorStopGuard(st, task, nil)
 		},
 	}
-	tool := subagent.New(cfg)
+	runner := subagent.NewRunner(cfg)
 	args, _ := json.Marshal(map[string]string{"agent": "editor", "task": task})
-	if _, err := tool.Execute(context.Background(), args); err != nil {
+	if _, err := runner.AsTool().Execute(context.Background(), args); err != nil {
 		t.Fatalf("subagent execute: %v", err)
 	}
 }

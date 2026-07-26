@@ -168,7 +168,7 @@ type PlanStartRecord struct {
 | 0 | 无条件项:规划补齐入 Router(穷举规格先行);decisions.jsonl 审计。实现改进:规划师身份从既有 `RunMeta.PlanningTier` 推导,无需新增记录机制 | ✅ 2026-07-12 |
 | 1 | 文风层交付(docs/voice-layer.md) | ✅ 2026-07-12 |
 | 2 | Step 2 RFC 定稿(docs/engine-rfc.md,七道必答题) | ✅ 2026-07-12 |
-| 3 | WorkerRunner:确认 subagent.Tool 可程序化直调,事件经 ctx ToolProgress 中继 | ✅ 2026-07-12 |
+| 3 | WorkerRunner:以 subagent.Runner 程序化直调,事件经 ctx ToolProgress 中继 | ✅ 2026-07-22 |
 | 4-5 | Engine 接管全部派发 + Arbiter 四场景接线(plan_start/intervention/failure/deadlock),直连 Engine 执行器(实施中发现 Engine 先行使 steering 过渡管线整个不用建,4/5 合并落地) | ✅ 2026-07-12 |
 | 6 | 删除 Coordinator 及全部配套(§十清单全部执行);端到端集成测试(真实工具写完整书/失败裁定/僵局裁定) | ✅ 2026-07-12 |
 

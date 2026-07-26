@@ -3,14 +3,15 @@
 > 状态:定稿(2026-07-12)。基于对 host/observer/subagent/usage/cocreate 的代码侦察。
 > 结论:全部七题有低风险答案,进入实施。关联:docs/engine-arbiter.md。
 
-## 1. Worker 提取面 → 零提取:程序化调用现有 subagent.Tool
+## 1. Worker 执行面：程序化调用 subagent.Runner
 
-> 后记(2026-07-12):agentcore 随后新增了程序化入口 `subagent.Tool.Run`(类型化入参/结果/错误链),
+> 后记(2026-07-22)：agentcore 已把类型化执行与模型工具协议拆开。`Runner.Run` 是宿主入口；
+> `Runner.AsTool()` 仅供需要让 LLM 自主派发 subagent 的宿主使用。AINovel 只依赖 Runner。
 > Engine 已改用它——本节"经 Execute 的 JSON 壳直调"的描述保留为决策时点的历史对照;
 > `parseSubagentResultError` 等结果嗅探已随之删除。
 
-`subagent.Tool.Execute` 是普通方法,每次调用跑一个完整 `agentcore.AgentLoop`。Engine 直接调用它,
-build.go 的**全部装配原样生效**:角色模型+failover、prompt cache key(#seq 每次自增)、ThinkingLevel、
+`Runner.Run(agent, task)` 每次启动一个完整 `agentcore.AgentLoop`。Engine 直接调用它，build.go 的
+**全部装配原样生效**：角色模型+failover、prompt cache key(#seq 每次自增)、ThinkingLevel、
 UsageRecorder/SessionLogger(OnMessage)、Writer ContextManagerFactory、RestorePack、StopGuardFactory、
 StopAfterTools。`BuildCoordinator` 改名 `BuildWorkers`,仅删去 coordinator 专属件。
 
@@ -21,7 +22,7 @@ thinking/retry/context)**复用率 ~95%**。DISPATCH 行改由 Engine 直接发�
 Coordinator 左栏叙述流消失,由 Engine 叙述事件替代。
 
 **/model 与推理强度**:模型切换经 ModelSet swap(configs 持 failover wrapper,原机制);推理强度经
-`subagentTool.SetThinkingLevel`(applyThinking 保留,删 coordinator 分支)。
+`runner.SetThinkingLevel`(applyThinking 保留,删 coordinator 分支)。
 
 ## 2. Engine 生命周期
 
@@ -53,7 +54,7 @@ repeat==3 → Arbiter `deadlock` 咨询;Arbiter 建议 retry **不清零**;repea
 ## 6. 崩溃语义 → 免费
 
 不需要判断"上个 Worker 是否产生有效事实":工具层 checkpoint+digest 幂等,Route 从 store 重算,
-重复派发安全(与 ToolsAreIdempotent 同一铁律)。恢复 = 直接进循环。PendingSteer 在循环启动前作为
+重复派发安全。agentcore 的模型流重试不会跨越工具执行边界。恢复 = 直接进循环。PendingSteer 在循环启动前作为
 干预走 Arbiter。
 
 ## 7. 原型验收

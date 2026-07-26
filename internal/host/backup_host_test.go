@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/voocel/agentcore"
-	"github.com/voocel/agentcore/subagent"
 	corecontext "github.com/voocel/agentcore/context"
+	"github.com/voocel/agentcore/subagent"
 	"github.com/voocel/ainovel-cli/internal/agents/ctxpack"
 	"github.com/voocel/ainovel-cli/internal/backup"
 	"github.com/voocel/ainovel-cli/internal/domain"
@@ -103,12 +103,12 @@ func TestEngine_CorruptProgressNoWorker(t *testing.T) {
 
 	var workerCalls int32
 	e := &engine{
-		store:      st,
-		workers:    subagent.New(),
-		notify:     func(_, _, _, _ string) {},
-		emitEvent:  func(Event) {},
-		onPause:    func(string) {},
-		onDone:     func() {},
+		store:           st,
+		workers:         subagent.NewRunner(),
+		notify:          func(_, _, _, _ string) {},
+		emitEvent:       func(Event) {},
+		onPause:         func(string) {},
+		onDone:          func() {},
 		beforeRunWorker: func() { atomic.AddInt32(&workerCalls, 1) },
 	}
 	e.gate = NewChapterAdvanceGate(st, func(string) {}, func(string, string) {})
@@ -145,8 +145,8 @@ func TestEngine_WorkerBoundaryOneSnapshot(t *testing.T) {
 	writeProgress(t, st, &domain.Progress{
 		CurrentVolume: 1, CurrentArc: 1,
 		CompletedChapters: []int{1},
-		Phase:            domain.PhaseWriting,
-		TotalChapters:    2,
+		Phase:             domain.PhaseWriting,
+		TotalChapters:     2,
 	})
 	// Draft needed by commit_chapter tool
 	if err := st.Drafts.SaveDraft(2, "# Ch2\nboundary test content."); err != nil {
@@ -174,7 +174,7 @@ func TestEngine_WorkerBoundaryOneSnapshot(t *testing.T) {
 		StopAfterTools: []string{"commit_chapter"},
 	}
 
-	e, _, done := newTestEngine(t, st, subagent.New(writer), nil)
+	e, _, done := newTestEngine(t, st, subagent.NewRunner(writer), nil)
 	e.backupArc = func(v, a int) error {
 		atomic.AddInt32(&snapCalls, 1)
 		return nil
@@ -220,7 +220,7 @@ func TestEngine_OnDoneBlocksRestart(t *testing.T) {
 	releaseOnDone := make(chan struct{})
 	e := &engine{
 		store:     st,
-		workers:   subagent.New(),
+		workers:   subagent.NewRunner(),
 		notify:    func(_, _, _, _ string) {},
 		emitEvent: func(Event) {},
 		onPause:   func(string) {},

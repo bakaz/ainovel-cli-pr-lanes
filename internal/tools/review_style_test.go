@@ -64,7 +64,7 @@ func productionReviseJSON() string {
 	return `{"verdict":"revise","strength":{"dimension":"hook","evidence":"开篇悬念设置得当"},"findings":[{"dimension":"pacing","category":"style","severity":"warning","evidence":"第二段节奏偏慢","problem":"描写过细","revision":"压缩中间描写"}]}`
 }
 
-func newMockCritic(fn func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error)) *subagent.Tool {
+func newMockCritic(fn func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error)) *subagent.Runner {
 	model := &mockCriticModel{fn: fn}
 	cfg := subagent.Config{
 		Name:        "style_critic",
@@ -72,7 +72,7 @@ func newMockCritic(fn func(i int, msgs []agentcore.Message) (*agentcore.LLMRespo
 		Model:       model,
 		MaxTurns:    1,
 	}
-	return subagent.New(cfg)
+	return subagent.NewRunner(cfg)
 }
 
 // ── Test helpers ─────────────────────────────────────────────────────
@@ -920,9 +920,9 @@ func TestReviewStyle_CriticModelProvenance(t *testing.T) {
 	cfg := subagent.Config{
 		Name: "style_critic", Description: "test", Model: model, MaxTurns: 1,
 	}
-	criticTool := subagent.New(cfg)
+	criticRunner := subagent.NewRunner(cfg)
 
-	tool := NewReviewStyleTool(st, criticTool, testCriticVersion)
+	tool := NewReviewStyleTool(st, criticRunner, testCriticVersion)
 	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
