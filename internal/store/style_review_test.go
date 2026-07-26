@@ -342,8 +342,8 @@ func TestStyleReviewStore_RejectsInvalidV1Transition(t *testing.T) {
 		DraftDigest: testDraft, BasisDigest: testBasis,
 	})
 	err := s.StyleReview.Save(l)
-	if err == nil || !strings.Contains(err.Error(), "invalid V1 transition") {
-		t.Fatalf("expected V1 transition error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "invalid V2 transition") {
+		t.Fatalf("expected transition error, got %v", err)
 	}
 }
 

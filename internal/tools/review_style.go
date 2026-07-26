@@ -437,6 +437,7 @@ func (t *ReviewStyleTool) callCritic(ctx context.Context, chapter int, content s
 			Category:   strings.TrimSpace(f.Category),
 			Severity:   strings.TrimSpace(f.Severity),
 			Evidence:   strings.TrimSpace(f.Evidence),
+			Problem:    strings.TrimSpace(f.Problem),
 			Suggestion: strings.TrimSpace(f.Revision),
 		}
 		if !finding.Valid() {
@@ -507,7 +508,7 @@ func (t *ReviewStyleTool) appendFinalResult(chapter int, attemptID string, reque
 	case domain.ReviewVerdictPass:
 		nextStatus = domain.ReviewStatusAcceptedRev
 	case domain.ReviewVerdictRevise:
-		nextStatus = domain.ReviewStatusExhausted
+		nextStatus = domain.ReviewStatusRevisionOpen // V2: loop back to revision_open by default
 	default:
 		return nil, fmt.Errorf("unexpected verdict %q for final review", result.Verdict)
 	}
@@ -517,6 +518,15 @@ func (t *ReviewStyleTool) appendFinalResult(chapter int, attemptID string, reque
 		if cur == nil {
 			return nil, fmt.Errorf("ledger disappeared during update")
 		}
+
+		// V2: detect stagnation — same finding signature as previous
+		// final_revise → revision_open → exhausted to prevent infinite loops.
+		if nextStatus == domain.ReviewStatusRevisionOpen {
+			if domain.DetectFinalReviewStagnation(cur, result) {
+				nextStatus = domain.ReviewStatusExhausted
+			}
+		}
+
 		req := request
 		if req == nil {
 			for i := len(cur.Cycles) - 1; i >= 0; i-- {

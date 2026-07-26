@@ -696,37 +696,37 @@ func TestValidateLedger_V1_FinalToAcceptedRevised(t *testing.T) {
 	}
 }
 
-func TestValidateLedger_V1_FinalToExhausted(t *testing.T) {
-	l := validFlow(ReviewStatusExhausted)
+func TestValidateLedger_V2_FinalToRevisionOpen(t *testing.T) {
+	l := validFlowForV2()
 	if err := ValidateLedger(l); err != nil {
-		t.Fatalf("final→exhausted should be valid: %v", err)
+		t.Fatalf("final→revision_open should be valid in V2: %v", err)
 	}
 }
 
-func TestValidateLedger_V1_ExhaustedToOverridden(t *testing.T) {
+func TestValidateLedger_LegacyExhaustedToOverridden(t *testing.T) {
 	l := validFlow(ReviewStatusOverridden)
 	if err := ValidateLedger(l); err != nil {
 		t.Fatalf("exhausted→overridden should be valid: %v", err)
 	}
 }
 
-// ── Negative V1 transitions ─────────────────────────────────────────
+// ── Negative V2 transitions ─────────────────────────────────────────
 
-func TestValidateLedger_V1_RejectsInitialToFinalPending(t *testing.T) {
+func TestValidateLedger_V2_RejectsInitialToFinalPending(t *testing.T) {
 	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
 	l.Cycles = append(l.Cycles, mkEntry(2, ReviewStatusFinalPending, ReviewVerdictPass))
 	err := ValidateLedger(l)
-	if err == nil || !strings.Contains(err.Error(), "invalid V1 transition") {
-		t.Fatalf("expected V1 transition error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "invalid V2 transition") {
+		t.Fatalf("expected V2 transition error, got %v", err)
 	}
 }
 
-func TestValidateLedger_V1_RejectsRevisionToAcceptedInitial(t *testing.T) {
+func TestValidateLedger_V2_RejectsRevisionToAcceptedInitial(t *testing.T) {
 	l := validFlow(ReviewStatusRevisionOpen)
 	l.Cycles = append(l.Cycles, mkEntry(3, ReviewStatusAcceptedInitial, ReviewVerdictPass))
 	err := ValidateLedger(l)
-	if err == nil || !strings.Contains(err.Error(), "invalid V1 transition") {
-		t.Fatalf("expected V1 transition error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "invalid V2 transition") {
+		t.Fatalf("expected V2 transition error, got %v", err)
 	}
 }
 
@@ -766,7 +766,7 @@ func TestValidateLedger_TerminalBlocksSubsequent(t *testing.T) {
 	l := validFlow(ReviewStatusAcceptedRev)
 	l.Cycles = append(l.Cycles, mkEntry(5, ReviewStatusInitialPending, ReviewVerdictPass))
 	err := ValidateLedger(l)
-	if err == nil || !strings.Contains(err.Error(), "invalid V1 transition") {
+	if err == nil || !strings.Contains(err.Error(), "invalid V2 transition") {
 		t.Fatalf("expected V1 transition error, got %v", err)
 	}
 }
@@ -869,6 +869,8 @@ func mkEntry(cycle int, status StyleReviewStatus, verdict StyleReviewVerdict) St
 	return e
 }
 
+
+
 // validFlow builds a multi-cycle critic-mode ledger following the V1 graph
 // up through the given terminal status.
 func validFlow(terminal Status) *StyleReviewLedger {
@@ -948,5 +950,190 @@ func validFlow(terminal Status) *StyleReviewLedger {
 	return l
 }
 
+// validFlowForV2 builds a V2 ledger: initial_pending → revision_open → final_pending → revision_open (loop).
+func validFlowForV2() *StyleReviewLedger {
+	d := testDraft
+	b := testBasis
+	req := &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"}
+	find := []StyleReviewFinding{testFind}
+	return &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: req, DraftDigest: d, BasisDigest: b},
+			{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+				AttemptID: "a1", Request: req,
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "revise", Findings: find},
+				DraftDigest: d, BasisDigest: b},
+			{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"}, DraftDigest: d, BasisDigest: b},
+			{Cycle: 4, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T13:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "still needs work", Findings: find},
+				DraftDigest: d, BasisDigest: b},
+		},
+	}
+}
+
 // Status alias for validFlow parameter.
 type Status = StyleReviewStatus
+
+// ── FindingsSignature tests ──────────────────────────────────────────
+
+func TestFindingsSignature_DifferentFindings(t *testing.T) {
+	r1 := &StyleReviewResult{Findings: []StyleReviewFinding{
+		{Dimension: "pacing", Category: "style", Severity: "warning", Suggestion: "慢"},
+	}}
+	r2 := &StyleReviewResult{Findings: []StyleReviewFinding{
+		{Dimension: "hook", Category: "plot", Severity: "error", Suggestion: "悬念弱"},
+	}}
+	sig1 := r1.FindingsSignature()
+	sig2 := r2.FindingsSignature()
+	if sig1 == "" {
+		t.Fatal("expected non-empty sig for r1")
+	}
+	if sig2 == "" {
+		t.Fatal("expected non-empty sig for r2")
+	}
+	if sig1 == sig2 {
+		t.Fatal("different findings should produce different signatures")
+	}
+}
+
+func TestFindingsSignature_ReorderedSame(t *testing.T) {
+	r1 := &StyleReviewResult{Findings: []StyleReviewFinding{
+		{Dimension: "pacing", Category: "style", Severity: "warning", Suggestion: "慢"},
+		{Dimension: "hook", Category: "plot", Severity: "error", Suggestion: "悬念弱"},
+	}}
+	r2 := &StyleReviewResult{Findings: []StyleReviewFinding{
+		{Dimension: "hook", Category: "plot", Severity: "error", Suggestion: "悬念弱"},
+		{Dimension: "pacing", Category: "style", Severity: "warning", Suggestion: "慢"},
+	}}
+	sig1 := r1.FindingsSignature()
+	sig2 := r2.FindingsSignature()
+	if sig1 == "" || sig2 == "" {
+		t.Fatal("expected non-empty signatures")
+	}
+	if sig1 != sig2 {
+		t.Fatal("reordered same findings should produce identical signature")
+	}
+}
+
+func TestFindingsSignature_NilResult(t *testing.T) {
+	var r *StyleReviewResult
+	if sig := r.FindingsSignature(); sig != "" {
+		t.Fatalf("nil result should return empty sig, got %q", sig)
+	}
+}
+
+func TestFindingsSignature_EmptyFindings(t *testing.T) {
+	r := &StyleReviewResult{Findings: []StyleReviewFinding{}}
+	if sig := r.FindingsSignature(); sig != "" {
+		t.Fatalf("empty findings should return empty sig, got %q", sig)
+	}
+}
+
+// ── DetectFinalReviewStagnation tests ────────────────────────────────
+
+func TestDetectStagnation_NoPriorRevOpen(t *testing.T) {
+	find := []StyleReviewFinding{{Dimension: "hook", Category: "plot", Severity: "error", Problem: "平淡", Suggestion: "加悬念"}}
+	ledger := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: &StyleReviewRequest{Prompt: "init", Model: "m"}, DraftDigest: testDraft, BasisDigest: testBasis},
+		},
+	}
+	result := &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "e", Findings: find}
+	if DetectFinalReviewStagnation(ledger, result) {
+		t.Fatal("no prior revision_open → should not detect stagnation")
+	}
+}
+
+func TestDetectStagnation_InitialRevOpenNeverTriggers(t *testing.T) {
+	find := []StyleReviewFinding{{Dimension: "hook", Category: "plot", Severity: "error", Problem: "平淡", Suggestion: "加悬念"}}
+	d := testDraft
+	b := testBasis
+	// Ledger: initial_pending → revision_open only.  This is the initial review
+	// cycle, NOT a final-revise cycle.  Stagnation must NOT trigger even if
+	// the result has the same findings, because there is no adjacent final_pending.
+	ledger := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: &StyleReviewRequest{Prompt: "init", Model: "m"}, DraftDigest: d, BasisDigest: b},
+			{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+				AttemptID: "a1", Request: &StyleReviewRequest{Prompt: "init", Model: "m"},
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "needs work", Findings: find},
+				DraftDigest: d, BasisDigest: b},
+		},
+	}
+	// Same findings but no adjacent final_pending → must NOT detect stagnation
+	result := &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "still same", Findings: find}
+	if DetectFinalReviewStagnation(ledger, result) {
+		t.Fatal("initial (non-final) revision_open must never trigger stagnation")
+	}
+}
+
+func TestDetectStagnation_SameSig_Detected(t *testing.T) {
+	find := []StyleReviewFinding{{Dimension: "hook", Category: "plot", Severity: "error", Problem: "平淡", Suggestion: "加悬念"}}
+	d := testDraft
+	b := testBasis
+	// Build a ledger with a strict adjacent final_pending → revision_open chain
+	ledger := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: &StyleReviewRequest{Prompt: "init", Model: "m"}, DraftDigest: d, BasisDigest: b},
+			{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+				AttemptID: "a1", Request: &StyleReviewRequest{Prompt: "init", Model: "m"},
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "needs work", Findings: find},
+				DraftDigest: d, BasisDigest: b},
+			{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "m"}, DraftDigest: d, BasisDigest: b},
+			{Cycle: 4, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T13:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "m"},
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "same issues", Findings: find},
+				DraftDigest: d, BasisDigest: b},
+		},
+	}
+	// Same findings again → stagnation (would be cycle 5)
+	result := &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "still same", Findings: find}
+	if !DetectFinalReviewStagnation(ledger, result) {
+		t.Fatal("same finding signature with adjacent final_revise should detect stagnation")
+	}
+}
+
+func TestDetectStagnation_DifferentSig_NotDetected(t *testing.T) {
+	find1 := []StyleReviewFinding{{Dimension: "hook", Category: "plot", Severity: "error", Problem: "平淡", Suggestion: "加悬念"}}
+	find2 := []StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Problem: "拖沓", Suggestion: "压缩"}}
+	d := testDraft
+	b := testBasis
+	// Build strict adjacent final chain
+	ledger := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: &StyleReviewRequest{Prompt: "init", Model: "m"}, DraftDigest: d, BasisDigest: b},
+			{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+				AttemptID: "a1", Request: &StyleReviewRequest{Prompt: "init", Model: "m"},
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "needs work", Findings: find1},
+				DraftDigest: d, BasisDigest: b},
+			{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "m"}, DraftDigest: d, BasisDigest: b},
+			{Cycle: 4, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T13:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "m"},
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "different issues", Findings: find1},
+				DraftDigest: d, BasisDigest: b},
+		},
+	}
+	// Different findings → no stagnation
+	result := &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "new issues", Findings: find2}
+	if DetectFinalReviewStagnation(ledger, result) {
+		t.Fatal("different finding signature should not detect stagnation")
+	}
+}
+
+func TestDetectStagnation_NilLedger(t *testing.T) {
+	result := &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "e", Findings: []StyleReviewFinding{{Dimension: "hook", Category: "plot", Severity: "error", Suggestion: "弱"}}}
+	if DetectFinalReviewStagnation(nil, result) {
+		t.Fatal("nil ledger → no stagnation")
+	}
+}
+
+func TestDetectStagnation_NilResult(t *testing.T) {
+	ledger := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic}
+	if DetectFinalReviewStagnation(ledger, nil) {
+		t.Fatal("nil result → no stagnation")
+	}
+}

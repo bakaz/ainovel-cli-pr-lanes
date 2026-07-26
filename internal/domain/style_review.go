@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -41,14 +43,15 @@ const (
 	ReviewStatusOverridden      StyleReviewStatus = "overridden"
 )
 
-// Exact V1 transition graph (one pre-commit cycle, at most two critic attempts):
+// V2 transition graph (multi-cycle: revision_open can loop through final review):
 //
 //	initial_pending ──accepted_initial──→ [terminal]
-//	initial_pending ──revision_open──────→ final_pending
+//	initial_pending ──revision_open──────→ final_pending (via next review_style call)
 //	initial_pending ──degraded───────────→ [terminal]
-//	revision_open ──final_pending────────→ (continued)
+//	revision_open ──final_pending────────→ (via edit→check_consistency→review_style)
 //	final_pending ──accepted_revised─────→ [terminal]
-//	final_pending ──exhausted────────────→ overridden
+//	final_pending ──revision_open────────→ (loop: revise → edit → check → final_pending → revise → ...)
+//	final_pending ──exhausted────────────→ (stagnation: repeated identical final findings)
 //	final_pending ──degraded─────────────→ [terminal]
 //	exhausted ──overridden───────────────→ [terminal]
 
@@ -84,6 +87,8 @@ func (s StyleReviewStatus) IsActive() bool {
 
 // ── V1 transition table ─────────────────────────────────────────────
 
+// v1Transitions covers the original V1 graph (pre-v2-upgrade) so that
+// existing exhausted-holding ledgers remain valid after upgrade.
 var v1Transitions = map[StyleReviewStatus]map[StyleReviewStatus]bool{
 	ReviewStatusInitialPending: {
 		ReviewStatusAcceptedInitial: true,
@@ -103,9 +108,33 @@ var v1Transitions = map[StyleReviewStatus]map[StyleReviewStatus]bool{
 	},
 }
 
-func isValidV1Transition(from, to StyleReviewStatus) bool {
-	if m, ok := v1Transitions[from]; ok {
-		return m[to]
+// v2Transitions is the V2 graph: final_pending revise loops back to revision_open.
+var v2Transitions = map[StyleReviewStatus]map[StyleReviewStatus]bool{
+	ReviewStatusInitialPending: {
+		ReviewStatusAcceptedInitial: true,
+		ReviewStatusRevisionOpen:    true,
+		ReviewStatusDegraded:        true,
+	},
+	ReviewStatusRevisionOpen: {
+		ReviewStatusFinalPending: true,
+	},
+	ReviewStatusFinalPending: {
+		ReviewStatusAcceptedRev:  true,
+		ReviewStatusRevisionOpen: true, // V2: revise → revision_open (loop)
+		ReviewStatusDegraded:     true,
+	},
+	ReviewStatusExhausted: {
+		ReviewStatusOverridden: true, // legacy only
+	},
+}
+
+func isValidV2Transition(from, to StyleReviewStatus) bool {
+	// Accept transition if allowed by V2 (preferred) or V1 (legacy fallback).
+	if m, ok := v2Transitions[from]; ok && m[to] {
+		return true
+	}
+	if m, ok := v1Transitions[from]; ok && m[to] {
+		return true
 	}
 	return false
 }
@@ -183,6 +212,7 @@ type StyleReviewFinding struct {
 	Severity   string `json:"severity"`
 	Category   string `json:"category"`
 	Evidence   string `json:"evidence"`
+	Problem    string `json:"problem,omitempty"`
 	Suggestion string `json:"suggestion,omitempty"`
 }
 
@@ -254,6 +284,97 @@ func (r *StyleReviewResult) Valid() bool {
 		}
 	}
 	return true
+}
+
+// FindingsSignature returns a deterministic hash of the normalized finding list
+// (excluding Evidence which is citation text, not the issue identity).
+// Used for stagnation detection: identical signatures across consecutive final
+// reviews indicate the critic is raising the same issues despite edits.
+// findingSigIdentity extracts the identity-bearing fields from a finding.
+// Priority: dimension/category/severity + (problem+suggestion when non-empty),
+// falling back to normalized evidence only when both problem and suggestion are empty.
+// Normalization: trimmed, lowercased, single-spaced.
+func findingSigIdentity(f StyleReviewFinding) string {
+	norm := func(s string) string {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return ""
+		}
+		// Normalize whitespace: trim + collapse runs to single space + lowercase
+		s = strings.ToLower(s)
+		re := regexp.MustCompile(`\s+`)
+		return re.ReplaceAllString(s, " ")
+	}
+	major := norm(f.Problem) + "|" + norm(f.Suggestion)
+	if major == "|" {
+		major = norm(f.Evidence)
+	}
+	return norm(f.Dimension) + "|" + norm(f.Category) + "|" + norm(f.Severity) + "|" + major
+}
+
+// FindingsSignature returns a deterministic hash of the normalized finding list.
+// Each finding's identity is determined by dimension/category/severity plus
+// the descriptive identity (problem+suggestion, falling back to evidence when
+// both are empty).  Used for stagnation detection: identical signatures across
+// consecutive final reviews indicate the critic is raising the same issues.
+func (r *StyleReviewResult) FindingsSignature() string {
+	if r == nil || len(r.Findings) == 0 {
+		return ""
+	}
+	// Extract identity strings, sort for determinism, hash.
+	ids := make([]string, len(r.Findings))
+	for i, f := range r.Findings {
+		ids[i] = findingSigIdentity(f)
+	}
+	sort.Strings(ids)
+	data, _ := json.Marshal(ids)
+	h := sha256.Sum256(data)
+	return "findingsig:" + hex.EncodeToString(h[:8])
+}
+
+// isStrictAdjacentFinalRevise checks whether the ledgers i-th cycle is a
+// revision_open that was produced by a final_pending → revise transition
+// (i.e. the cycle before it is a final_pending).  Cycles[0] (initial
+// revision_open) returns false.
+func isStrictAdjacentFinalRevise(ledger *StyleReviewLedger, i int) bool {
+	if i <= 0 || i >= len(ledger.Cycles) {
+		return false
+	}
+	return ledger.Cycles[i].Status == ReviewStatusRevisionOpen &&
+		ledger.Cycles[i-1].Status == ReviewStatusFinalPending
+}
+
+// DetectFinalReviewStagnation checks whether a final-review revise result is
+// stagnant: the normalized finding signature matches the immediately preceding
+// final_pending → revision_open cycle's result, meaning the critic returned
+// the same issues despite an edit attempt.  When true the caller should
+// produce exhausted instead of looping back to revision_open.
+//
+// Only strictly adjacent final cycles are compared — the initial
+// initial_pending → revision_open never triggers exhaustion.
+//
+// A nil/empty ledger, nil/empty result, or no prior final-revise cycle means
+// no stagnation.
+func DetectFinalReviewStagnation(ledger *StyleReviewLedger, currentResult *StyleReviewResult) bool {
+	if currentResult == nil || ledger == nil || ledger.IsEmpty() {
+		return false
+	}
+	currentSig := currentResult.FindingsSignature()
+	if currentSig == "" {
+		return false
+	}
+	// Scan backwards for the most recent revision_open that was produced by a
+	// strict adjacent final_pending → revision_open transition.
+	for i := len(ledger.Cycles) - 1; i >= 0; i-- {
+		if isStrictAdjacentFinalRevise(ledger, i) {
+			entry := ledger.Cycles[i]
+			if entry.Result != nil {
+				prevSig := entry.Result.FindingsSignature()
+				return prevSig != "" && prevSig == currentSig
+			}
+		}
+	}
+	return false
 }
 
 // ── StyleReviewOverride ─────────────────────────────────────────────
@@ -735,11 +856,11 @@ func validateCycleRules(l *StyleReviewLedger) error {
 		}
 	}
 
-	// ── 2. V1 transition edges ──
+	// ── 2. V2 transition edges ──
 	for i := 0; i < len(l.Cycles)-1; i++ {
 		from, to := l.Cycles[i].Status, l.Cycles[i+1].Status
-		if !isValidV1Transition(from, to) {
-			return fmt.Errorf("ledger: invalid V1 transition %q → %q at cycles [%d]→[%d]", from, to, i, i+1)
+		if !isValidV2Transition(from, to) {
+			return fmt.Errorf("ledger: invalid V2 transition %q → %q at cycles [%d]→[%d]", from, to, i, i+1)
 		}
 	}
 

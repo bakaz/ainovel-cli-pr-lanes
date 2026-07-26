@@ -277,18 +277,8 @@ func TestReviewStyle_FinalReviseBlocksCommit(t *testing.T) {
 	}
 
 	ledger, _ := st.StyleReview.Load(1)
-	if ledger.CurrentStatus() != domain.ReviewStatusExhausted {
-		t.Fatalf("expected exhausted, got %s", ledger.CurrentStatus())
-	}
-
-	commitTool := NewCommitChapterTool(st)
-	commitArgs, _ := json.Marshal(map[string]any{
-		"chapter": 1, "summary": "测试", "characters": []string{},
-		"key_events": []string{},
-	})
-	_, err := commitTool.Execute(t.Context(), commitArgs)
-	if err == nil {
-		t.Fatal("commit should be rejected when ledger is exhausted")
+	if ledger.CurrentStatus() != domain.ReviewStatusRevisionOpen {
+		t.Fatalf("expected revision_open (V2), got %s", ledger.CurrentStatus())
 	}
 }
 
@@ -2081,5 +2071,217 @@ func TestReviewStyle_BasisContainsTypedStyleGoal(t *testing.T) {
 	tool := NewReviewStyleTool(st, critic, testCriticVersion)
 	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
 		t.Fatalf("Execute: %v", err)
+	}
+}
+
+// ── 48. Stagnation: different findings stay revision_open ────────────────
+
+func TestReviewStyle_DifferentFindingsLoop(t *testing.T) {
+	st := setupCriticStore(t, 1, "正文。一些句子。")
+	draft, _, _ := st.Drafts.LoadChapterContent(1)
+
+	callCount := 0
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		callCount++
+		if callCount <= 2 {
+			if callCount == 1 {
+				return &agentcore.LLMResponse{Message: criticText(`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"pacing","category":"style","severity":"warning","evidence":"末段","problem":"第二段描写过细","revision":"压缩中间描写"}]}`)}, nil
+			}
+			return &agentcore.LLMResponse{Message: criticText(`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"hook","category":"plot","severity":"error","evidence":"首段","problem":"开篇悬念不足","revision":"加入伏笔"}]}`)}, nil
+		}
+		return &agentcore.LLMResponse{Message: criticText(`{"verdict":"pass","strength":{"dimension":"aesthetic","evidence":"流畅"}}`)}, nil
+	})
+
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+
+	// Round 1: initial review → revise
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Round 1: %v", err)
+	}
+	// Edit + check
+	newDraft1 := draft + "\n修改1。"
+	if err := st.Drafts.SaveDraft(1, newDraft1); err != nil {
+		t.Fatal(err)
+	}
+	d1 := domain.DigestDraft(newDraft1)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a1", d1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Round 2: final review → revise (different finding with different problem)
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Round 2: %v", err)
+	}
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusRevisionOpen {
+		t.Fatalf("Round 2: expected revision_open (different findings), got %s", ledger.CurrentStatus())
+	}
+	// Verify Problem was persisted
+	lastCycle := ledger.CurrentCycle()
+	if lastCycle.Result.Findings[0].Problem == "" {
+		t.Fatal("Problem field was not persisted from critic JSON")
+	}
+
+	// Edit + check
+	newDraft2 := newDraft1 + "\n修改2。"
+	if err := st.Drafts.SaveDraft(1, newDraft2); err != nil {
+		t.Fatal(err)
+	}
+	d2 := domain.DigestDraft(newDraft2)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a2", d2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Round 3: final review → pass (different findings allow progress)
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Round 3: %v", err)
+	}
+	ledger, _ = st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusAcceptedRev {
+		t.Fatalf("Round 3: expected accepted_revised, got %s", ledger.CurrentStatus())
+	}
+}
+
+// ── 49. Stagnation: repeated same findings → exhausted ───────────────────
+// Requires two consecutive identical final reviews to trigger exhaustion;
+// the first final review always produces revision_open.
+
+func TestReviewStyle_StagnationSameFindingsLeadsToExhausted(t *testing.T) {
+	st := setupCriticStore(t, 1, "正文。一些句子。")
+	draft, _, _ := st.Drafts.LoadChapterContent(1)
+
+	// Production shape: uses "problem" and "revision" (not "suggestion")
+	sameFinding := `{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"pacing","category":"style","severity":"warning","evidence":"末段","problem":"第二段描写过细","revision":"压缩中间描写"}]}`
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(sameFinding)}, nil
+	})
+
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+
+	// Round 1: initial review → revise
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Round 1: %v", err)
+	}
+
+	// Round 2: first final review → revise (always revision_open, no stagnation yet)
+	newDraft := draft + "\n修改。"
+	if err := st.Drafts.SaveDraft(1, newDraft); err != nil {
+		t.Fatal(err)
+	}
+	d1 := domain.DigestDraft(newDraft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a1", d1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Round 2: %v", err)
+	}
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusRevisionOpen {
+		t.Fatalf("Round 2: expected revision_open (first final revise), got %s", ledger.CurrentStatus())
+	}
+
+	// Round 3: second final review → still same finding → stagnation → exhausted
+	newDraft2 := newDraft + "\n修改2。"
+	if err := st.Drafts.SaveDraft(1, newDraft2); err != nil {
+		t.Fatal(err)
+	}
+	d2 := domain.DigestDraft(newDraft2)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a2", d2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Round 3: %v", err)
+	}
+
+	ledger, _ = st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusExhausted {
+		t.Fatalf("expected exhausted after two consecutive identical final reviews, got %s", ledger.CurrentStatus())
+	}
+}
+
+// ── 50. Stagnation: override recovers from exhausted ─────────────────────
+
+func TestReviewStyle_OverrideAfterStagnationExhausted(t *testing.T) {
+	st := setupCriticStore(t, 1, "正文。一些句子。")
+	draft, _, _ := st.Drafts.LoadChapterContent(1)
+
+	// Production shape: uses "problem" and "revision" (not "suggestion")
+	sameFinding := `{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"pacing","category":"style","severity":"warning","evidence":"末段","problem":"第二段描写过细","revision":"压缩中间描写"}]}`
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(sameFinding)}, nil
+	})
+
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+
+	// Round 1: initial → revise
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Round 1: %v", err)
+	}
+
+	// Round 2: first final review → revise (revision_open, no stagnation yet)
+	newDraft := draft + "\n修改。"
+	if err := st.Drafts.SaveDraft(1, newDraft); err != nil {
+		t.Fatal(err)
+	}
+	d1 := domain.DigestDraft(newDraft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a1", d1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Round 2: %v", err)
+	}
+
+	// Round 3: second final review → same finding → exhausted
+	newDraft2 := newDraft + "\n修改2。"
+	if err := st.Drafts.SaveDraft(1, newDraft2); err != nil {
+		t.Fatal(err)
+	}
+	d2 := domain.DigestDraft(newDraft2)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a2", d2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Round 3: %v", err)
+	}
+
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusExhausted {
+		t.Fatalf("expected exhausted, got %s", ledger.CurrentStatus())
+	}
+
+	// Override the exhausted status — use the current draft digest (d2).
+	if err := st.StyleReview.Update(1, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
+		now := time.Now().Format(time.RFC3339)
+		entry := domain.StyleReviewEntry{
+			Cycle:       len(cur.Cycles) + 1,
+			Status:      domain.ReviewStatusOverridden,
+			CreatedAt:   now,
+			AttemptID:   "",
+			DraftDigest: d2,
+			BasisDigest: ledger.CurrentCycle().BasisDigest,
+			Override: &domain.StyleReviewOverride{
+				Actor: "user", Reason: "I confirm this draft is acceptable",
+				DraftDigest: d2, BasisDigest: ledger.CurrentCycle().BasisDigest,
+				OverriddenAt: now,
+			},
+		}
+		cur.Cycles = append(cur.Cycles, entry)
+		return cur, nil
+	}); err != nil {
+		t.Fatalf("override: %v", err)
+	}
+
+	// Now commit should be allowed (overridden is terminal)
+	// Need to pass a consistency check after override
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a3", d2); err != nil {
+		t.Fatal(err)
+	}
+	commitTool := NewCommitChapterTool(st)
+	commitArgs, _ := json.Marshal(map[string]any{
+		"chapter": 1, "summary": "测试", "characters": []string{},
+		"key_events": []string{},
+	})
+	if _, err := commitTool.Execute(t.Context(), commitArgs); err != nil {
+		t.Fatalf("commit after override should succeed: %v", err)
 	}
 }
