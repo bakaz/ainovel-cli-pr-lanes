@@ -765,6 +765,9 @@ func (m *Model) applyEvent(ev host.Event) {
 			if ev.Failed {
 				existing.Failed = true
 			}
+			if ev.Discarded {
+				existing.Discarded = true
+			}
 			if ev.Level != "" {
 				existing.Level = ev.Level
 			}

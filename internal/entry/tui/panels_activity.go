@@ -91,6 +91,10 @@ func renderEventLine(ev host.Event, width, spinnerFrame int) string {
 		case running:
 			icon = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(runningSpinner(spinnerFrame))
 			sum = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(truncate(ev.Summary, maxSumW))
+		case ev.Discarded:
+			// discarded = retry 放弃的 tool call，不是执行失败
+			icon = lipgloss.NewStyle().Foreground(colorDim).Render("⊘")
+			sum = lipgloss.NewStyle().Foreground(colorDim).Italic(true).Render(truncate(ev.Summary, maxSumW))
 		case ev.Failed:
 			icon = lipgloss.NewStyle().Foreground(colorError).Bold(true).Render("✕")
 			sum = lipgloss.NewStyle().Foreground(colorError).Render(truncate(ev.Summary, maxSumW))
