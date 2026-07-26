@@ -1,9 +1,11 @@
 package tools
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/rules"
@@ -11,23 +13,36 @@ import (
 	"github.com/voocel/ainovel-cli/internal/stylestat"
 )
 
+// writer_style_card 防御性上限。Writer 的 200KB 预算中仅分配 ~2% 给此卡片；
+// 上限基于 compass 设计约束（long prose 3-5 条 ≤50 字，dialogue 角色 ≤10 个）
+// 并留出合理余量以支持当前弧补充规则。
+const (
+	writerStyleCardMaxProseRules    = 20   // 合并 long+current 后的最多 prose 规则数
+	writerStyleCardMaxDialogueChars = 20   // 合并后的最多对话角色数
+	writerStyleCardMaxRulesPerChar  = 10   // 单个角色的最多对话规则条数
+	writerStyleCardMaxRuleLen       = 200  // 单条规则的最大 UTF-8 字符数（约 4× long 设计上限 50）
+	writerStyleCardMaxTotalBytes    = 4096 // 整个卡片序列化后的最大字节数（≈2% 的 200KB Writer 预算）
+)
+
 type contextBuildState struct {
-	chapter          int
-	profile          domain.ContextProfile
-	progress         *domain.Progress
-	runMeta          *domain.RunMeta
-	currentEntry     *domain.OutlineEntry
-	chapterPlan      *domain.ChapterPlan
-	storyThreads     []domain.RecallItem
-	foreshadow       []domain.ForeshadowEntry
-	relationships    []domain.RelationshipEntry
-	allStateChanges  []domain.StateChange
-	styleRules       *domain.WritingStyleRules
-	styleRulesCompass *domain.WritingStyleRulesCompass // Compass 双层格式
-	styleAnchorsManual *domain.StyleAnchorsV1          // 归一化后的手动锚点（meta/style_anchors.json）
-	styleAnchorsAuto  []string                          // 自动提取的风格锚点（仅当无 manual 且无 style_rules 时 legacy 回退，或 include_auto=true）
-	manStatus         store.ManualFileStatus             // 手动文件状态
-	hasStyleRules     bool                               // 缓存是否存在 style_rules
+	chapter             int
+	profile             domain.ContextProfile
+	progress            *domain.Progress
+	runMeta             *domain.RunMeta
+	currentEntry        *domain.OutlineEntry
+	chapterPlan         *domain.ChapterPlan
+	storyThreads        []domain.RecallItem
+	foreshadow          []domain.ForeshadowEntry
+	relationships       []domain.RelationshipEntry
+	allStateChanges     []domain.StateChange
+	styleRules          *domain.WritingStyleRules
+	styleRulesCompass   *domain.WritingStyleRulesCompass // Compass 双层格式
+	styleAnchorsManual  *domain.StyleAnchorsV1           // 归一化后的手动锚点（meta/style_anchors.json）
+	styleAnchorsAuto    []string                         // 自动提取的风格锚点（仅当无 manual 且无 style_rules 时 legacy 回退，或 include_auto=true）
+	manStatus           store.ManualFileStatus           // 手动文件状态
+	hasStyleRules       bool                             // 缓存是否存在 style_rules
+	styleReviewStatus   domain.StyleReviewStatus         // 当前章节风格评审状态（空字符串=未开始）
+	styleReviewFeedback map[string]any                   // 精炼的风格评审反馈（仅 revision_open/final_pending/exhausted 时存在）
 }
 type chapterContextEnvelope struct {
 	Working    map[string]any
@@ -207,6 +222,17 @@ func (t *ContextTool) prepareChapterContext(chapter int, envelope *chapterContex
 	if runMeta != nil && runMeta.PlanningTier != "" {
 		envelope.Episodic["planning_tier"] = runMeta.PlanningTier
 	}
+
+	// 加载风格评审状态与精炼反馈（仅用于 Writer 分支感知，不暴露账本内部细节）
+	if runMeta != nil && runMeta.StyleReviewMode.Enabled() {
+		if ledger, lErr := t.store.StyleReview.Load(chapter); lErr == nil && ledger != nil {
+			state.styleReviewStatus = ledger.CurrentStatus()
+			state.styleReviewFeedback = buildCompactStyleReviewFeedback(ledger)
+		} else if lErr != nil {
+			warn("style_review_ledger", lErr)
+		}
+	}
+
 	if progress != nil && progress.TotalChapters > 0 {
 		state.profile = domain.NewContextProfile(progress.TotalChapters)
 	}
@@ -383,7 +409,7 @@ func (t *ContextTool) buildChapterContext(result map[string]any, state contextBu
 
 	t.buildChapterEpisodicMemory(&envelope, state, warn)
 	t.buildChapterWorkingMemory(&envelope, state, warn)
-	t.buildChapterReferencePack(&envelope, state)
+	t.buildChapterReferencePack(&envelope, state, warn)
 	t.buildChapterSelectedMemory(&envelope, state, warn)
 	t.buildStyleStats(&envelope, state)
 	envelope.apply(result)
@@ -483,6 +509,17 @@ func (t *ContextTool) buildChapterWorkingMemory(envelope *chapterContextEnvelope
 		if len(state.progress.HookHistory) > 0 {
 			checkpoint["hook_history"] = state.progress.HookHistory
 		}
+		// Expose style review mode/status for Writer branching
+		if state.runMeta != nil && state.runMeta.StyleReviewMode != "" {
+			checkpoint["style_review_mode"] = string(state.runMeta.StyleReviewMode)
+		}
+		if state.styleReviewStatus != "" {
+			checkpoint["style_review_status"] = string(state.styleReviewStatus)
+		}
+		// 精炼风格评审反馈：仅 Writer 在 revision_open/final_pending/exhausted 时注入
+		if t.role == "writer" && state.styleReviewFeedback != nil {
+			checkpoint["style_review_feedback"] = state.styleReviewFeedback
+		}
 		envelope.Working["checkpoint"] = checkpoint
 	}
 
@@ -578,15 +615,22 @@ func (t *ContextTool) buildChapterEpisodicMemory(envelope *chapterContextEnvelop
 	}
 }
 
-func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope, state contextBuildState) {
+func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope, state contextBuildState, warn func(string, error)) {
 	// ── 角色门控：所有 anchor 类字段（manual/auto/legacy）仅 Writer/Editor 可见 ──
 	isWriterOrEditor := t.role == "writer" || t.role == "editor"
+	isWriter := t.role == "writer"
+
+	// ── 计算一次作用域过滤后的 compass，供 style_rules 和 writer_style_card 共用 ──
+	compassForView := scopedCompassForChapter(t.store, state.chapter, warn)
 
 	// 1. style_rules：仅 Writer/Editor 注入正文笔法（prose/dialogue/taboos）；
 	//    Architect/Coordinator 即使 chapter>0 也不应注入 prose style_rules。
-	if isWriterOrEditor && state.styleRulesCompass != nil && state.styleRulesCompass.HasProseStyleContent() {
-		envelope.References["style_rules"] = buildCompassProseInjectionView(state.styleRulesCompass)
-	} else if isWriterOrEditor && state.styleRules != nil && (len(state.styleRules.Prose) > 0 || len(state.styleRules.Dialogue) > 0 || len(state.styleRules.Taboos) > 0) {
+	//
+	//    compass 路径阻断 legacy 降级：compass 存在（compassForView != nil）时
+	//    无论是否注入 prose 内容，都不退回 legacy styleRules/anchors。
+	if isWriterOrEditor && compassForView != nil && compassForView.HasProseStyleContent() {
+		envelope.References["style_rules"] = buildCompassProseInjectionView(compassForView)
+	} else if isWriterOrEditor && compassForView == nil && state.styleRules != nil && (len(state.styleRules.Prose) > 0 || len(state.styleRules.Dialogue) > 0 || len(state.styleRules.Taboos) > 0) {
 		envelope.References["style_rules"] = state.styleRules
 	} else if isWriterOrEditor && state.manStatus == store.StatusNotExist {
 		// 无风格规则且无手动文件时回退到 legacy style_anchors / voice_samples
@@ -620,7 +664,17 @@ func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope
 		}
 	}
 
-	// 2. style_anchors_manual：仅 Writer/Editor，按当前章节过滤，只注入精简视图（id+excerpt）
+	// 2. writer_style_card：Writer 专用正面的 prose+dialogue 风格卡片。
+	//    跟随 compassForView 作用域结果，不含 taboos/user_rules/anchor 字段。
+	//    ⌈bounded⌋ 诉求：不出现在 non-compass 路径，也不复制 user_rules 或 anchor excerpt。
+	if isWriter && compassForView != nil {
+		card := buildWriterStyleCard(compassForView)
+		if card != nil {
+			envelope.References["writer_style_card"] = card
+		}
+	}
+
+	// 3. style_anchors_manual：仅 Writer/Editor，按当前章节过滤，只注入精简视图（id+excerpt）
 	if isWriterOrEditor && state.styleAnchorsManual != nil && len(state.styleAnchorsManual.Anchors) > 0 {
 		if injection := state.styleAnchorsManual.ToInjectionView(state.chapter); len(injection) > 0 {
 			envelope.References["style_anchors_manual"] = injection
@@ -634,6 +688,67 @@ func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope
 	}
 
 	envelope.References["references"] = t.writerReferences(state.chapter)
+}
+
+// scopedCompassForChapter loads the compass and filters the current section
+// based on the exact chapter-scope logic used by the Writer context.
+// This ensures ReviewBasis uses the same scoped data as the Writer card.
+// Returns nil when no compass with prose content exists or is loadable.
+func scopedCompassForChapter(st *store.Store, chapter int, warn func(string, error)) *domain.WritingStyleRulesCompass {
+	compass, err := st.World.LoadStyleRulesCompass()
+	if err != nil || compass == nil || !compass.HasProseStyleContent() {
+		return nil
+	}
+	if compass.Current == nil {
+		return compass
+	}
+
+	// Same oracle gate as Writer context's buildChapterReferencePack:
+	// progress unavailable → fail closed exclude current;
+	// non-layered → always include current;
+	// layered → only include when chapter belongs to matching volume+arc.
+	progress, pErr := st.Progress.Load()
+	if pErr != nil || progress == nil {
+		if warn != nil {
+			warn("style_rules_current_scope", fmt.Errorf(
+				"进度状态不可用（progress=nil），style_rules.current (卷%d弧%d) 已降级为仅 long 规则",
+				compass.Current.Volume, compass.Current.Arc,
+			))
+		}
+		filtered := *compass
+		filtered.Current = nil
+		return &filtered
+	}
+
+	if !progress.Layered {
+		return compass
+	}
+
+	volume, arc, locateErr := st.Outline.LocateChapter(chapter)
+	if locateErr != nil {
+		if warn != nil {
+			warn("style_rules_current_scope", fmt.Errorf(
+				"定位章节 %d 在分层大纲中失败: %w", chapter, locateErr,
+			))
+		}
+		filtered := *compass
+		filtered.Current = nil
+		return &filtered
+	}
+	if volume != compass.Current.Volume || arc != compass.Current.Arc {
+		if warn != nil {
+			warn("style_rules_current_scope", fmt.Errorf(
+				"章节 %d (卷%d弧%d) 不在 style_rules.current (卷%d弧%d) 范围内，降级为仅 long 规则",
+				chapter, volume, arc,
+				compass.Current.Volume, compass.Current.Arc,
+			))
+		}
+		filtered := *compass
+		filtered.Current = nil
+		return &filtered
+	}
+
+	return compass
 }
 
 // buildCompassProseInjectionView Writer/Editor：仅 prose/dialogue/taboos（无 outline）。
@@ -713,6 +828,7 @@ func buildCompassProseInjectionView(compass *domain.WritingStyleRulesCompass) ma
 	}
 	return view
 }
+
 // buildCompassOutlineInjectionView Architect：仅 outline 规划规则（无 prose/dialogue/taboos）。
 func buildCompassOutlineInjectionView(compass *domain.WritingStyleRulesCompass) map[string]any {
 	if compass == nil || !compass.HasOutlineContent() {
@@ -776,6 +892,69 @@ func buildCompassInjectionView(compass *domain.WritingStyleRulesCompass) map[str
 	return view
 }
 
+// buildCompactStyleReviewFeedback 从账本中提取精炼的风格评审反馈视图。
+// 仅当最近完成的周期有 result 且当前状态为 revision_open/final_pending/exhausted
+// 时返回非 nil 结果。返回结构含 strength（正面评价）和 findings（最多 3 条精简条目）。
+// 绝不泄漏完整账本内部细节（attempt_id、digest、request metadata 等）。
+func buildCompactStyleReviewFeedback(ledger *domain.StyleReviewLedger) map[string]any {
+	if ledger == nil || ledger.IsEmpty() {
+		return nil
+	}
+	status := ledger.CurrentStatus()
+	// 仅 revision_open/final_pending/exhausted 需要反馈
+	switch status {
+	case domain.ReviewStatusRevisionOpen, domain.ReviewStatusFinalPending, domain.ReviewStatusExhausted:
+		// 继续
+	default:
+		return nil
+	}
+
+	// 找到最后一个有 result 的周期
+	var lastResult *domain.StyleReviewEntry
+	for i := len(ledger.Cycles) - 1; i >= 0; i-- {
+		if ledger.Cycles[i].Result != nil {
+			lastResult = &ledger.Cycles[i]
+			break
+		}
+	}
+	if lastResult == nil {
+		return nil
+	}
+
+	r := lastResult.Result
+	feedback := map[string]any{
+		"verdict": string(r.Verdict),
+	}
+	// strength: 正面评价
+	if r.Evidence != "" {
+		feedback["strength"] = map[string]any{
+			"evidence": truncateRunes(r.Evidence, 60),
+		}
+	}
+	// findings: 最多 3 条精简条目
+	if len(r.Findings) > 0 {
+		n := len(r.Findings)
+		if n > 3 {
+			n = 3
+		}
+		compact := make([]map[string]any, 0, n)
+		for i, f := range r.Findings {
+			if i >= 3 {
+				break
+			}
+			compact = append(compact, map[string]any{
+				"dimension":  f.Dimension,
+				"severity":   f.Severity,
+				"category":   f.Category,
+				"evidence":   truncateRunes(f.Evidence, 60),
+				"suggestion": f.Suggestion,
+			})
+		}
+		feedback["findings"] = compact
+	}
+	return feedback
+}
+
 // mergeOutlinePlanning 合并 long/current 规划规则：long 在前，current 追加未重复条目。
 func mergeOutlinePlanning(long, current *domain.OutlinePlanningRules) *domain.OutlinePlanningRules {
 	out := &domain.OutlinePlanningRules{}
@@ -803,6 +982,132 @@ func mergeOutlinePlanning(long, current *domain.OutlinePlanningRules) *domain.Ou
 		return nil
 	}
 	return out
+}
+
+// charEntry is a lighter inline representation for writer_style_card dialogue entries.
+// Using a named package-level type so estimateWriterStyleCardBytes can reference it.
+type charEntry struct {
+	Name  string   `json:"name"`
+	Rules []string `json:"rules"`
+}
+
+// buildWriterStyleCard 从已作用域过滤的 compass 构建 Writer 风格卡片。
+// 只含 prose + dialogue（不含 taboos、volume、arc、last_updated）。
+// long 优先，current 补充；五项防御性上限确保不超预算。
+// 达到上限时截断末尾条目/字符；card 为空时返回 nil。
+func buildWriterStyleCard(compass *domain.WritingStyleRulesCompass) map[string]any {
+	if compass == nil {
+		return nil
+	}
+
+	// ── 收集 prose（long 在前，current 补充不重复） ──
+	var prose []string
+	if compass.Long != nil {
+		for _, p := range compass.Long.Prose {
+			if utf8.RuneCountInString(p) > writerStyleCardMaxRuleLen {
+				p = string([]rune(p)[:writerStyleCardMaxRuleLen])
+			}
+			if p != "" {
+				prose = append(prose, p)
+			}
+			if len(prose) >= writerStyleCardMaxProseRules {
+				break
+			}
+		}
+	}
+	if compass.Current != nil && len(prose) < writerStyleCardMaxProseRules {
+		for _, p := range compass.Current.Prose {
+			if slices.Contains(prose, p) {
+				continue
+			}
+			if utf8.RuneCountInString(p) > writerStyleCardMaxRuleLen {
+				p = string([]rune(p)[:writerStyleCardMaxRuleLen])
+			}
+			if p != "" {
+				prose = append(prose, p)
+			}
+			if len(prose) >= writerStyleCardMaxProseRules {
+				break
+			}
+		}
+	}
+
+	// ── 收集 dialogue（long 优先同名，current 补充新角色） ──
+	var dialogue []charEntry
+	seenNames := make(map[string]bool)
+
+	appendChar := func(name string, rules []string) {
+		if name == "" || seenNames[name] {
+			return
+		}
+		if len(dialogue) >= writerStyleCardMaxDialogueChars {
+			return
+		}
+		var cappedRules []string
+		for _, r := range rules {
+			if utf8.RuneCountInString(r) > writerStyleCardMaxRuleLen {
+				r = string([]rune(r)[:writerStyleCardMaxRuleLen])
+			}
+			if r != "" {
+				cappedRules = append(cappedRules, r)
+			}
+			if len(cappedRules) >= writerStyleCardMaxRulesPerChar {
+				break
+			}
+		}
+		if len(cappedRules) > 0 {
+			seenNames[name] = true
+			dialogue = append(dialogue, charEntry{Name: name, Rules: cappedRules})
+		}
+	}
+
+	if compass.Long != nil {
+		for _, d := range compass.Long.Dialogue {
+			appendChar(d.Name, d.Rules)
+		}
+	}
+	if compass.Current != nil {
+		for _, d := range compass.Current.Dialogue {
+			appendChar(d.Name, d.Rules)
+		}
+	}
+
+	// ── 组装卡片，序列化后检查总字节上限 ──
+	if len(prose) == 0 && len(dialogue) == 0 {
+		return nil
+	}
+	card := make(map[string]any)
+	if len(prose) > 0 {
+		card["prose"] = prose
+	}
+	if len(dialogue) > 0 {
+		card["dialogue"] = dialogue
+	}
+
+	// 检查总字节上限：直接 JSON 序列化后量测
+	raw, _ := json.Marshal(card)
+	for len(raw) > writerStyleCardMaxTotalBytes && len(dialogue) > 0 {
+		dialogue = dialogue[:len(dialogue)-1]
+		if len(dialogue) > 0 {
+			card["dialogue"] = dialogue
+		} else {
+			delete(card, "dialogue")
+		}
+		raw, _ = json.Marshal(card)
+	}
+	for len(raw) > writerStyleCardMaxTotalBytes && len(prose) > 0 {
+		prose = prose[:len(prose)-1]
+		if len(prose) > 0 {
+			card["prose"] = prose
+		} else {
+			delete(card, "prose")
+		}
+		raw, _ = json.Marshal(card)
+	}
+	if len(card) == 0 {
+		return nil
+	}
+	return card
 }
 
 func (t *ContextTool) buildArchitectContext(result map[string]any, warn func(string, error)) {

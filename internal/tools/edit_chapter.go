@@ -84,6 +84,11 @@ func (t *EditChapterTool) Execute(ctx context.Context, args json.RawMessage) (js
 		return nil, fmt.Errorf("old_string 与 new_string 相同，无需修改: %w", errs.ErrToolArgs)
 	}
 
+	// critic 模式变异守卫
+	if err := CheckStyleReviewMutationGuard(t.store, a.Chapter); err != nil {
+		return nil, fmt.Errorf("edit_chapter: %w", err)
+	}
+
 	// 归属检查：已完成章节必须在重写队列中，避免污染终稿
 	if t.store.Progress.IsChapterCompleted(a.Chapter) {
 		progress, _ := t.store.Progress.Load()

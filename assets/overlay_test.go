@@ -13,6 +13,7 @@ func TestApplyOverridesWhitelistPrecedenceAndSources(t *testing.T) {
 	writeFile(t, filepath.Join(low, "prompts", "writer.md"), "LOW_WRITER\n{{VOICE}}")
 	writeFile(t, filepath.Join(high, "prompts", "writer.md"), "HIGH_WRITER\n{{VOICE}}")
 	writeFile(t, filepath.Join(high, "prompts", "arbiter-failure.md"), "ARBITER_FAILURE_CANARY")
+	writeFile(t, filepath.Join(high, "prompts", "style-critic.md"), "CRITIC_v1")
 	writeFile(t, filepath.Join(high, "prompts", "coordinator.md"), "UNSUPPORTED_CANARY")
 	writeFile(t, filepath.Join(high, "styles", "default.md"), "STYLE_CANARY")
 
@@ -27,6 +28,9 @@ func TestApplyOverridesWhitelistPrecedenceAndSources(t *testing.T) {
 	if bundle.Prompts.ArbiterFailure != "ARBITER_FAILURE_CANARY" {
 		t.Fatalf("arbiter prompt override missing: %q", bundle.Prompts.ArbiterFailure)
 	}
+	if bundle.Prompts.StyleCritic != "CRITIC_v1" {
+		t.Fatalf("style-critic prompt override missing: %q", bundle.Prompts.StyleCritic)
+	}
 	if bundle.Styles["default"] != "STYLE_CANARY" {
 		t.Fatalf("style override missing: %q", bundle.Styles["default"])
 	}
@@ -38,6 +42,26 @@ func TestApplyOverridesWhitelistPrecedenceAndSources(t *testing.T) {
 	}
 	if len(report.Warnings) != 1 || !strings.Contains(report.Warnings[0], "coordinator.md") {
 		t.Fatalf("unsupported file should be surfaced exactly once: %+v", report.Warnings)
+	}
+}
+
+func TestStyleCriticOverlay_RejectedOnInvalidUTF8(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "prompts", "style-critic.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte{0xff, 0xfe}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bundle := Load("default", LoadOptions{})
+	want := bundle.Prompts.StyleCritic
+	report := ApplyOverrides(&bundle, "default", []string{root})
+	if bundle.Prompts.StyleCritic != want {
+		t.Fatal("invalid style-critic overlay must fall back to embedded prompt")
+	}
+	if len(report.Warnings) != 1 || !strings.Contains(report.Warnings[0], "UTF-8") {
+		t.Fatalf("invalid UTF-8 warning missing: %+v", report.Warnings)
 	}
 }
 

@@ -269,6 +269,133 @@ func TestArchitectStopGuard_ArchiveOnlyCheckpointDoesNotSatisfy(t *testing.T) {
 	})
 }
 
+// TestWriterStopGuard_ExhaustedLedgerAllowsEndTurn 验证：当风格评审账本
+// 当前状态为 exhausted 时，Writer StopGuard 放行 end_turn 而不要求 commit。
+// exhausted 状态下 commit 被 commit 门控禁止，guard 若继续催 commit 会造成死循环。
+func TestWriterStopGuard_ExhaustedLedgerAllowsEndTurn(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Progress.StartChapter(1); err != nil {
+		t.Fatalf("StartChapter: %v", err)
+	}
+	// 为章节 1 创建 exhausted 账本
+	now := "2026-07-25T00:00:00Z"
+	draftDigest := "sha256:" + strings.Repeat("a", 64)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       1,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: now, AttemptID: "e1",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				CreatedAt: now, AttemptID: "e1",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictRevise, Evidence: "needs work",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Severity: "warning", Category: "style", Evidence: "slow"},
+					},
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 3, Status: domain.ReviewStatusFinalPending,
+				CreatedAt: now, AttemptID: "e2",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 4, Status: domain.ReviewStatusExhausted,
+				CreatedAt: now, AttemptID: "e2",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictRevise, Evidence: "still no",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Severity: "warning", Category: "style", Evidence: "still slow"},
+					},
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+		},
+	}
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	guard := NewWriterStopGuard(s, nil)
+	info := agentcore.StopInfo{
+		TurnIndex: 1,
+		Message:   agentcore.Message{StopReason: agentcore.StopReasonStop},
+	}
+	d := guard(context.Background(), info)
+	if !d.Allow {
+		t.Fatalf("exhausted ledger must allow end_turn, got Allow=%v Escalate=%v", d.Allow, d.Escalate)
+	}
+	if d.InjectMessage != "" {
+		t.Fatalf("exhausted ledger must not inject message, got %q", d.InjectMessage)
+	}
+}
+
+// TestWriterStopGuard_NormalLedgerStillBlocks 验证：有正常（非 exhausted）账本
+// 时 guard 仍然要求 commit——exhausted 是唯一豁免路径。
+func TestWriterStopGuard_NormalLedgerStillBlocks(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Progress.StartChapter(1); err != nil {
+		t.Fatalf("StartChapter: %v", err)
+	}
+	// accepted_initial 账本
+	now := "2026-07-25T00:00:00Z"
+	draftDigest := "sha256:" + strings.Repeat("a", 64)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       1,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: now, AttemptID: "n1",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 2, Status: domain.ReviewStatusAcceptedInitial,
+				CreatedAt: now, AttemptID: "n1",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictPass, Evidence: "ok",
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+		},
+	}
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	guard := NewWriterStopGuard(s, nil)
+	info := agentcore.StopInfo{
+		TurnIndex: 1,
+		Message:   agentcore.Message{StopReason: agentcore.StopReasonStop},
+	}
+	d := guard(context.Background(), info)
+	if d.Allow {
+		t.Fatal("accepted_initial ledger must still block end_turn (no commit checkpoint yet)")
+	}
+}
+
 // TestArchitectStopGuard_SaveFoundationCheckpointSatisfies 验证传统 save_foundation
 // 产物仍然能正常满足 guard（回归基线）。
 func TestArchitectStopGuard_SaveFoundationCheckpointSatisfies(t *testing.T) {

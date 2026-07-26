@@ -1,0 +1,952 @@
+package domain
+
+import (
+	"strings"
+	"testing"
+)
+
+// ── Shared test constants ───────────────────────────────────────────
+
+var (
+	testDraft = DigestDraft("draft")
+	testBasis = DigestReviewBasis(ReviewBasis{
+		FactualOutline: "c",
+		CriticVersion:  "v",
+	})
+	testFind = StyleReviewFinding{Dimension: FindingDimensionConsistency, Severity: FindingSeverityWarning, Category: FindingCategoryPlot, Evidence: "needs work"}
+)
+
+// ── StyleQualityMode ────────────────────────────────────────────────
+
+func TestStyleQualityMode_Valid(t *testing.T) {
+	tests := []struct {
+		mode  StyleQualityMode
+		valid bool
+	}{
+		{StyleQualityOff, true}, {StyleQualityCritic, true},
+		{StyleQualityMode(""), false}, {StyleQualityMode("auto"), false},
+	}
+	for _, tc := range tests {
+		got := tc.mode.Valid()
+		if got != tc.valid {
+			t.Errorf("StyleQualityMode(%q).Valid() = %v, want %v", tc.mode, got, tc.valid)
+		}
+	}
+}
+
+func TestStyleQualityMode_Enabled(t *testing.T) {
+	if StyleQualityOff.Enabled() {
+		t.Error("off should not be enabled")
+	}
+	if !StyleQualityCritic.Enabled() {
+		t.Error("critic should be enabled")
+	}
+}
+
+// ── StyleReviewStatus ───────────────────────────────────────────────
+
+func TestStyleReviewStatus_Valid(t *testing.T) {
+	for _, s := range []StyleReviewStatus{
+		ReviewStatusInitialPending, ReviewStatusAcceptedInitial, ReviewStatusRevisionOpen,
+		ReviewStatusFinalPending, ReviewStatusAcceptedRev,
+		ReviewStatusExhausted, ReviewStatusDegraded, ReviewStatusOverridden,
+	} {
+		if !s.Valid() {
+			t.Errorf("status %q should be valid", s)
+		}
+	}
+	if StyleReviewStatus("unknown").Valid() || StyleReviewStatus("").Valid() {
+		t.Error("unknown/empty status should be invalid")
+	}
+}
+
+func TestStyleReviewStatus_IsTerminal(t *testing.T) {
+	tests := []struct {
+		s    StyleReviewStatus
+		want bool
+	}{
+		{ReviewStatusInitialPending, false}, {ReviewStatusAcceptedInitial, true},
+		{ReviewStatusRevisionOpen, false}, {ReviewStatusFinalPending, false},
+		{ReviewStatusAcceptedRev, true}, {ReviewStatusExhausted, false},
+		{ReviewStatusDegraded, true}, {ReviewStatusOverridden, true},
+	}
+	for _, tc := range tests {
+		if tc.s.IsTerminal() != tc.want {
+			t.Errorf("IsTerminal(%q) = %v, want %v", tc.s, tc.s.IsTerminal(), tc.want)
+		}
+	}
+}
+
+func TestStyleReviewStatus_IsActive(t *testing.T) {
+	tests := []struct {
+		s    StyleReviewStatus
+		want bool
+	}{
+		{ReviewStatusInitialPending, true}, {ReviewStatusAcceptedInitial, false},
+		{ReviewStatusRevisionOpen, true}, {ReviewStatusFinalPending, true},
+		{ReviewStatusAcceptedRev, false}, {ReviewStatusExhausted, false},
+		{ReviewStatusDegraded, false}, {ReviewStatusOverridden, false},
+	}
+	for _, tc := range tests {
+		if tc.s.IsActive() != tc.want {
+			t.Errorf("IsActive(%q) = %v, want %v", tc.s, tc.s.IsActive(), tc.want)
+		}
+	}
+}
+
+// ── StyleReviewVerdict ──────────────────────────────────────────────
+
+func TestStyleReviewVerdict_Valid(t *testing.T) {
+	if !ReviewVerdictPass.Valid() || !ReviewVerdictRevise.Valid() {
+		t.Error("pass/revise should be valid")
+	}
+	if StyleReviewVerdict("").Valid() || StyleReviewVerdict("maybe").Valid() {
+		t.Error("empty/unknown verdict should be invalid")
+	}
+}
+
+// ── StyleReviewFinding ──────────────────────────────────────────────
+
+func TestStyleReviewFinding_Valid(t *testing.T) {
+	f := &StyleReviewFinding{Dimension: FindingDimensionConsistency, Severity: FindingSeverityError, Category: FindingCategoryPlot, Evidence: "text"}
+	if !f.Valid() {
+		t.Error("valid finding should be valid")
+	}
+}
+
+func TestStyleReviewFinding_InvalidCases(t *testing.T) {
+	var nilPtr *StyleReviewFinding
+	if nilPtr.Valid() {
+		t.Error("nil finding should be invalid via pointer receiver")
+	}
+
+	tests := []struct {
+		name string
+		f    StyleReviewFinding
+	}{
+		{"bad dimension", StyleReviewFinding{Dimension: "bogus", Severity: FindingSeverityWarning, Category: FindingCategoryStyle, Evidence: "t"}},
+		{"bad severity", StyleReviewFinding{Dimension: FindingDimensionPacing, Severity: "catastrophic", Category: FindingCategoryLogic, Evidence: "t"}},
+		{"bad category", StyleReviewFinding{Dimension: FindingDimensionAesthetic, Severity: FindingSeverityInfo, Category: "unknown", Evidence: "t"}},
+		{"empty evidence", StyleReviewFinding{Dimension: FindingDimensionCharacter, Severity: FindingSeverityError, Category: FindingCategoryTone, Evidence: ""}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.f.Valid() {
+				t.Error("should be invalid")
+			}
+		})
+	}
+}
+
+// ── StyleReviewResult ───────────────────────────────────────────────
+
+func TestStyleReviewResult_Valid(t *testing.T) {
+	r := &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok", Findings: []StyleReviewFinding{
+		{Dimension: FindingDimensionConsistency, Severity: FindingSeverityWarning, Category: FindingCategoryPlot, Evidence: "ev1"},
+	}}
+	if !r.Valid() {
+		t.Error("valid result should pass")
+	}
+}
+
+func TestStyleReviewResult_RejectsNil(t *testing.T) {
+	var r *StyleReviewResult
+	if r.Valid() {
+		t.Error("nil result should be invalid")
+	}
+}
+
+func TestStyleReviewResult_RejectsInvalidVerdict(t *testing.T) {
+	r := &StyleReviewResult{Verdict: "bogus", Evidence: "e"}
+	if r.Valid() {
+		t.Error("invalid verdict should be rejected")
+	}
+}
+
+func TestStyleReviewResult_RequiresEvidence(t *testing.T) {
+	r := &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: ""}
+	if r.Valid() {
+		t.Error("empty evidence should be rejected")
+	}
+}
+
+func TestStyleReviewResult_AllowsUpToThreeFindings(t *testing.T) {
+	for n := 0; n <= 3; n++ {
+		findings := make([]StyleReviewFinding, n)
+		for i := range findings {
+			findings[i] = StyleReviewFinding{Dimension: FindingDimensionConsistency, Severity: FindingSeverityWarning, Category: FindingCategoryPlot, Evidence: "x"}
+		}
+		r := &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "s", Findings: findings}
+		if !r.Valid() {
+			t.Errorf("result with %d findings should be valid", n)
+		}
+	}
+}
+
+func TestStyleReviewResult_RejectsMoreThanThreeFindings(t *testing.T) {
+	findings := make([]StyleReviewFinding, 4)
+	for i := range findings {
+		findings[i] = StyleReviewFinding{Dimension: FindingDimensionConsistency, Severity: FindingSeverityWarning, Category: FindingCategoryPlot, Evidence: "x"}
+	}
+	r := &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "s", Findings: findings}
+	if r.Valid() {
+		t.Error("result with 4 findings should be invalid")
+	}
+}
+
+// ── StyleReviewRequest ──────────────────────────────────────────────
+
+func TestStyleReviewRequest_Normalize_TruncatesLongPrompt(t *testing.T) {
+	r := &StyleReviewRequest{Prompt: strings.Repeat("a", maxReviewRequestPromptBytes+100)}
+	r.Normalize()
+	if len(r.Prompt) != maxReviewRequestPromptBytes {
+		t.Errorf("prompt length = %d, want %d", len(r.Prompt), maxReviewRequestPromptBytes)
+	}
+	if !r.PromptTrunc {
+		t.Error("PromptTrunc should be true")
+	}
+}
+
+func TestStyleReviewRequest_Normalize_NilSafe(t *testing.T) {
+	var r *StyleReviewRequest
+	r.Normalize()
+}
+
+func TestStyleReviewRequest_Normalize_ShortPromptUntouched(t *testing.T) {
+	r := &StyleReviewRequest{Prompt: "short"}
+	r.Normalize()
+	if r.Prompt != "short" || r.PromptTrunc {
+		t.Error("short prompt should not be truncated")
+	}
+}
+
+// ── Ledger helpers ──────────────────────────────────────────────────
+
+func TestStyleReviewLedger_CurrentCycle_Empty(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityOff}
+	if c := l.CurrentCycle(); c != nil {
+		t.Errorf("expected nil, got %+v", c)
+	}
+}
+
+func TestStyleReviewLedger_CurrentStatus_Empty(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityOff}
+	if s := l.CurrentStatus(); s != "" {
+		t.Errorf("expected empty string for empty ledger, got %q", s)
+	}
+}
+
+func TestStyleReviewLedger_IsEmpty(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityOff}
+	if !l.IsEmpty() {
+		t.Error("should be empty")
+	}
+	l.Cycles = []StyleReviewEntry{mkEntry(1, ReviewStatusAcceptedInitial, ReviewVerdictPass)}
+	if l.IsEmpty() {
+		t.Error("should not be empty")
+	}
+}
+
+func TestStyleReviewLedger_EmptyIsNotUnderReview(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityOff}
+	if l.IsUnderReview() {
+		t.Error("empty ledger should not be under review")
+	}
+}
+
+func TestStyleReviewLedger_IsUnderReview(t *testing.T) {
+	tests := []struct {
+		status StyleReviewStatus
+		want   bool
+	}{
+		{ReviewStatusInitialPending, true}, {ReviewStatusAcceptedInitial, false},
+		{ReviewStatusRevisionOpen, true}, {ReviewStatusFinalPending, true},
+		{ReviewStatusAcceptedRev, false}, {ReviewStatusExhausted, false},
+		{ReviewStatusDegraded, false}, {ReviewStatusOverridden, false},
+	}
+	for _, tc := range tests {
+		l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+			Cycles: []StyleReviewEntry{mkEntry(1, tc.status, ReviewVerdictPass)}}
+		if l.IsUnderReview() != tc.want {
+			t.Errorf("IsUnderReview() for %q = %v, want %v", tc.status, l.IsUnderReview(), tc.want)
+		}
+	}
+}
+
+func TestStyleReviewLedger_HasOverrides(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{mkEntry(1, ReviewStatusAcceptedInitial, ReviewVerdictPass)}}
+	if l.HasOverrides() {
+		t.Error("no overrides yet")
+	}
+	l.Cycles = append(l.Cycles, mkEntry(2, ReviewStatusOverridden, ReviewVerdictPass))
+	if !l.HasOverrides() {
+		t.Error("should have overrides")
+	}
+}
+
+// ── EntriesEqual ─────────────────────────────────────────────────────
+
+func TestEntriesEqual_Identical(t *testing.T) {
+	a := mkEntry(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	b := mkEntry(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	if !EntriesEqual(a, b) {
+		t.Error("identical entries should be equal")
+	}
+}
+
+func TestEntriesEqual_DifferentAttemptID(t *testing.T) {
+	a := mkEntry(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	b := mkEntry(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	b.AttemptID = "different"
+	if EntriesEqual(a, b) {
+		t.Error("entries with different attempt_id should not be equal")
+	}
+}
+
+func TestEntriesEqual_DifferentDigest(t *testing.T) {
+	a := mkEntry(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	b := mkEntry(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	b.DraftDigest = DigestDraft("other")
+	if EntriesEqual(a, b) {
+		t.Error("entries with different draft_digest should not be equal")
+	}
+}
+
+func TestEntriesEqual_DifferentResult(t *testing.T) {
+	a := mkEntry(1, ReviewStatusAcceptedInitial, ReviewVerdictPass)
+	b := mkEntry(1, ReviewStatusAcceptedInitial, ReviewVerdictPass)
+	b.Result.Evidence = "different"
+	if EntriesEqual(a, b) {
+		t.Error("entries with different result should not be equal")
+	}
+}
+
+// ── ValidateLedger: structural ──────────────────────────────────────
+
+func TestValidateLedger_Nil(t *testing.T) {
+	err := ValidateLedger(nil)
+	if err == nil {
+		t.Fatal("expected error for nil")
+	}
+}
+
+func TestValidateLedger_BadSchemaVersion(t *testing.T) {
+	err := ValidateLedger(&StyleReviewLedger{SchemaVersion: 99, Chapter: 1, Mode: StyleQualityOff})
+	if err == nil || !strings.Contains(err.Error(), "schema version") {
+		t.Fatalf("expected schema version error, got %v", err)
+	}
+}
+
+func TestValidateLedger_ChapterZero(t *testing.T) {
+	err := ValidateLedger(&StyleReviewLedger{SchemaVersion: 1, Chapter: 0, Mode: StyleQualityOff})
+	if err == nil || !strings.Contains(err.Error(), "chapter") {
+		t.Fatalf("expected chapter error, got %v", err)
+	}
+}
+
+func TestValidateLedger_InvalidMode(t *testing.T) {
+	err := ValidateLedger(&StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: "turbo"})
+	if err == nil || !strings.Contains(err.Error(), "mode") {
+		t.Fatalf("expected mode error, got %v", err)
+	}
+}
+
+func TestValidateLedger_EmptyCyclesValid(t *testing.T) {
+	err := ValidateLedger(&StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityOff})
+	if err != nil {
+		t.Fatalf("empty cycles should be valid: %v", err)
+	}
+}
+
+// ── Critic mode must start with initial_pending ─────────────────────
+
+func TestValidateLedger_CriticModeFirstCycleMustBeInitialPending(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{{
+			Cycle: 1, Status: ReviewStatusAcceptedInitial, CreatedAt: "2026-07-25T10:00:00Z",
+			Request: &StyleReviewRequest{Prompt: "x", Model: "gpt-4o"}, Result: &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "e"},
+			DraftDigest: testDraft, BasisDigest: testBasis,
+		}},
+	}
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "first cycle must be initial_pending") {
+		t.Fatalf("expected first cycle must be initial_pending, got %v", err)
+	}
+}
+
+// ── Off mode ────────────────────────────────────────────────────────
+
+// ── Critic mode zero cycles ────────────────────────────────────────
+
+func TestValidateLedger_CriticModeZeroCyclesInvalid(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic}
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "zero cycles") {
+		t.Fatalf("expected zero cycles error, got %v", err)
+	}
+}
+
+func TestValidateLedger_OffModeZeroCyclesValid(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityOff}
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("off mode zero cycles should be valid: %v", err)
+	}
+}
+
+// ── Non-blank model/prompt ─────────────────────────────────────────
+
+func TestValidateLedger_InitialPendingRequiresModel(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{{
+			Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z",
+			AttemptID: "a1", DraftDigest: testDraft, BasisDigest: testBasis,
+			Request: &StyleReviewRequest{Prompt: "review", Model: ""}, // missing model
+		}},
+	}
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "non-blank model") {
+		t.Fatalf("expected non-blank model error, got %v", err)
+	}
+}
+
+func TestValidateLedger_InitialPendingRequiresPrompt(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{{
+			Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z",
+			AttemptID: "a1", DraftDigest: testDraft, BasisDigest: testBasis,
+			Request: &StyleReviewRequest{Prompt: "", Model: "gpt-4o"}, // missing prompt
+		}},
+	}
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "non-blank prompt") {
+		t.Fatalf("expected non-blank prompt error, got %v", err)
+	}
+}
+
+func TestValidateLedger_InitialPendingRequiresNonBlankModelAndPromptInRequest(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{{
+			Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z",
+			AttemptID: "a1", DraftDigest: testDraft, BasisDigest: testBasis,
+			Request: &StyleReviewRequest{Prompt: "valid prompt", Model: "gpt-4o"},
+		}},
+	}
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("valid request with model/prompt should pass: %v", err)
+	}
+}
+
+func TestValidateLedger_OffModeAcceptsTerminal(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityOff,
+		Cycles: []StyleReviewEntry{mkEntry(1, ReviewStatusAcceptedInitial, ReviewVerdictPass)},
+	}
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("off mode terminal should be valid: %v", err)
+	}
+}
+
+func TestValidateLedger_OffModeRejectsActive(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityOff,
+		Cycles: []StyleReviewEntry{mkEntry(1, ReviewStatusInitialPending, ReviewVerdictPass)},
+	}
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "active status") {
+		t.Fatalf("expected active status rejection in off mode, got %v", err)
+	}
+}
+
+// ── Cycle sequence ──────────────────────────────────────────────────
+
+func TestValidateLedger_NonSequentialCycles(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, mkEntry(3, ReviewStatusAcceptedInitial, ReviewVerdictPass))
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "cycle[1]") {
+		t.Fatalf("expected numbering error, got %v", err)
+	}
+}
+
+func TestValidateLedger_MissingCreatedAt(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: ""}},
+	}
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "RFC3339") {
+		t.Fatalf("expected RFC3339 error, got %v", err)
+	}
+}
+
+// ── Initial_pending payload ─────────────────────────────────────────
+
+func TestValidateLedger_InitialPendingRequiresAttemptID(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{{
+			Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z",
+			Request:     &StyleReviewRequest{Prompt: "x", Model: "gpt-4o"},
+			DraftDigest: testDraft, BasisDigest: testBasis,
+		}},
+	}
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "attempt_id") {
+		t.Fatalf("expected attempt_id required, got %v", err)
+	}
+}
+
+func TestValidateLedger_InitialPendingRequiresDigests(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{{
+			Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z",
+			Request: &StyleReviewRequest{Prompt: "x", Model: "gpt-4o"}, AttemptID: "a1",
+		}},
+	}
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "draft_digest") {
+		t.Fatalf("expected digest required, got %v", err)
+	}
+}
+
+// ── Revise requires findings ────────────────────────────────────────
+
+func TestValidateLedger_RevisionOpenRequiresFindings(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID:   "a1",
+		Request:     &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"},
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "needs work"}, // no findings
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "requires at least one finding") {
+		t.Fatalf("expected findings required for revise, got %v", err)
+	}
+}
+
+func TestValidateLedger_RevisionOpenWithFindingsValid(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID:   "a1",
+		Request:     &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"},
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "needs work", Findings: []StyleReviewFinding{testFind}},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("revision_open with findings should be valid: %v", err)
+	}
+}
+
+// ── Attempt-ID binding ──────────────────────────────────────────────
+func TestValidateLedger_AttemptIDMismatchInitialPending(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusAcceptedInitial, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID:   "WRONG", // different from initial_pending's "a1"
+		Request:     &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"},
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "attempt_id") {
+		t.Fatalf("expected attempt_id mismatch error, got %v", err)
+	}
+}
+
+func TestValidateLedger_StaleDraftDigest(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusAcceptedInitial, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID:   "a1",
+		Request:     &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"},
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok"},
+		DraftDigest: DigestDraft("stale"), BasisDigest: testBasis,
+	})
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "draft_digest") {
+		t.Fatalf("expected draft_digest mismatch error, got %v", err)
+	}
+}
+
+func TestValidateLedger_StaleRequestPrompt(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusAcceptedInitial, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID:   "a1",
+		Request:     &StyleReviewRequest{Prompt: "different prompt", Model: "gpt-4o"}, // changed!
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "request metadata differs") {
+		t.Fatalf("expected request metadata mismatch error, got %v", err)
+	}
+}
+
+func TestValidateLedger_RequestMetadataSubstitutionRejected(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	req := &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"}
+	l.Cycles[0].Request = req
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusAcceptedInitial, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID:   "a1",
+		Request:     &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o", PromptTrunc: true}, // different!
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "request metadata differs") {
+		t.Fatalf("expected request metadata mismatch error for PromptTrunc, got %v", err)
+	}
+}
+
+func TestValidateLedger_RequestIncludeBasisSubstitutionRejected(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	req := &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o", IncludeBasis: true}
+	l.Cycles[0].Request = req
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusAcceptedInitial, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID:   "a1",
+		Request:     &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o", IncludeBasis: false}, // different!
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "request metadata differs") {
+		t.Fatalf("expected request metadata mismatch error for IncludeBasis, got %v", err)
+	}
+}
+
+func TestValidateLedger_RequestRequestedAtSubstitutionRejected(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	req := &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o", RequestedAt: "2026-07-25T10:00:00Z"}
+	l.Cycles[0].Request = req
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusAcceptedInitial, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID:   "a1",
+		Request:     &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o", RequestedAt: "2026-07-25T11:00:00Z"}, // different!
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "request metadata differs") {
+		t.Fatalf("expected request metadata mismatch error for RequestedAt, got %v", err)
+	}
+}
+
+func TestValidateLedger_AttemptIDBindingFinalPending(t *testing.T) {
+	// Build a full flow with final attempt ID mismatch
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID:   "a1",
+		Request:     &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"},
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "needs work", Findings: []StyleReviewFinding{testFind}},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z",
+		AttemptID:   "a2",
+		Request:     &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	// The successor of final_pending must share attempt_id "a2"
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 4, Status: ReviewStatusAcceptedRev, CreatedAt: "2026-07-25T13:00:00Z",
+		AttemptID:   "WRONG", // should be "a2"
+		Request:     &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "attempt_id") {
+		t.Fatalf("expected final pending attempt_id mismatch error, got %v", err)
+	}
+}
+
+// ── V1 transitions ──────────────────────────────────────────────────
+
+func TestValidateLedger_V1_InitialToAcceptedInitial(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, mkEntry(2, ReviewStatusAcceptedInitial, ReviewVerdictPass))
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("initial→accepted_initial should be valid: %v", err)
+	}
+}
+
+func TestValidateLedger_V1_InitialToRevisionOpen(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, mkEntry(2, ReviewStatusRevisionOpen, ReviewVerdictRevise))
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("initial→revision_open should be valid: %v", err)
+	}
+}
+
+func TestValidateLedger_V1_RevisionToFinalPending(t *testing.T) {
+	l := validFlow(ReviewStatusRevisionOpen)
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("revision→final_pending should be valid: %v", err)
+	}
+}
+
+func TestValidateLedger_V1_FinalToAcceptedRevised(t *testing.T) {
+	l := validFlow(ReviewStatusAcceptedRev)
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("final→accepted_revised should be valid: %v", err)
+	}
+}
+
+func TestValidateLedger_V1_FinalToExhausted(t *testing.T) {
+	l := validFlow(ReviewStatusExhausted)
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("final→exhausted should be valid: %v", err)
+	}
+}
+
+func TestValidateLedger_V1_ExhaustedToOverridden(t *testing.T) {
+	l := validFlow(ReviewStatusOverridden)
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("exhausted→overridden should be valid: %v", err)
+	}
+}
+
+// ── Negative V1 transitions ─────────────────────────────────────────
+
+func TestValidateLedger_V1_RejectsInitialToFinalPending(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, mkEntry(2, ReviewStatusFinalPending, ReviewVerdictPass))
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "invalid V1 transition") {
+		t.Fatalf("expected V1 transition error, got %v", err)
+	}
+}
+
+func TestValidateLedger_V1_RejectsRevisionToAcceptedInitial(t *testing.T) {
+	l := validFlow(ReviewStatusRevisionOpen)
+	l.Cycles = append(l.Cycles, mkEntry(3, ReviewStatusAcceptedInitial, ReviewVerdictPass))
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "invalid V1 transition") {
+		t.Fatalf("expected V1 transition error, got %v", err)
+	}
+}
+
+// ── Degraded payload ────────────────────────────────────────────────
+
+func TestValidateLedger_DegradedRequiresDigests(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID: "a1",
+		Request:   &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"},
+		Error:     "network failure",
+		// no digests
+	})
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "draft_digest") {
+		t.Fatalf("expected digest required for degraded, got %v", err)
+	}
+}
+
+// ── Overridden digest equality ──────────────────────────────────────
+
+func TestValidateLedger_OverriddenDigestMismatch(t *testing.T) {
+	// Build valid flow to overridden, then corrupt the override digest
+	l := validFlow(ReviewStatusOverridden)
+	l.Cycles[4].Override.DraftDigest = DigestDraft("wrong")
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "override draft_digest") {
+		t.Fatalf("expected digest mismatch error, got %v", err)
+	}
+}
+
+// ── Terminality ─────────────────────────────────────────────────────
+
+func TestValidateLedger_TerminalBlocksSubsequent(t *testing.T) {
+	// Build valid flow, then add a cycle after the terminal accepted_revised
+	l := validFlow(ReviewStatusAcceptedRev)
+	l.Cycles = append(l.Cycles, mkEntry(5, ReviewStatusInitialPending, ReviewVerdictPass))
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "invalid V1 transition") {
+		t.Fatalf("expected V1 transition error, got %v", err)
+	}
+}
+
+// ── Digest helpers ──────────────────────────────────────────────────
+
+func TestDigestDraft_Format(t *testing.T) {
+	d := DigestDraft("hello")
+	if !strings.HasPrefix(d, "sha256:") || len(d) != 7+64 {
+		t.Errorf("bad format: %q", d)
+	}
+}
+
+func TestDigestDraft_Deterministic(t *testing.T) {
+	if DigestDraft("x") != DigestDraft("x") {
+		t.Error("not deterministic")
+	}
+}
+
+func TestIsValidDigest(t *testing.T) {
+	tests := []struct {
+		s    string
+		want bool
+	}{
+		{"sha256:" + strings.Repeat("a", 64), true},
+		{"sha256:" + strings.Repeat("A", 64), false},
+		{"sha256:abc", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		if IsValidDigest(tc.s) != tc.want {
+			t.Errorf("IsValidDigest(%q) = %v, want %v", tc.s, !tc.want, tc.want)
+		}
+	}
+}
+
+func TestDigestReviewBasis_Deterministic(t *testing.T) {
+	basis := ReviewBasis{
+		FactualOutline: "c",
+		CriticVersion:  "v",
+	}
+	a := DigestReviewBasis(basis)
+	b := DigestReviewBasis(basis)
+	if a != b {
+		t.Error("not deterministic")
+	}
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+// validLedger creates a single-cycle critic-mode ledger starting at the given
+// initial_pending status with canonical test digests and attempt ID "a1".
+func validLedger(chapter int, status StyleReviewStatus, verdict StyleReviewVerdict) *StyleReviewLedger {
+	return &StyleReviewLedger{
+		SchemaVersion: 1, Chapter: chapter, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{mkEntry(1, status, verdict)},
+	}
+}
+
+// mkEntry creates a single entry that passes its status payload validation.
+func mkEntry(cycle int, status StyleReviewStatus, verdict StyleReviewVerdict) StyleReviewEntry {
+	e := StyleReviewEntry{
+		Cycle:       cycle,
+		Status:      status,
+		CreatedAt:   "2026-07-25T10:00:00Z",
+		AttemptID:   "a1",
+		DraftDigest: testDraft,
+		BasisDigest: testBasis,
+	}
+	switch status {
+	case ReviewStatusInitialPending:
+		e.Request = &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"}
+	case ReviewStatusAcceptedInitial:
+		e.Request = &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"}
+		e.Result = &StyleReviewResult{Verdict: verdict, Evidence: "ok"}
+	case ReviewStatusRevisionOpen:
+		e.Request = &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"}
+		e.Result = &StyleReviewResult{Verdict: verdict, Evidence: "needs work", Findings: []StyleReviewFinding{testFind}}
+	case ReviewStatusFinalPending:
+		e.Request = &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"}
+		e.AttemptID = "a2"
+	case ReviewStatusAcceptedRev:
+		e.Request = &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"}
+		e.Result = &StyleReviewResult{Verdict: verdict, Evidence: "ok"}
+		e.AttemptID = "a2"
+	case ReviewStatusExhausted:
+		e.Request = &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"}
+		e.Result = &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "still needs work", Findings: []StyleReviewFinding{testFind}}
+		e.AttemptID = "a2"
+	case ReviewStatusDegraded:
+		e.Error = "infrastructure failure"
+		e.Request = &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"}
+	case ReviewStatusOverridden:
+		e.AttemptID = "a2"
+		e.Override = &StyleReviewOverride{
+			Actor: "user", Reason: "manual override",
+			DraftDigest: testDraft, BasisDigest: testBasis, OverriddenAt: "2026-07-25T11:00:00Z",
+		}
+	}
+	return e
+}
+
+// validFlow builds a multi-cycle critic-mode ledger following the V1 graph
+// up through the given terminal status.
+func validFlow(terminal Status) *StyleReviewLedger {
+	d := testDraft
+	b := testBasis
+	req := &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"}
+	find := []StyleReviewFinding{testFind}
+
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: req, DraftDigest: d, BasisDigest: b},
+		},
+	}
+
+	switch terminal {
+	case ReviewStatusRevisionOpen:
+		l.Cycles = append(l.Cycles, StyleReviewEntry{
+			Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+			AttemptID: "a1", Request: req,
+			Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "revise", Findings: find},
+			DraftDigest: d, BasisDigest: b,
+		})
+	case ReviewStatusFinalPending:
+		l.Cycles = append(l.Cycles,
+			StyleReviewEntry{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+				AttemptID: "a1", Request: req,
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "revise", Findings: find},
+				DraftDigest: d, BasisDigest: b},
+			StyleReviewEntry{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"}, DraftDigest: d, BasisDigest: b},
+		)
+	case ReviewStatusAcceptedRev:
+		l.Cycles = append(l.Cycles,
+			StyleReviewEntry{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+				AttemptID: "a1", Request: req,
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "revise", Findings: find},
+				DraftDigest: d, BasisDigest: b},
+			StyleReviewEntry{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"}, DraftDigest: d, BasisDigest: b},
+			StyleReviewEntry{Cycle: 4, Status: ReviewStatusAcceptedRev, CreatedAt: "2026-07-25T13:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "pass"},
+				DraftDigest: d, BasisDigest: b},
+		)
+	case ReviewStatusExhausted:
+		l.Cycles = append(l.Cycles,
+			StyleReviewEntry{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+				AttemptID: "a1", Request: req,
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "revise", Findings: find},
+				DraftDigest: d, BasisDigest: b},
+			StyleReviewEntry{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"}, DraftDigest: d, BasisDigest: b},
+			StyleReviewEntry{Cycle: 4, Status: ReviewStatusExhausted, CreatedAt: "2026-07-25T13:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "exhausted", Findings: find},
+				DraftDigest: d, BasisDigest: b},
+		)
+	case ReviewStatusOverridden:
+		l.Cycles = append(l.Cycles,
+			StyleReviewEntry{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+				AttemptID: "a1", Request: req,
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "revise", Findings: find},
+				DraftDigest: d, BasisDigest: b},
+			StyleReviewEntry{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"}, DraftDigest: d, BasisDigest: b},
+			StyleReviewEntry{Cycle: 4, Status: ReviewStatusExhausted, CreatedAt: "2026-07-25T13:00:00Z",
+				AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+				Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "exhausted", Findings: find},
+				DraftDigest: d, BasisDigest: b},
+			StyleReviewEntry{Cycle: 5, Status: ReviewStatusOverridden, CreatedAt: "2026-07-25T14:00:00Z",
+				AttemptID:   "a2",
+				DraftDigest: d, BasisDigest: b,
+				Override: &StyleReviewOverride{Actor: "user", Reason: "bypass", DraftDigest: d, BasisDigest: b, OverriddenAt: "2026-07-25T15:00:00Z"},
+			},
+		)
+	}
+	return l
+}
+
+// Status alias for validFlow parameter.
+type Status = StyleReviewStatus

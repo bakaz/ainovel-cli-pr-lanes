@@ -39,6 +39,9 @@ type Prompts struct {
 	ArbiterPlanStart    string
 	ArbiterIntervention string
 	ArbiterFailure      string
+
+	// StyleCritic 文风审查提示词(LLM-as-function,无 simulation guidance 包装)。
+	StyleCritic string
 }
 
 // Bundle 表示运行所需的静态资源集合。
@@ -221,6 +224,7 @@ func loadPrompts() Prompts {
 		ArbiterPlanStart:    mustRead(promptsFS, "prompts/arbiter-plan-start.md"),
 		ArbiterIntervention: mustRead(promptsFS, "prompts/arbiter-intervention.md"),
 		ArbiterFailure:      mustRead(promptsFS, "prompts/arbiter-failure.md"),
+		StyleCritic:         mustRead(promptsFS, "prompts/style-critic.md"),
 	}
 }
 

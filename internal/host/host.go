@@ -83,8 +83,8 @@ type Host struct {
 
 	mu         sync.Mutex
 	lifecycle  lifecycle
-	cocreating bool // 阶段共创占用：paused 窗口内堵住 import/simulate/continue 的并发介入
-	restoring  bool // restore in progress; blocks startEngine/Resume/intervention
+	cocreating bool           // 阶段共创占用：paused 窗口内堵住 import/simulate/continue 的并发介入
+	restoring  bool           // restore in progress; blocks startEngine/Resume/intervention
 	activeOps  sync.WaitGroup // async import/simulation in-flight; Restore waits
 	closeOnce  sync.Once
 
@@ -838,6 +838,111 @@ func (h *Host) AdvanceOneChapter() error {
 		// 许可按章节号持久化且同目标幂等，调用方稍后重试不会重复授权。
 		return fmt.Errorf("章节许可已保存，但 Engine 仍在完成上一轮停止；请稍后重试 /next")
 	}
+	return nil
+}
+
+// SetStyleReviewMode 切换风格评审质量模式。它只写入用户运行意图，
+// 不修改已有风格评审账本或草稿内容。off 关闭评审，critic 启用批评模式。
+// 使用 h.store.RunMeta.SetStyleReviewMode 持久化，验证请求值有效，
+// 发射相应状态事件。
+func (h *Host) SetStyleReviewMode(mode domain.StyleQualityMode) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
+	if !mode.Valid() {
+		return fmt.Errorf("不支持的风格评审模式 %q，可用值：off, critic", mode)
+	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+	if h.isRestoring() {
+		return fmt.Errorf("恢复操作进行中，无法切换风格评审模式")
+	}
+	if err := h.store.RunMeta.SetStyleReviewMode(mode); err != nil {
+		return err
+	}
+	label := "已关闭"
+	if mode.Enabled() {
+		label = "批评模式"
+	}
+	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM",
+		Summary: "风格评审模式已切换为" + label, Level: "info"})
+	return nil
+}
+
+// StyleReviewOverride 覆盖已耗尽的风格评审账本，追加 overridden 条目并允许后续提交。
+// chapter 必须 > 0，reason 必须非空。仅当账本当前状态为 exhausted 时允许操作。
+// 使用当前草稿摘要和基础摘要执行 append-only 覆盖。
+//
+// 覆盖后评审处于 overridden terminal "快照权威"状态：后续基础配置变更不阻挡 commit。
+// 操作成功后调用方应指示用户运行 /continue 以恢复 Writer 创作。
+func (h *Host) StyleReviewOverride(chapter int, reason string) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
+	if chapter <= 0 {
+		return fmt.Errorf("章节号必须大于 0")
+	}
+	if strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("覆盖原因不能为空")
+	}
+
+	// 1. 加载账本
+	ledger, err := h.store.StyleReview.Load(chapter)
+	if err != nil {
+		return fmt.Errorf("加载风格评审账本: %w", err)
+	}
+	if ledger == nil || ledger.IsEmpty() {
+		return fmt.Errorf("第 %d 章尚无风格评审账本", chapter)
+	}
+	if ledger.CurrentStatus() != domain.ReviewStatusExhausted {
+		return fmt.Errorf("第 %d 章当前评审状态 %q，仅 exhausted 可被覆盖", chapter, ledger.CurrentStatus())
+	}
+
+	// 2. 加载草稿并计算摘要
+	content, _, err := h.store.Drafts.LoadChapterContent(chapter)
+	if err != nil {
+		return fmt.Errorf("加载草稿: %w", err)
+	}
+	if content == "" {
+		return fmt.Errorf("第 %d 章无草稿内容", chapter)
+	}
+	draftDigest := domain.DigestDraft(content)
+
+	// 3. 计算基础摘要（使用固定版本标识，与 commit gate 校验一致）
+	const overrideVersion = "override-v1"
+	basisDigest := tools.ComputeBasisDigest(h.store, chapter, overrideVersion)
+
+	// 4. Append-only 覆盖
+	now := time.Now().Format(time.RFC3339)
+	if err := h.store.StyleReview.Update(chapter, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
+		if cur == nil {
+			return nil, fmt.Errorf("账本已消失")
+		}
+		nextCycle := len(cur.Cycles) + 1
+		cur.Cycles = append(cur.Cycles, domain.StyleReviewEntry{
+			Cycle:       nextCycle,
+			Status:      domain.ReviewStatusOverridden,
+			CreatedAt:   now,
+			AttemptID:   fmt.Sprintf("override-%d-%d", chapter, time.Now().UnixNano()),
+			Request:     &domain.StyleReviewRequest{Prompt: overrideVersion},
+			DraftDigest: draftDigest,
+			BasisDigest: basisDigest,
+			// Override 记录用户干预的审计轨迹
+			Override: &domain.StyleReviewOverride{
+				Actor:        "user",
+				Reason:       reason,
+				DraftDigest:  draftDigest,
+				BasisDigest:  basisDigest,
+				OverriddenAt: now,
+			},
+		})
+		return cur, nil
+	}); err != nil {
+		return fmt.Errorf("追加 overridden 条目: %w", err)
+	}
+
+	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM",
+		Summary: fmt.Sprintf("已覆盖第 %d 章风格评审（原因：%s），现在可以提交。请运行 /continue 恢复 Writer 创作", chapter, reason), Level: "info"})
 	return nil
 }
 

@@ -114,6 +114,12 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 	if a.Chapter <= 0 {
 		return nil, fmt.Errorf("chapter must be > 0: %w", errs.ErrToolArgs)
 	}
+
+	// critic 模式 commit 闸门：校验一致性、账本状态、摘要匹配
+	if err := CheckCommitStyleGate(t.store, a.Chapter); err != nil {
+		return nil, fmt.Errorf("commit_chapter: %w", err)
+	}
+
 	if t.store.Progress.IsChapterCompleted(a.Chapter) {
 		// 清理可能残留的 PendingCommit（崩溃发生在 ProgressMarked 之后、ClearPendingCommit 之前）
 		if pending, _ := t.store.Signals.LoadPendingCommit(); pending != nil && pending.Chapter == a.Chapter {

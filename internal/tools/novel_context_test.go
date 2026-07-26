@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/rules"
@@ -1388,7 +1389,7 @@ func TestBuildCompassInjectionView_LongPriority(t *testing.T) {
 			Taboos: []string{"current禁忌"},
 			Dialogue: []domain.CharacterVoice{
 				{Name: "全局角色", Rules: []string{"current对话"}}, // 同角色→合并时 long 优先
-				{Name: "弧角色", Rules: []string{"弧特有对话"}},    // long 没有→应出现
+				{Name: "弧角色", Rules: []string{"弧特有对话"}},      // long 没有→应出现
 			},
 			LastUpdated: "2024-03-01T00:00:00Z",
 		},
@@ -2609,5 +2610,1861 @@ func TestContextToolLoadingSummaryNoArchiveRefs(t *testing.T) {
 	}
 	if strings.Contains(payload.Summary, "存档引用:") {
 		t.Fatalf("expected no '存档引用:' in loading summary without markers, got %q", payload.Summary)
+	}
+}
+
+// ── style_rules.current 章节作用域校验（layered 模式） ──
+//
+//	layered 模式下，Writer/Editor 的 chapter 上下文仅当目标章节实际属于
+//	style_rules.current 的卷/弧时，才注入 current prose/dialogue/taboos。
+//	不匹配时降级为仅 long 规则并发出上下文警告。
+//	历史重写章节使用分层大纲定位，不依赖 Progress.CurrentVolume/CurrentArc。
+
+// setupLayeredStyleRulesScopeTest 创建分层大纲+进度的测试存储。
+// 大纲结构：卷1弧1(1-2章)、卷1弧2(3-4章)、卷2弧1(5-6章)。
+// current 指向卷1弧1。
+func setupLayeredStyleRulesScopeTest(t *testing.T) *store.Store {
+	t.Helper()
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 6); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatalf("SetLayered: %v", err)
+	}
+	if err := s.Progress.UpdateVolumeArc(1, 1); err != nil {
+		t.Fatalf("UpdateVolumeArc: %v", err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatalf("SavePremise: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开篇", CoreEvent: "故事开始"},
+		{Chapter: 2, Title: "推进", CoreEvent: "弧内推进"},
+		{Chapter: 3, Title: "转折", CoreEvent: "弧转折"},
+		{Chapter: 4, Title: "收束", CoreEvent: "弧收束"},
+		{Chapter: 5, Title: "新卷", CoreEvent: "第二卷开端"},
+		{Chapter: 6, Title: "新章", CoreEvent: "第二卷推进"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SaveLayeredOutline([]domain.VolumeOutline{
+		{
+			Index: 1, Title: "第一卷", Theme: "启程",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "弧一", Goal: "建立", Chapters: []domain.OutlineEntry{
+					{Chapter: 1, Title: "开篇"},
+					{Chapter: 2, Title: "推进"},
+				}},
+				{Index: 2, Title: "弧二", Goal: "冲突", Chapters: []domain.OutlineEntry{
+					{Chapter: 3, Title: "转折"},
+					{Chapter: 4, Title: "收束"},
+				}},
+			},
+		},
+		{
+			Index: 2, Title: "第二卷", Theme: "深入",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "弧一", Goal: "探索", Chapters: []domain.OutlineEntry{
+					{Chapter: 5, Title: "新卷"},
+					{Chapter: 6, Title: "新章"},
+				}},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("SaveLayeredOutline: %v", err)
+	}
+	return s
+}
+
+func TestStyleRulesCurrent_ScopeMatch_Writer(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose:  []string{"长期规则"},
+		Taboos: []string{"长期禁忌"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose:       []string{"当前弧规则"},
+		Taboos:      []string{"当前弧禁忌"},
+		Dialogue:    []domain.CharacterVoice{{Name: "弧角色", Rules: []string{"弧对话风格"}}},
+		LastUpdated: "2024-06-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 2})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp == nil {
+		t.Fatal("expected reference_pack")
+	}
+	sr, exists := rp["style_rules"]
+	if !exists {
+		t.Fatal("writer should see style_rules")
+	}
+	srMap := sr.(map[string]any)
+	if _, has := srMap["long"]; !has {
+		t.Fatal("expected 'long' sub-object")
+	}
+	if _, has := srMap["current"]; !has {
+		t.Fatal("expected 'current' sub-object when chapter matches")
+	}
+	if srMap["volume"] != float64(1) || srMap["arc"] != float64(1) {
+		t.Fatalf("volume/arc from current: %v/%v", srMap["volume"], srMap["arc"])
+	}
+}
+
+func TestStyleRulesCurrent_ScopeMismatch_Writer(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose:  []string{"长期规则"},
+		Taboos: []string{"长期禁忌"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose:       []string{"当前弧规则"},
+		Taboos:      []string{"当前弧禁忌"},
+		Dialogue:    []domain.CharacterVoice{{Name: "弧角色", Rules: []string{"弧对话风格"}}},
+		LastUpdated: "2024-06-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 4})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	warns, _ := payload["_warnings"].([]any)
+	if len(warns) == 0 {
+		t.Fatal("expected _warnings for scope mismatch")
+	}
+	foundScopeWarn := false
+	for _, w := range warns {
+		if strings.Contains(w.(string), "style_rules_current_scope") {
+			foundScopeWarn = true
+			break
+		}
+	}
+	if !foundScopeWarn {
+		t.Fatalf("expected style_rules_current_scope warning, got: %v", warns)
+	}
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp == nil {
+		t.Fatal("expected reference_pack")
+	}
+	sr, exists := rp["style_rules"]
+	if !exists {
+		t.Fatal("writer should see style_rules (long remains)")
+	}
+	srMap := sr.(map[string]any)
+	if _, has := srMap["current"]; has {
+		t.Fatal("'current' sub-object must be absent on scope mismatch")
+	}
+}
+
+func TestStyleRulesCurrent_ScopeMatch_Editor(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose: []string{"长期规则"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose: []string{"当前弧规则"},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "editor")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp == nil {
+		t.Fatal("expected reference_pack")
+	}
+	sr, exists := rp["style_rules"]
+	if !exists {
+		t.Fatal("editor should see style_rules")
+	}
+	srMap := sr.(map[string]any)
+	if _, has := srMap["current"]; !has {
+		t.Fatal("editor: 'current' sub-object should be present on match")
+	}
+}
+
+func TestStyleRulesCurrent_ScopeMismatch_Editor(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose: []string{"长期规则"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose: []string{"当前弧规则"},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "editor")
+	args, _ := json.Marshal(map[string]any{"chapter": 3})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	warns, _ := payload["_warnings"].([]any)
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w.(string), "style_rules_current_scope") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("editor should get scope warning, got: %v", warns)
+	}
+	rp, _ := payload["reference_pack"].(map[string]any)
+	sr, exists := rp["style_rules"]
+	if !exists {
+		t.Fatal("editor should see style_rules (long remains)")
+	}
+	srMap := sr.(map[string]any)
+	if _, has := srMap["current"]; has {
+		t.Fatal("editor: 'current' sub-object must be absent on mismatch")
+	}
+}
+
+func TestStyleRulesCurrent_NonLayeredCompat(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	s.Init()
+	s.Progress.Init("test", 5)
+	s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	})
+	s.Outline.SavePremise("## 题材和基调\n测试\n")
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose: []string{"长期规则"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose: []string{"当前规则"},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 2})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	rp, _ := payload["reference_pack"].(map[string]any)
+	sr, exists := rp["style_rules"]
+	if !exists {
+		t.Fatal("should see style_rules in non-layered mode")
+	}
+	srMap := sr.(map[string]any)
+	if _, has := srMap["current"]; !has {
+		t.Fatal("non-layered: current sub-object must be present")
+	}
+}
+
+func TestStyleRulesCurrent_OnlyCurrentMismatch(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{}, "test: long empty"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose:  []string{"仅当前弧规则"},
+		Taboos: []string{"仅当前弧禁忌"},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 6})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	warns, _ := payload["_warnings"].([]any)
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w.(string), "style_rules_current_scope") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected scope warning, got: %v", warns)
+	}
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp == nil {
+		t.Fatal("expected reference_pack")
+	}
+	if _, exists := rp["style_rules"]; exists {
+		t.Fatal("style_rules must not be injected when only current prose exists and chapter mismatched")
+	}
+}
+
+// ── Oracle gate 1: progress 不可用/目标章节不可定位时 fail closed ──
+
+func TestStyleRulesCurrent_ProgressNilFailClosed(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	s.Init()
+	s.Outline.SavePremise("## 题材和基调\n测试\n")
+	s.Outline.SaveLayeredOutline([]domain.VolumeOutline{
+		{
+			Index: 1, Title: "第一卷", Theme: "启程",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "弧一", Goal: "建立", Chapters: []domain.OutlineEntry{
+					{Chapter: 1, Title: "开篇"},
+				}},
+			},
+		},
+	})
+	s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开篇", CoreEvent: "故事开始"},
+	})
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose:  []string{"长期规则"},
+		Taboos: []string{"长期禁忌"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose:       []string{"当前规则"},
+		Taboos:      []string{"当前禁忌"},
+		LastUpdated: "2024-06-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	warns, _ := payload["_warnings"].([]any)
+	if len(warns) == 0 {
+		t.Fatal("expected _warnings for nil progress")
+	}
+	foundScopeWarn := false
+	for _, w := range warns {
+		if strings.Contains(w.(string), "style_rules_current_scope") {
+			foundScopeWarn = true
+			break
+		}
+	}
+	if !foundScopeWarn {
+		t.Fatalf("expected style_rules_current_scope warning, got: %v", warns)
+	}
+	rp, _ := payload["reference_pack"].(map[string]any)
+	sr, exists := rp["style_rules"]
+	if !exists {
+		t.Fatal("style_rules should be injected (long remains)")
+	}
+	srMap := sr.(map[string]any)
+	if _, hasCur := srMap["current"]; hasCur {
+		t.Fatal("'current' sub-object must be absent when progress is nil")
+	}
+	if _, hasVol := srMap["volume"]; hasVol {
+		t.Fatal("flat 'volume' must be absent when progress nil")
+	}
+	if _, hasArc := srMap["arc"]; hasArc {
+		t.Fatal("flat 'arc' must be absent when progress nil")
+	}
+	if _, hasLong := srMap["long"]; !hasLong {
+		t.Fatal("'long' sub-object should remain")
+	}
+}
+
+func TestStyleRulesCurrent_UnlocatableChapterFailClosed(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose:  []string{"长期规则"},
+		Taboos: []string{"长期禁忌"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose:       []string{"当前规则"},
+		Taboos:      []string{"当前禁忌"},
+		LastUpdated: "2024-06-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 99})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	warns, _ := payload["_warnings"].([]any)
+	if len(warns) == 0 {
+		t.Fatal("expected _warnings for unlocatable chapter")
+	}
+	foundScopeWarn := false
+	for _, w := range warns {
+		if strings.Contains(w.(string), "style_rules_current_scope") {
+			foundScopeWarn = true
+			break
+		}
+	}
+	if !foundScopeWarn {
+		t.Fatalf("expected style_rules_current_scope warning, got: %v", warns)
+	}
+	rp, _ := payload["reference_pack"].(map[string]any)
+	sr, exists := rp["style_rules"]
+	if !exists {
+		t.Fatal("style_rules should be injected (long remains)")
+	}
+	srMap := sr.(map[string]any)
+	if _, hasCur := srMap["current"]; hasCur {
+		t.Fatal("'current' must be absent when chapter is unlocatable")
+	}
+}
+
+// ── writer_style_card ──
+
+func writerStyleCardContent(t *testing.T, payload map[string]any) map[string]any {
+	t.Helper()
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp == nil {
+		return nil
+	}
+	card, _ := rp["writer_style_card"].(map[string]any)
+	return card
+}
+
+func TestWriterStyleCard_ScopeMatch_Writer(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose: []string{"长期规则"},
+		Dialogue: []domain.CharacterVoice{
+			{Name: "全局角色", Rules: []string{"全局语气"}},
+		},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose: []string{"当前规则"},
+		Dialogue: []domain.CharacterVoice{
+			{Name: "全局角色", Rules: []string{"当前语气"}},
+			{Name: "弧角色", Rules: []string{"弧语气"}},
+		},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 2})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	card := writerStyleCardContent(t, payload)
+	if card == nil {
+		t.Fatal("expected writer_style_card")
+	}
+	prose, _ := card["prose"].([]any)
+	if len(prose) != 2 || prose[0] != "长期规则" || prose[1] != "当前规则" {
+		t.Fatalf("prose mismatch: %v", prose)
+	}
+	dialogue, _ := card["dialogue"].([]any)
+	if len(dialogue) != 2 {
+		t.Fatalf("expected 2 dialogue entries, got %d", len(dialogue))
+	}
+	gEntry := dialogue[0].(map[string]any)
+	if gEntry["name"] != "全局角色" || gEntry["rules"].([]any)[0] != "全局语气" {
+		t.Fatalf("global dialogue should use long rules: %+v", gEntry)
+	}
+	for _, key := range []string{"taboos", "volume", "arc", "last_updated"} {
+		if _, has := card[key]; has {
+			t.Fatalf("writer_style_card must not contain %q", key)
+		}
+	}
+}
+
+func TestWriterStyleCard_ScopeMismatch_Writer(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose: []string{"长期规则"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose: []string{"当前规则"},
+		Dialogue: []domain.CharacterVoice{
+			{Name: "弧角色", Rules: []string{"弧语气"}},
+		},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 4})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	card := writerStyleCardContent(t, payload)
+	if card == nil {
+		t.Fatal("expected writer_style_card (long prose remains)")
+	}
+	prose, _ := card["prose"].([]any)
+	if len(prose) != 1 || prose[0] != "长期规则" {
+		t.Fatalf("mismatch: prose should be only from long, got %v", prose)
+	}
+	if _, hasDi := card["dialogue"]; hasDi {
+		t.Fatal("dialogue must be absent on mismatch (was from current)")
+	}
+	warns, _ := payload["_warnings"].([]any)
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w.(string), "style_rules_current_scope") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected scope warning, got: %v", warns)
+	}
+}
+
+func TestWriterStyleCard_NotForEditor(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose: []string{"长期规则"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose: []string{"当前规则"},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "editor")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	card := writerStyleCardContent(t, payload)
+	if card != nil {
+		t.Fatal("editor must not get writer_style_card")
+	}
+}
+
+func TestWriterStyleCard_NotForArchitect(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose: []string{"长期规则"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose: []string{"当前规则"},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "architect")
+	args, _ := json.Marshal(map[string]any{})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	card := writerStyleCardContent(t, payload)
+	if card != nil {
+		t.Fatal("architect must not get writer_style_card")
+	}
+}
+
+func TestWriterStyleCard_NotForCoordinator(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose: []string{"长期规则"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose: []string{"当前规则"},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "coordinator")
+	args, _ := json.Marshal(map[string]any{})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	card := writerStyleCardContent(t, payload)
+	if card != nil {
+		t.Fatal("coordinator must not get writer_style_card")
+	}
+}
+
+func TestWriterStyleCard_AbsentWhenCompassNil(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	s.Init()
+	s.Progress.Init("test", 3)
+	s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	})
+	s.Outline.SavePremise("## 题材和基调\n测试\n")
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	card := writerStyleCardContent(t, payload)
+	if card != nil {
+		t.Fatal("writer_style_card must be absent when compass is nil")
+	}
+}
+
+// ── writer_style_card 防御性上限 ──
+
+func TestWriterStyleCard_OversizedCompassCaps(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	s.Init()
+	if err := s.Progress.Init("test", 10); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatalf("SetLayered: %v", err)
+	}
+	if err := s.Progress.UpdateVolumeArc(1, 1); err != nil {
+		t.Fatalf("UpdateVolumeArc: %v", err)
+	}
+	s.Outline.SavePremise("## 题材和基调\n测试\n")
+	s.Outline.SaveLayeredOutline([]domain.VolumeOutline{
+		{
+			Index: 1, Title: "V1", Theme: "T",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "A1", Goal: "G", Chapters: []domain.OutlineEntry{
+					{Chapter: 1, Title: "ch1"},
+					{Chapter: 2, Title: "ch2"},
+				}},
+			},
+		},
+	})
+	s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "ch1"},
+		{Chapter: 2, Title: "ch2"},
+	})
+
+	// ── long: 15 prose, 15 dialogue chars ──
+	longProse := make([]string, 15)
+	for i := range longProse {
+		if i == 0 {
+			longProse[i] = strings.Repeat("长", 250)
+		} else {
+			longProse[i] = fmt.Sprintf("长期规则%d", i)
+		}
+	}
+	longDialogue := make([]domain.CharacterVoice, 15)
+	for i := range longDialogue {
+		rules := make([]string, 12)
+		for j := range rules {
+			rules[j] = fmt.Sprintf("L%d", j)
+		}
+		if i == 0 {
+			rules[0] = strings.Repeat("超", 250)
+		}
+		longDialogue[i] = domain.CharacterVoice{
+			Name:  fmt.Sprintf("长角色%02d", i),
+			Rules: rules,
+		}
+	}
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose:    longProse,
+		Dialogue: longDialogue,
+	}, "test: oversized long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+
+	// ── current: 25 prose, 25 dialogue chars (部分同名) ──
+	currentProse := make([]string, 25)
+	for i := range currentProse {
+		currentProse[i] = fmt.Sprintf("当前%d", i)
+	}
+	currentDialogue := make([]domain.CharacterVoice, 25)
+	for i := range currentDialogue {
+		rules := make([]string, 12)
+		for j := range rules {
+			rules[j] = fmt.Sprintf("C%d", j)
+		}
+		var name string
+		if i < 5 {
+			name = fmt.Sprintf("长角色%02d", i)
+		} else {
+			name = fmt.Sprintf("短角色%02d", i)
+		}
+		currentDialogue[i] = domain.CharacterVoice{
+			Name:  name,
+			Rules: rules,
+		}
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose:    currentProse,
+		Dialogue: currentDialogue,
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+
+	// ── Execute ──
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+
+	card := writerStyleCardContent(t, payload)
+	if card == nil {
+		t.Fatal("expected writer_style_card")
+	}
+
+	// 1. MaxProseRules cap: 20 (15 long + 5 current dedup)
+	prose, _ := card["prose"].([]any)
+	if len(prose) > 20 {
+		t.Fatalf("prose rules capped at 20, got %d", len(prose))
+	}
+	if len(prose) != 20 {
+		t.Fatalf("expected exactly 20 prose rules (15 long + 5 current dedup), got %d", len(prose))
+	}
+	for i := 0; i < 15; i++ {
+		if i == 0 {
+			continue // truncated 250 '长' to 200
+		}
+		if !strings.Contains(prose[i].(string), "长期规则") {
+			t.Fatalf("prose[%d] should be long rule, got %q", i, prose[i])
+		}
+	}
+	for i := 15; i < 20; i++ {
+		if !strings.HasPrefix(prose[i].(string), "当前") {
+			t.Fatalf("prose[%d] should be current rule, got %q", i, prose[i])
+		}
+	}
+	rule0 := prose[0].(string)
+	if len([]rune(rule0)) > 200 {
+		t.Fatalf("rule[0] truncated to ≤200 runes, got %d", len([]rune(rule0)))
+	}
+	if len([]rune(rule0)) != 200 {
+		t.Fatalf("rule[0] expected exactly 200 runes (was 250, truncated), got %d", len([]rune(rule0)))
+	}
+
+	// 2. MaxDialogueChars cap: 20 (15 long + 5 current new)
+	dialogue, _ := card["dialogue"].([]any)
+	if len(dialogue) > 20 {
+		t.Fatalf("dialogue chars capped at 20, got %d", len(dialogue))
+	}
+	if len(dialogue) != 20 {
+		t.Fatalf("expected exactly 20 dialogue chars (15 long + 5 current new), got %d", len(dialogue))
+	}
+	for i, d := range dialogue {
+		entry := d.(map[string]any)
+		name := entry["name"].(string)
+		if i < 15 {
+			if !strings.HasPrefix(name, "长角色") {
+				t.Fatalf("dialogue[%d] should be long char, got %q", i, name)
+			}
+		} else {
+			if !strings.HasPrefix(name, "短角色") {
+				t.Fatalf("dialogue[%d] should be current new char, got %q", i, name)
+			}
+		}
+	}
+
+	// 3. MaxRulesPerChar cap: 10 (12 provided, capped to 10)
+	for i, d := range dialogue {
+		entry := d.(map[string]any)
+		rules, _ := entry["rules"].([]any)
+		if len(rules) > 10 {
+			t.Fatalf("dialogue[%d] rules capped at 10, got %d", i, len(rules))
+		}
+		if len(rules) != 10 {
+			t.Fatalf("dialogue[%d] expected exactly 10 rules (was 12, truncated), got %d", i, len(rules))
+		}
+		if i == 0 {
+			rule0 := rules[0].(string)
+			if len([]rune(rule0)) > 200 {
+				t.Fatalf("dialogue[0].rules[0] truncated to ≤200 runes, got %d", len([]rune(rule0)))
+			}
+			if len([]rune(rule0)) != 200 {
+				t.Fatalf("dialogue[0].rules[0] expected exactly 200 runes (was 250, truncated), got %d", len([]rune(rule0)))
+			}
+		}
+	}
+
+	// 4. Rule len cap (already verified above)
+
+	// 5. Total bytes cap
+	raw, _ := json.Marshal(card)
+	if len(raw) > 4096 {
+		t.Fatalf("writer_style_card total bytes capped at 4096, got %d", len(raw))
+	}
+
+	// No scope warning (matching chapter)
+	if warns, _ := payload["_warnings"].([]any); len(warns) > 0 {
+		for _, w := range warns {
+			if strings.Contains(w.(string), "style_rules_current_scope") {
+				t.Fatal("no scope warning on match")
+			}
+		}
+	}
+}
+
+// ── Style review mode/status in Writer context ──
+
+// TestContextToolWriterSeesStyleReviewModeAndStatus 验证 Writer 上下文的
+// checkpoint 中暴露 style_review_mode 和 style_review_status，且其他角色不可见。
+func TestContextToolWriterSeesStyleReviewModeAndStatus(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatalf("SavePremise: %v", err)
+	}
+
+	// 设置 critic 模式
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+
+	// 创建评审账本并写入已知状态（initial_pending → accepted_initial）
+	now := time.Now().Format(time.RFC3339)
+	draftDigest := "sha256:" + strings.Repeat("a", 64)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       1,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle:     1,
+				Status:    domain.ReviewStatusInitialPending,
+				CreatedAt: now,
+				AttemptID: "test-initial",
+				Request: &domain.StyleReviewRequest{
+					Prompt:      "test-critic-v1",
+					Model:       "test-model",
+					RequestedAt: now,
+				},
+				DraftDigest: draftDigest,
+				BasisDigest: basisDigest,
+			},
+			{
+				Cycle:     2,
+				Status:    domain.ReviewStatusAcceptedInitial,
+				CreatedAt: now,
+				AttemptID: "test-initial",
+				Request: &domain.StyleReviewRequest{
+					Prompt:      "test-critic-v1",
+					Model:       "test-model",
+					RequestedAt: now,
+				},
+				Result: &domain.StyleReviewResult{
+					Verdict:  domain.ReviewVerdictPass,
+					Evidence: "ok",
+				},
+				DraftDigest: draftDigest,
+				BasisDigest: basisDigest,
+			},
+		},
+	}
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	// ── Writer 应该看到 mode + status ──
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	working, ok := payload["working_memory"].(map[string]any)
+	if !ok {
+		t.Fatal("expected working_memory")
+	}
+	cp, ok := working["checkpoint"].(map[string]any)
+	if !ok {
+		t.Fatal("expected checkpoint in working_memory")
+	}
+
+	mode, hasMode := cp["style_review_mode"]
+	if !hasMode {
+		t.Fatal("Writer checkpoint must have style_review_mode when critic mode is set")
+	}
+	if mode != string(domain.StyleQualityCritic) {
+		t.Fatalf("style_review_mode expected %q, got %v", domain.StyleQualityCritic, mode)
+	}
+
+	status, hasStatus := cp["style_review_status"]
+	if !hasStatus {
+		t.Fatal("Writer checkpoint must have style_review_status when ledger exists")
+	}
+	if status != string(domain.ReviewStatusAcceptedInitial) {
+		t.Fatalf("style_review_status expected %q, got %v", domain.ReviewStatusAcceptedInitial, status)
+	}
+
+	// 无账本时 status 不应出现
+	args2, _ := json.Marshal(map[string]any{"chapter": 2})
+	result2, err := tool.Execute(context.Background(), args2)
+	if err != nil {
+		t.Fatalf("Execute ch2: %v", err)
+	}
+	var payload2 map[string]any
+	json.Unmarshal(result2, &payload2)
+	working2 := payload2["working_memory"].(map[string]any)
+	cp2, _ := working2["checkpoint"].(map[string]any)
+	if _, hasMode2 := cp2["style_review_mode"]; !hasMode2 {
+		t.Fatal("Writer checkpoint must have style_review_mode even without ledger")
+	}
+	if _, hasStatus2 := cp2["style_review_status"]; hasStatus2 {
+		t.Fatal("Writer checkpoint must not have style_review_status when no ledger exists")
+	}
+}
+
+// TestContextToolWriterStyleReviewStatusExhausted 验证 exhausted 状态正确暴露。
+func TestContextToolWriterStyleReviewStatusExhausted(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatalf("SavePremise: %v", err)
+	}
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+
+	// 创建 exhausted 账本
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       1,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle:     1,
+				Status:    domain.ReviewStatusInitialPending,
+				CreatedAt: now,
+				AttemptID: "ex-initial",
+				Request: &domain.StyleReviewRequest{
+					Prompt:      "test-critic-v1",
+					Model:       "test-model",
+					RequestedAt: now,
+				},
+				DraftDigest: "sha256:" + strings.Repeat("a", 64),
+				BasisDigest: "sha256:" + strings.Repeat("b", 64),
+			},
+			{
+				Cycle:     2,
+				Status:    domain.ReviewStatusRevisionOpen,
+				CreatedAt: now,
+				AttemptID: "ex-initial",
+				Request: &domain.StyleReviewRequest{
+					Prompt:      "test-critic-v1",
+					Model:       "test-model",
+					RequestedAt: now,
+				},
+				Result: &domain.StyleReviewResult{
+					Verdict:  domain.ReviewVerdictRevise,
+					Evidence: "needs work",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Severity: "warning", Category: "style", Evidence: "slow start"},
+					},
+				},
+				DraftDigest: "sha256:" + strings.Repeat("a", 64),
+				BasisDigest: "sha256:" + strings.Repeat("b", 64),
+			},
+			{
+				Cycle:     3,
+				Status:    domain.ReviewStatusFinalPending,
+				CreatedAt: now,
+				AttemptID: "ex-final",
+				Request: &domain.StyleReviewRequest{
+					Prompt:      "test-critic-v1",
+					Model:       "test-model",
+					RequestedAt: now,
+				},
+				DraftDigest: "sha256:" + strings.Repeat("a", 64),
+				BasisDigest: "sha256:" + strings.Repeat("b", 64),
+			},
+			{
+				Cycle:     4,
+				Status:    domain.ReviewStatusExhausted,
+				CreatedAt: now,
+				AttemptID: "ex-final",
+				Request: &domain.StyleReviewRequest{
+					Prompt:      "test-critic-v1",
+					Model:       "test-model",
+					RequestedAt: now,
+				},
+				Result: &domain.StyleReviewResult{
+					Verdict:  domain.ReviewVerdictRevise,
+					Evidence: "still needs work",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Severity: "warning", Category: "style", Evidence: "slow start"},
+					},
+				},
+				DraftDigest: "sha256:" + strings.Repeat("a", 64),
+				BasisDigest: "sha256:" + strings.Repeat("b", 64),
+			},
+		},
+	}
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save exhausted ledger: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	working := payload["working_memory"].(map[string]any)
+	cp := working["checkpoint"].(map[string]any)
+
+	status, _ := cp["style_review_status"].(string)
+	if status != string(domain.ReviewStatusExhausted) {
+		t.Fatalf("expected exhausted status, got %q", status)
+	}
+}
+
+// TestContextToolWriterStyleReviewOffMode 验证 off 模式下不暴露 mode/status。
+func TestContextToolWriterStyleReviewOffMode(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatalf("SavePremise: %v", err)
+	}
+	// 默认 mode 是 off，不设置 critic 模式
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	working := payload["working_memory"].(map[string]any)
+	cp, ok := working["checkpoint"].(map[string]any)
+	if !ok {
+		t.Fatal("expected checkpoint")
+	}
+	if _, hasMode := cp["style_review_mode"]; hasMode {
+		t.Fatal("off mode must not inject style_review_mode")
+	}
+	if _, hasStatus := cp["style_review_status"]; hasStatus {
+		t.Fatal("off mode must not inject style_review_status")
+	}
+}
+
+// TestContextToolWriterStyleReviewDegraded 验证 degraded 状态正确暴露。
+func TestContextToolWriterStyleReviewDegraded(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatalf("SavePremise: %v", err)
+	}
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+
+	draftDigest := "sha256:" + strings.Repeat("a", 64)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       1,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle:     1,
+				Status:    domain.ReviewStatusInitialPending,
+				CreatedAt: now,
+				AttemptID: "deg-initial",
+				Request: &domain.StyleReviewRequest{
+					Prompt:      "test-critic-v1",
+					Model:       "test-model",
+					RequestedAt: now,
+				},
+				DraftDigest: draftDigest,
+				BasisDigest: basisDigest,
+			},
+			{
+				Cycle:     2,
+				Status:    domain.ReviewStatusDegraded,
+				CreatedAt: now,
+				AttemptID: "deg-initial",
+				Request: &domain.StyleReviewRequest{
+					Prompt:      "test-critic-v1",
+					Model:       "test-model",
+					RequestedAt: now,
+				},
+				Error:       "critic model unreachable",
+				DraftDigest: draftDigest,
+				BasisDigest: basisDigest,
+			},
+		},
+	}
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	working := payload["working_memory"].(map[string]any)
+	cp := working["checkpoint"].(map[string]any)
+
+	status, _ := cp["style_review_status"].(string)
+	if status != string(domain.ReviewStatusDegraded) {
+		t.Fatalf("expected degraded status, got %q", status)
+	}
+}
+
+// ── 损坏 progress 时 fail closed ──
+
+func TestWriterStyleCard_CorruptProgressStripsCurrent(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 10); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Progress.SetLayered(true); err != nil {
+		t.Fatalf("SetLayered: %v", err)
+	}
+	if err := s.Progress.UpdateVolumeArc(1, 1); err != nil {
+		t.Fatalf("UpdateVolumeArc: %v", err)
+	}
+	// Corrupt progress.json
+	progressPath := filepath.Join(dir, "meta", "progress.json")
+	if err := os.WriteFile(progressPath, []byte("{broken json"), 0o644); err != nil {
+		t.Fatalf("WriteFile corrupt progress: %v", err)
+	}
+	s.Outline.SavePremise("## 题材和基调\n测试\n")
+	s.Outline.SaveLayeredOutline([]domain.VolumeOutline{
+		{
+			Index: 1, Title: "V1", Theme: "T",
+			Arcs: []domain.ArcOutline{
+				{Index: 1, Title: "A1", Goal: "G", Chapters: []domain.OutlineEntry{
+					{Chapter: 1, Title: "ch1"},
+				}},
+			},
+		},
+	})
+	s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "ch1"},
+	})
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Prose: []string{"长期规则"},
+	}, "test: long"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose: []string{"当前规则"},
+		Dialogue: []domain.CharacterVoice{
+			{Name: "弧角色", Rules: []string{"弧语气"}},
+		},
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+
+	// ── style_rules 排除 current ──
+	rp, _ := payload["reference_pack"].(map[string]any)
+	sr, exists := rp["style_rules"]
+	if !exists {
+		t.Fatal("expected style_rules (long remains)")
+	}
+	srMap := sr.(map[string]any)
+	if _, hasCur := srMap["current"]; hasCur {
+		t.Fatal("style_rules 'current' must be absent when progress is corrupt")
+	}
+	if _, hasVol := srMap["volume"]; hasVol {
+		t.Fatal("style_rules flat 'volume' must be absent when progress corrupt")
+	}
+	if _, hasArc := srMap["arc"]; hasArc {
+		t.Fatal("style_rules flat 'arc' must be absent when progress corrupt")
+	}
+	if _, hasLong := srMap["long"]; !hasLong {
+		t.Fatal("style_rules 'long' sub-object must remain")
+	}
+
+	// ── writer_style_card 不含 current 衍生物 ──
+	card := writerStyleCardContent(t, payload)
+	if card == nil {
+		t.Fatal("expected writer_style_card (long prose remains)")
+	}
+	prose, _ := card["prose"].([]any)
+	if len(prose) != 1 || prose[0] != "长期规则" {
+		t.Fatalf("card prose should be only long rule, got %v", prose)
+	}
+	if _, hasDi := card["dialogue"]; hasDi {
+		t.Fatal("card dialogue must be absent (was from current)")
+	}
+
+	// ── warning ──
+	warns, _ := payload["_warnings"].([]any)
+	if len(warns) == 0 {
+		t.Fatal("expected _warnings for corrupt progress")
+	}
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w.(string), "style_rules_current_scope") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected style_rules_current_scope warning, got: %v", warns)
+	}
+}
+
+// TestStyleRulesCurrent_NestedAndFlattenedFieldAbsenceOnMismatch
+// verifies that on scope mismatch both nested current fields and flat
+// volume/arc/last_updated are absent while long taboos remain.
+func TestStyleRulesCurrent_NestedAndFlattenedFieldAbsenceOnMismatch(t *testing.T) {
+	s := setupLayeredStyleRulesScopeTest(t)
+	if err := s.World.SaveStyleRulesLong(domain.StyleRulesLong{
+		Taboos: []string{"全书禁忌"},
+	}, "test: long only taboos"); err != nil {
+		t.Fatalf("SaveStyleRulesLong: %v", err)
+	}
+	if err := s.World.SaveStyleRulesCurrent(domain.StyleRulesCurrent{
+		Volume: 1, Arc: 1,
+		Prose:       []string{"仅当前弧规则"},
+		Dialogue:    []domain.CharacterVoice{{Name: "弧角", Rules: []string{"弧语"}}},
+		LastUpdated: "2024-06-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("SaveStyleRulesCurrent: %v", err)
+	}
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 5})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	warns, _ := payload["_warnings"].([]any)
+	if len(warns) == 0 {
+		t.Fatal("expected _warnings on scope mismatch")
+	}
+	rp, _ := payload["reference_pack"].(map[string]any)
+	if rp == nil {
+		t.Fatal("expected reference_pack")
+	}
+	sr, exists := rp["style_rules"]
+	if !exists {
+		t.Fatal("style_rules should be injected (long taboos remain)")
+	}
+	srMap := sr.(map[string]any)
+
+	// Nested: current absent
+	if _, hasCurrent := srMap["current"]; hasCurrent {
+		t.Fatal("'current' sub-object must be absent on scope mismatch")
+	}
+	// Long present
+	if _, hasLong := srMap["long"]; !hasLong {
+		t.Fatal("expected 'long' sub-object (taboos remain)")
+	}
+	// Flat fields from current all absent
+	for _, key := range []string{"volume", "arc", "last_updated", "prose", "dialogue"} {
+		if _, has := srMap[key]; has {
+			t.Fatalf("flat %q must be absent on mismatch", key)
+		}
+	}
+	// taboos flat field present (from long)
+	if _, has := srMap["taboos"]; !has {
+		t.Fatal("flat 'taboos' should be present (from long)")
+	}
+}
+
+// ── Style review feedback tests ──
+
+// TestContextToolWriterStyleReviewFeedback_RevisionOpen 验证 revision_open 状态
+// 下 Writer 能收到精炼反馈（strength + findings），且 feedback 不包含账本内部细节。
+func TestContextToolWriterStyleReviewFeedback_RevisionOpen(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatalf("SavePremise: %v", err)
+	}
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	draftDigest := "sha256:" + strings.Repeat("a", 64)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       1,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle:     1,
+				Status:    domain.ReviewStatusInitialPending,
+				CreatedAt: now,
+				AttemptID: "t-init",
+				Request: &domain.StyleReviewRequest{
+					Prompt: "v1", Model: "m", RequestedAt: now,
+				},
+				DraftDigest: draftDigest,
+				BasisDigest: basisDigest,
+			},
+			{
+				Cycle:     2,
+				Status:    domain.ReviewStatusRevisionOpen,
+				CreatedAt: now,
+				AttemptID: "t-init",
+				Request: &domain.StyleReviewRequest{
+					Prompt: "v1", Model: "m", RequestedAt: now,
+				},
+				Result: &domain.StyleReviewResult{
+					Verdict:  domain.ReviewVerdictRevise,
+					Evidence: "开篇紧凑，悬念设置到位",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Severity: "warning", Category: "style", Evidence: "第二段节奏偏慢", Suggestion: "压缩中间描述"},
+						{Dimension: "character", Severity: "info", Category: "tone", Evidence: "对话略显生硬", Suggestion: "增加口语化"},
+					},
+				},
+				DraftDigest: draftDigest,
+				BasisDigest: basisDigest,
+			},
+		},
+	}
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	working := payload["working_memory"].(map[string]any)
+	cp := working["checkpoint"].(map[string]any)
+
+	// 检查 mode + status
+	if cp["style_review_mode"] != "critic" {
+		t.Fatal("expected style_review_mode=critic")
+	}
+	if cp["style_review_status"] != "revision_open" {
+		t.Fatal("expected style_review_status=revision_open")
+	}
+
+	// 检查 feedback 存在且结构正确
+	fb, ok := cp["style_review_feedback"].(map[string]any)
+	if !ok {
+		t.Fatal("expected style_review_feedback in checkpoint for revision_open")
+	}
+	if fb["verdict"] != "revise" {
+		t.Fatalf("expected verdict=revise, got %v", fb["verdict"])
+	}
+	strength, ok := fb["strength"].(map[string]any)
+	if !ok {
+		t.Fatal("expected strength in feedback")
+	}
+	if !strings.Contains(strength["evidence"].(string), "开篇紧凑") {
+		t.Fatalf("strength evidence mismatch: %v", strength["evidence"])
+	}
+	findings, ok := fb["findings"].([]any)
+	if !ok || len(findings) != 2 {
+		t.Fatalf("expected 2 findings, got %d", len(findings))
+	}
+	// 检查不暴露账本内部细节
+	for _, key := range []string{"attempt_id", "draft_digest", "basis_digest", "request", "error", "override"} {
+		if _, has := cp[key]; has {
+			t.Fatalf("checkpoint must not expose ledger internal %q", key)
+		}
+	}
+}
+
+// TestContextToolWriterStyleReviewFeedback_Exhausted 验证 exhausted 状态下
+// Writer 能收到最后一条 revise result 的反馈。
+func TestContextToolWriterStyleReviewFeedback_Exhausted(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatalf("SavePremise: %v", err)
+	}
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	draftDigest := "sha256:" + strings.Repeat("a", 64)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       1,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: now, AttemptID: "x1",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				CreatedAt: now, AttemptID: "x1",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictRevise, Evidence: "好方向",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Severity: "error", Category: "style", Evidence: "太慢", Suggestion: "加快节奏"},
+					},
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 3, Status: domain.ReviewStatusFinalPending,
+				CreatedAt: now, AttemptID: "x2",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 4, Status: domain.ReviewStatusExhausted,
+				CreatedAt: now, AttemptID: "x2",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictRevise, Evidence: "仍未通过",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Severity: "error", Category: "style", Evidence: "仍太慢", Suggestion: "大幅压缩"},
+					},
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+		},
+	}
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	working := payload["working_memory"].(map[string]any)
+	cp := working["checkpoint"].(map[string]any)
+
+	status, _ := cp["style_review_status"].(string)
+	if status != "exhausted" {
+		t.Fatalf("expected exhausted status, got %q", status)
+	}
+
+	fb, ok := cp["style_review_feedback"].(map[string]any)
+	if !ok {
+		t.Fatal("expected style_review_feedback for exhausted")
+	}
+	if fb["verdict"] != "revise" {
+		t.Fatalf("expected verdict=revise, got %v", fb["verdict"])
+	}
+	// 应使用最后一条 result（exhausted 周期的），而不是 revision_open 的
+	findings := fb["findings"].([]any)
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(findings))
+	}
+	f0 := findings[0].(map[string]any)
+	if !strings.Contains(f0["evidence"].(string), "仍太慢") {
+		t.Fatalf("expected latest exhausted evidence, got %v", f0["evidence"])
+	}
+}
+
+// TestContextToolWriterStyleReviewFeedback_AcceptedInitialNoFeedback 验证
+// accepted_initial 等 terminal 状态不会产生 feedback。
+func TestContextToolWriterStyleReviewFeedback_AcceptedInitialNoFeedback(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatalf("SavePremise: %v", err)
+	}
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	draftDigest := "sha256:" + strings.Repeat("a", 64)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	ledger := buildPassLedger(t, 1, now, draftDigest, basisDigest)
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	working := payload["working_memory"].(map[string]any)
+	cp := working["checkpoint"].(map[string]any)
+
+	if _, has := cp["style_review_feedback"]; has {
+		t.Fatal("accepted_initial must not have style_review_feedback")
+	}
+}
+
+// TestContextToolWriterStyleReviewFeedback_NotForEditor 验证 Editor 看不到
+// style_review_feedback（仅 Writer）。
+func TestContextToolWriterStyleReviewFeedback_NotForEditor(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatalf("SavePremise: %v", err)
+	}
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	draftDigest := "sha256:" + strings.Repeat("a", 64)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	ledger := buildReviseLedger(t, 1, now, draftDigest, basisDigest)
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	// Editor 不应看到 feedback
+	tool := NewContextToolForRole(s, References{}, "default", "editor")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	if wm, ok := payload["working_memory"].(map[string]any); ok {
+		if cp, ok := wm["checkpoint"].(map[string]any); ok {
+			if _, has := cp["style_review_feedback"]; has {
+				t.Fatal("editor must not see style_review_feedback")
+			}
+		}
+	}
+}
+
+// TestContextToolWriterStyleReviewFeedback_FinalPending 验证 final_pending
+// 状态下有反馈（帮助 writer 了解之前的问题）。
+func TestContextToolWriterStyleReviewFeedback_FinalPending(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatalf("SavePremise: %v", err)
+	}
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	draftDigest := "sha256:" + strings.Repeat("a", 64)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	// initial_pending → revision_open → final_pending
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       1,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: now, AttemptID: "fp1",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				CreatedAt: now, AttemptID: "fp1",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictRevise, Evidence: "有潜力",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Severity: "warning", Category: "style", Evidence: "开头太慢", Suggestion: "加速"},
+					},
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 3, Status: domain.ReviewStatusFinalPending,
+				CreatedAt: now, AttemptID: "fp2",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+		},
+	}
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	working := payload["working_memory"].(map[string]any)
+	cp := working["checkpoint"].(map[string]any)
+
+	if cp["style_review_status"] != "final_pending" {
+		t.Fatalf("expected final_pending, got %v", cp["style_review_status"])
+	}
+	fb, ok := cp["style_review_feedback"].(map[string]any)
+	if !ok {
+		t.Fatal("expected style_review_feedback for final_pending")
+	}
+	if fb["verdict"] != "revise" {
+		t.Fatalf("expected verdict=revise, got %v", fb["verdict"])
+	}
+}
+
+// ── Helpers for feedback tests ──
+
+func buildPassLedger(t *testing.T, chapter int, now, draftDigest, basisDigest string) domain.StyleReviewLedger {
+	t.Helper()
+	return domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       chapter,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: now, AttemptID: "h-init",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 2, Status: domain.ReviewStatusAcceptedInitial,
+				CreatedAt: now, AttemptID: "h-init",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictPass, Evidence: "ok",
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+		},
+	}
+}
+
+func buildReviseLedger(t *testing.T, chapter int, now, draftDigest, basisDigest string) domain.StyleReviewLedger {
+	t.Helper()
+	return domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       chapter,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: now, AttemptID: "h-rev",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				CreatedAt: now, AttemptID: "h-rev",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictRevise, Evidence: "good",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Severity: "warning", Category: "style", Evidence: "slow", Suggestion: "fix"},
+					},
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+		},
 	}
 }

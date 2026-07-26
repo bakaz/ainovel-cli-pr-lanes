@@ -46,7 +46,7 @@ func TestConfigResolveReasoningEffort(t *testing.T) {
 }
 
 func TestValidateBaseRejectsNonConfigurableRoles(t *testing.T) {
-	for _, role := range []string{"coordinator", "arbiter"} {
+	for _, role := range []string{"coordinator", "arbiter", "invalid_role"} {
 		t.Run(role, func(t *testing.T) {
 			cfg := Config{
 				Provider:  "openrouter",
@@ -67,6 +67,56 @@ func TestValidateBaseRejectsNonConfigurableRoles(t *testing.T) {
 				t.Fatalf("应包装 errs.ErrConfig，得到: %v", err)
 			}
 		})
+	}
+}
+
+// TestCriticRole_ValidateAndFallback 验证 critic 角色可通过校验且无配置时回落默认模型。
+func TestCriticRole_ValidateAndFallback(t *testing.T) {
+	// critic 显式配置应通过校验
+	cfg := Config{
+		Provider:  "openrouter",
+		ModelName: "default-model",
+		Providers: map[string]ProviderConfig{
+			"openrouter": {APIKey: "sk-test-123456"},
+		},
+		Roles: map[string]RoleConfig{
+			"critic": {Provider: "openrouter", Model: "critic-model"},
+		},
+	}
+	if err := cfg.ValidateBase(); err != nil {
+		t.Fatalf("critic 角色配置应通过校验: %v", err)
+	}
+
+	// critic 未配置时回落到默认 —— ModelSet 的 ForRole 逻辑已覆盖
+	// （ForRole("critic") 返回 ms.Default），此测试仅验证配置校验不拒绝 critic。
+	// 不在 roles 中声明 critic 时的默认回落属于 ModelSet 行为。
+}
+
+// TestCriticRole_UnconfiguredFallsBack 验证未配 critic 角色时 ModelSet.ForRole 返回默认模型。
+func TestCriticRole_UnconfiguredFallsBack(t *testing.T) {
+	cfg := Config{
+		Provider:  "openrouter",
+		ModelName: "default-model",
+		Providers: map[string]ProviderConfig{
+			"openrouter": {Type: "openai", APIKey: "sk-test-123456"},
+		},
+		// Roles 明确缺失 critic —— 应回落默认
+		Roles: map[string]RoleConfig{
+			"writer": {Provider: "openrouter", Model: "writer-model"},
+		},
+	}
+	ms, err := NewModelSet(cfg)
+	if err != nil {
+		t.Fatalf("NewModelSet: %v", err)
+	}
+
+	// critic 未配置 -> ForRole 应返回默认模型
+	got := ms.ForRole("critic")
+	if got == nil {
+		t.Fatal("未配置 critic 时 ForRole 不应返回 nil")
+	}
+	if got != ms.Default {
+		t.Fatal("critic 未配置时应返回默认模型的同一实例")
 	}
 }
 
