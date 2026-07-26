@@ -150,7 +150,7 @@ JSON 数组，每条含：category、rule、boundary。
    - **故事接近终点**（清单第 2-5 条大体成立，或一卷之内可把它们全部收束）→ 进入第 3 步，规划**收官卷**
    - **全部完结条件当下已满足**（六条全过，**刚写完的这一卷**就是终点）→ **不生成、不追加任何新卷**，直接 `save_foundation(type="complete_book", content={}, reason="<一句话完结依据>")` 收尾，然后跳到第 5 步
 3. **自主决定**新卷主题和走向（不是填预设框架）。若是收官卷：卷的叙事功能就是收束与兑现——弧结构必须把 `compass.long.open_threads` 与活跃伏笔**全部分配到各弧回收**，不再开新长线
-4. 生成 VolumeOutline 并落盘 `save_foundation(type="append_volume", content=<VolumeOutline>, reason="<一句话判定理由>")`——reason 是工具参数（不放进 content），写清单核对后"为何续卷/为何宣告收官"的结论，会记入裁定审计：
+4. 生成 VolumeOutline 并落盘 `save_foundation(type="append_volume", content=<VolumeOutline>, reason="<一句话判定理由>")`——**reason 必填**（写在工具参数中，不放进 content），为清单核对后"为何续卷/为何宣告收官"的结论，会记入裁定审计；**V3 运行时不可传 scale**。volume.content.index 必须 ≥ 1：
    ```json
    {
      "index": N,
@@ -163,7 +163,7 @@ JSON 数组，每条含：category、rule、boundary。
      ]
    }
    ```
-   第一弧含详细章节，其余骨架。`final` **仅收官卷携带**（普通卷省略该字段），且必须放在 content 的 JSON 顶层、不是工具参数；收官卷落盘后**核对返回中含 `final_volume: true`**——缺失说明 final 放错了位置，需重新落盘。收官卷所有章节写完、卷末评审与摘要齐备后系统**自动完结**，无需再调 complete_book。
+   第一弧必须 **detailed**（chapters 非空且每章 scenes 结构完整），首弧若为骨架（缺 chapters 或 scenes 为空）会被工具拒绝；其余骨架弧。`final` **仅收官卷携带**（普通卷省略该字段），且必须放在 content 的 JSON 顶层、不是工具参数；收官卷落盘后**核对返回中含 `final_volume: true`**——缺失说明 final 放错了位置，需重新落盘。收官卷所有章节写完、卷末评审与摘要齐备后系统**自动完结**，无需再调 complete_book。
 5. 更新短罗盘：用 `section="current"` 写入下一阶段的 `direction/open_threads`。仅当长期目标确实改变时，另用 `section="long"` + `reason` 移除已收束的长线、添加新的跨卷长线或调整规模；不要因日常展开而改 long。
 
 ### 完结判定清单（complete_book / 宣告收官卷前必须逐项核对）
@@ -211,7 +211,7 @@ JSON 数组，每条含：category、rule、boundary。
 
 **收官卷内的弧**（layered_outline 中该卷带 `"final": true`）：本弧是收官段——章节设计以回收伏笔、收束长线、兑现承诺为目标，对照 `foreshadow_ledger` 与 `compass.long.open_threads` 把未收项分配进各章；**禁止新开长线或埋新钩子**（收官卷写完即自动完结，新埋的伏笔永远没有机会回收）。若这是收官卷的最后一弧，末章要正面回答 `compass.long.ending_direction` 的核心命题。
 
-**版本说明**：V3 运行时的 `save_foundation(type="append_volume"/"expand_arc")` 调用不传递 scale 参数；Core4 按自身版本契约传递。本约束专为 V3 运行时设计，不构成对 Core4 的禁止——Core4 应遵循其版本约定。
+**版本说明**：V3 运行时 `save_foundation(type="append_volume"/"expand_arc")` **不允许** scale 参数（schema 层面拒绝），Core4 按自身版本契约传递。本约束专为 V3 运行时设计，不构成对 Core4 的禁止——Core4 应遵循其版本约定。
 
 ## 增量修改模式
 

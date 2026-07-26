@@ -223,7 +223,7 @@ func volumeOutlineSchema(v3 bool) map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"index": scenePropInt("卷序号"),
+			"index": map[string]any{"type": "integer", "description": "卷序号", "minimum": 1},
 			"title": scenePropString("卷标题"),
 			"theme": scenePropString("本卷核心冲突/主题"),
 			"final": map[string]any{"type": "boolean", "description": "收官卷标记"},
@@ -320,8 +320,8 @@ func (t *SaveFoundationTool) v3Schema() map[string]any {
 			t.v3BranchReq("append_volume", vol, map[string]map[string]any{
 				"reason": map[string]any{"type": "string", "description": "卷末判定理由"},
 			}, "reason"),
-			t.v3Branch("characters", map[string]any{"type": "array", "items": characterSchema()}, nil),
-			t.v3Branch("world_rules", map[string]any{"type": "array", "items": worldRuleSchema()}, nil),
+			t.v3Branch("characters", map[string]any{"type": "array", "items": characterSchema()}, map[string]map[string]any{"scale": scaleEnum}),
+			t.v3Branch("world_rules", map[string]any{"type": "array", "items": worldRuleSchema()}, map[string]map[string]any{"scale": scaleEnum}),
 			t.v3Branch("update_compass", map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -1035,7 +1035,7 @@ func validateV3ArgumentKeys(typeName string, keys map[string]json.RawMessage) er
 		allowed["section"] = true
 		allowed["reason"] = true
 	case "characters", "world_rules":
-		// only type + content
+		allowed["scale"] = true
 	}
 	for key := range keys {
 		if !allowed[key] {

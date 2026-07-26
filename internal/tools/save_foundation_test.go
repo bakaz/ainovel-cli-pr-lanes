@@ -2437,6 +2437,82 @@ func TestV3Schema_NegativePayloads(t *testing.T) {
 			},
 		},
 		{
+			"append_volume_index_zero",
+			map[string]any{
+				"type": "append_volume", "reason": "test",
+				"content": map[string]any{
+					"index": 0, "title": "卷", "theme": "主题",
+					"arcs": []any{map[string]any{
+						"index": 1, "title": "弧", "goal": "目标",
+						"chapters": []any{map[string]any{
+							"chapter": 1, "title": "章", "core_event": "事件",
+							"scenes": []any{map[string]any{
+								"goal": "g", "action": "a", "conflict": "c", "outcome": "o",
+								"body_reaction": "b", "emotion_reaction": "e", "erotic_charge": "ec",
+							}},
+						}},
+					}},
+				},
+			},
+		},
+		{
+			"append_volume_index_negative",
+			map[string]any{
+				"type": "append_volume", "reason": "test",
+				"content": map[string]any{
+					"index": -5, "title": "卷", "theme": "主题",
+					"arcs": []any{map[string]any{
+						"index": 1, "title": "弧", "goal": "目标",
+						"chapters": []any{map[string]any{
+							"chapter": 1, "title": "章", "core_event": "事件",
+							"scenes": []any{map[string]any{
+								"goal": "g", "action": "a", "conflict": "c", "outcome": "o",
+								"body_reaction": "b", "emotion_reaction": "e", "erotic_charge": "ec",
+							}},
+						}},
+					}},
+				},
+			},
+		},
+		{
+			"append_volume_missing_reason",
+			map[string]any{
+				"type": "append_volume",
+				"content": map[string]any{
+					"index": 2, "title": "卷", "theme": "主题",
+					"arcs": []any{map[string]any{
+						"index": 1, "title": "弧", "goal": "目标",
+						"chapters": []any{map[string]any{
+							"chapter": 1, "title": "章", "core_event": "事件",
+							"scenes": []any{map[string]any{
+								"goal": "g", "action": "a", "conflict": "c", "outcome": "o",
+								"body_reaction": "b", "emotion_reaction": "e", "erotic_charge": "ec",
+							}},
+						}},
+					}},
+				},
+			},
+		},
+		{
+			"append_volume_with_scale",
+			map[string]any{
+				"type": "append_volume", "reason": "test", "scale": "long",
+				"content": map[string]any{
+					"index": 2, "title": "卷", "theme": "主题",
+					"arcs": []any{map[string]any{
+						"index": 1, "title": "弧", "goal": "目标",
+						"chapters": []any{map[string]any{
+							"chapter": 1, "title": "章", "core_event": "事件",
+							"scenes": []any{map[string]any{
+								"goal": "g", "action": "a", "conflict": "c", "outcome": "o",
+								"body_reaction": "b", "emotion_reaction": "e", "erotic_charge": "ec",
+							}},
+						}},
+					}},
+				},
+			},
+		},
+		{
 			"append_volume_empty_arcs",
 			map[string]any{
 				"type": "append_volume", "reason": "test",
@@ -3253,5 +3329,83 @@ func TestSaveFoundationUpdateCompass_MarkerUnchangedNotBlockedByOldMalformed(t *
 	// 旧畸形 marker 应当保留不变
 	if len(compass.Long.OpenThreads) != 1 || compass.Long.OpenThreads[0] != "中间有 [room:bad] 标记" {
 		t.Fatalf("old malformed marker should be preserved: %+v", compass.Long.OpenThreads)
+	}
+}
+
+// ── Characters / World_Rules with scale ─────────────────────────────
+
+func TestSaveFoundationV3_CharactersScale(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := st.Progress.Init("test", 1); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	tool := NewSaveFoundationTool(st, projectprofile.NewSceneBeatV3Contract())
+
+	// Valid scale short
+	args, _ := json.Marshal(map[string]any{
+		"type": "characters", "content": []map[string]any{
+			{"name": "主角", "role": "hero", "description": "test"},
+		},
+		"scale": "short",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("characters with scale=short should succeed: %v", err)
+	}
+	meta, _ := st.RunMeta.Load()
+	if meta.PlanningTier != "short" {
+		t.Fatalf("expected PlanningTier=short, got %q", meta.PlanningTier)
+	}
+}
+
+func TestSaveFoundationV3_WorldRulesScale(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := st.Progress.Init("test", 1); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	tool := NewSaveFoundationTool(st, projectprofile.NewSceneBeatV3Contract())
+
+	// Valid scale mid
+	args, _ := json.Marshal(map[string]any{
+		"type": "world_rules", "content": []map[string]any{
+			{"category": "magic", "rule": "magic must be cool", "boundary": "limit"},
+		},
+		"scale": "mid",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("world_rules with scale=mid should succeed: %v", err)
+	}
+	meta, _ := st.RunMeta.Load()
+	if meta.PlanningTier != "mid" {
+		t.Fatalf("expected PlanningTier=mid, got %q", meta.PlanningTier)
+	}
+}
+
+func TestSaveFoundationV3_CharactersWorldRulesRejectInvalidScale(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	tool := NewSaveFoundationTool(st, projectprofile.NewSceneBeatV3Contract())
+
+	for _, typeName := range []string{"characters", "world_rules"} {
+		args, _ := json.Marshal(map[string]any{
+			"type": typeName, "content": []map[string]any{{}},
+			"scale": "extra-long",
+		})
+		_, err := tool.Execute(context.Background(), args)
+		if err == nil {
+			t.Fatalf("%s with invalid scale should be rejected", typeName)
+		}
 	}
 }
