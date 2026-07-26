@@ -1223,3 +1223,228 @@ func TestEnginePrecheckV3_TargetAgentsFailClosedOnMissingOrCorruptProgress(t *te
 		}
 	}
 }
+
+// ── Exhausted style review ledger blocks writer dispatch ───────────
+
+// exhaustedTestStore creates a store where chapter is in critic mode with
+// the given ledger (exhausted or overridden).  The chapter is active (not
+// completed) so that precheck's non-V3 writerTargetChapter resolves to it.
+func exhaustedTestStore(t *testing.T, chapter int, ledger *domain.StyleReviewLedger) *storepkg.Store {
+	t.Helper()
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: chapter, Title: "测试章", CoreEvent: "a"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.StartChapter(chapter); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.StyleReview.Save(*ledger); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// exhaustedLedger builds a V1-style exhausted ledger for testing.
+func exhaustedLedger(chapter int) *domain.StyleReviewLedger {
+	d := domain.DigestDraft("content")
+	find := []domain.StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Evidence: "e"}}
+	return &domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: chapter, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z",
+				AttemptID: "a1", Request: &domain.StyleReviewRequest{Prompt: "p", Model: "m"}, DraftDigest: d, BasisDigest: d},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+				AttemptID: "a1", Request: &domain.StyleReviewRequest{Prompt: "p", Model: "m"},
+				Result:   &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "e", Findings: find},
+				DraftDigest: d, BasisDigest: d},
+			{Cycle: 3, Status: domain.ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z",
+				AttemptID: "a2", Request: &domain.StyleReviewRequest{Prompt: "final", Model: "m"}, DraftDigest: d, BasisDigest: d},
+			{Cycle: 4, Status: domain.ReviewStatusExhausted, CreatedAt: "2026-07-25T13:00:00Z",
+				AttemptID: "a2", Request: &domain.StyleReviewRequest{Prompt: "final", Model: "m"},
+				Result:   &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "e", Findings: find},
+				DraftDigest: d, BasisDigest: d},
+		},
+	}
+}
+
+func TestEngine_ExhaustedLedgerNoWriterDispatch(t *testing.T) {
+	const ch = 1
+	st := exhaustedTestStore(t, ch, exhaustedLedger(ch))
+
+	var workerCalls int32
+	e := &engine{
+		store:           st,
+		workers:         subagent.NewRunner(),
+		notify:          func(_, _, _, _ string) {},
+		emitEvent:       func(Event) {},
+		onPause:         func(string) {},
+		onDone:          func() {},
+		beforeRunWorker: func() { atomic.AddInt32(&workerCalls, 1) },
+	}
+	e.gate = NewChapterAdvanceGate(st, func(string) {}, func(string, string) {})
+	// The writer will target ch via writerTargetChapter (NextChapter).
+	e.next = nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	e.done = done
+	e.running = true
+	e.cancel = cancel
+	go e.run(ctx)
+	<-done
+
+	if n := atomic.LoadInt32(&workerCalls); n != 0 {
+		t.Fatalf("runWorker called %d times, expected 0 (exhausted should block dispatch)", n)
+	}
+}
+
+func TestEngine_ExhaustedLedgerLoadFailurePauses(t *testing.T) {
+	const ch = 1
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: ch, Title: "测试章", CoreEvent: "a"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.StartChapter(ch); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	// Write corrupt ledger directly
+	ledgerDir := filepath.Join(st.Dir(), "meta", "style_review")
+	if err := os.MkdirAll(ledgerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ledgerDir, "01.json"), []byte("{corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var paused atomic.Int32
+	e := &engine{
+		store:     st,
+		workers:   subagent.NewRunner(),
+		notify:    func(_, _, _, _ string) {},
+		emitEvent: func(Event) {},
+		onDone:    func() {},
+	}
+	e.gate = NewChapterAdvanceGate(st, func(string) {}, func(string, string) {})
+	// Explicitly set next to writer for chapter 1 — bypass Route.
+	e.next = &flow.Instruction{Agent: "writer", Task: "写第 1 章", Chapter: 1}
+	e.onPause = func(string) { paused.Add(1); e.abort() }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	e.done = done
+	e.running = true
+	e.cancel = cancel
+	go e.run(ctx)
+	<-done
+
+	if n := paused.Load(); n == 0 {
+		t.Fatalf("expected engine to pause on corrupt style review ledger, but it did not (paused=%d)", n)
+	}
+}
+
+func TestEngine_ExhaustedLedgerOverrideRecovers(t *testing.T) {
+	const ch = 1
+	st := exhaustedTestStore(t, ch, exhaustedLedger(ch))
+
+	// Override the exhausted ledger
+	d := domain.DigestDraft("content")
+	now := time.Now().Format(time.RFC3339)
+	if err := st.StyleReview.Update(ch, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
+		cur.Cycles = append(cur.Cycles, domain.StyleReviewEntry{
+			Cycle:       5,
+			Status:      domain.ReviewStatusOverridden,
+			CreatedAt:   now,
+			DraftDigest: d,
+			BasisDigest: d,
+			Override: &domain.StyleReviewOverride{
+				Actor: "user", Reason: "I confirm this draft", DraftDigest: d, BasisDigest: d, OverriddenAt: now,
+			},
+		})
+		return cur, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Also need a consistency checkpoint for the writer to make progress
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(ch), "consistency_check", "a", d); err != nil {
+		t.Fatal(err)
+	}
+	// Initialize RunMeta so AdvanceMode is auto (not empty/invalid)
+	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+		t.Fatal(err)
+	}
+	// Re-set style review mode (Init preserves advance mode but clears style mode)
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+
+	var workerCalls int32
+	var paused atomic.Int32
+	// Use a Runner with a single writer agent that returns success
+	idleWriter := &scriptedChatModel{fn: func(msgs []agentcore.Message) agentcore.Message {
+		return testTextMsg("done")
+	}}
+	writerCfg := subagent.Config{
+		Name: "writer", Description: "idle", Model: idleWriter,
+		SystemPrompt: "test", MaxTurns: 1,
+	}
+	obs := newObserver(st, func(Event) {}, func(string) {}, func() {})
+	e := &engine{
+		store:           st,
+		workers:         subagent.NewRunner(writerCfg),
+		observer:        obs,
+		notify:          func(_, _, _, _ string) {},
+		emitEvent:       func(Event) {},
+		onDone:          func() {},
+		refresh:         func() {},
+		beforeRunWorker: func() { atomic.AddInt32(&workerCalls, 1) },
+	}
+	e.gate = NewChapterAdvanceGate(st, func(string) {}, func(string, string) {})
+	// Explicitly set next to writer for chapter 1 — bypass Route.
+	e.next = &flow.Instruction{Agent: "writer", Task: "写第 1 章", Chapter: 1}
+	e.onPause = func(string) { paused.Add(1) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Stop engine after a short delay to check workerCalls
+	time.AfterFunc(50*time.Millisecond, cancel)
+	done := make(chan struct{})
+	e.done = done
+	e.running = true
+	e.cancel = cancel
+	go e.run(ctx)
+	<-done
+
+	if n := atomic.LoadInt32(&workerCalls); n == 0 {
+		t.Fatal("expected writer to be dispatched after override, but it was not")
+	}
+}

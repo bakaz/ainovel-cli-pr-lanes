@@ -388,6 +388,16 @@ func (e *engine) precheck(inst *flow.Instruction) *flow.Instruction {
 			ch = writerTargetChapter(e.store)
 		}
 		if ch > 0 {
+			// 检查 legacy exhausted：阻止 writer dispatch，避免工具调用风暴
+			exhausted, loadErr := e.isStyleReviewExhausted(ch)
+			if loadErr != nil {
+				e.pauseWithNotify("engine", fmt.Sprintf("引擎预检 Writer: 第 %d 章评审状态检查失败: %v", ch, loadErr))
+				return &flow.Instruction{}
+			}
+			if exhausted {
+				e.pauseWithNotify("engine", fmt.Sprintf("引擎预检 Writer: 第 %d 章评审已耗尽（exhausted），无法继续创作。请使用 /style-override 覆盖评审结果后重试", ch))
+				return &flow.Instruction{}
+			}
 			if isV3 {
 				// V3: Writer 必须有一个有效展开的 outline entry。
 				// 缺失、无效或加载错误一律 hard pause，不允许回退到 Architect。
@@ -830,6 +840,26 @@ func (e *engine) handleCompletedChapters(_ context.Context, before int) bool {
 		return false
 	}
 	return false
+}
+
+// isStyleReviewExhausted 检查指定章节的 style review 账本是否处于 legacy exhausted 状态。
+// 当加载/校验失败时返回 error，调用方必须 fail-closed pause。
+func (e *engine) isStyleReviewExhausted(chapter int) (bool, error) {
+	meta, err := e.store.RunMeta.Load()
+	if err != nil {
+		return false, fmt.Errorf("load RunMeta: %w", err)
+	}
+	if meta == nil || meta.StyleReviewMode != domain.StyleQualityCritic {
+		return false, nil
+	}
+	ledger, err := e.store.StyleReview.Load(chapter)
+	if err != nil {
+		return false, fmt.Errorf("load style review ledger: %w", err)
+	}
+	if ledger == nil || ledger.IsEmpty() {
+		return false, nil
+	}
+	return ledger.CurrentStatus() == domain.ReviewStatusExhausted, nil
 }
 
 // engineDone 返回引擎完成通知通道（nil 表示引擎未运行或已结束）。
