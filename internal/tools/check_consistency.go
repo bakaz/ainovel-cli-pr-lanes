@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/ainovel-cli/internal/domain"
@@ -106,5 +107,59 @@ func (t *CheckConsistencyTool) Execute(_ context.Context, args json.RawMessage) 
 		return nil, fmt.Errorf("checkpoint consistency check: %w", err)
 	}
 
+	// ── 计算 required_next_action 辅助提示 ──
+	action := computeNextAction(t, a.Chapter, violations, digestStr)
+	if action != nil {
+		result["required_next_action"] = action
+	}
+
 	return json.Marshal(result)
+}
+
+// computeNextAction 加载运行元信息和风格评审账本，调用纯函数计算下一步建议。
+// 读取失败/异常时返回 nil（字段缺省，不阻塞 check_consistency 主结果）。
+func computeNextAction(t *CheckConsistencyTool, chapter int, violations []rules.Violation, digestStr string) *RequiredNextAction {
+	meta, err := t.store.RunMeta.Load()
+	if err != nil || meta == nil {
+		return nil
+	}
+
+	ledger, lerr := t.store.StyleReview.Load(chapter)
+	if lerr != nil {
+		return nil
+	}
+
+	// rewrite queue 检测：直接加载 Progress（不复用吞错的 boolean helper）
+	inRewriteQueue := false
+	progress, pErr := t.store.Progress.Load()
+	if pErr != nil {
+		return nil
+	}
+	if progress != nil {
+		inRewriteQueue = slices.Contains(progress.CompletedChapters, chapter) &&
+			slices.Contains(progress.PendingRewrites, chapter)
+	}
+
+	// rewrite 队列需要终稿 digest 来判断草稿是否实际变更
+	var finalDigest string
+	if inRewriteQueue {
+		finalContent, fErr := t.store.Drafts.LoadChapterText(chapter)
+		if fErr != nil {
+			return nil
+		}
+		if finalContent != "" {
+			h := sha256.Sum256([]byte(finalContent))
+			finalDigest = fmt.Sprintf("sha256:%x", h[:])
+		}
+	}
+
+	return ComputeRequiredNextAction(
+		meta.StyleReviewMode,
+		chapter,
+		hasErrorViolations(violations),
+		digestStr,
+		ledger,
+		inRewriteQueue,
+		finalDigest,
+	)
 }
