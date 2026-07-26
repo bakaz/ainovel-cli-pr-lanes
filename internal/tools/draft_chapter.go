@@ -76,6 +76,9 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 	if err := EnsureChapterExpanded(t.store, a.Chapter); err != nil {
 		return nil, err
 	}
+	if err := CheckStyleReviewMutationGuard(t.store, a.Chapter); err != nil {
+		return nil, fmt.Errorf("draft_chapter: %w", err)
+	}
 	if t.store.Progress.IsChapterCompleted(a.Chapter) {
 		progress, _ := t.store.Progress.Load()
 		inRewriteQueue := progress != nil && slices.Contains(progress.PendingRewrites, a.Chapter)

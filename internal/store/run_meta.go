@@ -36,7 +36,27 @@ func (s *RunMetaStore) loadUnlocked() (*domain.RunMeta, error) {
 		}
 		return nil, err
 	}
+	// 边界归一化：空值 → off，未知值 → 明确拒绝
+	if err := normalizeStyleReviewMode(&meta); err != nil {
+		return nil, err
+	}
 	return &meta, nil
+}
+
+// normalizeStyleReviewMode 在加载边界将空 StyleReviewMode 归一化为 off，
+// 未知持久化值则报错，确保程序不会静默禁用不兼容的模式。
+func normalizeStyleReviewMode(meta *domain.RunMeta) error {
+	if meta == nil {
+		return nil
+	}
+	if meta.StyleReviewMode == "" {
+		meta.StyleReviewMode = domain.StyleQualityOff
+		return nil
+	}
+	if !meta.StyleReviewMode.Valid() {
+		return fmt.Errorf("不支持的 style_review_mode %q，请使用创建该项目的新版 ainovel", meta.StyleReviewMode)
+	}
+	return nil
 }
 
 func (s *RunMetaStore) saveUnlocked(meta domain.RunMeta) error {
@@ -66,11 +86,15 @@ func (s *RunMetaStore) Init(style, provider, model string) error {
 			meta.AdvanceMode = existing.AdvanceMode
 			meta.AdvancePermitChapter = existing.AdvancePermitChapter
 			meta.AdvanceHold = existing.AdvanceHold
+			meta.StyleReviewMode = existing.StyleReviewMode
 		}
 		if meta.AdvanceMode == "" {
 			meta.AdvanceMode = domain.ChapterAdvanceAuto
 		}
 		if err := validateAdvanceControl(meta); err != nil {
+			return err
+		}
+		if err := normalizeStyleReviewMode(&meta); err != nil {
 			return err
 		}
 		return s.saveUnlocked(meta)
@@ -267,6 +291,27 @@ func (s *RunMetaStore) SetPlanningTier(tier domain.PlanningTier) error {
 			meta = &domain.RunMeta{}
 		}
 		meta.PlanningTier = tier
+		return s.saveUnlocked(*meta)
+	})
+}
+
+// SetStyleReviewMode 设置风格评审质量模式；空值设为 off，未知值拒绝。
+func (s *RunMetaStore) SetStyleReviewMode(mode domain.StyleQualityMode) error {
+	if mode == "" {
+		mode = domain.StyleQualityOff
+	}
+	if !mode.Valid() {
+		return fmt.Errorf("不支持的风格评审模式 %q", mode)
+	}
+	return s.io.WithWriteLock(func() error {
+		meta, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if meta == nil {
+			meta = &domain.RunMeta{}
+		}
+		meta.StyleReviewMode = mode
 		return s.saveUnlocked(*meta)
 	})
 }

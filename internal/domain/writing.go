@@ -11,14 +11,50 @@ import (
 // ChapterPlan 章节写作构思，Writer 自主生成。
 // 不再强制场景拆分，Agent 自己决定如何组织内容。
 type ChapterPlan struct {
-	Chapter    int             `json:"chapter"`
-	Title      string          `json:"title"`
-	Goal       string          `json:"goal"`
-	Conflict   string          `json:"conflict"`
-	Hook       string          `json:"hook"`
-	EmotionArc string          `json:"emotion_arc,omitempty"`
-	Notes      string          `json:"notes,omitempty"` // Agent 的自由备忘
-	Contract   ChapterContract `json:"contract,omitempty"`
+	Chapter    int               `json:"chapter"`
+	Title      string            `json:"title"`
+	Goal       string            `json:"goal"`
+	Conflict   string            `json:"conflict"`
+	Hook       string            `json:"hook"`
+	EmotionArc string            `json:"emotion_arc,omitempty"`
+	Notes      string            `json:"notes,omitempty"` // Agent 的自由备忘
+	Contract   ChapterContract   `json:"contract,omitempty"`
+	StyleGoal  *ChapterStyleGoal `json:"style_goal,omitempty"` // 可选：本章风格目标
+}
+
+// ChapterStyleGoal 是本章的正面风格目标，指导 Writer 的 prose 调性。
+// 所有维度都应是简洁、正向的指导。
+// 每个字段 ≤ 200 Unicode 字符。
+// Validate 仅检查长度；plan_chapter 调用方需额外确保所有字段非空。
+type ChapterStyleGoal struct {
+	FocalFilter         string `json:"focal_filter,omitempty"`          // 视角/焦点过滤：POV 选择、信息披露策略
+	ProseMovement       string `json:"prose_movement,omitempty"`        // 叙述推进方式：场景流、过渡风格
+	DetailStrategy      string `json:"detail_strategy,omitempty"`       // 细节密度策略：详略分配、感官侧重
+	Rhythm              string `json:"rhythm,omitempty"`                // 节奏预期：句式变化、段落节奏
+	VariationFromRecent string `json:"variation_from_recent,omitempty"` // 与近 X 章的差异化提示
+}
+
+// Validate 检查 ChapterStyleGoal 各字段长度是否 ≤ 200 Unicode 字符。
+// nil 接收器返回 nil（兼容旧存序列化数据）。
+func (g *ChapterStyleGoal) Validate() error {
+	if g == nil {
+		return nil
+	}
+	maxFieldRunes := 200
+	fields := map[string]string{
+		"focal_filter":          g.FocalFilter,
+		"prose_movement":        g.ProseMovement,
+		"detail_strategy":       g.DetailStrategy,
+		"rhythm":                g.Rhythm,
+		"variation_from_recent": g.VariationFromRecent,
+	}
+	for name, val := range fields {
+		runes := utf8.RuneCountInString(val)
+		if runes > maxFieldRunes {
+			return fmt.Errorf("style_goal.%s 长度 %d 超过上限 %d 个字符", name, runes, maxFieldRunes)
+		}
+	}
+	return nil
 }
 
 // ChapterContract 是 Writer 和 Editor 共享的章节验收契约。
@@ -145,12 +181,12 @@ func (c *WritingStyleRulesCompass) HasOutlineContent() bool {
 // 长期规则是全书统一的风格基准，不包含局部装置名、循环次数、积分算法、具体参数。
 // 更新必须显式给出 reason 且做字段级合并。
 type StyleRulesLong struct {
-	Prose       []string               `json:"prose,omitempty"`    // 3-5 条叙述风格规则，每条 ≤50 字
-	Dialogue    []CharacterVoice       `json:"dialogue,omitempty"` // 角色对话风格规则，跨弧稳定
-	Taboos      []string               `json:"taboos,omitempty"`   // 全书通用禁忌
-	Outline     *OutlinePlanningRules  `json:"outline,omitempty"`  // 规划层 beat 规则（非正文笔法）
-	Reason      string                 `json:"reason,omitempty"`   // 上次更新原因（审计元数据）
-	LastUpdated string                 `json:"last_updated,omitempty"` // ISO8601 更新时间
+	Prose       []string              `json:"prose,omitempty"`        // 3-5 条叙述风格规则，每条 ≤50 字
+	Dialogue    []CharacterVoice      `json:"dialogue,omitempty"`     // 角色对话风格规则，跨弧稳定
+	Taboos      []string              `json:"taboos,omitempty"`       // 全书通用禁忌
+	Outline     *OutlinePlanningRules `json:"outline,omitempty"`      // 规划层 beat 规则（非正文笔法）
+	Reason      string                `json:"reason,omitempty"`       // 上次更新原因（审计元数据）
+	LastUpdated string                `json:"last_updated,omitempty"` // ISO8601 更新时间
 }
 
 // Validate 检查 long 规则是否含有禁止的局部实现细节。
@@ -198,7 +234,7 @@ type StyleRulesCurrent struct {
 	Prose       []string              `json:"prose,omitempty"`
 	Dialogue    []CharacterVoice      `json:"dialogue,omitempty"`
 	Taboos      []string              `json:"taboos,omitempty"`
-	Outline     *OutlinePlanningRules `json:"outline,omitempty"` // 本弧规划 beat 补充
+	Outline     *OutlinePlanningRules `json:"outline,omitempty"`      // 本弧规划 beat 补充
 	LastUpdated string                `json:"last_updated,omitempty"` // ISO8601
 }
 
@@ -355,16 +391,16 @@ type StyleAnchorProvenance struct {
 
 // StyleAnchorItem 是 style_anchors.json 中的一条风格锚点。
 type StyleAnchorItem struct {
-	ID         string                `json:"id"`                   // 唯一标识，TrimSpace 非空，长度 ≤ 64 Unicode 字符
-	Excerpt    string                `json:"excerpt"`              // TrimSpace 非空，长度 ≤ 1000 Unicode 字符
-	AppliesTo  *StyleAnchorAppliesTo `json:"applies_to,omitempty"` // 可选，目标章范围约束
-	Provenance *StyleAnchorProvenance `json:"provenance,omitempty"`// 可选，来源元数据
+	ID         string                 `json:"id"`                   // 唯一标识，TrimSpace 非空，长度 ≤ 64 Unicode 字符
+	Excerpt    string                 `json:"excerpt"`              // TrimSpace 非空，长度 ≤ 1000 Unicode 字符
+	AppliesTo  *StyleAnchorAppliesTo  `json:"applies_to,omitempty"` // 可选，目标章范围约束
+	Provenance *StyleAnchorProvenance `json:"provenance,omitempty"` // 可选，来源元数据
 }
 
 // StyleAnchorsV1 是 v1 格式的风格锚点文件（meta/style_anchors.json）。
 type StyleAnchorsV1 struct {
 	Version     int               `json:"version"`                // 必须为 1
-	Anchors     []StyleAnchorItem `json:"anchors"`               // 锚点列表
+	Anchors     []StyleAnchorItem `json:"anchors"`                // 锚点列表
 	IncludeAuto bool              `json:"include_auto,omitempty"` // true=额外注入 auto 提取锚点（低优先级）
 }
 

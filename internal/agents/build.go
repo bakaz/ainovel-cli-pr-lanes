@@ -29,6 +29,9 @@ func agentToRole(name string) string {
 	if strings.HasPrefix(name, "architect_") {
 		return "architect"
 	}
+	if name == "style_critic" {
+		return "critic"
+	}
 	return name
 }
 
@@ -228,6 +231,28 @@ func BuildWorkers(
 	//（system 地板 + 末消息尖端）。provider 不支持时由 agentcore 按能力静默丢弃，
 	// 多轮会话下读缓存收益恒为正，故不设开关。
 	cacheBase := promptCacheBase(store.Dir())
+
+	// ── 风格批评者子代理（纯文本一次性评审，无工具） ──
+	criticModel := models.ForRoleWithFailover("critic", reportFailover)
+	// 批评者提示词身份：实际 prompt 内容的 sha256 前缀（可溯源）
+	promptHash := sha256.Sum256([]byte(bundle.Prompts.StyleCritic))
+	criticPromptHash := "prompt:" + hex.EncodeToString(promptHash[:8])
+	criticCfg := subagent.Config{
+		Name:               "style_critic",
+		Description:        "文风审查工具：评价草稿是否符合风格要求",
+		Model:              criticModel,
+		SystemPrompt:       bundle.Prompts.StyleCritic,
+		MaxTurns:           1,
+		MaxRetries:         subagentMaxRetries,
+		ToolsAreIdempotent: true,
+		OnMessage:          onMsg,
+		PromptCacheKey:     cacheBase + "-style_critic",
+	}
+	criticTool := subagent.New(criticCfg)
+
+	// 把 review_style 注入 writer 工具集（传递 prompt 内容哈希作为版本标识）
+	reviewStyle := tools.NewReviewStyleTool(store, criticTool, criticPromptHash)
+	writerTools = append(writerTools, reviewStyle)
 
 	architectStopGuardFactory := func(_, _ string) agentcore.StopGuard {
 		return guard.NewArchitectStopGuard(store, onGuardBlock)

@@ -41,6 +41,7 @@ var supportedPromptFiles = []string{
 	"arbiter-plan-start.md",
 	"arbiter-intervention.md",
 	"arbiter-failure.md",
+	"style-critic.md",
 }
 
 // ApplyOverrides 依次应用资源根，后面的目录覆盖前面的目录。所有读取均使用固定
@@ -95,6 +96,8 @@ func applyPromptOverrides(bundle *Bundle, root string, report *OverlayReport) {
 				bundle.Prompts.ArbiterIntervention = raw
 			case "arbiter-failure.md":
 				bundle.Prompts.ArbiterFailure = raw
+			case "style-critic.md":
+				bundle.Prompts.StyleCritic = raw
 			}
 		}
 		recordApplied(bundle, filepath.ToSlash(rel), src, report)
@@ -282,6 +285,7 @@ func (b *Bundle) recordEmbeddedSources(style string) {
 		"simulation-source.md": b.Prompts.SimulationSource, "simulation-merge.md": b.Prompts.SimulationMerge,
 		"arbiter-plan-start.md": b.Prompts.ArbiterPlanStart, "arbiter-intervention.md": b.Prompts.ArbiterIntervention,
 		"arbiter-failure.md": b.Prompts.ArbiterFailure,
+		"style-critic.md":    b.Prompts.StyleCritic,
 	}
 	for name, value := range prompts {
 		record("prompts/"+name, value)
@@ -336,6 +340,8 @@ func (b Bundle) EffectiveResource(key string) (string, bool) {
 		return b.Prompts.ArbiterIntervention, true
 	case "prompts/arbiter-failure.md":
 		return b.Prompts.ArbiterFailure, true
+	case "prompts/style-critic.md":
+		return b.Prompts.StyleCritic, true
 	}
 	return "", false
 }

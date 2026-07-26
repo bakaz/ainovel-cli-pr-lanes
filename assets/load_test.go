@@ -37,6 +37,50 @@ func TestBuildWriterPrompt_ByteIdenticalToPreSplit(t *testing.T) {
 	}
 }
 
+// TestWriterPrompt_StyleGoalFieldKeysMatchSchema 验证 writer.md 中 style_goal
+// 的五字段名与 Go schema 中的 JSON key 完全一致,避免 prompt 与实现不同步。
+func TestWriterPrompt_StyleGoalFieldKeysMatchSchema(t *testing.T) {
+	protocol := mustRead(promptsFS, "prompts/writer.md")
+	requiredKeys := []string{
+		"focal_filter",
+		"prose_movement",
+		"detail_strategy",
+		"rhythm",
+		"variation_from_recent",
+	}
+	for _, key := range requiredKeys {
+		if !strings.Contains(protocol, key) {
+			t.Errorf("writer.md 缺少 schema field key %q", key)
+		}
+	}
+	// Verify the enclosing object name matches schema
+	if !strings.Contains(protocol, "`style_goal`") {
+		t.Error("writer.md 必须用 `style_goal` 引用 schema 对象名")
+	}
+}
+
+// TestWriterPrompt_StylePrecedenceIsConsistent 验证文风优先级指引无矛盾
+// (Gate 1 Oracle 跟进: writer_style_card > manual anchors 在优先级列表明确,
+// style_anchors_manual 不含歧义的优先标记,抽象风格冲突规则限域到 simulation_profile)。
+func TestWriterPrompt_StylePrecedenceIsConsistent(t *testing.T) {
+	protocol := mustRead(promptsFS, "prompts/writer.md")
+
+	// 显式优先级链必须存在且 writer_style_card 高于 manual anchors
+	if !strings.Contains(protocol, "writer_style_card（如有）> manual anchors") {
+		t.Error("优先级列表必须明确 writer_style_card > manual anchors")
+	}
+
+	// style_anchors_manual 不得带裸 "（优先）" 标签——这与 writer_style_card > manual anchors 矛盾
+	if strings.Contains(protocol, "style_anchors_manual`**（优先）") {
+		t.Error("style_anchors_manual 不得有裸 '（优先）' 标签 — 与优先级列表 writer_style_card > manual anchors 矛盾")
+	}
+
+	// 抽象风格冲突规则必须限域到 simulation_profile, 不能作为孤立的通用优先级声明
+	if !strings.Contains(protocol, "`simulation_profile` 中的抽象风格冲突以 manual anchors 为准") {
+		t.Error("抽象风格冲突规则必须明确限域到 `simulation_profile`，避免与优先级列表矛盾")
+	}
+}
+
 // TestLoad_NoOverrides 零覆盖时 Voice/AntiAITone 与内置逐字节一致。
 func TestLoad_NoOverrides(t *testing.T) {
 	b := Load("default", LoadOptions{})
@@ -49,6 +93,115 @@ func TestLoad_NoOverrides(t *testing.T) {
 	if _, ok := b.Styles["default"]; !ok {
 		t.Fatal("内置风格集应含 default")
 	}
+}
+
+// TestStyleCriticPrompt_Loaded 验证 style-critic.md 嵌入并可通过 Load 正常访问。
+func TestStyleCriticPrompt_Loaded(t *testing.T) {
+	b := Load("default", LoadOptions{})
+	if b.Prompts.StyleCritic == "" {
+		t.Fatal("StyleCritic prompt 应非空")
+	}
+	if !contains(t, b.Prompts.StyleCritic, "verdict") || !contains(t, b.Prompts.StyleCritic, "pass|revise") {
+		t.Fatal("StyleCritic 须包含 verdict 字段和 pass|revise 枚举")
+	}
+	if !contains(t, b.Prompts.StyleCritic, "findings") {
+		t.Fatal("StyleCritic 须包含 findings 字段")
+	}
+	if !contains(t, b.Prompts.StyleCritic, "dimension") {
+		t.Fatal("StyleCritic 须包含 dimension 字段")
+	}
+	if !contains(t, b.Prompts.StyleCritic, "severity") {
+		t.Fatal("StyleCritic 须包含 severity 字段")
+	}
+	if !contains(t, b.Prompts.StyleCritic, "strength") {
+		t.Fatal("StyleCritic 须包含 strength 正面评价")
+	}
+	// 须包含版本标识
+	if !contains(t, b.Prompts.StyleCritic, "v1") && !contains(t, b.Prompts.StyleCritic, "version") {
+		t.Fatal("StyleCritic 须含版本标识")
+	}
+	// 禁止给出改写文本
+	if !contains(t, b.Prompts.StyleCritic, "不重写") && !contains(t, b.Prompts.StyleCritic, "不得给出具体措辞") {
+		t.Fatal("StyleCritic 须禁止给出改写文本")
+	}
+}
+
+// TestStyleCriticPrompt_DomainEnumContract 验证 style-critic.md 的有效维度/类别/severity
+// 与 domain 包中的枚举完全对齐。
+func TestStyleCriticPrompt_DomainEnumContract(t *testing.T) {
+	b := Load("default", LoadOptions{})
+	p := b.Prompts.StyleCritic
+
+	// 所有有效维度必须出现
+	for _, dim := range []string{"consistency", "character", "pacing", "continuity", "foreshadow", "hook", "aesthetic"} {
+		if !contains(t, p, dim) {
+			t.Errorf("style-critic.md 须包含有效 dimension %q", dim)
+		}
+	}
+
+	// 所有有效类别必须出现
+	for _, cat := range []string{"plot", "style", "logic", "tone", "grammar"} {
+		if !contains(t, p, cat) {
+			t.Errorf("style-critic.md 须包含有效 category %q", cat)
+		}
+	}
+
+	// 所有有效 severity 必须出现
+	for _, sev := range []string{"critical", "error", "warning", "info"} {
+		if !contains(t, p, sev) {
+			t.Errorf("style-critic.md 须包含有效 severity %q", sev)
+		}
+	}
+
+	// verdict 必须是严格枚举
+	if !contains(t, p, `"pass"`) || !contains(t, p, `"revise"`) {
+		t.Error("style-critic.md verdict 枚举必须含 pass 和 revise")
+	}
+
+	// strength 必须存在且必须含 evidence
+	if !contains(t, p, "\"evidence\"") {
+		t.Error("style-critic.md strength 必须含 evidence 字段")
+	}
+
+	// 最多 3 条 findings
+	if !contains(t, p, "最多 3 条") && !contains(t, p, "最多 3") {
+		t.Error("style-critic.md 必须约束 findings 最多 3 条")
+	}
+
+	// 必须声明格式不合法 = invalid
+	if !contains(t, p, "不合法") && !contains(t, p, "格式不合法") && !contains(t, p, "视为格式不合法") {
+		t.Error("style-critic.md 必须声明超出有效列表的值为格式不合法")
+	}
+
+	// 不得声称接收了未提供的输入（basis 中的字段是合法输入——critic只收到 draft + basis
+	// 两个顶层输入，其中 basis 包含 style_goal / chapter_contract / compass_* /
+	// anchor_excerpts / user_rules / factual_outline / critic_version）。
+	if contains(t, p, "chapter_plan") || contains(t, p, "style_rules") {
+		t.Error("style-critic.md 不应声称接收未在 basis 中定义的独立输入 chapter_plan / style_rules")
+	}
+}
+
+// TestStyleCritic_OverlaySupportsReplacement 验证 style-critic.md 可通过 overlay 替换。
+func TestStyleCritic_OverlaySupportsReplacement(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "prompts", "style-critic.md"), "CUSTOM_CRITIC_v1")
+	bundle := Load("default", LoadOptions{})
+	report := ApplyOverrides(&bundle, "default", []string{root})
+	if bundle.Prompts.StyleCritic != "CUSTOM_CRITIC_v1" {
+		t.Fatalf("overlay 替换失败: got %q", bundle.Prompts.StyleCritic)
+	}
+	if len(report.Warnings) > 0 {
+		t.Fatalf("不应有警告: %v", report.Warnings)
+	}
+	src, ok := bundle.Sources["prompts/style-critic.md"]
+	if !ok || src.Kind != "file" || len(src.SHA256) != 64 {
+		t.Fatalf("source 记录缺失或格式错误: %+v", src)
+	}
+}
+
+func contains(t *testing.T, s, sub string) bool {
+	t.Helper()
+	return strings.Contains(s, sub)
 }
 
 func writeFile(t *testing.T, path, content string) {

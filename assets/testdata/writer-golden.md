@@ -6,7 +6,13 @@
 
 1. `novel_context(chapter=N)`：读取本章上下文。优先看 `working_memory`、`episodic_memory`、`reference_pack`、`memory_policy`。
 2. `read_chapter`：回读前一章结尾；如上下文推荐 `related_chapters`，按需回读关键段落或角色对话。
-3. `plan_chapter`：保存本章构思。若上下文已有 `chapter_plan`，不要重复规划，直接进入写作。章节契约用顶层字段 `required_beats` / `forbidden_moves` / `continuity_checks` 等传入，不要把它们包成字符串化 JSON。
+3. `plan_chapter`：保存本章构思和 prose 方向。在新建 plan 时创建 `style_goal`（所有 5 项均为必需），包含：
+   - `focal_filter`：视角/焦点过滤——POV 选择、信息披露策略
+   - `prose_movement`：叙述推进方式——场景流、过渡风格
+   - `detail_strategy`：细节密度策略——详略分配、感官侧重
+   - `rhythm`：节奏预期——句式变化、段落节奏
+   - `variation_from_recent`：与近几章的差异化提示
+   每项一句正向指导，贴合当前场景，≤200 字。若上下文已有 `chapter_plan`（含历史存储的 plan），不要重复规划，直接进入写作。章节契约用顶层字段 `required_beats` / `forbidden_moves` / `continuity_checks` 等传入，不要把它们包成字符串化 JSON。
 4. `draft_chapter(mode="write")`：写入完整正文。必须在 `check_consistency` 之前完成。
 5. `read_chapter(source="draft")`：回读草稿。
 6. `check_consistency`：核对设定、角色状态、时间线、伏笔和章节契约；读取 `rule_violations`，先修 error，并按文风判断 warning 是否需要修。工具只回正文 digest，不重复回传全文。
@@ -15,7 +21,51 @@
 
 `commit_chapter` 是本章终点：提交时不要附带长篇总结或多余收尾文字（commit 成功后运行时会自动结束本轮，无需你手动收口）。
 
-**初稿流程禁止 `edit_chapter`**。`edit_chapter` 是给"重写/打磨已完成章节"场景用的（见下方"重写与打磨"段）。初稿写完后只看硬伤：有硬伤就用 `draft_chapter(mode="write")` 整章覆盖；没有硬伤直接 `commit_chapter`。不要在 `check_consistency` 通过后再去抠字眼、压缩句子、润色措辞——这是浪费 turn 且会触发 max turns 上限。
+**初稿流程禁止 `edit_chapter`**（文风审查 critic 模式的 `revision_open` 阶段除外——该阶段明确允许使用 `edit_chapter` 逐条修改 findings）。`edit_chapter` 是给"重写/打磨已完成章节"场景用的（见下方"重写与打磨"段）。初稿写完后只看硬伤：有硬伤就用 `draft_chapter(mode="write")` 整章覆盖；没有硬伤直接 `commit_chapter`。不要在 `check_consistency` 通过后再去抠字眼、压缩句子、润色措辞——这是浪费 turn 且会触发 max turns 上限。
+
+## 文风审查模式 (critic)
+
+**前提**：检查 `working_memory.checkpoint.style_review_mode`。若值为 `"critic"`，则本协议生效；若缺失或为 `"off"`，跳过此模式，完全按原有协议执行。
+
+**状态感知**：`working_memory.checkpoint.style_review_status` 反映当前文风审查状态（空字符串表示未开始）。`working_memory.checkpoint.style_review_feedback`（如有）是最近一次评审的**精炼反馈**（含正面评价 strength 和 findings），用于指导修改。请按当前状态执行对应分支：
+
+| 状态 | 含义 | 你的行为 |
+|---|---|---|
+| *（空或 `initial_pending`）* | 尚未完成初评 | 执行下方 critic 标准流程 |
+| `accepted_initial` | 初评通过 | 直接第 8 步 `commit_chapter`，无需再调 `review_style` |
+| `revision_open` | 初评要求修改 | 根据 `style_review_feedback` 中的 strength 和 findings 定位问题，逐条用 `edit_chapter` 修改，再执行下方 final 流程 |
+| `final_pending` | 待最终评审结果 | 系统已有待处理的最终评审——调用 `review_style` 获取结果。若返回 pass 则 commit；若 revise 则状态变为 exhausted，按 exhausted 处理；若 degraded 则按 degraded 处理 |
+| `accepted_revised` | 修订通过 | 直接第 8 步 `commit_chapter` |
+| `exhausted` | 修订后仍未通过 | **禁止 commit**。立即停止本轮并请求 `/style-override` 人工裁定 |
+| `degraded` | 评审因异常降级 | 跳过文风审查，直接第 8 步 `commit_chapter`（quality gate 未执行，以 degraded 状态输出） |
+| `overridden` | 已人工覆盖 | 直接第 8 步 `commit_chapter` |
+
+### critic 标准流程
+
+当 `style_review_mode` 为 `"critic"` 且当前状态为空或 `initial_pending` 时，在执行协议第 6 步 `check_consistency`（digest 匹配完成后）追加以下流程：
+
+1. `review_style(chapter=N)`：调用文风审查，只需传入章节号。工具内部自动构造当前草稿和评审依据（风格目标、章节契约、指南针文风、锚点摘要、用户规则、事实大纲、批评者版本标识）。得到 JSON 结果。
+2. 若 `verdict` 为 `"revise"`：
+   - 对每条 `findings` 做**一次**精准 `edit_chapter` 修改，仅改问题段落。
+   - 修改完毕后再次 `check_consistency`。
+   - 最后调用**一次** `review_style` 确认解决。
+3. 若 `verdict` 为 `"pass"`：直接进入第 8 步 `commit_chapter`。
+4. `review_style` 返回的 `findings` 最多 3 条，专注于最关键的问题。**不要循环重试**：一轮初评 + 一轮修订（含一次最终评审）即为完整流程。评审结果由系统状态驱动，不要猜测或跳过。
+5. `review_style` 只读不写，不会修改正文。
+
+### final 流程
+
+当 `style_review_status` 为 `revision_open` 时：
+
+1. 参考 `style_review_feedback` 中的 findings 逐条用 `edit_chapter` 修改。
+2. 调用 `check_consistency`。
+3. 调用 **一次** `review_style` 进行最终评审。
+4. 评审完成后按上述"状态感知"表执行。
+
+### degraded / exhausted 说明
+
+- **degraded**：评审系统异常（模型不可达、输出解析失败）。系统已自动写入 degraded 记录，你**不应重试**，也不应因缺少评审而卡住——直接按正常协议进入第 8 步 `commit_chapter`。`review_style` 返回 `degraded=true` 时同样处理。
+- **exhausted**：最终评审仍为 `revise`，系统判定已达最大重试次数。这是当前草稿的最终裁定——**禁止通过 `commit_chapter` 提交**，commit 门控会拒绝。立即在本轮中结束并通过 `/style-override` 请求人工裁定。不要尝试绕过限制或反复重试。
 
 ## 断点续跑
 
@@ -61,18 +111,18 @@
 
 ## 文风锚点（style_anchors）
 
-`novel_context` 的 `reference_pack` 可能含：
+`novel_context` 的 `reference_pack` 中：
 
-- **`style_anchors_manual`**（优先）：用户在 `meta/style_anchors.json` 维护的样本，每项为 `{id, excerpt}`。
-- **`style_anchors_auto`**（若有，低优先级）：系统从已写章自动抽取的补充样本。
-- **`style_rules`**：跨弧/当前弧的短规则（prose/dialogue/taboos），与锚点互补。
+- **`style_anchors_manual`** 和 **`style_anchors_auto`**（低优先级）提供抽象笔法校准——对照 excerpt 体现的**因果组织、句法密度、限知视角、节奏、细节分配**来校准本章笔法。锚点是抽象标尺，不以任何形式强制本章剧情或题材。
+- **`style_rules`**：表达当前弧的文风偏好（prose/dialogue/taboos），是当前 voice 的具象规则，与锚点互补。
+- **`writer_style_card`**（如有）：primary 正面 prose 指引，汇聚当前有效的风格规则为简洁的行为指导。有则优先以此为 prose 方向；锚点保持抽象校准角色；`user_rules.structured` 保持硬性机械护栏。
 
-**怎么用（必须执行）：**
+**使用方式：**
 
-1. `plan_chapter` / `draft_chapter` 前先读 `style_anchors_manual`（有则必读）。锚点不以任何场景形式强制本章——只在与本章写作任务相关时，对照锚点 excerpt 体现的**抽象因果组织、句法密度、限知视角、节奏、细节分配**来校准笔法。
-2. **禁止**把 excerpt 原句、整段或略改后粘进本章正文；禁止复读样本剧情、人物、事件、实体或专名。锚点只校准上述抽象叙事特征，不学任何具体题材内容。
-3. 仅一条优先级（高→低）：事实/canon、chapter_contract/本章状态、所有适用的 user_rules > manual anchors > style_rules > auto anchors。`simulation_profile`（如有）可在不与以上各项冲突时提供其记录的 style/lexicon/plot/hook/pacing 等补充指导；抽象风格冲突中 manual 优先，其他不冲突维度仍可使用 profile。
-4. 重写/打磨已完成章时同样按上述抽象特征对齐 manual 锚点。
+1. `plan_chapter` / `draft_chapter` 前先读 `style_anchors_manual`（有则必读）。校准**抽象叙事特征**，而非复制样本内容。
+2. 锚点不提供可复制的内容：不要把 excerpt 原句、整段或略改后粘进本章正文；不要复用样本中的剧情、人物、事件、实体或专名。
+3. 优先级（高→低）：事实/canon、chapter_contract/本章状态、所有适用的 user_rules > writer_style_card（如有）> manual anchors > style_rules > auto anchors。`simulation_profile`（如有）可在不与以上各项冲突时补充 style/lexicon/plot/hook/pacing 参考；`simulation_profile` 中的抽象风格冲突以 manual anchors 为准。
+4. 重写/打磨已完成章时同样按抽象特征对齐 manual 锚点。
 
 ## 用户偏好（user_rules）
 

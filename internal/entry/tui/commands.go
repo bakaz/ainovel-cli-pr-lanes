@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -146,6 +148,30 @@ func commandRegistryInstance() commandRegistry {
 			},
 		},
 		{
+			Name:        "style-critic",
+			Group:       "writing",
+			Usage:       "/style-critic on|off",
+			Description: "切换风格批评模式",
+			NeedsIdle:   true,
+			Run: func(m Model, args []string) (tea.Model, tea.Cmd) {
+				if len(args) != 1 || (args[0] != "on" && args[0] != "off") {
+					m.applyEvent(host.Event{Time: time.Now(), Category: "ERROR", Summary: "用法：/style-critic on|off", Level: "error"})
+					m.refreshEventViewport()
+					return m, nil
+				}
+				mode := domain.StyleQualityCritic
+				if args[0] == "off" {
+					mode = domain.StyleQualityOff
+				}
+				if err := m.runtime.SetStyleReviewMode(mode); err != nil {
+					m.applyEvent(host.Event{Time: time.Now(), Category: "ERROR", Summary: "切换风格评审模式失败：" + err.Error(), Level: "error"})
+					m.refreshEventViewport()
+					return m, nil
+				}
+				return m, fetchSnapshot(m.runtime)
+			},
+		},
+		{
 			Name:        "next",
 			Group:       "writing",
 			Usage:       "/next",
@@ -164,6 +190,48 @@ func commandRegistryInstance() commandRegistry {
 					return m, nil
 				}
 				return m, tea.Batch(fetchSnapshot(m.runtime), listenDone(m.runtime), m.textarea.Focus())
+			},
+		},
+		{
+			Name:        "style-override",
+			Group:       "writing",
+			Usage:       "/style-override <chapter> <reason>",
+			Description: "覆盖已耗尽的风格评审以允许提交",
+			NeedsIdle:   true,
+			Run: func(m Model, args []string) (tea.Model, tea.Cmd) {
+				if len(args) < 2 {
+					m.applyEvent(host.Event{
+						Time: time.Now(), Category: "ERROR",
+						Summary: "用法：/style-override <章节号> <原因>", Level: "error",
+					})
+					m.refreshEventViewport()
+					return m, nil
+				}
+				chapter, parseErr := strconv.Atoi(args[0])
+				if parseErr != nil || chapter <= 0 {
+					m.applyEvent(host.Event{
+						Time: time.Now(), Category: "ERROR",
+						Summary: "无效章节号：" + args[0], Level: "error",
+					})
+					m.refreshEventViewport()
+					return m, nil
+				}
+				reason := strings.Join(args[1:], " ")
+				if err := m.runtime.StyleReviewOverride(chapter, reason); err != nil {
+					m.applyEvent(host.Event{
+						Time: time.Now(), Category: "ERROR",
+						Summary: "风格评审覆盖失败：" + err.Error(), Level: "error",
+					})
+					m.refreshEventViewport()
+					return m, nil
+				}
+				m.applyEvent(host.Event{
+					Time: time.Now(), Category: "SYSTEM",
+					Summary: fmt.Sprintf("已覆盖第 %d 章风格评审（原因：%s），请运行 /continue 恢复 Writer 创作", chapter, reason),
+					Level:   "info",
+				})
+				m.refreshEventViewport()
+				return m, fetchSnapshot(m.runtime)
 			},
 		},
 		{

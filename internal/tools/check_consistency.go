@@ -62,7 +62,8 @@ func (t *CheckConsistencyTool) Execute(_ context.Context, args json.RawMessage) 
 		return nil, fmt.Errorf("no content found for chapter %d: %w", a.Chapter, errs.ErrToolPrecondition)
 	}
 	digest := sha256.Sum256([]byte(content))
-	result["content_digest"] = fmt.Sprintf("sha256:%x", digest[:])
+	digestStr := fmt.Sprintf("sha256:%x", digest[:])
+	result["content_digest"] = digestStr
 	result["word_count"] = wordCount
 	violations := append([]rules.Violation{}, rules.Lint(content)...)
 	structured := rules.SystemDefaults().Structured
@@ -97,9 +98,10 @@ func (t *CheckConsistencyTool) Execute(_ context.Context, args json.RawMessage) 
 		result["recent_summaries"] = summaries
 	}
 
-	if _, err := t.store.Checkpoints.AppendArtifact(
+	if _, err := t.store.Checkpoints.Append(
 		domain.ChapterScope(a.Chapter), "consistency_check",
 		fmt.Sprintf("drafts/%02d.draft.md", a.Chapter),
+		digestStr,
 	); err != nil {
 		return nil, fmt.Errorf("checkpoint consistency check: %w", err)
 	}

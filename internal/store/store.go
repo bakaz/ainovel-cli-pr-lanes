@@ -12,25 +12,26 @@ import (
 type Store struct {
 	dir string
 
-	Progress       *ProgressStore
-	Outline        *OutlineStore
-	Drafts         *DraftStore
-	Summaries      *SummaryStore
-	RunMeta        *RunMetaStore
-	UserRules      *UserRulesStore
-	Signals        *SignalStore
-	Runtime        *RuntimeStore
-	Characters     *CharacterStore
-	Cast           *CastStore
-	World          *WorldStore
-	Checkpoints    *CheckpointStore
-	Sessions       *SessionStore
-	Usage          *UsageStore
-	Simulation     *SimulationStore
+	Progress        *ProgressStore
+	Outline         *OutlineStore
+	Drafts          *DraftStore
+	Summaries       *SummaryStore
+	RunMeta         *RunMetaStore
+	UserRules       *UserRulesStore
+	Signals         *SignalStore
+	Runtime         *RuntimeStore
+	Characters      *CharacterStore
+	Cast            *CastStore
+	World           *WorldStore
+	Checkpoints     *CheckpointStore
+	Sessions        *SessionStore
+	Usage           *UsageStore
+	Simulation      *SimulationStore
 	StyleAnchors    *StyleAnchorsStore
 	Decisions       *DecisionStore
 	ProjectProfile  *ProjectProfileStore
 	PlanningArchive *PlanningArchiveStore
+	StyleReview     *StyleReviewStore
 
 	crossMu sync.Mutex // 保护跨域原子操作
 }
@@ -40,26 +41,27 @@ func NewStore(dir string) *Store {
 	io := newIO(dir)
 	outline := NewOutlineStore(io)
 	return &Store{
-		dir:            dir,
-		Progress:       NewProgressStore(newIO(dir)),
-		Outline:        outline,
-		Drafts:         NewDraftStore(newIO(dir)),
-		Summaries:      NewSummaryStore(newIO(dir), outline),
-		RunMeta:        NewRunMetaStore(newIO(dir)),
-		UserRules:      NewUserRulesStore(newIO(dir)),
-		Signals:        NewSignalStore(newIO(dir)),
-		Runtime:        NewRuntimeStore(newIO(dir)),
-		Characters:     NewCharacterStore(newIO(dir), outline),
-		Cast:           NewCastStore(newIO(dir)),
-		World:          NewWorldStore(newIO(dir)),
-		Checkpoints:    NewCheckpointStore(io),
-		Sessions:       NewSessionStore(newIO(dir)),
-		Usage:          NewUsageStore(newIO(dir)),
-		Simulation:     NewSimulationStore(newIO(dir)),
-		StyleAnchors:   NewStyleAnchorsStore(newIO(dir)),
+		dir:             dir,
+		Progress:        NewProgressStore(newIO(dir)),
+		Outline:         outline,
+		Drafts:          NewDraftStore(newIO(dir)),
+		Summaries:       NewSummaryStore(newIO(dir), outline),
+		RunMeta:         NewRunMetaStore(newIO(dir)),
+		UserRules:       NewUserRulesStore(newIO(dir)),
+		Signals:         NewSignalStore(newIO(dir)),
+		Runtime:         NewRuntimeStore(newIO(dir)),
+		Characters:      NewCharacterStore(newIO(dir), outline),
+		Cast:            NewCastStore(newIO(dir)),
+		World:           NewWorldStore(newIO(dir)),
+		Checkpoints:     NewCheckpointStore(io),
+		Sessions:        NewSessionStore(newIO(dir)),
+		Usage:           NewUsageStore(newIO(dir)),
+		Simulation:      NewSimulationStore(newIO(dir)),
+		StyleAnchors:    NewStyleAnchorsStore(newIO(dir)),
 		Decisions:       NewDecisionStore(newIO(dir)),
 		ProjectProfile:  NewProjectProfileStore(newIO(dir)),
 		PlanningArchive: NewPlanningArchiveStore(newIO(dir)),
+		StyleReview:     NewStyleReviewStore(newIO(dir)),
 	}
 }
 
@@ -134,7 +136,7 @@ func (s *Store) FoundationMissing() []string {
 // Init 创建所需的子目录结构。
 func (s *Store) Init() error {
 	return s.Progress.io.EnsureDirs([]string{
-		"chapters", "summaries", "drafts", "reviews", "meta", "meta/runtime", "meta/runtime/tasks", "meta/sessions", "meta/sessions/agents",
+		"chapters", "summaries", "drafts", "reviews", "meta", "meta/runtime", "meta/runtime/tasks", "meta/style_review", "meta/sessions", "meta/sessions/agents",
 	})
 }
 

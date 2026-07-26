@@ -134,10 +134,12 @@ type RoleConfig struct {
 
 // knownRoles 支持的可配置角色名。Arbiter 当前不开放角色级配置，
 // 统一使用顶层默认模型（host.arbiterModel 用 models.Default）。
+// critic 配置为可选，未配时回落默认模型。
 var knownRoles = map[string]bool{
 	"architect": true,
 	"writer":    true,
 	"editor":    true,
+	"critic":    true,
 }
 
 // Config 小说应用配置。
@@ -250,7 +252,7 @@ func (c *Config) ValidateBase() error {
 			return err
 		}
 		if !knownRoles[role] {
-			return fmt.Errorf("unknown role %q in roles config (valid: architect/writer/editor): %w", role, errs.ErrConfig)
+			return fmt.Errorf("unknown role %q in roles config (valid: architect/writer/editor/critic): %w", role, errs.ErrConfig)
 		}
 		if rc.Provider == "" || rc.Model == "" {
 			return fmt.Errorf("role %q must have both provider and model: %w", role, errs.ErrConfig)

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -124,8 +125,35 @@ func staticBlockMsg(msg string) func(map[string]struct{}) string {
 // NewWriterStopGuard 要求 writer 本轮至少产生一次成功的 commit_chapter。
 // 催促消息按已落盘的 step 进度组装：writer 是唯一有多步工具链的子代理，
 // 静态的"必须调 commit_chapter"在前置步骤缺失或 commit 本身报错时是误导。
+//
+// 特殊豁免：当风格评审账本当前状态为 exhausted 时，commit 被 commit 门控禁止，
+// 此时 writer 应请求 /style-override 而非继续 commit。StopGuard 在此情况下放行
+// end_turn（Allow: true），避免被催 commit 陷入死循环。
 func NewWriterStopGuard(st *store.Store, onBlock BlockHook) agentcore.StopGuard {
-	return newCheckpointDeltaGuard(st, "writer", []string{"commit"}, writerBlockMsg, onBlock)
+	inner := newCheckpointDeltaGuard(st, "writer", []string{"commit"}, writerBlockMsg, onBlock)
+	return func(ctx context.Context, info agentcore.StopInfo) agentcore.StopDecision {
+		// 检查风格评审账本是否 exhausted——此类章节 commit 被门控禁止，
+		// writer 无法通过 commit 满足 guard，放行 end_turn 让 writer 请求人工裁定。
+		if isStyleReviewExhausted(st) {
+			slog.Warn("subagent stop_guard 检测到 exhausted 账本，放行 end_turn",
+				"module", "agent.guard", "agent", "writer", "turn", info.TurnIndex)
+			return agentcore.StopDecision{Allow: true}
+		}
+		return inner(ctx, info)
+	}
+}
+
+// isStyleReviewExhausted 检查当前进行中的章节是否有 exhausted 风格评审账本。
+func isStyleReviewExhausted(st *store.Store) bool {
+	progress, err := st.Progress.Load()
+	if err != nil || progress == nil || progress.InProgressChapter <= 0 {
+		return false
+	}
+	ledger, err := st.StyleReview.Load(progress.InProgressChapter)
+	if err != nil || ledger == nil || ledger.IsEmpty() {
+		return false
+	}
+	return ledger.CurrentStatus() == domain.ReviewStatusExhausted
 }
 
 // writerBlockMsg 按本轮已出现的 checkpoint step 判断 writer 卡在哪一步。

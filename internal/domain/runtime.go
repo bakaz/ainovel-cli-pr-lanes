@@ -217,6 +217,7 @@ type RunMeta struct {
 	AdvanceMode          ChapterAdvanceMode `json:"advance_mode"`                     // 章节推进模式：auto / review
 	AdvancePermitChapter int                `json:"advance_permit_chapter,omitempty"` // review 模式下一次性许可的正向章节
 	AdvanceHold          *AdvanceHold       `json:"advance_hold,omitempty"`           // 当前干预签署的一次性暂停意图
+	StyleReviewMode      StyleQualityMode   `json:"style_review_mode,omitempty"`      // 风格评审质量模式：off / critic；零值等效 off
 }
 
 // ChapterAdvanceMode 决定新章节是否需要逐章许可。

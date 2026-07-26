@@ -90,8 +90,9 @@
 
   // 可选。按角色覆盖默认模型；未配的角色使用上面的 model。
   // reasoning_effort 也可按角色覆盖；未配时继承顶层 reasoning_effort。
-  // 角色：architect / writer / editor。fallbacks 在主模型失败时按序尝试。
-  // 注意：这里的 provider 同样是“指针”，必须指向 providers 里存在的 key。
+  // 角色：architect / writer / editor / critic。critic 未配时回落默认模型。
+  // fallbacks 在主模型失败时按序尝试。
+  // 注意：这里的 provider 同样是"指针"，必须指向 providers 里存在的 key。
   // "roles": {
   //   "writer": {
   //     "provider": "anthropic",

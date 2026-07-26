@@ -269,6 +269,13 @@ func TestPlanChapterMarksInProgress(t *testing.T) {
 		"goal":     "建立处境",
 		"conflict": "债务逼近",
 		"hook":     "发现线索",
+		"style_goal": map[string]any{
+			"focal_filter":          "主角限知视角",
+			"prose_movement":        "线性场景推进",
+			"detail_strategy":       "战斗详写过渡略写",
+			"rhythm":                "短句加快节奏",
+			"variation_from_recent": "减少景物描写",
+		},
 	})
 	if _, err := tool.Execute(context.Background(), args); err != nil {
 		t.Fatalf("Execute: %v", err)
