@@ -45,8 +45,13 @@ refer/
 output*
 workspace/
 .go-tmp/
-.slim/worktrees.json
+# BEGIN oh-my-opencode-slim worktrees
 .slim/worktrees/
+.slim/worktrees.json
+# END oh-my-opencode-slim worktrees
+# BEGIN oh-my-opencode-slim clonedeps
+.slim/clonedeps/repos/
+# END oh-my-opencode-slim clonedeps
 .slim/cache/
 .slim/deepwork/
 .tools/
