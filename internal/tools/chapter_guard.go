@@ -96,32 +96,23 @@ func CheckStyleReviewMutationGuard(st *store.Store, chapter int) error {
 
 // CheckCommitStyleGate 在 critic 模式下校验 commit 的前置条件。
 // 要求：
-//   - 最新的 consistency checkpoint 摘要精确匹配当前草稿摘要
+//   - 最新 consistency checkpoint 若存在，其摘要必须精确匹配当前草稿摘要（通用 freshness 校验）
 //   - 账本状态为 eligible terminal（accepted_initial、accepted_revised、degraded、overridden）
 //   - 当前草稿摘要匹配账本中最新条目的摘要
 //   - 当前基础摘要匹配账本中最新条目的基础摘要（检测风格目标/规则/锚点/批评者提示变更）
+//
+// Freshness 校验在 mode/rewrite queue 检查之前执行，确保一致性检查点不被绕过。
+// 无 checkpoint + off 模式仍允许（兼容边界）。
 //
 // Terminal 状态（accepted_initial、accepted_revised、degraded、overridden）
 // 是"快照权威"：评审锁定的是草稿快照，而非当时的基础配置。因此 terminal 状态
 // 下即使基础配置（风格目标、规则、锚点、批评者提示、大纲）已变更，commit 仍被
 // 允许——无需、也不可能重新评审已终结的审查。
 //
-// 已完成且在 PendingRewrites 队列中的章节不受批评者门控（重写/打磨路径）。
+// 已完成且在 PendingRewrites 队列中的章节仍然需要通过通用 freshness 校验；
+// 通过后跳过批评者门控（重写/打磨路径）。
 func CheckCommitStyleGate(st *store.Store, chapter int) error {
-	meta, err := st.RunMeta.Load()
-	if err != nil {
-		return fmt.Errorf("load run meta: %w: %w", errs.ErrStoreRead, err)
-	}
-	if meta == nil || meta.StyleReviewMode != domain.StyleQualityCritic {
-		return nil // off 模式不拦截
-	}
-
-	// 已完成 + 重写队列中 → 跳过批评者门控
-	if isCompletedAndInRewriteQueue(st, chapter) {
-		return nil
-	}
-
-	// 加载草稿并计算摘要
+	// 1. 加载草稿并计算摘要（同时用于 checkpoint freshness 和账本校验）
 	content, _, err := st.Drafts.LoadChapterContent(chapter)
 	if err != nil {
 		return fmt.Errorf("load content for commit gate: %w: %w", errs.ErrStoreRead, err)
@@ -131,18 +122,32 @@ func CheckCommitStyleGate(st *store.Store, chapter int) error {
 	}
 	currentDraftDigest := domain.DigestDraft(content)
 
-	// 校验一致性检查点存在且摘要匹配当前草稿
+	// 2. 通用 checkpoint freshness 校验（在 mode/rewrite queue 之前）
+	//    若存在 consistency_check checkpoint，其 digest 必须有效且匹配当前草稿。
 	consistencyCP := st.Checkpoints.LatestByStep(domain.ChapterScope(chapter), "consistency_check")
-	if consistencyCP == nil {
-		return fmt.Errorf("critic 模式：commit 前必须在章节 %d 上调用 check_consistency: %w",
-			chapter, errs.ErrToolPrecondition)
+	if consistencyCP != nil {
+		if !domain.IsValidDigest(consistencyCP.Digest) || consistencyCP.Digest != currentDraftDigest {
+			return fmt.Errorf("章节 %d 的草稿已变更或一致性检查点摘要无效，请重新运行 check_consistency: %w",
+				chapter, errs.ErrToolPrecondition)
+		}
 	}
-	if !domain.IsValidDigest(consistencyCP.Digest) || consistencyCP.Digest != currentDraftDigest {
-		return fmt.Errorf("critic 模式：章节 %d 的草稿已变更或一致性检查点摘要无效，请重新运行 check_consistency: %w",
-			chapter, errs.ErrToolPrecondition)
+	// 无 checkpoint：off 模式允许（step 3），critic 模式会继续到账本校验。
+
+	// 3. 模式检查：off 模式不拦截（若存在 checkpoint 已在上方校验）
+	meta, err := st.RunMeta.Load()
+	if err != nil {
+		return fmt.Errorf("load run meta: %w: %w", errs.ErrStoreRead, err)
+	}
+	if meta == nil || meta.StyleReviewMode != domain.StyleQualityCritic {
+		return nil
 	}
 
-	// 加载账本
+	// 4. 重写队列跳过（仅在通过 checkpoint freshness 后）
+	if isCompletedAndInRewriteQueue(st, chapter) {
+		return nil
+	}
+
+	// 5. 加载账本
 	ledger, err := st.StyleReview.Load(chapter)
 	if err != nil {
 		return fmt.Errorf("load style review ledger: %w: %w", errs.ErrStoreRead, err)
