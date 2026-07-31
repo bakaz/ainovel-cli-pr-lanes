@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -358,31 +359,9 @@ func TestPlanV3_Schema_SkeletonArcAcceptance(t *testing.T) {
 			},
 		},
 		{
-			// Skeleton arc with chapters=null → must pass schema
-			"layered_null_chapters",
-			map[string]any{
-				"type": "layered_outline", "scale": "long",
-				"content": []any{map[string]any{
-					"index": 1, "title": "卷", "theme": "主题",
-					"arcs": []any{
-						map[string]any{
-							"index": 1, "title": "首弧", "goal": "展开",
-							"chapters": []any{map[string]any{
-								"chapter": 1, "title": "章", "core_event": "事件",
-								"scenes": []any{scene},
-							}},
-						},
-						map[string]any{
-							"index": 2, "title": "骨架", "goal": "推进",
-							"estimated_chapters": 5,
-							"chapters":           nil,
-						},
-					},
-				}},
-			},
-		},
-		{
 			// Skeleton arc with chapters=[] (empty array) → must pass schema
+			// chapters:null 不在 tool schema 接受范围（禁 type:null，兼容 DeepSeek）；
+			// Execute 路径仍可容忍 null，见 TestPlanV3_SkeletonChaptersNullOrEmpty。
 			"layered_empty_chapters",
 			map[string]any{
 				"type": "layered_outline", "scale": "long",
@@ -456,6 +435,98 @@ func TestPlanV3_Schema_SkeletonArcAcceptance(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPlanV3_Schema_RejectsChaptersNull 确认 tool schema 不再用 type:null，
+// 因而 chapters:null 在 schema 层不通过（DeepSeek 兼容）；Execute 仍可容忍 null。
+func TestPlanV3_Schema_RejectsChaptersNull(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	tool := NewSaveFoundationTool(st, projectprofile.NewSceneBeatV3Contract())
+	sch := compileSaveSchema(t, tool.Schema())
+	scene := v3FullScene()
+	payload := map[string]any{
+		"type": "layered_outline", "scale": "long",
+		"content": []any{map[string]any{
+			"index": 1, "title": "卷", "theme": "主题",
+			"arcs": []any{
+				map[string]any{
+					"index": 1, "title": "首弧", "goal": "展开",
+					"chapters": []any{map[string]any{
+						"chapter": 1, "title": "章", "core_event": "事件",
+						"scenes": []any{scene},
+					}},
+				},
+				map[string]any{
+					"index": 2, "title": "骨架", "goal": "推进",
+					"estimated_chapters": 5,
+					"chapters":           nil,
+				},
+			},
+		}},
+	}
+	if err := validateAgainstSchema(t, sch, payload); err == nil {
+		t.Fatal("chapters:null should fail tool schema (no type:null); use omit or []")
+	}
+}
+
+// TestToolSchemas_NoJSONNullType 回归：发给 LLM 的 tool parameters 不得含 type:null。
+func TestToolSchemas_NoJSONNullType(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	schemas := []struct {
+		name string
+		s    map[string]any
+	}{
+		{"save_foundation_v3", NewSaveFoundationTool(st, projectprofile.NewSceneBeatV3Contract()).Schema()},
+		{"save_foundation_core4", NewSaveFoundationTool(st, nil).Schema()}, // nil contract → Core4 schema
+		{"save_planning_archive_entry", NewSavePlanningArchiveEntryTool(st).Schema()},
+	}
+	for _, tc := range schemas {
+		t.Run(tc.name, func(t *testing.T) {
+			if path := findJSONNullType(tc.s, "$"); path != "" {
+				t.Fatalf("tool schema contains type:null at %s (breaks DeepSeek function calling)", path)
+			}
+		})
+	}
+}
+
+func findJSONNullType(v any, path string) string {
+	switch x := v.(type) {
+	case map[string]any:
+		if t, ok := x["type"]; ok {
+			switch tt := t.(type) {
+			case string:
+				if tt == "null" {
+					return path + ".type"
+				}
+			case []any:
+				for _, item := range tt {
+					if s, ok := item.(string); ok && s == "null" {
+						return path + ".type"
+					}
+				}
+			}
+		}
+		for k, child := range x {
+			if p := findJSONNullType(child, path+"."+k); p != "" {
+				return p
+			}
+		}
+	case []any:
+		for i, child := range x {
+			if p := findJSONNullType(child, path+fmt.Sprintf("[%d]", i)); p != "" {
+				return p
+			}
+		}
+	}
+	return ""
 }
 
 // ── Skeleton arc with estimated_chapters missing or 0: schema rejection ──

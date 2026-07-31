@@ -3,12 +3,14 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/agentcore/subagent"
 	"github.com/voocel/ainovel-cli/assets"
 	"github.com/voocel/ainovel-cli/internal/bootstrap"
 	"github.com/voocel/ainovel-cli/internal/domain"
@@ -502,4 +504,129 @@ func TestBuildWorkers_V3GuidanceProductionWiring(t *testing.T) {
 			t.Error("Core4 prompt should not contain erotic_charge guidance")
 		}
 	})
+}
+
+// TestBuildWorkers_ToolSchemasNoJSONNullType 回归：DeepSeek/OpenAI 兼容接口会拒绝
+// tool parameters 中任何 "type": null。该测试从生产组合 buildWorkerToolsets 出发，
+// 覆盖四个角色的全部工具（同名工具/共享实例按名去重，Schema() 与角色无关），
+// 并用真实构造函数补入 BuildWorkers 在 buildWorkerToolsets 返回后追加到 writer
+// 的 review_style（build.go:253-254），确保每个 provider-shipped 的 schema 都被检查。
+// 对每个 tool.Schema() 做 JSON round-trip（Marshal → Unmarshal，即实际发给
+// provider 的字节），再递归检查所有名为 "type" 的属性：JSON null（Go nil 序列化
+// 后即为此）、字符串含 "null"、或列表含 "null" 均判失败。
+// 另外断言每个 schema 根必须是显式 object（type == "object"）：DeepSeek 也会拒绝
+// 无根 type 的 parameters（报 got 'type: null'），例如 {"anyOf":[...]}。
+// Core4 与 V3 两种契约都测，确保 save_foundation 两个 schema 变体都被覆盖。
+func TestBuildWorkers_ToolSchemasNoJSONNullType(t *testing.T) {
+	contracts := []struct {
+		name     string
+		contract *projectprofile.SceneBeatContract
+	}{
+		{"core4", projectprofile.NewCore4Contract()},
+		{"v3", projectprofile.NewSceneBeatV3Contract()},
+	}
+	for _, c := range contracts {
+		t.Run(c.name, func(t *testing.T) {
+			st := store.NewStore(t.TempDir())
+			bundle := assets.Load("default", assets.LoadOptions{})
+			ts := buildWorkerToolsets(st, bundle, "default", c.contract)
+			// review_style 由 BuildWorkers 在 buildWorkerToolsets 返回后追加到
+			// writer 工具集；用真实构造函数补入。其 Schema() 为静态结构，不依赖
+			// runner/store 内容，故 critic runner 用最小配置即可。
+			criticRunner := subagent.NewRunner(subagent.Config{
+				Name:         "style_critic",
+				Description:  "schema-guard",
+				SystemPrompt: "schema-guard",
+				MaxTurns:     1,
+			})
+			reviewStyle := tools.NewReviewStyleTool(st, criticRunner, "prompt:schema-guard-hash")
+			writerTools := append(ts.Writer, reviewStyle)
+			roles := []struct {
+				role  string
+				tools []agentcore.Tool
+			}{
+				{"architect_short", ts.ArchitectShort},
+				{"architect_long", ts.ArchitectLong},
+				{"writer", writerTools},
+				{"editor", ts.Editor},
+			}
+			checked := make(map[string]string) // tool name → 首个出现的角色
+			for _, r := range roles {
+				if len(r.tools) == 0 {
+					t.Errorf("%s: tool list is empty", r.role)
+					continue
+				}
+				for _, tool := range r.tools {
+					if _, dup := checked[tool.Name()]; dup {
+						continue // 共享实例/同名工具已检查过
+					}
+					checked[tool.Name()] = r.role
+					raw, err := json.Marshal(tool.Schema())
+					if err != nil {
+						t.Fatalf("%s: marshal schema: %v", tool.Name(), err)
+					}
+					var decoded any
+					if err := json.Unmarshal(raw, &decoded); err != nil {
+						t.Fatalf("%s: unmarshal schema: %v", tool.Name(), err)
+					}
+					if path := findNullTypePath(decoded, "$"); path != "" {
+						t.Errorf("%s (role %s): tool schema contains type:null at %s; DeepSeek/OpenAI-compatible providers reject this",
+							tool.Name(), r.role, path)
+					}
+					// 根必须是显式 object：DeepSeek 拒绝无根 type 的 tool parameters
+					// （报 got 'type: null'），如 {"anyOf":[...]}。
+					root, ok := decoded.(map[string]any)
+					if !ok {
+						t.Errorf("%s (role %s): tool schema root must be a JSON object (path $)", tool.Name(), r.role)
+						continue
+					}
+					rootType, _ := root["type"].(string)
+					if rootType != "object" {
+						t.Errorf("%s (role %s): tool schema root type must be \"object\", got %v (path $.type)",
+							tool.Name(), r.role, root["type"])
+					}
+				}
+			}
+		})
+	}
+}
+
+// findNullTypePath 递归遍历 JSON round-trip 后的 schema 值，返回第一个名为
+// "type" 且值为 JSON null（Go nil）、字符串含 "null"、或列表含 "null" 的
+// 属性的 JSON 路径（如 $.properties.arcs.items.anyOf[1].type）；未命中返回 ""。
+func findNullTypePath(v any, path string) string {
+	switch x := v.(type) {
+	case map[string]any:
+		if tv, ok := x["type"]; ok {
+			switch tt := tv.(type) {
+			case nil:
+				return path + ".type"
+			case string:
+				if strings.Contains(tt, "null") {
+					return path + ".type"
+				}
+			case []any:
+				for _, item := range tt {
+					if item == nil {
+						return path + ".type"
+					}
+					if s, ok := item.(string); ok && s == "null" {
+						return path + ".type"
+					}
+				}
+			}
+		}
+		for k, child := range x {
+			if p := findNullTypePath(child, path+"."+k); p != "" {
+				return p
+			}
+		}
+	case []any:
+		for i, child := range x {
+			if p := findNullTypePath(child, path+fmt.Sprintf("[%d]", i)); p != "" {
+				return p
+			}
+		}
+	}
+	return ""
 }

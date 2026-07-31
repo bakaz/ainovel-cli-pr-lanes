@@ -145,6 +145,7 @@ func arcOutlineSchema(v3 bool) map[string]any {
 	chPlanning := chapterOutlineSchema(v3, false)
 	if v3 {
 		return map[string]any{
+			"type": "object",
 			"anyOf": []any{
 				// detailed arc: must have non-empty chapters
 				map[string]any{
@@ -159,7 +160,8 @@ func arcOutlineSchema(v3 bool) map[string]any {
 					"required":             []string{"index", "title", "goal", "chapters"},
 					"additionalProperties": false,
 				},
-				// skeleton arc: estimated_chapters >= 1, chapters omitted/null/[]
+				// skeleton arc: estimated_chapters >= 1; omit chapters or pass []
+				// Note: do NOT use {"type":"null"} — DeepSeek/部分 OpenAI 兼容接口会拒绝 tool schema 中的 null type。
 				map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -167,12 +169,7 @@ func arcOutlineSchema(v3 bool) map[string]any {
 						"title":              scenePropString("弧标题"),
 						"goal":               scenePropString("弧目标（起承转合）"),
 						"estimated_chapters": map[string]any{"type": "integer", "description": "预估章数", "minimum": 1},
-						"chapters": map[string]any{
-							"anyOf": []any{
-								map[string]any{"type": "null"},
-								map[string]any{"type": "array", "maxItems": 0},
-							},
-						},
+						"chapters":           skeletonChaptersSchema(),
 					},
 					"required":             []string{"index", "title", "goal", "estimated_chapters"},
 					"additionalProperties": false,
@@ -180,8 +177,10 @@ func arcOutlineSchema(v3 bool) map[string]any {
 			},
 		}
 	}
-	// Core4: also use anyOf for detailed/skeleton (not a single generic passage)
+	// Core4: also use anyOf for detailed/skeleton (not a single generic passage).
+	// 外层必须有 type:object：DeepSeek 会拒绝无根 type 的 tool parameters（同 V3 根 schema）。
 	return map[string]any{
+		"type": "object",
 		"anyOf": []any{
 			map[string]any{
 				"type": "object",
@@ -201,17 +200,23 @@ func arcOutlineSchema(v3 bool) map[string]any {
 					"title":              scenePropString("弧标题"),
 					"goal":               scenePropString("弧目标（起承转合）"),
 					"estimated_chapters": map[string]any{"type": "integer", "description": "预估章数", "minimum": 1},
-					"chapters": map[string]any{
-						"anyOf": []any{
-							map[string]any{"type": "null"},
-							map[string]any{"type": "array", "maxItems": 0},
-						},
-					},
+					"chapters":           skeletonChaptersSchema(),
 				},
 				"required":             []string{"index", "title", "goal", "estimated_chapters"},
 				"additionalProperties": false,
 			},
 		},
+	}
+}
+
+// skeletonChaptersSchema 描述骨架弧可选的 chapters 字段。
+// 对外 schema 只允许空数组（或不传该字段）；禁止 type:null，避免 DeepSeek 等拒收 tools。
+// Execute 路径仍可容忍 JSON null（Go 解包后与省略等价）。
+func skeletonChaptersSchema() map[string]any {
+	return map[string]any{
+		"type":        "array",
+		"maxItems":    0,
+		"description": "骨架弧省略本字段或传空数组 []；不要传 null",
 	}
 }
 
@@ -300,7 +305,10 @@ func (t *SaveFoundationTool) v3Schema() map[string]any {
 	chOpt := chapterOutlineSchema(true, false) // planning paths: chapter optional
 	vol := volumeOutlineSchema(true)
 	scaleEnum := map[string]any{"type": "string", "enum": []string{"short", "mid", "long"}}
+	// 根必须是显式 object：DeepSeek 会拒绝无根 type 的 tool parameters
+	// （报 got 'type: null'），例如 {"anyOf":[...]}。
 	return map[string]any{
+		"type": "object",
 		"anyOf": []any{
 			t.v3Branch("premise", map[string]any{"type": "string", "description": "premise 前提（Markdown 字符串）"}, map[string]map[string]any{"scale": scaleEnum}),
 			t.v3Branch("outline", map[string]any{"type": "array", "description": "outline: Chapter 对象数组", "items": chReq, "minItems": 1}, map[string]map[string]any{"scale": scaleEnum}),

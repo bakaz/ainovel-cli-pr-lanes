@@ -1493,6 +1493,88 @@ func TestSaveFoundationSchemaBranches(t *testing.T) {
 	}
 }
 
+// TestCore4Schema_ArcsItemsTypeObjectAndHeterogeneousContent 回归：
+//  1. Core4 arcs.items 组合 map 必须带 type:"object"（与 V3 根 schema 同理，
+//     DeepSeek 会拒绝无根 type 的嵌套 schema，报 got 'type: null'）。
+//  2. core4Schema 的 content 保持异构：premise string 与 array-content 命令
+//     （outline / layered_outline）都必须仍能通过 schema 验证——防止有人为给
+//     arcs.items 加 type 而误伤 content 的 anyOf 分支。
+func TestCore4Schema_ArcsItemsTypeObjectAndHeterogeneousContent(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	tool := NewSaveFoundationTool(st, testContract) // Core4
+	s := tool.Schema()
+
+	// layered_outline 分支是 arcs.items 的 canonical 位置；
+	// append_volume 分支复用同一个 vol items map（见 core4Schema）。
+	arcItems := getNestedProp(getAnyOf(s, anyOfLayeredOutline), "items", "properties", "arcs", "items")
+	if arcItems == nil {
+		t.Fatal("Core4 layered_outline arcs.items schema not found")
+	}
+	if typ, _ := arcItems["type"].(string); typ != "object" {
+		t.Fatalf("Core4 arcs.items composition map type = %q, want \"object\"", typ)
+	}
+	if anyOf, ok := arcItems["anyOf"].([]any); !ok || len(anyOf) != 2 {
+		t.Fatalf("Core4 arcs.items should keep detailed/skeleton anyOf, got %v", arcItems["anyOf"])
+	}
+
+	// 异构 content 回归：string（premise）与 array-content（outline /
+	// layered_outline，后者流经 arcs.items）都必须通过 schema。
+	sch := compileSaveSchema(t, s)
+	payloads := []struct {
+		name    string
+		payload map[string]any
+	}{
+		{
+			"premise_string",
+			map[string]any{
+				"type": "premise", "scale": "long",
+				"content": "# 书名\n\n## 题材和基调\n测试",
+			},
+		},
+		{
+			"outline_array",
+			map[string]any{
+				"type": "outline", "scale": "short",
+				"content": []any{map[string]any{
+					"chapter": 1, "title": "章", "core_event": "事件",
+					"scenes": []any{map[string]any{
+						"goal": "g", "action": "a", "conflict": "c", "outcome": "o",
+					}},
+				}},
+			},
+		},
+		{
+			"layered_outline_array_with_arcs",
+			map[string]any{
+				"type": "layered_outline", "scale": "long",
+				"content": []any{map[string]any{
+					"index": 1, "title": "卷", "theme": "主题",
+					"arcs": []any{map[string]any{
+						"index": 1, "title": "弧", "goal": "目标",
+						"chapters": []any{map[string]any{
+							"chapter": 1, "title": "章", "core_event": "事件",
+							"scenes": []any{map[string]any{
+								"goal": "g", "action": "a", "conflict": "c", "outcome": "o",
+							}},
+						}},
+					}},
+				}},
+			},
+		},
+	}
+	for _, tc := range payloads {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateAgainstSchema(t, sch, tc.payload); err != nil {
+				t.Errorf("Core4 valid payload should pass schema: %v", err)
+			}
+		})
+	}
+}
+
 // TestSaveFoundationOutlineWithBodyEmotionReaction 验证 body_reaction / emotion_reaction
 // 通过 save_foundation 工具落盘后正确持久化。同时验证 legacy string scenes 不受影响。
 func TestSaveFoundationOutlineWithBodyEmotionReaction(t *testing.T) {

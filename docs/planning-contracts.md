@@ -49,7 +49,7 @@
 
 | 特征 | 详细弧 | 骨架弧 |
 |------|--------|--------|
-| `chapters` | 非空数组（≥1） | 省略 / `null` / `[]` |
+| `chapters` | 非空数组（≥1） | 省略 / `[]`（tool schema 禁止 `null` type，兼容 DeepSeek；Execute 仍可容忍 JSON null） |
 | `estimated_chapters` | 可为任意值（转换前归零） | ≥ 1 |
 | `IsDetailed()` | `true` | `false` |
 | `IsSkeleton()` | `false` | `true` |

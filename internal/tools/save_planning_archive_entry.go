@@ -38,11 +38,10 @@ func (t *SavePlanningArchiveEntryTool) Schema() map[string]any {
 		schema.Property("action", schema.Enum("操作类型", "upsert", "delete")).Required(),
 		schema.Property("kind", schema.String("条目类型（当前仅支持 room）")).Required(),
 		schema.Property("id", schema.String("条目 ID，大小写敏感，不 trim/规范化")).Required(),
+		// data：upsert 为对象；delete 省略本字段。禁止 type:null（DeepSeek 等拒收 tool schema）。
 		schema.Property("data", map[string]any{
-			"oneOf": []any{
-				map[string]any{"type": "object", "description": "条目数据（upsert 时必须为 JSON 对象，delete 时不可传）"},
-				map[string]any{"type": "null"},
-			},
+			"type":        "object",
+			"description": "条目数据（upsert 时必须为 JSON 对象；delete 时省略本字段，不要传 null）",
 		}),
 		schema.Property("summary", schema.String("条目摘要，会随条目一起持久化")),
 		schema.Property("reason", schema.String("操作理由，upsert/delete 均必填")).Required(),
