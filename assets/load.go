@@ -30,6 +30,7 @@ type Prompts struct {
 	ArchitectLong    string
 	Writer           string // 协议模板,含 {{VOICE}} 占位符;终稿经 BuildWriterPrompt 组装
 	Editor           string
+	Polisher         string // 文风精修师（独立 Runner，仅精修已有草稿，不评审不提交）
 	ImportFoundation string
 	ImportAnalyzer   string
 	SimulationSource string
@@ -216,6 +217,7 @@ func loadPrompts() Prompts {
 		ArchitectLong:    WithSimulationGuidance(mustRead(promptsFS, "prompts/architect-long.md"), "architect"),
 		Writer:           WithSimulationGuidance(mustRead(promptsFS, "prompts/writer.md"), "writer"),
 		Editor:           WithSimulationGuidance(mustRead(promptsFS, "prompts/editor.md"), "editor"),
+		Polisher:         WithSimulationGuidance(mustRead(promptsFS, "prompts/polisher.md"), "polisher"),
 		ImportFoundation: mustRead(promptsFS, "prompts/import-foundation.md"),
 		ImportAnalyzer:   mustRead(promptsFS, "prompts/import-chapter-analyzer.md"),
 		SimulationSource: mustRead(promptsFS, "prompts/simulation-source.md"),
@@ -254,6 +256,8 @@ func (b *Bundle) OverridePrompt(file, raw string) error {
 		b.Prompts.Writer = wrapped
 	case "editor.md":
 		b.Prompts.Editor = wrapped
+	case "polisher.md":
+		b.Prompts.Polisher = wrapped
 	}
 	return nil
 }
@@ -264,6 +268,7 @@ var promptRole = map[string]string{
 	"architect-long.md":  "architect",
 	"writer.md":          "writer",
 	"editor.md":          "editor",
+	"polisher.md":        "polisher",
 }
 
 const simulationGuidance = `## 仿写画像

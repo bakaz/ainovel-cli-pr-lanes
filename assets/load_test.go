@@ -95,6 +95,50 @@ func TestLoad_NoOverrides(t *testing.T) {
 	}
 }
 
+// TestPolisherPrompt_LoadedAndOverlay 验证 polisher.md 嵌入加载（含仿写画像包装）与
+// overlay 覆盖路径（workspace/.ainovel/prompts/）。
+func TestPolisherPrompt_LoadedAndOverlay(t *testing.T) {
+	b := Load("default", LoadOptions{})
+	if b.Prompts.Polisher == "" {
+		t.Fatal("Polisher prompt 应非空")
+	}
+	// 与 writer/editor 同款：核心提示词带仿写画像包装
+	if !contains(t, b.Prompts.Polisher, "仿写画像") {
+		t.Fatal("Polisher 应带 simulation guidance 包装（按 writer 同款）")
+	}
+	// 受限协议：不重规划 / 不评审 / 不提交
+	if !contains(t, b.Prompts.Polisher, "plan_chapter") {
+		t.Fatal("Polisher 应禁止 plan_chapter")
+	}
+	if !contains(t, b.Prompts.Polisher, "review_style") || !contains(t, b.Prompts.Polisher, "commit_chapter") {
+		t.Fatal("Polisher 应声明 review_style/commit_chapter 由调用方执行")
+	}
+	// no-op 允许
+	if !contains(t, b.Prompts.Polisher, "changed=false") && !contains(t, b.Prompts.Polisher, "no-op") {
+		t.Fatal("Polisher 应允许 no-op（changed=false）")
+	}
+
+	// overlay 覆盖：polisher.md 走白名单覆盖
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "prompts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "prompts", "polisher.md"), []byte("POLISHER_EXTERNAL_CANARY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report := ApplyOverrides(&b, "default", []string{root})
+	if len(report.Warnings) != 0 {
+		t.Fatalf("unexpected overlay warnings: %+v", report.Warnings)
+	}
+	// 核心提示词走 OverridePrompt：raw 前置 + simulation guidance 包装追加（与 writer/editor 同款）
+	if !strings.HasPrefix(b.Prompts.Polisher, "POLISHER_EXTERNAL_CANARY") {
+		t.Fatalf("polisher overlay failed: %q", b.Prompts.Polisher)
+	}
+	if !contains(t, b.Prompts.Polisher, "仿写画像") {
+		t.Fatal("polisher overlay 后应保留 simulation guidance 包装")
+	}
+}
+
 // TestStyleCriticPrompt_Loaded 验证 style-critic.md 嵌入并可通过 Load 正常访问。
 func TestStyleCriticPrompt_Loaded(t *testing.T) {
 	b := Load("default", LoadOptions{})
