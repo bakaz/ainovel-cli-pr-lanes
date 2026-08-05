@@ -1433,16 +1433,36 @@ func (h *Host) fillDetails(snap *UISnapshot, progress *domain.Progress) {
 	loadedWorld := 0
 	if timeline, err := h.store.World.LoadTimeline(); err == nil {
 		loadedWorld++
-		// 按章号倒序取最近 5 条(同章按事件时间倒序)
-		sort.Slice(timeline, func(i, j int) bool {
-			if timeline[i].Chapter != timeline[j].Chapter {
-				return timeline[i].Chapter > timeline[j].Chapter
+		// 只展示已完成章节以内的时间线,过滤旧版残留的高章号条目。
+		// maxCompleted 必须遍历求最大值:CompletedChapters 只 append 不排序
+		// (见 store/progress.go MarkChapterComplete),取 [len-1] 在乱序时算错。
+		// progress 为 nil 或零完成章时不显示时间线(不回退成全量)。
+		maxCompleted := 0
+		if progress != nil {
+			for _, ch := range progress.CompletedChapters {
+				if ch > maxCompleted {
+					maxCompleted = ch
+				}
 			}
-			return timeline[i].Time > timeline[j].Time
-		})
-		for i := 0; i < len(timeline) && len(snap.RecentTimeline) < 5; i++ {
-			snap.RecentTimeline = append(snap.RecentTimeline,
-				fmt.Sprintf("第%d章: %s", timeline[i].Chapter, truncate(timeline[i].Event, 30)))
+		}
+		if maxCompleted > 0 {
+			filtered := timeline[:0]
+			for _, e := range timeline {
+				if e.Chapter <= maxCompleted {
+					filtered = append(filtered, e)
+				}
+			}
+			// 按章号倒序取最近 5 条(同章按事件时间倒序)
+			sort.Slice(filtered, func(i, j int) bool {
+				if filtered[i].Chapter != filtered[j].Chapter {
+					return filtered[i].Chapter > filtered[j].Chapter
+				}
+				return filtered[i].Time > filtered[j].Time
+			})
+			for i := 0; i < len(filtered) && len(snap.RecentTimeline) < 5; i++ {
+				snap.RecentTimeline = append(snap.RecentTimeline,
+					fmt.Sprintf("第%d章: %s", filtered[i].Chapter, truncate(filtered[i].Event, 30)))
+			}
 		}
 	}
 	if active, err := h.store.World.LoadActiveForeshadow(); err == nil {

@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -106,19 +107,28 @@ func TestTimeline_AppendIsIdempotent(t *testing.T) {
 func TestTimeline_LoadRecent(t *testing.T) {
 	s := newTestStore(t)
 	_ = s.World.SaveTimeline([]domain.TimelineEvent{
-		{Chapter: 1}, {Chapter: 3}, {Chapter: 5}, {Chapter: 7},
+		{Chapter: 1}, {Chapter: 3}, {Chapter: 5}, {Chapter: 7}, {Chapter: 518},
 	})
 
 	for _, tt := range []struct {
-		current, window, want int
+		current, window int
+		want            []int
 	}{
-		{7, 10, 4}, // 全部
-		{7, 3, 2},  // ch5,ch7
-		{5, 2, 3},  // ch3,ch5,ch7
+		{7, 10, []int{1, 3, 5, 7}}, // 全部（ch518 远未来条目被上界过滤）
+		{7, 3, []int{5, 7}},        // ch5,ch7
+		{5, 2, []int{3, 5}},        // ch3,ch5（ch7 超出上界 current=5，不再包含）
+		{5, 10, []int{1, 3, 5}},    // 上界生效：ch7/ch518 均被过滤
 	} {
-		got, _ := s.World.LoadRecentTimeline(tt.current, tt.window)
-		if len(got) != tt.want {
-			t.Errorf("LoadRecent(%d,%d): want %d, got %d", tt.current, tt.window, tt.want, len(got))
+		got, err := s.World.LoadRecentTimeline(tt.current, tt.window)
+		if err != nil {
+			t.Fatalf("LoadRecent(%d,%d): %v", tt.current, tt.window, err)
+		}
+		var chapters []int
+		for _, e := range got {
+			chapters = append(chapters, e.Chapter)
+		}
+		if !slices.Equal(chapters, tt.want) {
+			t.Errorf("LoadRecent(%d,%d): want chapters %v, got %v", tt.current, tt.window, tt.want, chapters)
 		}
 	}
 }

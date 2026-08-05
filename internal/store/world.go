@@ -71,7 +71,8 @@ func (s *WorldStore) AppendTimelineEvents(newEvents []domain.TimelineEvent) erro
 	})
 }
 
-// LoadRecentTimeline 返回最近 window 章内的时间线事件。
+// LoadRecentTimeline 返回 [current-window, current] 章范围内的时间线事件。
+// 上界 current 用于过滤旧版残留的远期条目（如正文已回滚但 timeline 未清理的章节）。
 func (s *WorldStore) LoadRecentTimeline(current, window int) ([]domain.TimelineEvent, error) {
 	all, err := s.LoadTimeline()
 	if err != nil {
@@ -80,7 +81,7 @@ func (s *WorldStore) LoadRecentTimeline(current, window int) ([]domain.TimelineE
 	minCh := max(current-window, 1)
 	var filtered []domain.TimelineEvent
 	for _, e := range all {
-		if e.Chapter >= minCh {
+		if e.Chapter >= minCh && e.Chapter <= current {
 			filtered = append(filtered, e)
 		}
 	}
