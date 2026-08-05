@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1230,5 +1231,334 @@ func TestEditChapterNextStepMentionsRecheck(t *testing.T) {
 		if !strings.Contains(nextStep, "check") && !strings.Contains(nextStep, "核验") {
 			t.Fatalf("next_step must not suggest commit without recheck, got %q", nextStep)
 		}
+	}
+}
+
+// --- 结构化候选反馈测试（oracle-5） ---
+
+// fakeEditToolErr 返回固定错误，用于测试底层错误 → 结构化错误的分类。
+type fakeEditToolErr struct{ err error }
+
+func (f *fakeEditToolErr) Execute(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+	return nil, f.err
+}
+
+// newEditChapterTestStore 构造测试 store 并保存草稿，返回 store 与原文。
+func newEditChapterTestStore(t *testing.T, chapter int, draft string) *store.Store {
+	t.Helper()
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 10); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Drafts.SaveDraft(chapter, draft); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	return s
+}
+
+// TestEditChapterAnchorNotFoundWhitespaceNormalized old_string 仅在忽略空白后
+// 唯一匹配 → 结构化错误标记 match_mode=whitespace_normalized 且
+// whitespace_normalized_unique=true；草稿不被自动修改。
+func TestEditChapterAnchorNotFoundWhitespaceNormalized(t *testing.T) {
+	// 草稿中"指节 发白"带空格，old_string 无空格 → 上游精确匹配失败，
+	// 但忽略空白后唯一命中。
+	original := "他握紧了拳头，指节 发白。"
+	s := newEditChapterTestStore(t, 2, original)
+
+	tool := NewEditChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter":    2,
+		"old_string": "指节发白",
+		"new_string": "指节泛起青白",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("expected structured anchor-not-found error")
+	}
+	if !errors.Is(err, errs.ErrToolPrecondition) {
+		t.Fatalf("expected ErrToolPrecondition, got %v", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"code=edit_anchor_not_found",
+		"chapter=2",
+		"match_mode=whitespace_normalized",
+		"whitespace_normalized_unique=true",
+		"candidate_count=",
+		"retry_instruction=",
+		"draft_digest=sha256:",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing %q:\n%s", want, msg)
+		}
+	}
+	// 候选不得自动应用：草稿保持原样
+	got, _ := s.Drafts.LoadDraft(2)
+	if got != original {
+		t.Fatalf("draft must stay untouched (no auto-apply), got %q", got)
+	}
+}
+
+// TestEditChapterAnchorNotFoundExactMode old_string 与草稿相似但确实不存在 →
+// match_mode=exact、whitespace_normalized_unique=false，候选片段出现在错误
+// 消息中供模型参考。
+func TestEditChapterAnchorNotFoundExactMode(t *testing.T) {
+	original := "他握紧了拳头，指节发白。\n\n她转过身，泪水滑落。"
+	s := newEditChapterTestStore(t, 2, original)
+
+	tool := NewEditChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter":    2,
+		"old_string": "她转过身，泪珠滑落。", // 泪珠 ≠ 泪水：精确与忽略空白均不匹配
+		"new_string": "她背过身去，泪珠滚落。",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("expected structured anchor-not-found error")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"code=edit_anchor_not_found",
+		"match_mode=exact",
+		"whitespace_normalized_unique=false",
+		"candidate_count=1",
+		"retry_instruction=",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing %q:\n%s", want, msg)
+		}
+	}
+	// 候选片段（相似行）应出现在错误消息中
+	if !strings.Contains(msg, "她转过身，泪水滑落。") {
+		t.Errorf("error message should contain candidate block, got:\n%s", msg)
+	}
+	// 草稿保持原样
+	got, _ := s.Drafts.LoadDraft(2)
+	if got != original {
+		t.Fatalf("draft must stay untouched, got %q", got)
+	}
+}
+
+// TestEditChapterAnchorNotFoundCandidates 通过注入上游错误文本验证候选解析：
+// candidate_count、候选片段与 draft_digest 均正确，且候选不自动应用。
+func TestEditChapterAnchorNotFoundCandidates(t *testing.T) {
+	original := "他握紧了拳头，指节发白。\n\n她转过身，泪水滑落。"
+	s := newEditChapterTestStore(t, 2, original)
+
+	// 模拟 agentcore EditTool 带候选的失配错误文本（真实格式）
+	upstreamErr := "could not find the exact text in drafts/02.draft.md. " +
+		"The old text must match exactly including all whitespace and newlines.\n\n" +
+		"Possible old_string candidates (copy one exactly):\n" +
+		"1. lines 3-3\n```text\n她转过身，泪水滑落。\n```\n" +
+		"2. lines 5-5\n```text\n他握紧了拳头，指节发白。\n```"
+	tool := &EditChapterTool{
+		store: s,
+		edit:  &fakeEditToolErr{err: fmt.Errorf("%s", upstreamErr)},
+	}
+	args, _ := json.Marshal(map[string]any{
+		"chapter":    2,
+		"old_string": "不存在的文本",
+		"new_string": "替换文本",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("expected structured anchor-not-found error")
+	}
+	if !errors.Is(err, errs.ErrToolPrecondition) {
+		t.Fatalf("expected ErrToolPrecondition, got %v", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"code=edit_anchor_not_found",
+		"chapter=2",
+		"candidate_count=2",
+		"retry_instruction=",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing %q:\n%s", want, msg)
+		}
+	}
+	// 两条候选均应出现
+	for _, cand := range []string{"她转过身，泪水滑落。", "他握紧了拳头，指节发白。"} {
+		if !strings.Contains(msg, cand) {
+			t.Errorf("error message missing candidate %q:\n%s", cand, msg)
+		}
+	}
+	// draft_digest 应与磁盘草稿一致
+	actual, _ := s.Drafts.LoadDraft(2)
+	h := sha256.Sum256([]byte(actual))
+	if !strings.Contains(msg, "draft_digest=sha256:"+hex.EncodeToString(h[:])) {
+		t.Errorf("error message should carry draft digest sha256:%s:\n%s", hex.EncodeToString(h[:]), msg)
+	}
+	// 候选不自动应用
+	if actual != original {
+		t.Fatalf("draft must stay untouched, got %q", actual)
+	}
+}
+
+// TestEditChapterNoopStructured old_string == new_string → 结构化 edit_noop 错误，
+// 提示停止重复调用；草稿不被修改。
+func TestEditChapterNoopStructured(t *testing.T) {
+	original := "他握紧了拳头，指节发白。"
+	s := newEditChapterTestStore(t, 2, original)
+
+	tool := NewEditChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter":    2,
+		"old_string": "指节发白",
+		"new_string": "指节发白",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("expected structured no-op error")
+	}
+	if !errors.Is(err, errs.ErrToolPrecondition) {
+		t.Fatalf("expected ErrToolPrecondition, got %v", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"code=edit_noop",
+		"chapter=2",
+		"retry_instruction=",
+		"draft_digest=sha256:",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing %q:\n%s", want, msg)
+		}
+	}
+	// 草稿不被修改
+	got, _ := s.Drafts.LoadDraft(2)
+	if got != original {
+		t.Fatalf("draft must stay untouched, got %q", got)
+	}
+}
+
+// TestEditChapterNoopFromUpstream 上游返回归一化后无变化的错误
+// （old==new 归一化 / whitespace 归一化）→ 同样转成结构化 edit_noop。
+func TestEditChapterNoopFromUpstream(t *testing.T) {
+	tests := []struct {
+		name string
+		err  string
+	}{
+		{
+			name: "identical",
+			err:  "old_string and new_string are identical in drafts/02.draft.md. Provide a new_string that is different from the matched text",
+		},
+		{
+			name: "normalized no-change",
+			err:  "no changes made to drafts/02.draft.md. The replacement produced identical content (likely a whitespace or line-ending difference was normalized away)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newEditChapterTestStore(t, 2, "他握紧了拳头，指节发白。")
+			tool := &EditChapterTool{
+				store: s,
+				edit:  &fakeEditToolErr{err: fmt.Errorf("%s", tt.err)},
+			}
+			args, _ := json.Marshal(map[string]any{
+				"chapter":    2,
+				"old_string": "指节发白",
+				"new_string": "指节发白",
+			})
+			_, err := tool.Execute(context.Background(), args)
+			if err == nil {
+				t.Fatal("expected structured no-op error")
+			}
+			if !errors.Is(err, errs.ErrToolPrecondition) {
+				t.Fatalf("expected ErrToolPrecondition, got %v", err)
+			}
+			for _, want := range []string{"code=edit_noop", "chapter=2", "retry_instruction="} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error message missing %q:\n%s", want, err)
+				}
+			}
+		})
+	}
+}
+
+// TestEditChapterUnclassifiedErrorPassthrough 无法识别的底层错误（如歧义匹配）
+// 保持原透传，不包装成结构化错误。
+func TestEditChapterUnclassifiedErrorPassthrough(t *testing.T) {
+	s := newEditChapterTestStore(t, 2, "他笑了。她也笑了。")
+	tool := NewEditChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter":    2,
+		"old_string": "笑了",
+		"new_string": "沉默了",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("expected ambiguous-match rejection")
+	}
+	if strings.Contains(err.Error(), "code=edit_anchor_not_found") {
+		t.Fatalf("ambiguous match must NOT be classified as anchor-not-found: %v", err)
+	}
+}
+
+// TestParseEditCandidates 直接验证候选解析：数量上限、围栏提取、超长截断。
+func TestParseEditCandidates(t *testing.T) {
+	longBlock := strings.Repeat("长", maxCandidateRunes+50)
+	synthetic := "could not find the exact text in drafts/02.draft.md. " +
+		"The old text must match exactly including all whitespace and newlines.\n\n" +
+		"Possible old_string candidates (copy one exactly):\n" +
+		"1. lines 3-3\n```text\n她转过身，泪水滑落。\n```\n" +
+		"2. lines 5-5\n```text\n" + longBlock + "\n```\n" +
+		"3. lines 7-7\n```text\n第三候选。\n```\n" +
+		"4. lines 9-9\n```text\n第四候选（不应被解析）。\n```\n" +
+		"   Use read with offset=9 limit=1 to see the full block."
+
+	cands := parseEditCandidates(synthetic)
+	if len(cands) != maxCandidateCount {
+		t.Fatalf("candidate count = %d, want %d", len(cands), maxCandidateCount)
+	}
+	if cands[0] != "她转过身，泪水滑落。" {
+		t.Errorf("candidate[0] = %q, want the first fenced block", cands[0])
+	}
+	// 超长候选被截断（保留前缀 + 截断标记）
+	if !strings.HasPrefix(cands[1], longBlock[:maxCandidateRunes]) {
+		t.Errorf("candidate[1] should keep the leading part of the long block")
+	}
+	if len([]rune(cands[1])) > maxCandidateRunes+3 {
+		t.Errorf("candidate[1] too long: %d runes (limit %d)", len([]rune(cands[1])), maxCandidateRunes)
+	}
+	if cands[2] != "第三候选。" {
+		t.Errorf("candidate[2] = %q", cands[2])
+	}
+
+	// 无候选标记 → nil
+	if got := parseEditCandidates("could not find the exact text in drafts/02.draft.md. The old text must match exactly"); got != nil {
+		t.Fatalf("expected nil candidates without marker, got %v", got)
+	}
+	// 围栏未闭合 → 收集到文本结尾（错误文本来自单次 fmt.Errorf，不会被截断）
+	if got := parseEditCandidates("Possible old_string candidates (copy one exactly):\n1. lines 1-1\n```text\n未闭合"); len(got) != 1 || got[0] != "未闭合" {
+		t.Fatalf("expected unterminated fence content collected, got %v", got)
+	}
+}
+
+// TestCountWhitespaceNormalized 验证"忽略空白后出现次数"统计。
+func TestCountWhitespaceNormalized(t *testing.T) {
+	tests := []struct {
+		name  string
+		draft string
+		old   string
+		want  int
+	}{
+		{name: "single", draft: "第 一 章\n测试", old: "第一章测试", want: 1},
+		{name: "crlf ignored", draft: "第一行。\r\n第二行。", old: "第一行。第二行。", want: 1},
+		{name: "multiple", draft: "指节发白 指节发白", old: "指节 发白", want: 2},
+		{name: "not found", draft: "他握紧了拳头。", old: "她转过身。", want: 0},
+		{name: "empty old", draft: "任意草稿", old: "", want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := countWhitespaceNormalized(tt.draft, tt.old); got != tt.want {
+				t.Fatalf("countWhitespaceNormalized(%q, %q) = %d, want %d", tt.draft, tt.old, got, tt.want)
+			}
+		})
 	}
 }

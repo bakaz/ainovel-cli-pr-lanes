@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/voocel/agentcore/schema"
@@ -99,8 +100,10 @@ func (t *EditChapterTool) Execute(ctx context.Context, args json.RawMessage) (js
 	if a.OldString == "" {
 		return nil, fmt.Errorf("old_string 不能为空: %w", errs.ErrToolArgs)
 	}
+	// no-op 守卫：old==new 时直接返回结构化 edit_noop 错误，阻止模型重复调用。
+	// 放在 FSM/播种之前：即使 drafts 尚不存在也不产生任何副作用。
 	if a.OldString == a.NewString {
-		return nil, fmt.Errorf("old_string 与 new_string 相同，无需修改: %w", errs.ErrToolArgs)
+		return nil, t.buildNoopError(a.Chapter, t.loadChapterTextBestEffort(a.Chapter))
 	}
 
 	// 章节流水线强制状态机（Enabled 时）：draft_dirty/needs_edit/revision_open
@@ -147,6 +150,11 @@ func (t *EditChapterTool) Execute(ctx context.Context, args json.RawMessage) (js
 	})
 	result, err := t.edit.Execute(ctx, subArgs)
 	if err != nil {
+		// 把底层 agentcore 文本错误转成结构化错误（候选仅作建议，不自动应用）；
+		// 无法识别/无需结构化的错误保持原透传。
+		if structured := t.classifyEditError(a.Chapter, a.OldString, oldDraft, err); structured != nil {
+			return nil, structured
+		}
 		return nil, fmt.Errorf("apply edit: %w: %w", errs.ErrToolPrecondition, err)
 	}
 
@@ -164,8 +172,7 @@ func (t *EditChapterTool) Execute(ctx context.Context, args json.RawMessage) (js
 	}
 	chapterWordCount := domain.WordCount(newDraft)
 	wordCountDelta := chapterWordCount - oldWordCount
-	hash := sha256.Sum256([]byte(newDraft))
-	draftDigest := "sha256:" + hex.EncodeToString(hash[:])
+	draftDigest := digestOf(newDraft)
 
 	// 通过比较新旧草稿确定实际变更字节范围（不受上游模糊匹配/CRLF/缩进影响）
 	changeStart, changeEnd, changeOK := findChangedRange(oldDraft, newDraft)
@@ -211,6 +218,212 @@ func (t *EditChapterTool) Execute(ctx context.Context, args json.RawMessage) (js
 		passthrough[k] = v
 	}
 	return json.Marshal(passthrough)
+}
+
+// ── 结构化候选反馈 ─────────────────────────────────────────────────────────
+//
+// edit_chapter 是最频繁的工具，old_string 失配（"could not find the exact
+// text in ..."）是主要失败模式。底层 agentcore.EditTool 失配时会返回相似
+// 候选片段，但只存在于错误文本中。这里把该文本错误转成结构化、稳定、可
+// 指导模型重试的错误消息：
+//
+//   - code=edit_anchor_not_found：old_string 未精确匹配，携带候选片段（仅
+//     作建议，绝不自动应用——小说正文相似句可能语义不同）
+//   - code=edit_noop：old_string == new_string（或归一化后无实际变化），
+//     提示停止重复调用
+//
+// 保持与仓库既有错误约定兼容：自定义错误类型 + Unwrap(errs.ErrToolPrecondition)。
+
+const (
+	// maxCandidateCount 是错误消息中候选片段的最大条数。
+	maxCandidateCount = 3
+	// maxCandidateRunes 是错误消息中单条候选片段的最大长度（rune），
+	// 防止把整章塞回 tool_result。
+	maxCandidateRunes = 200
+)
+
+// EditAnchorNotFoundError 表示 old_string 未在草稿中找到精确匹配。
+// Candidates 仅供模型参考（提示从草稿复制原文），不参与自动替换。
+type EditAnchorNotFoundError struct {
+	Chapter                    int
+	MatchMode                  string // "exact" 或 "whitespace_normalized"
+	CandidateCount             int
+	Candidates                 []string
+	WhitespaceNormalizedUnique bool
+	RetryInstruction           string
+	DraftDigest                string
+}
+
+func (e *EditAnchorNotFoundError) Error() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "code=edit_anchor_not_found chapter=%d match_mode=%s candidate_count=%d whitespace_normalized_unique=%t",
+		e.Chapter, e.MatchMode, e.CandidateCount, e.WhitespaceNormalizedUnique)
+	if e.DraftDigest != "" {
+		fmt.Fprintf(&sb, " draft_digest=%s", e.DraftDigest)
+	}
+	fmt.Fprintf(&sb, "\nretry_instruction=%s", e.RetryInstruction)
+	if len(e.Candidates) > 0 {
+		sb.WriteString("\ncandidates(仅作参考，未自动应用):\n")
+		for _, c := range e.Candidates {
+			sb.WriteString("```text\n")
+			sb.WriteString(c)
+			sb.WriteString("\n```\n")
+		}
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// Unwrap 使结构化错误可通过 errors.Is(err, errs.ErrToolPrecondition) 判定。
+func (e *EditAnchorNotFoundError) Unwrap() error { return errs.ErrToolPrecondition }
+
+// EditNoopError 表示本次编辑是无操作（old==new 或归一化后无实际变化）。
+type EditNoopError struct {
+	Chapter          int
+	RetryInstruction string
+	DraftDigest      string
+}
+
+func (e *EditNoopError) Error() string {
+	s := fmt.Sprintf("code=edit_noop chapter=%d", e.Chapter)
+	if e.DraftDigest != "" {
+		s += " draft_digest=" + e.DraftDigest
+	}
+	return s + "\nretry_instruction=" + e.RetryInstruction
+}
+
+// Unwrap 使结构化错误可通过 errors.Is(err, errs.ErrToolPrecondition) 判定。
+func (e *EditNoopError) Unwrap() error { return errs.ErrToolPrecondition }
+
+// classifyEditError 把底层 agentcore.EditTool 的文本错误转成结构化错误。
+// 仅识别"锚点未找到"与"no-op"两类；其余错误（歧义匹配、文件缺失等）
+// 返回 nil 保持原透传，避免过度包装改变既有行为。
+func (t *EditChapterTool) classifyEditError(chapter int, oldString, draft string, err error) error {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "could not find the exact text in"):
+		return t.buildAnchorNotFoundError(chapter, oldString, draft, msg)
+	case strings.Contains(msg, "old_string and new_string are identical in"),
+		strings.Contains(msg, "no changes made to"):
+		return t.buildNoopError(chapter, draft)
+	}
+	return nil
+}
+
+func (t *EditChapterTool) buildAnchorNotFoundError(chapter int, oldString, draft, msg string) error {
+	candidates := parseEditCandidates(msg)
+	// 忽略全部空白后的匹配计数：>0 说明文本存在、只是空白不一致；
+	// ==1 才是"忽略空白后唯一且可无损映射"（whitespace_normalized_unique=true）。
+	count := countWhitespaceNormalized(draft, oldString)
+	mode := "exact"
+	unique := false
+	if count >= 1 {
+		mode = "whitespace_normalized"
+		unique = count == 1
+	}
+	return &EditAnchorNotFoundError{
+		Chapter:                    chapter,
+		MatchMode:                  mode,
+		CandidateCount:             len(candidates),
+		Candidates:                 candidates,
+		WhitespaceNormalizedUnique: unique,
+		RetryInstruction: fmt.Sprintf(
+			"不要重新打字。先调用 read_chapter(chapter=%d, source='draft') 读取草稿，从草稿中复制候选原文作为 old_string（必须逐字一致，包含所有空白与换行），再调用 edit_chapter(chapter=%d, old_string=<复制原文>, new_string=<新文本>)。候选片段仅供参考、不会被自动应用；若草稿中确实不存在该文本，说明草稿已变化，请基于最新草稿重新决定修改。",
+			chapter, chapter),
+		DraftDigest: digestOf(draft),
+	}
+}
+
+func (t *EditChapterTool) buildNoopError(chapter int, draft string) error {
+	return &EditNoopError{
+		Chapter: chapter,
+		RetryInstruction: fmt.Sprintf(
+			"停止重复调用 edit_chapter。先调用 read_chapter(chapter=%d, source='draft') 重新读取草稿确认当前内容：若确需修改，请给出与 old_string 不同的 new_string 后重试；若无需修改，直接调用 check_consistency 核验当前状态。",
+			chapter),
+		DraftDigest: digestOf(draft),
+	}
+}
+
+// loadChapterTextBestEffort 只读地取章节当前文本（drafts 优先，其次 chapters）。
+// 仅用于参数校验阶段构造错误消息时附带 draft_digest，不触发任何播种写盘。
+func (t *EditChapterTool) loadChapterTextBestEffort(chapter int) string {
+	if text, err := t.store.Drafts.LoadDraft(chapter); err == nil && text != "" {
+		return text
+	}
+	if text, err := t.store.Drafts.LoadChapterText(chapter); err == nil {
+		return text
+	}
+	return ""
+}
+
+// digestOf 计算文本的 SHA-256 摘要（"sha256:" 前缀）；空文本返回 ""。
+func digestOf(text string) string {
+	if text == "" {
+		return ""
+	}
+	hash := sha256.Sum256([]byte(text))
+	return "sha256:" + hex.EncodeToString(hash[:])
+}
+
+// parseEditCandidates 从 agentcore 错误文本的 "Possible old_string candidates"
+// 段落解析候选片段（```text 围栏内的内容），最多 maxCandidateCount 条、
+// 单条截断至 maxCandidateRunes。底层候选本身已限 3 条，这里双保险。
+// 无法解析时返回 nil（错误消息退化为无候选的纯文本）。
+func parseEditCandidates(errMsg string) []string {
+	const marker = "Possible old_string candidates"
+	idx := strings.Index(errMsg, marker)
+	if idx < 0 {
+		return nil
+	}
+	lines := strings.Split(errMsg[idx:], "\n")
+	var out []string
+	for i := 0; i < len(lines); i++ {
+		if !strings.HasPrefix(strings.TrimSpace(lines[i]), "```text") {
+			continue
+		}
+		var sb strings.Builder
+		i++
+		for ; i < len(lines); i++ {
+			if strings.TrimSpace(lines[i]) == "```" {
+				break
+			}
+			sb.WriteString(lines[i])
+			sb.WriteByte('\n')
+		}
+		block := strings.TrimRight(sb.String(), "\n")
+		if block == "" {
+			continue
+		}
+		out = append(out, truncateRunes(block, maxCandidateRunes))
+		if len(out) >= maxCandidateCount {
+			break
+		}
+	}
+	return out
+}
+
+// countWhitespaceNormalized 统计忽略全部空白后 old 在 draft 中的出现次数。
+// 仅用于结构化错误提示（match_mode / whitespace_normalized_unique），
+// 不参与任何自动替换。
+func countWhitespaceNormalized(draft, old string) int {
+	normDraft := stripWhitespace(draft)
+	normOld := stripWhitespace(old)
+	if normOld == "" {
+		return 0
+	}
+	return strings.Count(normDraft, normOld)
+}
+
+// stripWhitespace 移除全部 Unicode 空白（含 \r\n、NBSP、行首缩进），
+// 用于"忽略空白"语义的匹配计数。
+func stripWhitespace(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for _, r := range s {
+		if !unicode.IsSpace(r) {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
 }
 
 // ensureDraft 保证 drafts/{ch}.draft.md 存在：
