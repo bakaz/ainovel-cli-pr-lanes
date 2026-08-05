@@ -282,22 +282,9 @@ func (t *ContextTool) prepareChapterContext(chapter int, envelope *chapterContex
 	// 重写时把"为什么改 + 改哪里"交给 writer：理由来自返工队列，具体批评来自本章评审
 	// （selectReviewLessons 只召回 chapter-1..chapter-3，恰好漏掉本章本身，writer 又无读评审的工具）。
 	// 正文不在此注入——保持"正文按需 read_chapter 拉"的约定不破。
+	// polish_draft 工具复用同一 builder（buildRewriteBrief），保证两处 brief 结构不漂移。
 	if isRewrite {
-		brief := map[string]any{"reason": progress.RewriteReason}
-		if review, reviewErr := t.store.World.LoadReview(chapter); reviewErr == nil && review != nil {
-			if review.Summary != "" {
-				brief["review_summary"] = review.Summary
-			}
-			if len(review.Issues) > 0 {
-				brief["issues"] = review.Issues
-			}
-			if len(review.ContractMisses) > 0 {
-				brief["contract_misses"] = review.ContractMisses
-			}
-		} else if reviewErr != nil {
-			warn("rewrite_review", reviewErr)
-		}
-		envelope.Working["rewrite_brief"] = brief
+		envelope.Working["rewrite_brief"] = buildRewriteBrief(t.store, state.runMeta, chapter, warn)
 	}
 
 	foreshadow, foreshadowErr := t.store.World.LoadActiveForeshadow()
@@ -516,8 +503,8 @@ func (t *ContextTool) buildChapterWorkingMemory(envelope *chapterContextEnvelope
 		if state.styleReviewStatus != "" {
 			checkpoint["style_review_status"] = string(state.styleReviewStatus)
 		}
-		// 精炼风格评审反馈：仅 Writer 在 revision_open/final_pending/exhausted 时注入
-		if t.role == "writer" && state.styleReviewFeedback != nil {
+		// 精炼风格评审反馈：仅 Writer/Polisher 在 revision_open/final_pending/exhausted 时注入
+		if (t.role == "writer" || t.role == "polisher") && state.styleReviewFeedback != nil {
 			checkpoint["style_review_feedback"] = state.styleReviewFeedback
 		}
 		envelope.Working["checkpoint"] = checkpoint
@@ -616,9 +603,9 @@ func (t *ContextTool) buildChapterEpisodicMemory(envelope *chapterContextEnvelop
 }
 
 func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope, state contextBuildState, warn func(string, error)) {
-	// ── 角色门控：所有 anchor 类字段（manual/auto/legacy）仅 Writer/Editor 可见 ──
-	isWriterOrEditor := t.role == "writer" || t.role == "editor"
-	isWriter := t.role == "writer"
+	// ── 角色门控：所有 anchor 类字段（manual/auto/legacy）仅 Writer/Editor/Polisher 可见 ──
+	isWriterOrEditor := t.role == "writer" || t.role == "editor" || t.role == "polisher"
+	isWriter := t.role == "writer" || t.role == "polisher"
 
 	// ── 计算一次作用域过滤后的 compass，供 style_rules 和 writer_style_card 共用 ──
 	compassForView := scopedCompassForChapter(t.store, state.chapter, warn)
@@ -664,7 +651,7 @@ func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope
 		}
 	}
 
-	// 2. writer_style_card：Writer 专用正面的 prose+dialogue 风格卡片。
+	// 2. writer_style_card：Writer/Polisher 专用正面的 prose+dialogue 风格卡片。
 	//    跟随 compassForView 作用域结果，不含 taboos/user_rules/anchor 字段。
 	//    ⌈bounded⌋ 诉求：不出现在 non-compass 路径，也不复制 user_rules 或 anchor excerpt。
 	if isWriter && compassForView != nil {
@@ -674,7 +661,7 @@ func (t *ContextTool) buildChapterReferencePack(envelope *chapterContextEnvelope
 		}
 	}
 
-	// 3. style_anchors_manual：仅 Writer/Editor，按当前章节过滤，只注入精简视图（id+excerpt）
+	// 3. style_anchors_manual：仅 Writer/Editor，按当前章节过滤，只注入精简视图（id+excerpt+note）
 	if isWriterOrEditor && state.styleAnchorsManual != nil && len(state.styleAnchorsManual.Anchors) > 0 {
 		if injection := state.styleAnchorsManual.ToInjectionView(state.chapter); len(injection) > 0 {
 			envelope.References["style_anchors_manual"] = injection
@@ -892,6 +879,137 @@ func buildCompassInjectionView(compass *domain.WritingStyleRulesCompass) map[str
 	return view
 }
 
+// lastStyleReviewResultEntry 返回账本中"最新一个有 Result 的周期"条目；
+// 账本为 nil、为空或没有任何有 Result 的周期时返回 nil。
+// buildCompactStyleReviewFeedback 与 buildFullStyleReviewCriticView 共用同一遍历语义。
+func lastStyleReviewResultEntry(ledger *domain.StyleReviewLedger) *domain.StyleReviewEntry {
+	if ledger == nil {
+		return nil
+	}
+	for i := len(ledger.Cycles) - 1; i >= 0; i-- {
+		if ledger.Cycles[i].Result != nil {
+			return &ledger.Cycles[i]
+		}
+	}
+	return nil
+}
+
+// buildFullStyleReviewCriticView 从账本提取 critic 最新一轮评审的完整投影（rewrite_brief 专用）。
+//
+// 与 buildCompactStyleReviewFeedback（初稿路径）的区别：
+//   - 不做状态门控：accepted_initial / accepted_revised / exhausted 等任意状态的结果
+//     都可见（重写方需要看到 critic 最近一次"说了什么"，包括终态前最后一条 revise 结果）；
+//   - findings 完整保留六字段（dimension/category/severity/evidence/problem/suggestion），
+//     不截断 evidence、不丢 problem（critic prompt 本身已限 evidence ≤40 字）；
+//   - 附带 status / verdict / draft_digest 审计字段。
+//
+// 只投影最新一个有 Result 的周期；ledger 为空或无结果周期时返回 nil（调用方省略字段）。
+func buildFullStyleReviewCriticView(ledger *domain.StyleReviewLedger) map[string]any {
+	entry := lastStyleReviewResultEntry(ledger)
+	if entry == nil {
+		return nil
+	}
+	view := map[string]any{
+		"status": string(entry.Status),
+	}
+	r := entry.Result
+	if r.Verdict != "" {
+		view["verdict"] = string(r.Verdict)
+	}
+	if entry.DraftDigest != "" {
+		view["draft_digest"] = entry.DraftDigest
+	}
+	if len(r.Findings) > 0 {
+		findings := make([]map[string]any, 0, len(r.Findings))
+		for _, f := range r.Findings {
+			// 六字段齐全：problem/suggestion 为空也保留键（空串），保证结构稳定可审计。
+			findings = append(findings, map[string]any{
+				"dimension":  f.Dimension,
+				"category":   f.Category,
+				"severity":   f.Severity,
+				"evidence":   f.Evidence,
+				"problem":    f.Problem,
+				"suggestion": f.Suggestion,
+			})
+		}
+		view["findings"] = findings
+	}
+	return view
+}
+
+// buildRewriteCandidateProvenance 构造 rewrite_brief 的最小 provenance（作者身份审计）。
+//
+// draft_digest 是当前草稿正文的 sha256 指纹（内容级锚点，与账本 DraftDigest 同源算法）。
+// stage 固定为 "rewrite"：本投影只出现在重写分支。
+//
+// author_model：取自 RunMeta.LastAuthorModel——由 Engine 在每次 writer 派发时记录的真实
+// 作者模型（写正文的模型），不再从 StyleReview 反推（旧实现误取评审当前草稿的 critic 模型，
+// 字段名与事实不符，不能用于 guard）。RunMeta 无记录时省略 author_model，仅保留 digest+stage。
+//
+// parent_digest：当前草稿所源自的 DS 初稿 digest（最近一次 polish 的 input_digest）；
+// 无 polish 记录时省略。
+func buildRewriteCandidateProvenance(meta *domain.RunMeta, st *store.Store, chapter int, draftDigest string) map[string]any {
+	candidate := map[string]any{
+		"draft_digest": draftDigest,
+		"stage":        "rewrite",
+	}
+	if meta != nil && meta.LastAuthorModel != "" {
+		candidate["author_model"] = meta.LastAuthorModel
+	}
+	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(chapter), "polish"); cp != nil && cp.InputDigest != "" {
+		candidate["parent_digest"] = cp.InputDigest
+	}
+	return candidate
+}
+
+// buildRewriteBrief 构造 rewrite_brief：返工原因 + 审阅摘要/问题/契约漏项 + critic 完整评审
+// 投影 + candidate 最小溯源。由 novel_context 的 isRewrite 分支与 polish_draft 工具共用，
+// 保证重写/打磨两条路径看到同一份事实。
+func buildRewriteBrief(st *store.Store, meta *domain.RunMeta, chapter int, warn func(string, error)) map[string]any {
+	progress, pErr := st.Progress.Load()
+	if pErr != nil {
+		if warn != nil {
+			warn("progress", pErr)
+		}
+		return map[string]any{}
+	}
+	if progress == nil {
+		return map[string]any{"reason": ""}
+	}
+	brief := map[string]any{"reason": progress.RewriteReason}
+	if review, reviewErr := st.World.LoadReview(chapter); reviewErr == nil && review != nil {
+		if review.Summary != "" {
+			brief["review_summary"] = review.Summary
+		}
+		if len(review.Issues) > 0 {
+			brief["issues"] = review.Issues
+		}
+		if len(review.ContractMisses) > 0 {
+			brief["contract_misses"] = review.ContractMisses
+		}
+	} else if reviewErr != nil && warn != nil {
+		warn("rewrite_review", reviewErr)
+	}
+	// critic 完整评审投影：把"哪里改、怎么改"（findings 六字段全保留）交给重写方。
+	// 只注入最新一轮有 Result 的周期；ledger 为空或 mode 关闭时省略 critic_review。
+	if meta != nil && meta.StyleReviewMode.Enabled() {
+		if ledger, lErr := st.StyleReview.Load(chapter); lErr == nil && ledger != nil {
+			if criticView := buildFullStyleReviewCriticView(ledger); criticView != nil {
+				brief["critic_review"] = criticView
+			}
+		} else if lErr != nil && warn != nil {
+			warn("style_review_ledger_for_rewrite", lErr)
+		}
+	}
+	// 最小 provenance（作者身份审计）：当前草稿 digest + 阶段 + 真实作者模型。
+	if content, _, contentErr := st.Drafts.LoadChapterContent(chapter); contentErr == nil && content != "" {
+		brief["candidate"] = buildRewriteCandidateProvenance(meta, st, chapter, domain.DigestDraft(content))
+	} else if contentErr != nil && warn != nil {
+		warn("rewrite_draft_digest", contentErr)
+	}
+	return brief
+}
+
 // buildCompactStyleReviewFeedback 从账本中提取精炼的风格评审反馈视图。
 // 仅当最近完成的周期有 result 且当前状态为 revision_open/final_pending/exhausted
 // 时返回非 nil 结果。返回结构含 strength（正面评价）和 findings（最多 3 条精简条目）。
@@ -910,13 +1028,7 @@ func buildCompactStyleReviewFeedback(ledger *domain.StyleReviewLedger) map[strin
 	}
 
 	// 找到最后一个有 result 的周期
-	var lastResult *domain.StyleReviewEntry
-	for i := len(ledger.Cycles) - 1; i >= 0; i-- {
-		if ledger.Cycles[i].Result != nil {
-			lastResult = &ledger.Cycles[i]
-			break
-		}
-	}
+	lastResult := lastStyleReviewResultEntry(ledger)
 	if lastResult == nil {
 		return nil
 	}

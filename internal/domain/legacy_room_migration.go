@@ -241,7 +241,7 @@ func ConvertLegacyRooms(refs []LegacyRoomRef) ([]PlanningArchiveEntry, error) {
 
 // MigrateLegacyRoomsResult 描述迁移结果。
 type MigrateLegacyRoomsResult struct {
-	Status       string `json:"status"`                 // migrated / already_exists / no_legacy_rooms / cleaned_up / conflict / error
+	Status       string `json:"status"`                  // migrated / already_exists / no_legacy_rooms / cleaned_up / conflict / error
 	EntriesCount int    `json:"entries_count,omitempty"` // 仅 migrated/cleaned_up 时有值
 	Message      string `json:"message,omitempty"`       // 人类可读详情
 }

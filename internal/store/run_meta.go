@@ -87,6 +87,7 @@ func (s *RunMetaStore) Init(style, provider, model string) error {
 			meta.AdvancePermitChapter = existing.AdvancePermitChapter
 			meta.AdvanceHold = existing.AdvanceHold
 			meta.StyleReviewMode = existing.StyleReviewMode
+			meta.LastAuthorModel = existing.LastAuthorModel
 		}
 		if meta.AdvanceMode == "" {
 			meta.AdvanceMode = domain.ChapterAdvanceAuto
@@ -312,6 +313,25 @@ func (s *RunMetaStore) SetStyleReviewMode(mode domain.StyleQualityMode) error {
 			meta = &domain.RunMeta{}
 		}
 		meta.StyleReviewMode = mode
+		return s.saveUnlocked(*meta)
+	})
+}
+
+// SetLastAuthorModel 记录最近一次 writer 派发时生效的模型名（provenance 用真实作者模型）。
+// 由 Engine 在 runWorker 派发 writer 前调用；空模型名忽略。
+func (s *RunMetaStore) SetLastAuthorModel(model string) error {
+	if strings.TrimSpace(model) == "" {
+		return nil
+	}
+	return s.io.WithWriteLock(func() error {
+		meta, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if meta == nil {
+			meta = &domain.RunMeta{}
+		}
+		meta.LastAuthorModel = model
 		return s.saveUnlocked(*meta)
 	})
 }

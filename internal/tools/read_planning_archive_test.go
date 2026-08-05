@@ -30,10 +30,10 @@ func TestReadPlanningArchive_Ok(t *testing.T) {
 	}
 
 	var result struct {
-		Status  string                     `json:"status"`
-		Refs    []PlanningRef              `json:"refs"`
+		Status  string                        `json:"status"`
+		Refs    []PlanningRef                 `json:"refs"`
 		Found   []domain.PlanningArchiveEntry `json:"found"`
-		Missing []PlanningRef              `json:"missing"`
+		Missing []PlanningRef                 `json:"missing"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
 		t.Fatal(err)
@@ -66,9 +66,9 @@ func TestReadPlanningArchive_Partial(t *testing.T) {
 	}
 
 	var result struct {
-		Status  string                     `json:"status"`
+		Status  string                        `json:"status"`
 		Found   []domain.PlanningArchiveEntry `json:"found"`
-		Missing []PlanningRef              `json:"missing"`
+		Missing []PlanningRef                 `json:"missing"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
 		t.Fatal(err)
@@ -101,7 +101,7 @@ func TestReadPlanningArchive_NotFound(t *testing.T) {
 	}
 
 	var result struct {
-		Status  string `json:"status"`
+		Status  string        `json:"status"`
 		Missing []PlanningRef `json:"missing"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
@@ -168,10 +168,10 @@ func TestReadPlanningArchive_ArchiveAbsentWithLegacyFallback(t *testing.T) {
 	}
 
 	var result struct {
-		Status  string                     `json:"status"`
-		Hint    string                     `json:"_hint"`
+		Status  string                        `json:"status"`
+		Hint    string                        `json:"_hint"`
 		Found   []domain.PlanningArchiveEntry `json:"found"`
-		Missing []PlanningRef              `json:"missing"`
+		Missing []PlanningRef                 `json:"missing"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
 		t.Fatal(err)
@@ -212,9 +212,9 @@ func TestReadPlanningArchive_ArchiveAbsentLegacyPartial(t *testing.T) {
 	}
 
 	var result struct {
-		Status  string                     `json:"status"`
+		Status  string                        `json:"status"`
 		Found   []domain.PlanningArchiveEntry `json:"found"`
-		Missing []PlanningRef              `json:"missing"`
+		Missing []PlanningRef                 `json:"missing"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
 		t.Fatal(err)
@@ -251,8 +251,8 @@ func TestReadPlanningArchive_DedupRefs(t *testing.T) {
 	}
 
 	var result struct {
-		Status string `json:"status"`
-		Refs   []PlanningRef `json:"refs"`
+		Status string                        `json:"status"`
+		Refs   []PlanningRef                 `json:"refs"`
 		Found  []domain.PlanningArchiveEntry `json:"found"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {

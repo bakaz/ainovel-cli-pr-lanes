@@ -82,4 +82,18 @@ type Checkpoint struct {
 	Artifact   string    `json:"artifact,omitempty"`
 	Digest     string    `json:"digest,omitempty"`
 	OccurredAt time.Time `json:"occurred_at"`
+	// 以下字段仅 polish 步骤（polish_draft 工具）使用，其余步骤为零值。
+	InputDigest   string `json:"input_digest,omitempty"`   // 精修前的草稿 digest（DS 初稿）
+	PolisherModel string `json:"polisher_model,omitempty"` // 执行精修的 polisher 模型名
+	Stage         string `json:"stage,omitempty"`          // "draft"（初稿精修）或 "rewrite"（返工队列精修）
+	Changed       bool   `json:"changed,omitempty"`        // 精修是否实际改动正文（false=no-op，允许）
+}
+
+// PolishCheckpointMeta 是 polish 步骤 checkpoint 的附加元数据。
+// Digest（主字段）即 output_digest。
+type PolishCheckpointMeta struct {
+	InputDigest   string
+	PolisherModel string
+	Stage         string
+	Changed       bool
 }

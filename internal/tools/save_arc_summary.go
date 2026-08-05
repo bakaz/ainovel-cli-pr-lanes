@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -12,6 +13,9 @@ import (
 	"github.com/voocel/ainovel-cli/internal/errs"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
+
+// 短数字箭头账本：20→22、24->28（prose/dialogue 禁止；taboos 不检）
+var styleRulesDigitArrow = regexp.MustCompile(`\d{1,3}\s*(?:→|->|➜)\s*\d{1,3}`)
 
 // SaveArcSummaryTool 保存弧级摘要和角色快照，Editor 在弧结束时调用。
 type SaveArcSummaryTool struct {
@@ -45,9 +49,9 @@ func (t *SaveArcSummaryTool) Schema() map[string]any {
 		schema.Property("rules", schema.Array("2-3 条语言特征规则（每条 ≤30 字）", schema.String(""))).Required(),
 	)
 	styleRulesSchema := schema.Object(
-		schema.Property("prose", schema.Array("3-5 条叙述风格规则（每条 ≤50 字，要具体可执行）", schema.String(""))).Required(),
-		schema.Property("dialogue", schema.Array("核心角色的对话特征规则", voiceSchema)).Required(),
-		schema.Property("taboos", schema.Array("本小说需避免的写法", schema.String(""))),
+		schema.Property("prose", schema.Array("3-5 条正向（≤50字）：按黑暗情色小说写——主轴/焦点/节奏/词感；对齐 long.reason；禁止把说明文/观察报告腔升格成规范", schema.String(""))).Required(),
+		schema.Property("dialogue", schema.Array("核心角色口吻/行为（话后接肉；非频率报表）", voiceSchema)).Required(),
+		schema.Property("taboos", schema.Array("不要怎样写：说明文、观察报告、黏膜网格、脊髓解释、意味着、第N下、盆底等；本弧污染进这里", schema.String(""))),
 	)
 	return schema.Object(
 		schema.Property("volume", schema.Int("卷号")).Required(),
@@ -152,6 +156,14 @@ func validateArcSummaryStyleRules(rules *arcSummaryStyleRules) error {
 	if len(rules.Dialogue) == 0 {
 		return fmt.Errorf("style_rules.dialogue is required when style_rules is provided; expected array of objects {name, rules}: %w", errs.ErrToolArgs)
 	}
+	for i, line := range rules.Prose {
+		if strings.TrimSpace(line) == "" {
+			return fmt.Errorf("style_rules.prose[%d] is empty: %w", i, errs.ErrToolArgs)
+		}
+		if hit := styleRulesPollutionHit(line); hit != "" {
+			return fmt.Errorf("style_rules.prose[%d] looks like metering/observation pollution (%s); put bans in taboos, rewrite prose as body-process how-to (≤50 chars, tactile outcomes): %w", i, hit, errs.ErrToolArgs)
+		}
+	}
 	for i, voice := range rules.Dialogue {
 		if strings.TrimSpace(voice.Name) == "" {
 			return fmt.Errorf("style_rules.dialogue[%d].name is required: %w", i, errs.ErrToolArgs)
@@ -163,7 +175,65 @@ func validateArcSummaryStyleRules(rules *arcSummaryStyleRules) error {
 			if strings.TrimSpace(rule) == "" {
 				return fmt.Errorf("style_rules.dialogue[%d].rules[%d] is empty: %w", i, j, errs.ErrToolArgs)
 			}
+			if hit := styleRulesPollutionHit(rule); hit != "" {
+				return fmt.Errorf("style_rules.dialogue[%d].rules[%d] looks like metering/observation pollution (%s); put bans in taboos, keep dialogue as voice/behavior only: %w", i, j, hit, errs.ErrToolArgs)
+			}
 		}
 	}
+	// taboos 允许出现「避免次/分…」等禁令字样，不做污染拦截
 	return nil
+}
+
+// styleRulesPollutionHit 检测 prose/dialogue 是否把近章账本/观察腔升格成「本弧要这样写」。
+// 命中则返回短标签；taboos 侧不调用本函数。
+func styleRulesPollutionHit(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	// 频率/次分账本（正文污染主因）
+	markers := []struct {
+		sub string
+		tag string
+	}{
+		{"次/分", "次/分"},
+		{"次每分", "次每分"},
+		{"次每分钟", "次每分钟"},
+		{"差额", "次数差额"},
+		{"跳至", "跳至N"},
+		{"骤升至", "骤升至N"},
+		{"基线从", "基线从N"},
+		{"基线高", "基线高N次"},
+		{"双栏", "双栏读数"},
+		{"开尔文", "色温开尔文"},
+		{"+500K", "色温K"},
+		{"声景为节拍", "声景节拍器"},
+		{"传导链", "神经传导链"},
+		{"意味着", "意味着解释链"},
+		{"不是A是B", "否定绕弯"},
+		{"不是…而是", "否定绕弯"},
+		{"蠕动×", "蠕动乘次"},
+		{"蠕动 x", "蠕动乘次"},
+		{"第一下", "数字动作串"},
+		{"第二下", "数字动作串"},
+		{"第三下", "数字动作串"},
+		{"第N颗", "序号串戏"},
+		{"四次收缩", "数字动作串"},
+		{"赫兹", "工程频率腔"},
+		{"整数比", "工程频率腔"},
+		{"谐波", "工程频率腔"},
+	}
+	lower := s
+	for _, m := range markers {
+		if strings.Contains(lower, m.sub) {
+			// 「避免/禁止 + 污染词」视为 ban 句，允许出现在 prose 时仍危险——prose 应写正向怎么落
+			// 若整句以 避免/禁止 开头，更像误放进 prose 的 taboo：仍拒，要求挪到 taboos
+			return m.tag
+		}
+	}
+	// 纯数字跳变账本：20→22、24→28 等（箭头两侧短数字）
+	if styleRulesDigitArrow.MatchString(s) {
+		return "数字箭头账本"
+	}
+	return ""
 }

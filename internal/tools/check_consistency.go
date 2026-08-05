@@ -18,11 +18,17 @@ import (
 // 纯 IO 工具：只负责加载数据，不注入指令。
 type CheckConsistencyTool struct {
 	store *store.Store
+	// pipelineEnabled 是精修流水线开关（BuildWorkers 注入）：开启时若草稿缺少
+	// 与当前 digest 匹配的 polish checkpoint，required_next_action 建议 polish_draft。
+	pipelineEnabled bool
 }
 
 func NewCheckConsistencyTool(store *store.Store) *CheckConsistencyTool {
 	return &CheckConsistencyTool{store: store}
 }
+
+// SetPipelineEnabled 设置精修流水线开关（BuildWorkers 注入）。
+func (t *CheckConsistencyTool) SetPipelineEnabled(v bool) { t.pipelineEnabled = v }
 
 func (t *CheckConsistencyTool) Name() string { return "check_consistency" }
 func (t *CheckConsistencyTool) Description() string {
@@ -66,12 +72,10 @@ func (t *CheckConsistencyTool) Execute(_ context.Context, args json.RawMessage) 
 	digestStr := fmt.Sprintf("sha256:%x", digest[:])
 	result["content_digest"] = digestStr
 	result["word_count"] = wordCount
-	violations := append([]rules.Violation{}, rules.Lint(content)...)
-	structured := rules.SystemDefaults().Structured
-	if snap, loadErr := t.store.UserRules.Load(); loadErr == nil && snap != nil {
-		structured = snap.Structured
-	}
-	violations = append(violations, rules.Check(content, wordCount, structured)...)
+	// 用户规则机械检查 + 文学腔句式硬闸。draft/check 阶段只报事实不阻断
+	// （error 级拦截发生在 commit_chapter 的 CheckLiteraryProseGate 与
+	// review_style 的 accepted 前置闸——见 ReviewStyleTool.checkMechanicalGate）。
+	violations := computeMechanicalViolations(t.store, content, wordCount)
 	result["rule_violations"] = violations
 
 	// 对照数据：保留全局性的一致性检查数据，避免重复加载 novel_context 已有的窗口数据
@@ -99,7 +103,10 @@ func (t *CheckConsistencyTool) Execute(_ context.Context, args json.RawMessage) 
 		result["recent_summaries"] = summaries
 	}
 
-	if _, err := t.store.Checkpoints.Append(
+	// 每次执行都追加新 checkpoint（不做 digest 幂等去重）：review_style 依赖
+	// consistency_check 的 seq > polish checkpoint 的 seq 证明 polish → consistency
+	// → critic 的顺序；幂等去重会让"打磨后重复 check"不再推进 seq，破坏顺序绑定。
+	if _, err := t.store.Checkpoints.AppendAlways(
 		domain.ChapterScope(a.Chapter), "consistency_check",
 		fmt.Sprintf("drafts/%02d.draft.md", a.Chapter),
 		digestStr,
@@ -140,6 +147,16 @@ func computeNextAction(t *CheckConsistencyTool, chapter int, violations []rules.
 			slices.Contains(progress.PendingRewrites, chapter)
 	}
 
+	// 精修流水线（pipeline 启用时）：草稿缺少 fresh polish checkpoint → 建议 polish_draft。
+	// 覆盖两类场景：初稿写完后直接 check（应先 polish_draft）；critic revise 后正文被改
+	// （commit gate 会拒绝 stale checkpoint，这里提前引导重跑 polish_draft）。
+	if t.pipelineEnabled && !hasErrorViolations(violations) && !polishCheckpointMatches(t.store, chapter, digestStr) {
+		return &RequiredNextAction{
+			Action: ActionPolishDraft,
+			Reason: fmt.Sprintf("第 %d 章缺少与当前草稿匹配的 polish 记录，请先调用 polish_draft 精修后再继续", chapter),
+		}
+	}
+
 	// rewrite 队列需要终稿 digest 来判断草稿是否实际变更
 	var finalDigest string
 	if inRewriteQueue {
@@ -153,6 +170,15 @@ func computeNextAction(t *CheckConsistencyTool, chapter int, violations []rules.
 		}
 	}
 
+	// pipeline 启用时把最新 polish checkpoint seq 传给下一步建议（R == latest P
+	// 绑定，与 CheckPolishPipelineGate 的严格绑定一致）；关闭时传 nil（不绑定）。
+	var binding *PolishPipelineBinding
+	if t.pipelineEnabled {
+		if cp := t.store.Checkpoints.LatestByStep(domain.ChapterScope(chapter), "polish"); cp != nil {
+			binding = &PolishPipelineBinding{LatestPolishSeq: cp.Seq}
+		}
+	}
+
 	return ComputeRequiredNextAction(
 		meta.StyleReviewMode,
 		chapter,
@@ -161,5 +187,19 @@ func computeNextAction(t *CheckConsistencyTool, chapter int, violations []rules.
 		ledger,
 		inRewriteQueue,
 		finalDigest,
+		binding,
 	)
+}
+
+// computeMechanicalViolations 计算章节草稿的机械违规集：rules.Lint（内置产品底线）
+// + rules.CheckLiteraryGate（用户规则机械检查 + 文学腔句式硬闸，含本书用户规则
+// 快照）。check_consistency 与 review_style 的 accepted 前置闸共用此函数，
+// 保证"评审可接受的草稿"与"一致性检查可见的 error"使用同一规则集、同一严重度判定。
+func computeMechanicalViolations(st *store.Store, content string, wordCount int) []rules.Violation {
+	vs := append([]rules.Violation{}, rules.Lint(content)...)
+	structured := rules.SystemDefaults().Structured
+	if snap, loadErr := st.UserRules.Load(); loadErr == nil && snap != nil {
+		structured = snap.Structured
+	}
+	return append(vs, rules.CheckLiteraryGate(content, wordCount, structured)...)
 }

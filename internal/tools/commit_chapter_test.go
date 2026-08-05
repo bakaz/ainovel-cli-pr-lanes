@@ -50,7 +50,7 @@ func TestCommitChapterRejectsNonPendingRewrite(t *testing.T) {
 	if err := store.Progress.SetFlow(domain.FlowRewriting); err != nil {
 		t.Fatalf("SetFlow: %v", err)
 	}
-	if err := store.Drafts.SaveDraft(3, "这是错误章节的正文。"); err != nil {
+	if err := store.Drafts.SaveDraft(3, "这是错误章节的正文。她心里骂自己丢人，真不要脸。"); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
 
@@ -104,7 +104,7 @@ func TestCommitChapterAllowsPendingRewrite(t *testing.T) {
 	if err := store.Progress.SetFlow(domain.FlowRewriting); err != nil {
 		t.Fatalf("SetFlow: %v", err)
 	}
-	if err := store.Drafts.SaveDraft(2, "这是正确待重写章节的正文。"); err != nil {
+	if err := store.Drafts.SaveDraft(2, "这是正确待重写章节的正文。她心里骂自己丢人，真不要脸。"); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
 
@@ -162,7 +162,7 @@ func TestCommitChapterUpdatesCastLedger(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Save core characters: %v", err)
 	}
-	if err := s.Drafts.SaveDraft(1, "第一章正文，林墨遇到客栈老板老周与小厮阿云。"); err != nil {
+	if err := s.Drafts.SaveDraft(1, "第一章正文，林墨遇到客栈老板老周与小厮阿云。她心里骂自己丢人，真不要脸。"); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
 
@@ -215,7 +215,7 @@ func TestCommitChapterReplayAfterPartialCommitDoesNotDuplicateWorldState(t *test
 	if err := s.Progress.Init("test", 10); err != nil {
 		t.Fatalf("InitProgress: %v", err)
 	}
-	if err := s.Drafts.SaveDraft(1, "第一章正文，林墨遇到黑影并突破。"); err != nil {
+	if err := s.Drafts.SaveDraft(1, "第一章正文，林墨遇到黑影并突破。她心里骂自己丢人，真不要脸。"); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
 
@@ -307,7 +307,7 @@ func TestCommitChapterNonLayeredRecompletesAfterRework(t *testing.T) {
 	}
 
 	// 两章写完并完结。第 2 章备齐 drafts/chapters，供返工提交。
-	ch2 := "第二章原始正文，用于模拟已提交终稿。"
+	ch2 := "第二章原始正文，用于模拟已提交终稿。她心里骂自己丢人，真不要脸。"
 	if err := s.Drafts.SaveDraft(2, ch2); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
@@ -397,8 +397,8 @@ func TestCommitChapterLayeredReopenRecompletesDespiteOpenThread(t *testing.T) {
 	}
 
 	// 两章写完落盘并完结
-	ch2 := "第二章原始正文，模拟已提交终稿。"
-	for ch, body := range map[int]string{1: "第一章正文。", 2: ch2} {
+	ch2 := "第二章原始正文，模拟已提交终稿。她心里骂自己丢人，真不要脸。"
+	for ch, body := range map[int]string{1: "第一章正文。她心里骂自己丢人，真不要脸。", 2: ch2} {
 		if err := s.Drafts.SaveDraft(ch, body); err != nil {
 			t.Fatalf("SaveDraft %d: %v", ch, err)
 		}
@@ -460,7 +460,7 @@ func TestCommitChapterRejectsPolishWithoutDraftChange(t *testing.T) {
 	}
 
 	// 模拟第 2 章已正常完成：drafts 与 chapters 内容相同。
-	original := "第二章原始正文内容，用于模拟已提交终稿。"
+	original := "第二章原始正文内容，用于模拟已提交终稿。她心里骂自己丢人，真不要脸。"
 	if err := s.Drafts.SaveDraft(2, original); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
@@ -535,7 +535,7 @@ func TestCommitChapterLayeredRejectsOutOfRangeChapter(t *testing.T) {
 	_ = s.Progress.UpdatePhase(domain.PhaseWriting)
 
 	// 越界章节 2 的 commit 必须硬失败
-	if err := s.Drafts.SaveDraft(2, "越界章节正文，必须被拦下。"); err != nil {
+	if err := s.Drafts.SaveDraft(2, "越界章节正文，必须被拦下。她心里骂自己丢人，真不要脸。"); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
 	tool := NewCommitChapterTool(s)
@@ -602,7 +602,7 @@ func TestCommitChapterLayeredAutoCompletesWhenDone(t *testing.T) {
 
 	tool := NewCommitChapterTool(s)
 	commit := func(ch int) map[string]any {
-		if err := s.Drafts.SaveDraft(ch, fmt.Sprintf("第 %d 章正文内容，用于测试确定性完结。", ch)); err != nil {
+		if err := s.Drafts.SaveDraft(ch, fmt.Sprintf("第 %d 章正文内容，用于测试确定性完结。她心里骂自己丢人，真不要脸。", ch)); err != nil {
 			t.Fatalf("SaveDraft %d: %v", ch, err)
 		}
 		args, _ := json.Marshal(map[string]any{
@@ -702,7 +702,7 @@ func TestCommitChapterFinaleVolumeCompletesDespiteOpenThreads(t *testing.T) {
 
 	tool := NewCommitChapterTool(s)
 	commit := func(ch int) map[string]any {
-		if err := s.Drafts.SaveDraft(ch, fmt.Sprintf("第 %d 章正文内容，用于收官卷完结测试。", ch)); err != nil {
+		if err := s.Drafts.SaveDraft(ch, fmt.Sprintf("第 %d 章正文内容，用于收官卷完结测试。她心里骂自己丢人，真不要脸。", ch)); err != nil {
 			t.Fatalf("SaveDraft %d: %v", ch, err)
 		}
 		args, _ := json.Marshal(map[string]any{
@@ -794,7 +794,7 @@ func TestCommitChapterFinaleSkeletonArcBlocksCompletion(t *testing.T) {
 	_ = s.Progress.UpdatePhase(domain.PhaseWriting)
 
 	tool := NewCommitChapterTool(s)
-	if err := s.Drafts.SaveDraft(1, "第一章正文。"); err != nil {
+	if err := s.Drafts.SaveDraft(1, "第一章正文。她心里骂自己丢人，真不要脸。"); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
 	args, _ := json.Marshal(map[string]any{
@@ -864,7 +864,7 @@ func TestCommitChapterLayeredNoAutoCompleteWithOpenThreads(t *testing.T) {
 	}
 	_ = s.Progress.UpdatePhase(domain.PhaseWriting)
 
-	if err := s.Drafts.SaveDraft(1, "唯一一章的正文，但长线未收束。"); err != nil {
+	if err := s.Drafts.SaveDraft(1, "唯一一章的正文，但长线未收束。她心里骂自己丢人，真不要脸。"); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
 	tool := NewCommitChapterTool(s)

@@ -48,22 +48,22 @@ func (e ThreadParseError) Error() string {
 
 // ParseOpenThreadMarkers 严格解析 open_threads 条目末尾的 [room:<id>] marker(s)。
 //
-	// 规则：
-	//   - 只匹配末尾连续的 [room:<id>] suffix；marker 之间允许普通空格（如 "线索 [room:a] [room:b]"）。
-	//   - 非末尾处（中间）出现 marker 视为畸形并拒绝。
-	//   - 未闭合的 [room:...（缺少 ]）视为畸形并拒绝。
-	//   - marker 后不允许任何尾随 whitespace/非 marker 文本（最后一个 ] 后必须直接结束）。
-	//   - ID 中的任何 Unicode 空白字符或控制字符视为畸形并拒绝。
-	//   - ID 大小写敏感，不 trim/不转换/不规范化。
-	//   - 重复 id 去重保留首次出现顺序。
-	//   - 无 marker：返回原始文本（不 trim），RoomIDs 为空，ParseError 为空。
-	//   - 解析失败时（畸形/中间/未闭合/空/空白/trailing whitespace id）：返回 err != nil，
-	//     同时 ParsedOpenThread 的 NaturalSummary 设为原始文本、ParseError 设错误描述，
-	//     调用方可通过它决定是拒绝写入还是保留旧值。
-	//   - 特别注意：不做全局 TrimRight / TrimSpace 预处理；最后一个 ] 后的任何尾随
-	//     空白会导致解析失败，因为 marker 必须精确位于字符串最末（$ 锚定）。
-	//     marker 间的空格在逐个剥离时会被适当清除。
-	func ParseOpenThreadMarkers(entry string) (ParsedOpenThread, error) {
+// 规则：
+//   - 只匹配末尾连续的 [room:<id>] suffix；marker 之间允许普通空格（如 "线索 [room:a] [room:b]"）。
+//   - 非末尾处（中间）出现 marker 视为畸形并拒绝。
+//   - 未闭合的 [room:...（缺少 ]）视为畸形并拒绝。
+//   - marker 后不允许任何尾随 whitespace/非 marker 文本（最后一个 ] 后必须直接结束）。
+//   - ID 中的任何 Unicode 空白字符或控制字符视为畸形并拒绝。
+//   - ID 大小写敏感，不 trim/不转换/不规范化。
+//   - 重复 id 去重保留首次出现顺序。
+//   - 无 marker：返回原始文本（不 trim），RoomIDs 为空，ParseError 为空。
+//   - 解析失败时（畸形/中间/未闭合/空/空白/trailing whitespace id）：返回 err != nil，
+//     同时 ParsedOpenThread 的 NaturalSummary 设为原始文本、ParseError 设错误描述，
+//     调用方可通过它决定是拒绝写入还是保留旧值。
+//   - 特别注意：不做全局 TrimRight / TrimSpace 预处理；最后一个 ] 后的任何尾随
+//     空白会导致解析失败，因为 marker 必须精确位于字符串最末（$ 锚定）。
+//     marker 间的空格在逐个剥离时会被适当清除。
+func ParseOpenThreadMarkers(entry string) (ParsedOpenThread, error) {
 	orig := entry
 	rest := entry // 不 Trim，保持原样
 
@@ -168,6 +168,7 @@ type PlanningRef struct {
 // 返回的 parsed 中每条条目均有 ParseError 字段：
 //   - 空字符串表示解析成功，RoomIDs 有效
 //   - 非空字符串表示解析失败，RoomIDs 为空，NaturalSummary 为原始文本
+//
 // 调用方可以遍历 parsed 收集 warnings 给 LLM，同时不影响 refs 的提取。
 func ExtractPlanningRefs(openThreads []string) ([]PlanningRef, []ParsedOpenThread) {
 	refs := make([]PlanningRef, 0, 8)

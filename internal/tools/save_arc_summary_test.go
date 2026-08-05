@@ -80,3 +80,66 @@ func TestSaveArcSummaryRejectsDialogueStringArray(t *testing.T) {
 		t.Fatalf("expected style_rules.dialogue validation error, got %v", err)
 	}
 }
+
+func TestSaveArcSummaryRejectsMeteringPollutionInProse(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	tool := NewSaveArcSummaryTool(s)
+	args, err := json.Marshal(map[string]any{
+		"volume":              1,
+		"arc":                 2,
+		"title":               "课",
+		"summary":             "学校循环压成身体节律。",
+		"key_events":          []string{"椅缘碾磨"},
+		"character_snapshots": []map[string]any{},
+		"style_rules": map[string]any{
+			"prose": []string{
+				"盆底基线从20升至22，用次/分记录安静被重写",
+			},
+			"dialogue": []map[string]any{
+				{"name": "照料者", "rules": []string{"短句指令"}},
+			},
+			"taboos": []string{"避免盆底N次/分账本推进"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if _, err := tool.Execute(context.Background(), args); err == nil || !strings.Contains(err.Error(), "pollution") {
+		t.Fatalf("expected pollution validation error, got %v", err)
+	}
+}
+
+func TestSaveArcSummaryAllowsAntiMeteringInTaboosOnly(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	tool := NewSaveArcSummaryTool(s)
+	args, err := json.Marshal(map[string]any{
+		"volume":              1,
+		"arc":                 2,
+		"title":               "课",
+		"summary":             "学校循环压成身体节律。",
+		"key_events":          []string{"椅缘碾磨"},
+		"character_snapshots": []map[string]any{},
+		"style_rules": map[string]any{
+			"prose": []string{
+				"椅缘与门槛条立刻落到穴壁夹绞与渗液",
+				"暗语释放写可预期的松，颠簸写无预告乱绞",
+			},
+			"dialogue": []map[string]any{
+				{"name": "照料者", "rules": []string{"极短指令", "不解释"}},
+			},
+			"taboos": []string{"避免盆底N次/分与跳至XX账本推进", "避免意味着解释链"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+}

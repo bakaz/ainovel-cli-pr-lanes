@@ -280,7 +280,7 @@ func TestEditChapterWorksWithCommitValidation(t *testing.T) {
 		t.Fatalf("InitProgress: %v", err)
 	}
 
-	original := "风从窗缝里钻进来，带着潮湿的泥土气味。"
+	original := "风从窗缝里钻进来，带着潮湿的泥土气味。她心里骂自己丢人，真不要脸。"
 	if err := s.Drafts.SaveDraft(2, original); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
@@ -839,19 +839,19 @@ func TestEditChapterReplaceAllResult(t *testing.T) {
 // TestFindChangedRange 直接验证 findChangedRange 函数在各种场景下的正确性。
 func TestFindChangedRange(t *testing.T) {
 	tests := []struct {
-		name       string
-		oldDraft   string
-		newDraft   string
-		wantStart  int
-		wantEnd    int
-		wantOK     bool
-		wantSlice  string // newDraft[wantStart:wantEnd]
+		name      string
+		oldDraft  string
+		newDraft  string
+		wantStart int
+		wantEnd   int
+		wantOK    bool
+		wantSlice string // newDraft[wantStart:wantEnd]
 	}{
 		{
-			name:      "same content",
-			oldDraft:  "hello world",
-			newDraft:  "hello world",
-			wantOK:    false,
+			name:     "same content",
+			oldDraft: "hello world",
+			newDraft: "hello world",
+			wantOK:   false,
 		},
 		{
 			name:      "single replacement exact",
@@ -910,7 +910,7 @@ func TestFindChangedRange(t *testing.T) {
 		{
 			name:      "fuzzy equivalent content",
 			oldDraft:  "hello\u00A0world", // NBSP
-			newDraft:  "hello world",       // regular space (fuzzy match)
+			newDraft:  "hello world",      // regular space (fuzzy match)
 			wantStart: 5,
 			wantEnd:   6,
 			wantOK:    true,
@@ -960,7 +960,7 @@ func TestEditChapterFuzzyMatchAffectedContext(t *testing.T) {
 	args, _ := json.Marshal(map[string]any{
 		"chapter":    2,
 		"old_string": "第 一 章 测 试", // 普通空格
-		"new_string": "第一章测试",      // 无空格
+		"new_string": "第一章测试",     // 无空格
 	})
 	result, err := tool.Execute(context.Background(), args)
 	if err != nil {

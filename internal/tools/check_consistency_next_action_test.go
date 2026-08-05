@@ -24,10 +24,28 @@ func TestRWQ_DraftEqualsFinal_ReturnsEdit(t *testing.T) {
 	assertAction(t, a, ActionEditChapter)
 }
 
-func TestRWQ_DraftChanged_NoErrors_ReturnsCommit(t *testing.T) {
+// C1：返工草稿已修改但账本无绑定当前草稿的 terminal 结果 → 必须先 review_style 终验。
+func TestRWQ_DraftChanged_NoLedger_ReturnsReview(t *testing.T) {
 	draft := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	final := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, draft, nil, true, final)
+	assertAction(t, a, ActionReviewStyle)
+}
+
+// C1：返工草稿已修改但账本只有旧 digest 的 terminal 结果（未绑定当前草稿）→ review_style。
+func TestRWQ_DraftChanged_StaleLedgerDigest_ReturnsReview(t *testing.T) {
+	draft := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	final := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	oldDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, draft, mkLedger(domain.ReviewStatusAcceptedInitial, oldDigest), true, final)
+	assertAction(t, a, ActionReviewStyle)
+}
+
+// C1：返工草稿已修改且账本存在绑定当前草稿的 terminal 结果（新 epoch 终验通过）→ commit。
+func TestRWQ_DraftChanged_TerminalBinding_ReturnsCommit(t *testing.T) {
+	draft := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	final := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, draft, mkLedger(domain.ReviewStatusAcceptedInitial, draft), true, final)
 	assertAction(t, a, ActionCommitChapter)
 }
 
@@ -41,6 +59,35 @@ func TestRWQ_HasErrors_ReturnsNil(t *testing.T) {
 	d := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, true, d, nil, true, d)
 	assertNil(t, a)
+}
+
+// ── D2：mode=off 时 rewrite 走旧规则（不进 review_style 分支） ─────────
+
+func TestRWQ_OffMode_DraftChanged_ReturnsCommit(t *testing.T) {
+	draft := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	final := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	a := ComputeRequiredNextAction(domain.StyleQualityOff, 1, false, draft, nil, true, final)
+	assertAction(t, a, ActionCommitChapter)
+}
+
+func TestRWQ_OffMode_DraftEqualsFinal_ReturnsEdit(t *testing.T) {
+	d := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	a := ComputeRequiredNextAction(domain.StyleQualityOff, 1, false, d, nil, true, d)
+	assertAction(t, a, ActionEditChapter)
+}
+
+func TestRWQ_OffMode_NoFinalDigest_ReturnsEdit(t *testing.T) {
+	d := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	a := ComputeRequiredNextAction(domain.StyleQualityOff, 1, false, d, nil, true, "")
+	assertAction(t, a, ActionEditChapter)
+}
+
+// 对照：critic 模式 + rewrite + draft 已改（无账本）→ review_style（三段式，不进 commit）
+func TestRWQ_CriticMode_DraftChanged_ReturnsReview(t *testing.T) {
+	draft := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	final := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, draft, nil, true, final)
+	assertAction(t, a, ActionReviewStyle)
 }
 
 // ── Critic off ───────────────────────────────────────────────────────
@@ -57,6 +104,27 @@ func TestOff_EmptyModeTreatedAsOff(t *testing.T) {
 
 func TestOff_HasErrors_ReturnsNil(t *testing.T) {
 	a := ComputeRequiredNextAction(domain.StyleQualityOff, 1, true, "d", nil, false, "")
+	assertNil(t, a)
+}
+
+// C1 决策：mode=off 时 C1 不生效——PendingRewrite 章节走旧规则（draft != final → 建议
+// commit，不进 review_style）。
+func TestOff_RewriteDraftChanged_ReturnsCommit(t *testing.T) {
+	draft := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	final := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	// 即使没有任何账本（无 critic 终验），off 模式也建议 commit（旧规则）。
+	a := ComputeRequiredNextAction(domain.StyleQualityOff, 1, false, draft, nil, true, final)
+	assertAction(t, a, ActionCommitChapter)
+}
+
+func TestOff_RewriteDraftEqualsFinal_ReturnsEdit(t *testing.T) {
+	d := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	a := ComputeRequiredNextAction(domain.StyleQualityOff, 1, false, d, nil, true, d)
+	assertAction(t, a, ActionEditChapter)
+}
+
+func TestOff_Rewrite_HasErrors_ReturnsNil(t *testing.T) {
+	a := ComputeRequiredNextAction(domain.StyleQualityOff, 1, true, "d", nil, true, "f")
 	assertNil(t, a)
 }
 
@@ -188,7 +256,8 @@ func terminalStatuses() []termCase {
 	return []termCase{
 		{"accepted_initial", domain.ReviewStatusAcceptedInitial},
 		{"accepted_revised", domain.ReviewStatusAcceptedRev},
-		{"degraded", domain.ReviewStatusDegraded},
+		// degraded 是"评审调用故障"（可恢复），语义独立——见下方
+		// TestDegraded_* 系列（候选变化 → review_style，不再返回 nil）。
 		{"overridden", domain.ReviewStatusOverridden},
 	}
 }
@@ -220,6 +289,41 @@ func TestTerm_HasErrors_ReturnsNil(t *testing.T) {
 			t.Fatalf("%s errors: expected nil, got %+v", tc.name, a)
 		}
 	}
+}
+
+// ── C2：degraded（评审调用故障，可恢复）的 next action ────────────────
+// 候选未变（digest 匹配 + 绑定 seq == 最新 polish，或无绑定）→ commit；
+// 候选已变化（digest 或 seq 不匹配）→ review_style（而非 nil）。
+
+func TestDegraded_DigestValid_ReturnsCommit(t *testing.T) {
+	d := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, d, mkLedger(domain.ReviewStatusDegraded, d), false, "")
+	assertAction(t, a, ActionCommitChapter)
+}
+
+func TestDegraded_DigestMismatch_ReturnsReview(t *testing.T) {
+	ld := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cd := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, cd, mkLedger(domain.ReviewStatusDegraded, ld), false, "")
+	assertAction(t, a, ActionReviewStyle)
+}
+
+func TestDegraded_PipelineSeqStale_ReturnsReview(t *testing.T) {
+	d := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	// digest 匹配但绑定 seq（R=5）落后于最新 polish（P=6）→ 候选已更新 → review_style
+	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, d,
+		mkLedgerBound(domain.ReviewStatusDegraded, d, 5), false, "",
+		&PolishPipelineBinding{LatestPolishSeq: 6})
+	assertAction(t, a, ActionReviewStyle)
+}
+
+func TestDegraded_PipelineSeqCurrent_ReturnsCommit(t *testing.T) {
+	d := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	// digest 匹配且绑定 seq（R=6）== 最新 polish（P=6）→ 候选未变 → commit
+	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, d,
+		mkLedgerBound(domain.ReviewStatusDegraded, d, 6), false, "",
+		&PolishPipelineBinding{LatestPolishSeq: 6})
+	assertAction(t, a, ActionCommitChapter)
 }
 
 // ── exhausted → nil ─────────────────────────────────────────────────
@@ -282,7 +386,7 @@ func TestInteg_CriticOff_FieldPresent(t *testing.T) {
 	st := store.NewStore(t.TempDir())
 	savePermissiveUserRules(t, st)
 	must(t, st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityOff}))
-	must(t, st.Drafts.SaveDraft(1, "# 一\nabc"))
+	must(t, st.Drafts.SaveDraft(1, "# 一\nabc她心里骂自己丢人，真不要脸。"))
 	m := mustUnmarshal(t, mustExecute(t, st, 1))
 	if _, ok := m["required_next_action"]; !ok {
 		t.Fatal("expected required_next_action")
@@ -293,7 +397,7 @@ func TestInteg_CriticOn_NoLedger_FieldPresent(t *testing.T) {
 	st := store.NewStore(t.TempDir())
 	savePermissiveUserRules(t, st)
 	must(t, st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}))
-	must(t, st.Drafts.SaveDraft(1, "# 一\nabc"))
+	must(t, st.Drafts.SaveDraft(1, "# 一\nabc她心里骂自己丢人，真不要脸。"))
 	m := mustUnmarshal(t, mustExecute(t, st, 1))
 	if _, ok := m["required_next_action"]; !ok {
 		t.Fatal("expected required_next_action")
@@ -304,7 +408,7 @@ func TestInteg_Terminal_DigestMatch_FieldPresent(t *testing.T) {
 	st := store.NewStore(t.TempDir())
 	savePermissiveUserRules(t, st)
 	must(t, st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}))
-	content := "# 一\n终稿"
+	content := "# 一\n终稿她心里骂自己丢人，真不要脸。"
 	must(t, st.Drafts.SaveDraft(1, content))
 	digest := domain.DigestDraft(content)
 	basis := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -331,7 +435,7 @@ func TestInteg_RevisionOpen_Unchanged_FieldPresent(t *testing.T) {
 	st := store.NewStore(t.TempDir())
 	savePermissiveUserRules(t, st)
 	must(t, st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}))
-	content := "# 一\n待改"
+	content := "# 一\n待改她心里骂自己丢人，真不要脸。"
 	must(t, st.Drafts.SaveDraft(1, content))
 	digest := domain.DigestDraft(content)
 	basis := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -344,8 +448,8 @@ func TestInteg_RevisionOpen_Unchanged_FieldPresent(t *testing.T) {
 				Request: &domain.StyleReviewRequest{Prompt: "p", Model: "m"}, CreatedAt: now},
 			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, AttemptID: "a1",
 				DraftDigest: digest, BasisDigest: basis,
-				Request: &domain.StyleReviewRequest{Prompt: "p", Model: "m"},
-				Result:  &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "fix", Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Severity: "warning", Category: "style", Evidence: "s"}}},
+				Request:   &domain.StyleReviewRequest{Prompt: "p", Model: "m"},
+				Result:    &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "fix", Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Severity: "warning", Category: "style", Evidence: "s"}}},
 				CreatedAt: now},
 		},
 	}))
@@ -423,8 +527,8 @@ func TestInteg_Rewrite_DraftVsFinal_FieldPresent(t *testing.T) {
 	savePermissiveUserRules(t, st)
 	must(t, st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}))
 	must(t, st.Progress.Init("t", 10))
-	must(t, st.Drafts.SaveDraft(1, "# 一\n修改后"))
-	must(t, st.Drafts.SaveFinalChapter(1, "# 一\n原始终稿"))
+	must(t, st.Drafts.SaveDraft(1, "# 一\n修改后她心里骂自己丢人，真不要脸。"))
+	must(t, st.Drafts.SaveFinalChapter(1, "# 一\n原始终稿她心里骂自己丢人，真不要脸。"))
 	must(t, st.Progress.MarkChapterComplete(1, 10, "crisis", "quest"))
 	must(t, st.Progress.SetPendingRewrites([]int{1}, "重写"))
 	m := mustUnmarshal(t, mustExecute(t, st, 1))
@@ -438,7 +542,7 @@ func TestInteg_Rewrite_DraftEqualsFinal_FieldPresent(t *testing.T) {
 	savePermissiveUserRules(t, st)
 	must(t, st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}))
 	must(t, st.Progress.Init("t", 10))
-	content := "# 一\n未改"
+	content := "# 一\n未改她心里骂自己丢人，真不要脸。"
 	must(t, st.Drafts.SaveDraft(1, content))
 	must(t, st.Drafts.SaveFinalChapter(1, content))
 	must(t, st.Progress.MarkChapterComplete(1, 10, "crisis", "quest"))
@@ -631,4 +735,59 @@ func buildCycles(target domain.StyleReviewStatus, digest string) []domain.StyleR
 	default:
 		return nil
 	}
+}
+
+// ── C1-H1：pipeline 启用时 next action 绑定最新 polish seq（中等 2） ──────
+// 场景：Critic 已评审 P1 → 生成同 digest 的 no-op polish P2 → gate 因 P2 != R1
+// 拒绝 commit；next action 必须建议 review_style 而非 commit（控制面一致）。
+
+func TestRWQ_PipelineBinding_SeqBoundLatest_ReturnsCommit(t *testing.T) {
+	draft := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	final := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	// terminal 绑定 R=5 == 最新 polish P=5 → commit
+	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, draft,
+		mkLedgerBound(domain.ReviewStatusAcceptedInitial, draft, 5), true, final,
+		&PolishPipelineBinding{LatestPolishSeq: 5})
+	assertAction(t, a, ActionCommitChapter)
+}
+
+func TestRWQ_PipelineBinding_NoOpPolish_ReturnsReview(t *testing.T) {
+	draft := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	final := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	// Critic 已评审 P1（R=5），随后 no-op polish P2（最新 P=6，同 digest）→ review_style
+	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, draft,
+		mkLedgerBound(domain.ReviewStatusAcceptedInitial, draft, 5), true, final,
+		&PolishPipelineBinding{LatestPolishSeq: 6})
+	assertAction(t, a, ActionReviewStyle)
+}
+
+func TestRWQ_PipelineBinding_LegacyZeroSeq_ReturnsReview(t *testing.T) {
+	draft := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	final := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	// pipeline 启用但 terminal 无 seq 绑定（R=0，legacy）→ 建议重新终验
+	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, draft,
+		mkLedger(domain.ReviewStatusAcceptedInitial, draft), true, final,
+		&PolishPipelineBinding{LatestPolishSeq: 5})
+	assertAction(t, a, ActionReviewStyle)
+}
+
+func TestRWQ_PipelineBinding_NilBindingPreservesOldBehavior(t *testing.T) {
+	draft := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	final := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	// pipeline 关闭（binding nil）→ 不做 seq 绑定，terminal + digest 匹配即 commit
+	a := ComputeRequiredNextAction(domain.StyleQualityCritic, 1, false, draft,
+		mkLedgerBound(domain.ReviewStatusAcceptedInitial, draft, 1), true, final)
+	assertAction(t, a, ActionCommitChapter)
+}
+
+// mkLedgerBound 构造 terminal（accepted_initial）账本，并把全部请求的
+// PolishCheckpointSeq 设为 seq。
+func mkLedgerBound(status domain.StyleReviewStatus, digest string, seq int64) *domain.StyleReviewLedger {
+	l := mkLedger(status, digest)
+	for i := range l.Cycles {
+		if l.Cycles[i].Request != nil {
+			l.Cycles[i].Request.PolishCheckpointSeq = seq
+		}
+	}
+	return l
 }

@@ -12,10 +12,10 @@ import (
 // Schema 固定为 "ainovel.planning-archive"，Version 固定为 1。
 // 未知顶层字段通过 Extra 保留。
 type PlanningArchiveV1 struct {
-	Schema  string                `json:"schema"`
-	Version int                   `json:"version"`
+	Schema  string                 `json:"schema"`
+	Version int                    `json:"version"`
 	Entries []PlanningArchiveEntry `json:"entries"`
-	Extra   json.RawMessage       `json:"-"` // 未知顶层字段
+	Extra   json.RawMessage        `json:"-"` // 未知顶层字段
 }
 
 // entryKey 是 (Kind, ID) 的无碰撞复合键。
@@ -53,8 +53,8 @@ func (a *PlanningArchiveV1) Validate() error {
 // ── custom JSON for top-level Extra preservation ──
 
 type planningArchiveWire struct {
-	Schema  string                `json:"schema"`
-	Version int                   `json:"version"`
+	Schema  string                 `json:"schema"`
+	Version int                    `json:"version"`
 	Entries []PlanningArchiveEntry `json:"entries"`
 }
 

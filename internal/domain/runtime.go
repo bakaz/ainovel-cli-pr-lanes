@@ -218,6 +218,10 @@ type RunMeta struct {
 	AdvancePermitChapter int                `json:"advance_permit_chapter,omitempty"` // review 模式下一次性许可的正向章节
 	AdvanceHold          *AdvanceHold       `json:"advance_hold,omitempty"`           // 当前干预签署的一次性暂停意图
 	StyleReviewMode      StyleQualityMode   `json:"style_review_mode,omitempty"`      // 风格评审质量模式：off / critic；零值等效 off
+	// LastAuthorModel 最近一次 writer 派发时生效的模型名（正文写入的真实作者模型）。
+	// 由 Engine 在 runWorker 派发 writer 前记录，供 rewrite_brief 的 author provenance
+	// 使用——不再从 StyleReview 反推（旧实现误取 critic 模型）。
+	LastAuthorModel string `json:"last_author_model,omitempty"`
 }
 
 // ChapterAdvanceMode 决定新章节是否需要逐章许可。

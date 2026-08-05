@@ -21,11 +21,24 @@ import (
 // CommitChapterTool 提交章节：加载正文 → 保存终稿 → 生成摘要 → 更新状态 → 更新进度。
 type CommitChapterTool struct {
 	store *store.Store
+	// polishPipeline 是精修流水线的 commit 门控配置；nil = pipeline 关闭（不拦截）。
+	// 由 BuildWorkers 按配置注入（SetPolishPipeline）。
+	polishPipeline *PolishPipelineConfig
+}
+
+// PolishPipelineConfig 是精修流水线的 commit 门控配置。
+type PolishPipelineConfig struct {
+	// ExpectedModel 是 roles.polisher 显式配置时的当前模型名；空 = 未显式配置
+	// （跳过 polish checkpoint 的模型一致性校验）。
+	ExpectedModel string
 }
 
 func NewCommitChapterTool(store *store.Store) *CommitChapterTool {
 	return &CommitChapterTool{store: store}
 }
+
+// SetPolishPipeline 启用精修流水线 commit 门控（cfg 为 nil 时关闭）。
+func (t *CommitChapterTool) SetPolishPipeline(cfg *PolishPipelineConfig) { t.polishPipeline = cfg }
 
 // commitOutput 在 domain.CommitResult 之上嵌入扩展字段，保持 domain 包不依赖 rules。
 // 由于嵌入字段会被 JSON marshaler 提升（promoted），序列化结果等同于扁平结构。
@@ -118,6 +131,22 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 	// critic 模式 commit 闸门：校验一致性、账本状态、摘要匹配
 	if err := CheckCommitStyleGate(t.store, a.Chapter); err != nil {
 		return nil, fmt.Errorf("commit_chapter: %w", err)
+	}
+
+	// 精修流水线 commit 闸门：fresh polish checkpoint + 模型一致性 + 时序（pipeline 启用时）
+	if t.polishPipeline != nil {
+		if err := CheckPolishPipelineGate(t.store, a.Chapter, t.polishPipeline.ExpectedModel); err != nil {
+			return nil, fmt.Errorf("commit_chapter: %w", err)
+		}
+	}
+
+	// 文学腔句式硬闸（commit 级打回）：只拦"真正提交新正文"的路径——
+	// 新章提交与重写/打磨提交都算新正文；已完成章节的重复提交（skip 结果）跳过。
+	// 硬闸在一切写操作之前执行，违例即中止，终稿/摘要/进度都不会被改动。
+	if !t.store.Progress.IsChapterCompleted(a.Chapter) || isCompletedAndInRewriteQueue(t.store, a.Chapter) {
+		if err := CheckLiteraryProseGate(t.store, a.Chapter); err != nil {
+			return nil, fmt.Errorf("commit_chapter: %w", err)
+		}
 	}
 
 	if t.store.Progress.IsChapterCompleted(a.Chapter) {
@@ -375,14 +404,16 @@ func (t *CommitChapterTool) appendCommitCheckpoint(chapter int) error {
 }
 
 // checkRules 对章节正文做机械检查：内置产品底线 Lint（机制残留，始终执行）
-// + 用户规则 Check（读本书快照的 structured；快照缺失退到内置默认，保证机械底线始终在）。
+// + 用户规则 Check（读本书快照的 structured；快照缺失退到内置默认，保证机械底线始终在）
+// + 文学腔句式硬闸事实（硬闸已在 Execute 前置阶段拦截；此处同样跑一遍，
+// 把命中句随完整违例集落盘，供 editor 经 novel_context 审计）。
 func (t *CommitChapterTool) checkRules(text string) []rules.Violation {
 	violations := rules.Lint(text)
 	structured := rules.SystemDefaults().Structured
 	if snap, err := t.store.UserRules.Load(); err == nil && snap != nil {
 		structured = snap.Structured
 	}
-	return append(violations, rules.Check(text, utf8.RuneCountInString(text), structured)...)
+	return append(violations, rules.CheckLiteraryGate(text, utf8.RuneCountInString(text), structured)...)
 }
 
 // executeRewriteCommit 处理打磨/重写章节的提交：覆盖终稿与摘要、更新字数、drain 队列。

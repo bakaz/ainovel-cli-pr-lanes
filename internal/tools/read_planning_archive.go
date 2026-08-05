@@ -47,11 +47,11 @@ func (t *ReadPlanningArchiveTool) Schema() map[string]any {
 
 // ReadPlanningArchiveResult 是 read_planning_archive 的返回结构。
 type ReadPlanningArchiveResult struct {
-	Status string                    `json:"status"` // ok / partial / not_found / archive_absent / unsupported_version / invalid_archive
-	Hint   string                    `json:"_hint,omitempty"`
-	Refs   []PlanningRef             `json:"refs,omitempty"`   // 去重后的请求
-	Found  []domain.PlanningArchiveEntry `json:"found,omitempty"` // 匹配的条目
-	Missing []PlanningRef            `json:"missing,omitempty"`   // 未匹配的 ref
+	Status  string                        `json:"status"` // ok / partial / not_found / archive_absent / unsupported_version / invalid_archive
+	Hint    string                        `json:"_hint,omitempty"`
+	Refs    []PlanningRef                 `json:"refs,omitempty"`    // 去重后的请求
+	Found   []domain.PlanningArchiveEntry `json:"found,omitempty"`   // 匹配的条目
+	Missing []PlanningRef                 `json:"missing,omitempty"` // 未匹配的 ref
 }
 
 func (t *ReadPlanningArchiveTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {

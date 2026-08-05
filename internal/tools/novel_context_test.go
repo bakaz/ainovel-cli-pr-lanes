@@ -4468,3 +4468,429 @@ func buildReviseLedger(t *testing.T, chapter int, now, draftDigest, basisDigest 
 		},
 	}
 }
+
+// ── rewrite_brief: critic 完整 findings + 最小 provenance ──
+
+// TestContextToolRewriteBrief_CriticReviewFullFindings 验证重写分支下
+// rewrite_brief 注入 critic 完整评审投影：status/verdict/draft_digest +
+// findings 六字段齐全（含 problem/suggestion）、evidence 不截断；
+// candidate 溯源 digest/stage/author_model 正确。
+func TestContextToolRewriteBrief_CriticReviewFullFindings(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Progress.MarkChapterComplete(2, 3000, "", ""); err != nil {
+		t.Fatalf("MarkChapterComplete: %v", err)
+	}
+	if err := s.Progress.SetPendingRewrites([]int{2}, "节奏拖沓，需要压缩前半段"); err != nil {
+		t.Fatalf("SetPendingRewrites: %v", err)
+	}
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+	// P0 provenance：author_model 必须来自 RunMeta.LastAuthorModel（Engine 派发 writer
+	// 时记录的真实作者模型），而不是 StyleReview 反推的 critic 模型。
+	if err := s.RunMeta.SetLastAuthorModel("writer-ds-v1"); err != nil {
+		t.Fatalf("SetLastAuthorModel: %v", err)
+	}
+	draft := "第一章草稿正文。" + strings.Repeat("铺垫", 40)
+	if err := s.Drafts.SaveDraft(2, draft); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	// polish checkpoint：parent_digest 溯源到 DS 初稿 digest（polish 的 input_digest）。
+	if _, err := s.Checkpoints.AppendPolish(
+		domain.ChapterScope(2), "polish", "drafts/02.draft.md",
+		domain.DigestDraft("第一章草稿正文。"+strings.Repeat("铺垫", 40)+"精修后。"),
+		domain.PolishCheckpointMeta{
+			InputDigest:   domain.DigestDraft(draft),
+			PolisherModel: "mimo-polisher-v1",
+			Stage:         "rewrite",
+			Changed:       true,
+		},
+	); err != nil {
+		t.Fatalf("AppendPolish: %v", err)
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	draftDigest := domain.DigestDraft(draft)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	longEvidence := strings.Repeat("这段描写过于冗长，", 8) // 80 runes，验证完整投影不截断
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       2,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: now, AttemptID: "rw-init",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "mimo-v2.5", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				CreatedAt: now, AttemptID: "rw-init",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "mimo-v2.5", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict:  domain.ReviewVerdictRevise,
+					Evidence: "开篇紧凑，悬念设置到位",
+					Findings: []domain.StyleReviewFinding{
+						{
+							Dimension: "pacing", Category: "style", Severity: "warning",
+							Evidence:   longEvidence,
+							Problem:    "前半段描写过细，推进太慢",
+							Suggestion: "压缩中间描写，提前冲突",
+						},
+						{
+							Dimension: "character", Category: "tone", Severity: "info",
+							Evidence:   "对话略显生硬",
+							Problem:    "角色口吻与设定不一致",
+							Suggestion: "增加口语化",
+						},
+					},
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+		},
+	}
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 2})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	working := payload["working_memory"].(map[string]any)
+	brief, ok := working["rewrite_brief"].(map[string]any)
+	if !ok {
+		t.Fatal("expected rewrite_brief in chapter context")
+	}
+
+	// ── critic_review 完整投影 ──
+	cr, ok := brief["critic_review"].(map[string]any)
+	if !ok {
+		t.Fatal("expected critic_review in rewrite_brief")
+	}
+	if cr["status"] != "revision_open" {
+		t.Fatalf("critic_review.status = %v, want revision_open", cr["status"])
+	}
+	if cr["verdict"] != "revise" {
+		t.Fatalf("critic_review.verdict = %v, want revise", cr["verdict"])
+	}
+	if cr["draft_digest"] != draftDigest {
+		t.Fatalf("critic_review.draft_digest = %v, want %v", cr["draft_digest"], draftDigest)
+	}
+	findings, ok := cr["findings"].([]any)
+	if !ok || len(findings) != 2 {
+		t.Fatalf("expected 2 findings in critic_review, got %v", cr["findings"])
+	}
+	for i, raw := range findings {
+		f := raw.(map[string]any)
+		for _, key := range []string{"dimension", "category", "severity", "evidence", "problem", "suggestion"} {
+			if _, has := f[key]; !has {
+				t.Fatalf("finding[%d] missing key %q", i, key)
+			}
+		}
+	}
+	f0 := findings[0].(map[string]any)
+	if f0["problem"] != "前半段描写过细，推进太慢" {
+		t.Fatalf("finding[0].problem lost: %v", f0["problem"])
+	}
+	if f0["evidence"] != longEvidence {
+		t.Fatalf("finding[0].evidence truncated: got %d runes, want full %d",
+			len([]rune(f0["evidence"].(string))), len([]rune(longEvidence)))
+	}
+	if f0["suggestion"] != "压缩中间描写，提前冲突" {
+		t.Fatalf("finding[0].suggestion = %v", f0["suggestion"])
+	}
+
+	// ── candidate 最小溯源 ──
+	cand, ok := brief["candidate"].(map[string]any)
+	if !ok {
+		t.Fatal("expected candidate provenance in rewrite_brief")
+	}
+	if cand["draft_digest"] != domain.DigestDraft(draft) {
+		t.Fatalf("candidate.draft_digest = %v, want %v", cand["draft_digest"], domain.DigestDraft(draft))
+	}
+	if cand["stage"] != "rewrite" {
+		t.Fatalf("candidate.stage = %v, want rewrite", cand["stage"])
+	}
+	// P0 provenance：author_model 取真实作者模型（RunMeta.LastAuthorModel），
+	// 不再是 StyleReview 反推的 critic 模型（账本 request.model="mimo-v2.5"）。
+	if cand["author_model"] != "writer-ds-v1" {
+		t.Fatalf("candidate.author_model = %v, want writer-ds-v1（真实作者模型，非 critic 模型）", cand["author_model"])
+	}
+	// parent_digest 溯源到 DS 初稿 digest（最近一次 polish 的 input_digest）。
+	if cand["parent_digest"] != domain.DigestDraft(draft) {
+		t.Fatalf("candidate.parent_digest = %v, want %v", cand["parent_digest"], domain.DigestDraft(draft))
+	}
+}
+
+// TestContextToolRewriteBrief_OmitsCriticReviewWhenLedgerEmpty 验证 ledger 为空
+// 时 rewrite_brief 省略 critic_review，但 candidate 仍记录 digest+stage（无 author_model）。
+func TestContextToolRewriteBrief_OmitsCriticReviewWhenLedgerEmpty(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Progress.MarkChapterComplete(2, 3000, "", ""); err != nil {
+		t.Fatalf("MarkChapterComplete: %v", err)
+	}
+	if err := s.Progress.SetPendingRewrites([]int{2}, "重写原因"); err != nil {
+		t.Fatalf("SetPendingRewrites: %v", err)
+	}
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+	draft := "第二章草稿。"
+	if err := s.Drafts.SaveDraft(2, draft); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 2})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	working := payload["working_memory"].(map[string]any)
+	brief, ok := working["rewrite_brief"].(map[string]any)
+	if !ok {
+		t.Fatal("expected rewrite_brief in chapter context")
+	}
+	if _, has := brief["critic_review"]; has {
+		t.Fatal("critic_review must be omitted when ledger is empty")
+	}
+	cand, ok := brief["candidate"].(map[string]any)
+	if !ok {
+		t.Fatal("expected candidate provenance even without ledger")
+	}
+	if cand["draft_digest"] != domain.DigestDraft(draft) {
+		t.Fatalf("candidate.draft_digest = %v, want %v", cand["draft_digest"], domain.DigestDraft(draft))
+	}
+	if cand["stage"] != "rewrite" {
+		t.Fatalf("candidate.stage = %v, want rewrite", cand["stage"])
+	}
+	if _, has := cand["author_model"]; has {
+		t.Fatal("author_model must be omitted when no ledger result available")
+	}
+}
+
+// TestContextToolRewriteBrief_NonRewriteKeepsCompactFeedback 验证初稿路径不变：
+// 非重写章节没有 rewrite_brief，Writer 仍通过 checkpoint.style_review_feedback
+// 收到 compact 反馈（≤3 条、evidence 截断 60 字、无 problem 字段）。
+func TestContextToolRewriteBrief_NonRewriteKeepsCompactFeedback(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "开始"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Outline.SavePremise("## 题材和基调\n测试\n"); err != nil {
+		t.Fatalf("SavePremise: %v", err)
+	}
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	draftDigest := "sha256:" + strings.Repeat("a", 64)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	longEvidence := strings.Repeat("节奏拖沓描写冗长，", 10) // 80 runes > 60，验证 compact 截断
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       1,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: now, AttemptID: "cp-init",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				CreatedAt: now, AttemptID: "cp-init",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict:  domain.ReviewVerdictRevise,
+					Evidence: "开篇紧凑",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Category: "style", Severity: "warning", Evidence: longEvidence, Problem: "推进慢", Suggestion: "压缩"},
+						{Dimension: "character", Category: "tone", Severity: "info", Evidence: "生硬", Problem: "口吻", Suggestion: "口语化"},
+					},
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+		},
+	}
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	working := payload["working_memory"].(map[string]any)
+	if _, has := working["rewrite_brief"]; has {
+		t.Fatal("non-rewrite chapter must not have rewrite_brief")
+	}
+	cp, ok := working["checkpoint"].(map[string]any)
+	if !ok {
+		t.Fatal("expected checkpoint")
+	}
+	fb, ok := cp["style_review_feedback"].(map[string]any)
+	if !ok {
+		t.Fatal("expected compact style_review_feedback for revision_open")
+	}
+	findings, ok := fb["findings"].([]any)
+	if !ok || len(findings) != 2 {
+		t.Fatalf("expected 2 compact findings, got %v", fb["findings"])
+	}
+	for i, raw := range findings {
+		f := raw.(map[string]any)
+		if _, has := f["problem"]; has {
+			t.Fatalf("compact finding[%d] must not expose problem field", i)
+		}
+		ev, ok := f["evidence"].(string)
+		if !ok {
+			t.Fatalf("compact finding[%d] missing evidence", i)
+		}
+		if n := len([]rune(ev)); n > 63 { // 60 runes + "..."
+			t.Fatalf("compact finding[%d] evidence not truncated: %d runes", i, n)
+		}
+	}
+}
+
+// TestContextToolRewriteBrief_UsesLatestResultCycle 验证完整投影取"最新一个有
+// Result 的周期"：exhausted 周期的 revise 结果优先于更早的 revision_open。
+func TestContextToolRewriteBrief_UsesLatestResultCycle(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 5); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := s.Progress.MarkChapterComplete(2, 3000, "", ""); err != nil {
+		t.Fatalf("MarkChapterComplete: %v", err)
+	}
+	if err := s.Progress.SetPendingRewrites([]int{2}, "重写原因"); err != nil {
+		t.Fatalf("SetPendingRewrites: %v", err)
+	}
+	if err := s.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+	draft := "第二章草稿正文。"
+	if err := s.Drafts.SaveDraft(2, draft); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	draftDigest := domain.DigestDraft(draft)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	// initial_pending → revision_open → final_pending → exhausted
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1,
+		Chapter:       2,
+		Mode:          domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{
+				Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: now, AttemptID: "x1",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				CreatedAt: now, AttemptID: "x1",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictRevise, Evidence: "好方向",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Severity: "error", Category: "style", Evidence: "太慢", Suggestion: "加快节奏"},
+					},
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 3, Status: domain.ReviewStatusFinalPending,
+				CreatedAt: now, AttemptID: "x2",
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+			{
+				Cycle: 4, Status: domain.ReviewStatusExhausted,
+				CreatedAt: now, AttemptID: "x2",
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m", RequestedAt: now},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictRevise, Evidence: "仍未通过",
+					Findings: []domain.StyleReviewFinding{
+						{Dimension: "pacing", Severity: "error", Category: "style", Evidence: "仍太慢", Suggestion: "大幅压缩"},
+					},
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest,
+			},
+		},
+	}
+	if err := s.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 2})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	json.Unmarshal(result, &payload)
+	working := payload["working_memory"].(map[string]any)
+	brief, ok := working["rewrite_brief"].(map[string]any)
+	if !ok {
+		t.Fatal("expected rewrite_brief in chapter context")
+	}
+	cr, ok := brief["critic_review"].(map[string]any)
+	if !ok {
+		t.Fatal("expected critic_review in rewrite_brief")
+	}
+	if cr["status"] != "exhausted" {
+		t.Fatalf("critic_review.status = %v, want exhausted (latest result cycle)", cr["status"])
+	}
+	findings, ok := cr["findings"].([]any)
+	if !ok || len(findings) != 1 {
+		t.Fatalf("expected 1 finding from latest cycle, got %v", cr["findings"])
+	}
+	f0 := findings[0].(map[string]any)
+	if f0["evidence"] != "仍太慢" {
+		t.Fatalf("expected latest exhausted evidence, got %v", f0["evidence"])
+	}
+}

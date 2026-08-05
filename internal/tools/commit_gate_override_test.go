@@ -29,7 +29,7 @@ func TestCommitGate_ExhaustedBlocksCommit(t *testing.T) {
 
 // TestCommitGate_OverriddenAllowsCommit 验证 overridden 状态允许 commit。
 func TestCommitGate_OverriddenAllowsCommit(t *testing.T) {
-	draft := "正文内容。用于验证覆盖后可以提交。"
+	draft := "正文内容。用于验证覆盖后可以提交。她心里骂自己丢人，真不要脸。"
 	st := newCriticStoreWithExhaustedLedger(t, 1, draft)
 
 	// 追加 overridden 条目
@@ -186,7 +186,7 @@ func TestCommitGate_OffModeFreshCheckpointAllowsCommit(t *testing.T) {
 		t.Fatalf("Append checkpoint: %v", err)
 	}
 	// 编辑为 B
-	draftB := "版本 B。"
+	draftB := "版本 B。她心里骂自己丢人，真不要脸。"
 	if err := st.Drafts.SaveDraft(1, draftB); err != nil {
 		t.Fatalf("SaveDraft B: %v", err)
 	}
@@ -337,7 +337,7 @@ func TestCommitGate_OffModeNoCheckpointAllowsCommit(t *testing.T) {
 	if err := st.Progress.Init("test", 100); err != nil {
 		t.Fatalf("Progress.Init: %v", err)
 	}
-	if err := st.Drafts.SaveDraft(1, "一些正文。"); err != nil {
+	if err := st.Drafts.SaveDraft(1, "一些正文。她心里骂自己丢人，真不要脸。"); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
 	// 不创建任何 checkpoint

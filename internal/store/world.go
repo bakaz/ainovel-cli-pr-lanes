@@ -321,6 +321,7 @@ func (s *WorldStore) SaveStyleRules(rules domain.WritingStyleRules) error {
 //   - prose/taboos: long 优先，current 的非重复规则追加其后
 //   - dialogue: 按角色合并（同角色 long 优先，current 独有角色追加）
 //   - volume/arc/last_updated: 来自 current
+//
 // 至少 long-only 不会返回 nil。
 func (s *WorldStore) LoadStyleRules() (*domain.WritingStyleRules, error) {
 	compass, err := s.LoadStyleRulesCompass()

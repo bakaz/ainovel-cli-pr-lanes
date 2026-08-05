@@ -46,6 +46,100 @@ func TestCheckpointStore_AppendAndQuery(t *testing.T) {
 	}
 }
 
+// TestCheckpointStore_AppendPolish 验证 polish checkpoint 的附加元数据
+// （input_digest/polisher_model/stage/changed）落盘与读取 round-trip。
+// C1：AppendPolish 不做 digest 幂等去重——每次调用都追加新 checkpoint（新 seq），
+// 顺序绑定（polish → consistency → critic）依赖每次 polish 都推进 seq。
+func TestCheckpointStore_AppendPolish(t *testing.T) {
+	cs, dir := newTestCheckpointStore(t)
+
+	cp, err := cs.AppendPolish(
+		domain.ChapterScope(3), "polish", "drafts/03.draft.md", "sha256:out",
+		domain.PolishCheckpointMeta{
+			InputDigest:   "sha256:in",
+			PolisherModel: "mimo-polisher",
+			Stage:         "draft",
+			Changed:       true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("AppendPolish: %v", err)
+	}
+	if cp.Digest != "sha256:out" || cp.InputDigest != "sha256:in" ||
+		cp.PolisherModel != "mimo-polisher" || cp.Stage != "draft" || !cp.Changed {
+		t.Fatalf("polish metadata lost: %+v", cp)
+	}
+
+	// 相同 scope+step+digest 再次写入必须追加新记录（新 seq），不得去重返回旧记录。
+	cp2, err := cs.AppendPolish(
+		domain.ChapterScope(3), "polish", "drafts/03.draft.md", "sha256:out",
+		domain.PolishCheckpointMeta{InputDigest: "sha256:in", PolisherModel: "mimo-polisher", Stage: "draft", Changed: true},
+	)
+	if err != nil {
+		t.Fatalf("AppendPolish second: %v", err)
+	}
+	if cp2.Seq <= cp.Seq {
+		t.Fatalf("AppendPolish must always append a new checkpoint: seq %d vs %d", cp2.Seq, cp.Seq)
+	}
+	if all := cs.All(); len(all) != 2 {
+		t.Fatalf("expected 2 polish checkpoints after no-dedup appends, got %d", len(all))
+	}
+
+	// 磁盘 round-trip：新实例从 jsonl 恢复元数据（最新一条）
+	cs2 := NewCheckpointStore(newIO(dir))
+	got := cs2.LatestByStep(domain.ChapterScope(3), "polish")
+	if got == nil {
+		t.Fatal("polish checkpoint missing after restore")
+	}
+	if got.Seq != cp2.Seq || got.InputDigest != "sha256:in" || got.PolisherModel != "mimo-polisher" || got.Stage != "draft" || !got.Changed {
+		t.Fatalf("polish metadata lost after restore: %+v", got)
+	}
+}
+
+// TestCheckpointStore_AppendAlways 验证 AppendAlways 每次调用都追加新 checkpoint
+// （不做 digest 幂等去重），供 consistency_check 的顺序绑定使用。
+func TestCheckpointStore_AppendAlways(t *testing.T) {
+	cs, _ := newTestCheckpointStore(t)
+	scope := domain.ChapterScope(1)
+
+	cp1, err := cs.AppendAlways(scope, "consistency_check", "drafts/01.draft.md", "sha256:same")
+	if err != nil {
+		t.Fatalf("AppendAlways: %v", err)
+	}
+	cp2, err := cs.AppendAlways(scope, "consistency_check", "drafts/01.draft.md", "sha256:same")
+	if err != nil {
+		t.Fatalf("AppendAlways second: %v", err)
+	}
+	if cp2.Seq <= cp1.Seq {
+		t.Fatalf("AppendAlways must always append: seq %d vs %d", cp2.Seq, cp1.Seq)
+	}
+	// 对照组：Append 相同 digest 仍幂等去重（全局语义不变）
+	cp3, err := cs.Append(scope, "consistency_check", "drafts/01.draft.md", "sha256:same")
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if cp3.Seq != cp2.Seq {
+		t.Fatalf("Append must dedup same digest: seq %d vs %d", cp3.Seq, cp2.Seq)
+	}
+}
+
+// TestCheckpointStore_BySeq 验证按 seq 查询。
+func TestCheckpointStore_BySeq(t *testing.T) {
+	cs, _ := newTestCheckpointStore(t)
+	cp1, _ := cs.Append(domain.ChapterScope(1), "plan", "a", "sha256:1")
+	cp2, _ := cs.Append(domain.ChapterScope(1), "draft", "b", "sha256:2")
+
+	if got := cs.BySeq(cp1.Seq); got == nil || got.Step != "plan" {
+		t.Fatalf("BySeq(%d) = %+v, want plan", cp1.Seq, got)
+	}
+	if got := cs.BySeq(cp2.Seq); got == nil || got.Step != "draft" {
+		t.Fatalf("BySeq(%d) = %+v, want draft", cp2.Seq, got)
+	}
+	if got := cs.BySeq(cp2.Seq + 999); got != nil {
+		t.Fatalf("BySeq(unknown) = %+v, want nil", got)
+	}
+}
+
 func TestCheckpointStore_Idempotent(t *testing.T) {
 	cs, dir := newTestCheckpointStore(t)
 
