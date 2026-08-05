@@ -393,6 +393,7 @@ type StyleAnchorProvenance struct {
 type StyleAnchorItem struct {
 	ID         string                 `json:"id"`                   // 唯一标识，TrimSpace 非空，长度 ≤ 64 Unicode 字符
 	Excerpt    string                 `json:"excerpt"`              // TrimSpace 非空，长度 ≤ 1000 Unicode 字符
+	Note       string                 `json:"note,omitempty"`       // 可选，教学注记：本条锚点示范了什么写法，TrimSpace 后 ≤ 120 Unicode 字符
 	AppliesTo  *StyleAnchorAppliesTo  `json:"applies_to,omitempty"` // 可选，目标章范围约束
 	Provenance *StyleAnchorProvenance `json:"provenance,omitempty"` // 可选，来源元数据
 }
@@ -409,9 +410,10 @@ type StyleAnchorsV1 struct {
 type AnchorInjectionItem struct {
 	ID      string `json:"id"`
 	Excerpt string `json:"excerpt"`
+	Note    string `json:"note,omitempty"` // 可选，教学注记（透传自 StyleAnchorItem.Note）
 }
 
-// ToInjectionView 将完整锚点转换为注入视图（仅 id+excerpt），并过滤不匹配当前 chapter 的项。
+// ToInjectionView 将完整锚点转换为注入视图（仅 id+excerpt+note），并过滤不匹配当前 chapter 的项。
 func (s *StyleAnchorsV1) ToInjectionView(chapter int) []AnchorInjectionItem {
 	if s == nil {
 		return nil
@@ -424,6 +426,7 @@ func (s *StyleAnchorsV1) ToInjectionView(chapter int) []AnchorInjectionItem {
 		out = append(out, AnchorInjectionItem{
 			ID:      a.ID,
 			Excerpt: a.Excerpt,
+			Note:    a.Note,
 		})
 	}
 	return out
@@ -455,8 +458,8 @@ func (s *StyleAnchorsV1) Validate() []error {
 		add(fmt.Sprintf("version 必须为 1，当前为 %d", s.Version))
 	}
 
-	if len(s.Anchors) > 8 {
-		add(fmt.Sprintf("anchors 最多 8 项，当前 %d 项", len(s.Anchors)))
+	if len(s.Anchors) > 15 {
+		add(fmt.Sprintf("anchors 最多 15 项，当前 %d 项", len(s.Anchors)))
 	}
 
 	seenIDs := make(map[string]int)
@@ -488,6 +491,12 @@ func (s *StyleAnchorsV1) Validate() []error {
 		}
 		totalExcerptRunes += excerptRunes
 
+		// Note: 可选（空值允许），TrimSpace 后 ≤ 120 Unicode 字符
+		noteRunes := utf8.RuneCountInString(strings.TrimSpace(a.Note))
+		if noteRunes > 120 {
+			add(fmt.Sprintf("%s.note 长度 %d 超过上限 120 个字符", prefix, noteRunes))
+		}
+
 		// AppliesTo.chapter_ranges 校验
 		if a.AppliesTo != nil {
 			if len(a.AppliesTo.ChapterRanges) > 4 {
@@ -511,8 +520,8 @@ func (s *StyleAnchorsV1) Validate() []error {
 		}
 	}
 
-	if totalExcerptRunes > 8000 {
-		add(fmt.Sprintf("所有 anchors.excerpt 总长度 %d 超过上限 8000 个字符", totalExcerptRunes))
+	if totalExcerptRunes > 15000 {
+		add(fmt.Sprintf("所有 anchors.excerpt 总长度 %d 超过上限 15000 个字符", totalExcerptRunes))
 	}
 
 	return errs

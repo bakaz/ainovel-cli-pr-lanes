@@ -68,6 +68,45 @@ func TestStyleAnchorsStore_Valid(t *testing.T) {
 	}
 }
 
+func TestStyleAnchorsStore_NoteFieldAccepted(t *testing.T) {
+	// note 已加入新格式白名单：带 note 的文件应正常加载（StatusValid），note 原样保留
+	s := newStyleAnchorsTestStore(t)
+	writeStyleAnchorsFile(t, s, `{
+		"version": 1,
+		"anchors": [
+			{"id": "a1", "excerpt": "Excerpt one.", "note": "示范：动作句开头、身体反应直接落点。"},
+			{"id": "a2", "excerpt": "Excerpt two."}
+		]
+	}`)
+	res := s.StyleAnchors.LoadManual()
+	if res.Status != StatusValid {
+		t.Fatalf("expected StatusValid with note field, got %v (warnings: %v)", res.Status, res.Warnings)
+	}
+	if res.Anchors == nil || len(res.Anchors.Anchors) != 2 {
+		t.Fatal("expected 2 anchors")
+	}
+	if res.Anchors.Anchors[0].Note != "示范：动作句开头、身体反应直接落点。" {
+		t.Fatalf("expected note preserved, got %q", res.Anchors.Anchors[0].Note)
+	}
+	if res.Anchors.Anchors[1].Note != "" {
+		t.Fatalf("expected empty note for item without note, got %q", res.Anchors.Anchors[1].Note)
+	}
+
+	// note 超长 → corrupted（与 Validate 的 120 上限联动）
+	s2 := newStyleAnchorsTestStore(t)
+	data, _ := json.Marshal(map[string]any{
+		"version": 1,
+		"anchors": []map[string]any{
+			{"id": "a1", "excerpt": "Ex.", "note": strings.Repeat("好", 121)},
+		},
+	})
+	writeStyleAnchorsFile(t, s2, string(data))
+	res = s2.StyleAnchors.LoadManual()
+	if res.Status != StatusCorrupted {
+		t.Fatalf("expected StatusCorrupted for note > 120 runes, got %v", res.Status)
+	}
+}
+
 func TestStyleAnchorsStore_LegacyFormatIDPriority(t *testing.T) {
 	// id 应优先于 label
 	s := newStyleAnchorsTestStore(t)

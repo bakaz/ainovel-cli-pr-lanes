@@ -13,6 +13,7 @@ func TestStyleAnchorsV1_Validate_Valid(t *testing.T) {
 			{
 				ID:      "a1",
 				Excerpt: "夜色如墨，他在城头站了整夜。",
+				Note:    "示范：动作句开头、身体反应直接落点、心理后置一句。",
 				AppliesTo: &StyleAnchorAppliesTo{
 					ChapterRanges: [][2]int{{1, 5}, {10, 15}},
 				},
@@ -47,14 +48,14 @@ func TestStyleAnchorsV1_Validate_WrongVersion(t *testing.T) {
 
 func TestStyleAnchorsV1_Validate_TooManyAnchors(t *testing.T) {
 	s := StyleAnchorsV1{Version: 1}
-	for i := 0; i < 9; i++ {
+	for i := 0; i < 16; i++ {
 		s.Anchors = append(s.Anchors, StyleAnchorItem{
 			ID: fmt.Sprintf("a%d", i), Excerpt: "Test excerpt.",
 		})
 	}
 	errs := s.Validate()
-	if len(errs) == 0 || !strings.Contains(errs[0].Error(), "最多 8 项") {
-		t.Fatalf("expected max 8 items error, got: %v", errs)
+	if len(errs) == 0 || !strings.Contains(errs[0].Error(), "最多 15 项") {
+		t.Fatalf("expected max 15 items error, got: %v", errs)
 	}
 }
 
@@ -129,12 +130,58 @@ func TestStyleAnchorsV1_Validate_ExcerptTooLong(t *testing.T) {
 	}
 }
 
+func TestStyleAnchorsV1_Validate_NoteEmpty(t *testing.T) {
+	// 空/空白 note 允许（omitempty 向后兼容——旧文件无 note 字段也必须通过校验）
+	for name, note := range map[string]string{"empty": "", "whitespace": "   ", "newline": "\n\n"} {
+		t.Run(name, func(t *testing.T) {
+			s := StyleAnchorsV1{
+				Version: 1,
+				Anchors: []StyleAnchorItem{{ID: "a1", Excerpt: "Ex.", Note: note}},
+			}
+			if errs := s.Validate(); len(errs) > 0 {
+				t.Fatalf("expected empty note to be valid, got: %v", errs)
+			}
+		})
+	}
+}
+
+func TestStyleAnchorsV1_Validate_NoteAtLimit(t *testing.T) {
+	s := StyleAnchorsV1{
+		Version: 1,
+		Anchors: []StyleAnchorItem{{ID: "a1", Excerpt: "Ex.", Note: strings.Repeat("好", 120)}},
+	}
+	if errs := s.Validate(); len(errs) > 0 {
+		t.Fatalf("expected 120-rune note to be valid, got: %v", errs)
+	}
+}
+
+func TestStyleAnchorsV1_Validate_NoteTooLong(t *testing.T) {
+	s := StyleAnchorsV1{
+		Version: 1,
+		Anchors: []StyleAnchorItem{{ID: "a1", Excerpt: "Ex.", Note: strings.Repeat("好", 121)}},
+	}
+	errs := s.Validate()
+	if len(errs) == 0 {
+		t.Fatal("expected note too long error")
+	}
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Error(), "note 长度") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected note too long error mentioning note, got: %v", errs)
+	}
+}
+
 func TestStyleAnchorsV1_Validate_TotalExcerptTooLong(t *testing.T) {
 	s := StyleAnchorsV1{
 		Version: 1,
 		Anchors: []StyleAnchorItem{
-			{ID: "a1", Excerpt: strings.Repeat("好", 4001)},
-			{ID: "a2", Excerpt: strings.Repeat("好", 4001)},
+			{ID: "a1", Excerpt: strings.Repeat("好", 7501)},
+			{ID: "a2", Excerpt: strings.Repeat("好", 7501)},
 		},
 	}
 	errs := s.Validate()
@@ -236,7 +283,7 @@ func TestToInjectionView_FiltersAndStrips(t *testing.T) {
 	s := &StyleAnchorsV1{
 		Version: 1,
 		Anchors: []StyleAnchorItem{
-			{ID: "global", Excerpt: "Global.", AppliesTo: nil},
+			{ID: "global", Excerpt: "Global.", Note: "示范：全局适用写法。", AppliesTo: nil},
 			{ID: "in", Excerpt: "In range.", AppliesTo: &StyleAnchorAppliesTo{ChapterRanges: [][2]int{{3, 7}}}},
 			{ID: "out", Excerpt: "Out of range.", AppliesTo: &StyleAnchorAppliesTo{ChapterRanges: [][2]int{{10, 15}}}},
 		},
@@ -249,9 +296,16 @@ func TestToInjectionView_FiltersAndStrips(t *testing.T) {
 	if view[0].ID != "global" || view[1].ID != "in" {
 		t.Fatalf("wrong items: %+v", view)
 	}
-	// Verify stripped: only id+excerpt
+	// Verify stripped: only id+excerpt+note
 	if view[0].Excerpt == "" {
 		t.Fatal("expected excerpt in injection view")
+	}
+	// Note 透传：有 note 的项保留，无 note 的项为空字符串（序列化时 omitempty 剔除）
+	if view[0].Note != "示范：全局适用写法。" {
+		t.Fatalf("expected note passthrough, got %q", view[0].Note)
+	}
+	if view[1].Note != "" {
+		t.Fatalf("expected empty note for item without note, got %q", view[1].Note)
 	}
 }
 

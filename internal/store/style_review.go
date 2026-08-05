@@ -46,6 +46,15 @@ func (s *StyleReviewStore) loadUnlocked(chapter int) (*domain.StyleReviewLedger,
 	if ledger.Chapter != chapter {
 		return nil, fmt.Errorf("style review: chapter mismatch: path chapter %d, ledger chapter %d", chapter, ledger.Chapter)
 	}
+	// legacy 兼容：epoch 0 读取时归一化为 1（不强制迁移数据）。仅 0 → 1；
+	// 负数按非法数据处理，由 ValidateLedger 拒绝（fail closed）。
+	// 注意：这只在读取时生效——下次 Update 落盘时会把归一化后的值写回，
+	// 即发生"读取归一化 + 懒迁移"（无需显式迁移步骤）。
+	for i := range ledger.Cycles {
+		if ledger.Cycles[i].Epoch == 0 {
+			ledger.Cycles[i].Epoch = 1
+		}
+	}
 	if err := domain.ValidateLedger(&ledger); err != nil {
 		return nil, fmt.Errorf("style review: chapter %d validation: %w", chapter, err)
 	}

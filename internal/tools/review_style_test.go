@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -91,6 +92,10 @@ func setupCriticStore(t *testing.T, chapter int, draft string) *store.Store {
 	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
 		t.Fatalf("SetStyleReviewMode: %v", err)
 	}
+	// C2 机械规则前置闸：被评审的草稿必须机械干净，否则评审在 accepted 落盘前
+	// 被拒（自评口吻不足 / 章节字数不足 3000 等 error 级违例）。测试草稿统一经
+	// mechCleanDraft 包装，避免与闸门语义纠缠。
+	draft = mechCleanDraft(draft)
 	if draft != "" {
 		if err := st.Drafts.SaveDraft(chapter, draft); err != nil {
 			t.Fatalf("SaveDraft: %v", err)
@@ -104,6 +109,21 @@ func setupCriticStore(t *testing.T, chapter int, draft string) *store.Store {
 		t.Fatalf("Append checkpoint: %v", err)
 	}
 	return st
+}
+
+// mechCleanDraft 返回满足 review_style 机械规则前置闸（C2）的测试草稿：
+// 12 类文学腔硬闸中"自评口吻 ≥2"这一条（其余 11 类测试草稿天然不触发）。
+// 追加自评关键词"她心里骂自己丢人，真不要脸。"（含 心里骂/丢人/真不要脸
+// 三个命中词，且不匹配任何其它文学腔模式）。空串原样返回（表示无草稿）。
+func mechCleanDraft(draft string) string {
+	if draft == "" {
+		return ""
+	}
+	const filler = "她心里骂自己丢人，真不要脸。"
+	if !strings.Contains(draft, "丢人") && !strings.Contains(draft, "不要脸") {
+		draft += filler
+	}
+	return draft
 }
 
 func setupOffModeStore(t *testing.T, chapter int, draft string) *store.Store {
@@ -170,7 +190,7 @@ func TestReviewStyle_InitialPass(t *testing.T) {
 // ── 2. Revise → edit → final pass ────────────────────────────────────
 
 func TestReviewStyle_ReviseThenEditThenFinalPass(t *testing.T) {
-	draft := "第一章正文。初始草稿版本。"
+	draft := mechCleanDraft("第一章正文。初始草稿版本。")
 	st := setupCriticStore(t, 1, draft)
 
 	callCount := 0
@@ -246,7 +266,7 @@ func TestReviewStyle_ReviseThenEditThenFinalPass(t *testing.T) {
 // ── 3. Final revise blocks commit ────────────────────────────────────
 
 func TestReviewStyle_FinalReviseBlocksCommit(t *testing.T) {
-	draft := "第一章正文。"
+	draft := mechCleanDraft("第一章正文。")
 	st := setupCriticStore(t, 1, draft)
 
 	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
@@ -441,7 +461,7 @@ func TestReviewStyle_ReviseNoFindingsDegraded(t *testing.T) {
 // ── 8. Preseeded initial_pending recovery ────────────────────────────
 
 func TestReviewStyle_PreseededInitialPendingRecovery(t *testing.T) {
-	draft := "正文。"
+	draft := mechCleanDraft("正文。")
 	st := setupCriticStore(t, 1, draft)
 	draftDigest := domain.DigestDraft(draft)
 	basisDigest := ComputeBasisDigest(st, 1, testCriticVersion)
@@ -489,7 +509,7 @@ func TestReviewStyle_PreseededInitialPendingRecovery(t *testing.T) {
 // ── 9. Preseeded final_pending recovery ──────────────────────────────
 
 func TestReviewStyle_PreseededFinalPendingRecovery(t *testing.T) {
-	draft := "正文。"
+	draft := mechCleanDraft("正文。")
 	st := setupCriticStore(t, 1, draft)
 	draftDigest := domain.DigestDraft(draft)
 	basisDigest := ComputeBasisDigest(st, 1, testCriticVersion)
@@ -549,7 +569,7 @@ func TestReviewStyle_PreseededFinalPendingRecovery(t *testing.T) {
 // ── 10. Preseeded final + model failure → degraded with persisted request ──
 
 func TestReviewStyle_PreseededFinalFailureDegraded(t *testing.T) {
-	draft := "正文。"
+	draft := mechCleanDraft("正文。")
 	st := setupCriticStore(t, 1, draft)
 	draftDigest := domain.DigestDraft(draft)
 	basisDigest := ComputeBasisDigest(st, 1, testCriticVersion)
@@ -679,7 +699,21 @@ func TestReviewStyle_MutationGuardBlocksDuringPendingInitial(t *testing.T) {
 		_, err := tool.Execute(context.Background(), json.RawMessage(`{"chapter":1}`))
 		errCh <- err
 	}()
-	time.Sleep(200 * time.Millisecond)
+
+	// 轮询等待 initial_pending 落盘（review_style 先落 pending 再调 critic，critic 被
+	// blocked 挂起）——固定 sleep 在慢机器上会先于 pending 落盘执行 draft_chapter，
+	// 造成时序性误报。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ledger, _ := st.StyleReview.Load(1)
+		if ledger != nil && ledger.CurrentStatus() == domain.ReviewStatusInitialPending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("initial_pending ledger not created in time")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	draftTool := NewDraftChapterTool(st, testContract)
 	draftArgs, _ := json.Marshal(map[string]any{
@@ -734,7 +768,7 @@ func TestReviewStyle_MutationGuardAllowsDuringRevisionOpen(t *testing.T) {
 // ── 15. Commit gate: terminal allowed ────────────────────────────────
 
 func TestReviewStyle_CommitGatePassesForTerminalStatus(t *testing.T) {
-	draft := "第一章正文。"
+	draft := "第一章正文。她心里骂自己丢人，真不要脸。"
 	st := setupCriticStore(t, 1, draft)
 
 	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
@@ -848,9 +882,12 @@ func TestReviewStyle_RewriteQueueBypassesMutationGuard(t *testing.T) {
 	}
 }
 
-// ── 18. Rewrite-queue bypass commit gate ─────────────────────────────
+// ── 18. C1: rewrite queue 不再 bypass commit gate ────────────────────
 
-func TestReviewStyle_RewriteQueueBypassesCommitGate(t *testing.T) {
+// TestReviewStyle_RewriteQueueCommitRequiresCriticValidation 验证 C1：
+// 返工/重写队列章节没有新 epoch 的 critic 终验（无账本或账本未绑定当前草稿）时，
+// commit 被 CheckCommitStyleGate 拒绝（不再跳过批评者门控）。
+func TestReviewStyle_RewriteQueueCommitRequiresCriticValidation(t *testing.T) {
 	st := store.NewStore(t.TempDir())
 	if err := st.Init(); err != nil {
 		t.Fatalf("Init: %v", err)
@@ -863,7 +900,7 @@ func TestReviewStyle_RewriteQueueBypassesCommitGate(t *testing.T) {
 	}
 
 	// 完成章节在重写队列中
-	draft := "已完成的终稿内容。"
+	draft := "已完成的终稿内容。她心里骂自己丢人，真不要脸。"
 	if err := st.Drafts.SaveDraft(1, draft); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
@@ -879,7 +916,7 @@ func TestReviewStyle_RewriteQueueBypassesCommitGate(t *testing.T) {
 	if err := st.Progress.SetFlow(domain.FlowRewriting); err != nil {
 		t.Fatalf("SetFlow: %v", err)
 	}
-	// 写 exhausted 账本
+	// 草稿已修改（返工），但账本不存在（从未经新 epoch 评审）→ commit 必须被拒
 	if err := st.Drafts.SaveDraft(1, draft+"重写版"); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
@@ -890,11 +927,823 @@ func TestReviewStyle_RewriteQueueBypassesCommitGate(t *testing.T) {
 		"key_events": []string{"事件"},
 	})
 	_, err := commitTool.Execute(t.Context(), args)
+	if err == nil {
+		t.Fatal("rewrite commit without critic validation must be rejected (C1)")
+	}
+	if !strings.Contains(err.Error(), "评审") && !strings.Contains(err.Error(), "critic") {
+		t.Errorf("expected critic-gate rejection, got: %v", err)
+	}
+}
+
+// TestReviewStyle_RewriteQueueCommitPassesAfterNewEpochReview 验证 C1 正向路径：
+// 返工章节经 review_style 开启新 epoch 完成终验（terminal + digest 匹配）后 commit 放行。
+// TestReviewStyle_RewriteOpensNewEpochRealChain 验证 C1 返工新 epoch 的完整链路
+// （M2-1：真实调用 review_style 开启 epoch，不手工构造新 epoch 的 ledger）：
+// 旧 accepted 账本（epoch 1）+ pending_rewrites 章节 + 新 polish/consistency
+// checkpoint（seq 顺序 polish → consistency）→ review_style 开启 epoch 2，进入
+// initial_pending（D1：返工走完整评审周期），critic pass 后落地 accepted_initial
+// （epoch 2，绑定本次 polish seq）。
+func TestReviewStyle_RewriteOpensNewEpochRealChain(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := st.Progress.Init("test", 10); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+
+	// 完成章节 + 重写队列
+	final := "已完成的终稿内容。她心里骂自己丢人，真不要脸。"
+	rework := "返工后的新草稿。她心里骂自己丢人，真不要脸。"
+	if err := st.Drafts.SaveDraft(1, rework); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	if err := st.Drafts.SaveFinalChapter(1, final); err != nil {
+		t.Fatalf("SaveFinalChapter: %v", err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 100, "", ""); err != nil {
+		t.Fatalf("MarkChapterComplete: %v", err)
+	}
+	if err := st.Progress.SetPendingRewrites([]int{1}, "重写"); err != nil {
+		t.Fatalf("SetPendingRewrites: %v", err)
+	}
+	if err := st.Progress.SetFlow(domain.FlowRewriting); err != nil {
+		t.Fatalf("SetFlow: %v", err)
+	}
+	// 旧 epoch（epoch 1）的 accepted 账本（种子可手工构造；epoch 开启必须走工具）
+	now := time.Now().Format(time.RFC3339)
+	basisDigest := ComputeBasisDigest(st, 1, "test-v1")
+	originalDigest := domain.DigestDraft(final)
+	oldLedger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: originalDigest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"}},
+			{Cycle: 2, Status: domain.ReviewStatusAcceptedInitial, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: originalDigest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"},
+				Result:  &domain.StyleReviewResult{Verdict: domain.ReviewVerdictPass, Evidence: "ok"}},
+		},
+	}
+	if err := st.StyleReview.Save(oldLedger); err != nil {
+		t.Fatalf("Save old ledger: %v", err)
+	}
+	// 本次返工的 polish checkpoint + 重新 check_consistency（AppendAlways，seq 晚于 polish）
+	reworkDigest := domain.DigestDraft(rework)
+	polishCP, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", reworkDigest,
+		domain.PolishCheckpointMeta{InputDigest: reworkDigest, PolisherModel: "mimo-polisher", Stage: "rewrite", Changed: false},
+	)
 	if err != nil {
-		if strings.Contains(err.Error(), "critic") || strings.Contains(err.Error(), "评审") {
-			t.Fatalf("rewrite-queue should bypass commit gate: %v", err)
+		t.Fatalf("AppendPolish: %v", err)
+	}
+	if _, err := st.Checkpoints.AppendAlways(domain.ChapterScope(1), "consistency_check", "a2", reworkDigest); err != nil {
+		t.Fatalf("AppendAlways consistency: %v", err)
+	}
+
+	// 真实调用 review_style：旧 terminal + 重写队列 → 开启新 epoch（initial_pending）
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute review_style: %v", err)
+	}
+	var output StyleReviewOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if output.Verdict != "pass" || output.Status != string(domain.ReviewStatusAcceptedInitial) {
+		t.Fatalf("verdict/status = %s/%s, want pass/accepted_initial", output.Verdict, output.Status)
+	}
+
+	// 账本断言：epoch 2 完整周期 initial_pending → accepted_initial，绑定本次 polish seq
+	ledger, _ := st.StyleReview.Load(1)
+	if got := ledger.MaxEpoch(); got != 2 {
+		t.Fatalf("MaxEpoch = %d, want 2（返工开启新 epoch）", got)
+	}
+	if len(ledger.Cycles) != 4 {
+		t.Fatalf("cycles = %d, want 4（旧 2 + 新 epoch 的 initial_pending + accepted_initial）", len(ledger.Cycles))
+	}
+	pend := ledger.Cycles[2]
+	if pend.Status != domain.ReviewStatusInitialPending || pend.EpochValue() != 2 {
+		t.Fatalf("cycle[2] = %s epoch %d, want initial_pending epoch 2（D1：返工进入完整评审周期）", pend.Status, pend.EpochValue())
+	}
+	curr := ledger.Cycles[3]
+	if curr.Status != domain.ReviewStatusAcceptedInitial || curr.EpochValue() != 2 {
+		t.Fatalf("cycle[3] = %s epoch %d, want accepted_initial epoch 2", curr.Status, curr.EpochValue())
+	}
+	if curr.Request == nil || curr.Request.PolishCheckpointSeq != polishCP.Seq {
+		t.Fatalf("epoch-2 result 未绑定本次 polish seq：%+v", curr.Request)
+	}
+	if curr.DraftDigest != reworkDigest {
+		t.Fatalf("epoch-2 result digest 未绑定返工草稿：%s", curr.DraftDigest)
+	}
+}
+
+// ── C1-H3：degraded 新旧候选分流（M2-2） ─────────────────────────────
+
+// TestReviewStyle_DegradedSameCandidateRetriesSameEpoch 验证 degraded 绑定的 polish seq
+// 与当前最新 polish seq 相同时：当前 attempt retry，同 epoch 流转（M2-2a）。
+func TestReviewStyle_DegradedSameCandidateRetriesSameEpoch(t *testing.T) {
+	draft := "# 一\nabc她心里骂自己丢人，真不要脸。"
+	// 先追加 polish CP 拿到 seq，再构造绑定同一 seq 的 degraded 账本
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	digest := domain.DigestDraft(draft)
+	cp, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", digest,
+		domain.PolishCheckpointMeta{InputDigest: digest, PolisherModel: "mimo-polisher", Stage: "draft", Changed: false},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	basisDigest := ComputeBasisDigest(st, 1, "test-v1")
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: cp.Seq}},
+			{Cycle: 2, Status: domain.ReviewStatusDegraded, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: cp.Seq},
+				Error:   "critic call failed"},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.AppendAlways(domain.ChapterScope(1), "consistency_check", "a2", digest); err != nil {
+		t.Fatal(err)
+	}
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if got := loaded.MaxEpoch(); got != 1 {
+		t.Fatalf("MaxEpoch = %d, want 1（同候选 retry 不开启新 epoch）", got)
+	}
+	// 恢复为初评（degraded 前是 initial_pending），同 epoch 追加 initial_pending → accepted
+	if len(loaded.Cycles) != 4 {
+		t.Fatalf("cycles = %d, want 4（degraded + retry initial_pending + accepted）", len(loaded.Cycles))
+	}
+	if loaded.Cycles[2].Status != domain.ReviewStatusInitialPending || loaded.Cycles[2].EpochValue() != 1 {
+		t.Fatalf("cycle[2] = %s epoch %d, want initial_pending epoch 1", loaded.Cycles[2].Status, loaded.Cycles[2].EpochValue())
+	}
+	if loaded.Cycles[3].Status != domain.ReviewStatusAcceptedInitial || loaded.Cycles[3].EpochValue() != 1 {
+		t.Fatalf("cycle[3] = %s epoch %d, want accepted_initial epoch 1", loaded.Cycles[3].Status, loaded.Cycles[3].EpochValue())
+	}
+}
+
+// TestReviewStyle_DegradedOldCandidateOpensNewEpoch 验证 degraded 绑定旧 polish seq
+// （与当前最新 polish seq 不同）时：返工队列章节开启新 epoch 重新评审（M2-2b）。
+func TestReviewStyle_DegradedOldCandidateOpensNewEpoch(t *testing.T) {
+	draft := "# 一\nabc返工草稿她心里骂自己丢人，真不要脸。"
+	// 构造：degraded 绑定 seq 5（旧候选）；随后追加最新 polish（seq 6+）与 consistency。
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveFinalChapter(1, "旧终稿。"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 100, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.SetPendingRewrites([]int{1}, "重写"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.SetFlow(domain.FlowRewriting); err != nil {
+		t.Fatal(err)
+	}
+	digest := domain.DigestDraft(draft)
+	basisDigest := ComputeBasisDigest(st, 1, "test-v1")
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: 5}},
+			{Cycle: 2, Status: domain.ReviewStatusDegraded, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: 5},
+				Error:   "critic call failed"},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+	// 最新 polish seq（> 5），随后 consistency seq 更大
+	if _, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", digest,
+		domain.PolishCheckpointMeta{InputDigest: digest, PolisherModel: "mimo-polisher", Stage: "rewrite", Changed: false},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.AppendAlways(domain.ChapterScope(1), "consistency_check", "a2", digest); err != nil {
+		t.Fatal(err)
+	}
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if got := loaded.MaxEpoch(); got != 2 {
+		t.Fatalf("MaxEpoch = %d, want 2（degraded 旧候选开启新 epoch）", got)
+	}
+	if loaded.Cycles[2].Status != domain.ReviewStatusInitialPending || loaded.Cycles[2].EpochValue() != 2 {
+		t.Fatalf("cycle[2] = %s epoch %d, want initial_pending epoch 2", loaded.Cycles[2].Status, loaded.Cycles[2].EpochValue())
+	}
+	if loaded.Cycles[3].Status != domain.ReviewStatusAcceptedInitial || loaded.Cycles[3].EpochValue() != 2 {
+		t.Fatalf("cycle[3] = %s epoch %d, want accepted_initial epoch 2", loaded.Cycles[3].Status, loaded.Cycles[3].EpochValue())
+	}
+}
+
+// ── C2：degraded 恢复语义（oracle 设计，修复 83 章死锁） ───────────────
+// 候选身份判定与恢复策略解耦：非返工章节即使重新 polish（候选已变化）也允许
+// 在当前 epoch 恢复评审（不再拒绝）；返工章节旧候选仍开新 epoch。
+
+// degradedBaseStore 构造 C2 degraded 恢复测试基础：critic 模式 + 干净草稿 D1 +
+// polish P1 + consistency C1 + initial_pending(D1, R) → degraded(D1, R)。
+// legacy=true 时 R=0（无 seq 绑定）；否则 R = P1 seq（degraded 绑定当时的最新
+// polish）。返回 store、D1 digest、P1 seq。
+func degradedBaseStore(t *testing.T, draft string, legacy bool) (*store.Store, string, int64) {
+	t.Helper()
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	draft = mechCleanDraft(draft)
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	d1 := domain.DigestDraft(draft)
+	basis := ComputeBasisDigest(st, 1, "test-v1")
+	p1, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", d1,
+		domain.PolishCheckpointMeta{InputDigest: d1, PolisherModel: "mimo-polisher", Stage: "draft", Changed: false},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "c1", d1); err != nil {
+		t.Fatal(err)
+	}
+	rSeq := p1.Seq
+	if legacy {
+		rSeq = 0
+	}
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: d1, BasisDigest: basis,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: rSeq}},
+			{Cycle: 2, Status: domain.ReviewStatusDegraded, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: d1, BasisDigest: basis,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: rSeq},
+				Error:   "critic returned invalid finding"},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+	return st, d1, p1.Seq
+}
+
+// rePolishDraft 模拟 writer 重新 polish：新草稿 D2 + polish P2 + consistency C2。
+// 返回新 digest 与 P2 seq。
+func rePolishDraft(t *testing.T, st *store.Store, newText string) (string, int64) {
+	t.Helper()
+	newText = mechCleanDraft(newText)
+	if err := st.Drafts.SaveDraft(1, newText); err != nil {
+		t.Fatal(err)
+	}
+	d2 := domain.DigestDraft(newText)
+	p2, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a2", d2,
+		domain.PolishCheckpointMeta{InputDigest: d2, PolisherModel: "mimo-polisher", Stage: "draft", Changed: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.AppendAlways(domain.ChapterScope(1), "consistency_check", "c2", d2); err != nil {
+		t.Fatal(err)
+	}
+	return d2, p2.Seq
+}
+
+// TestReviewStyle_DegradedNonRewriteNewCandidateRecoversSameEpoch 验证测试 1：
+// 非返工 initial degraded + P2 新候选（R1 != P2、digest 变）→ 同 epoch 恢复
+// initial_pending → accepted_initial，epoch 不变，Request 绑定 P2。
+func TestReviewStyle_DegradedNonRewriteNewCandidateRecoversSameEpoch(t *testing.T) {
+	st, _, _ := degradedBaseStore(t, "第一章正文。", false)
+
+	d2, p2Seq := rePolishDraft(t, st, "精修后的新正文。")
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("non-rewrite degraded with new candidate must recover: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if output.Verdict != "pass" || output.Status != string(domain.ReviewStatusAcceptedInitial) {
+		t.Fatalf("expected accepted_initial, got verdict=%s status=%s", output.Verdict, output.Status)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if got := loaded.MaxEpoch(); got != 1 {
+		t.Fatalf("MaxEpoch = %d, want 1（非返工恢复不开启新 epoch）", got)
+	}
+	last := loaded.CurrentCycle()
+	if last.DraftDigest != d2 {
+		t.Fatalf("accepted digest = %s, want new candidate %s", last.DraftDigest, d2)
+	}
+	if last.Request == nil || last.Request.PolishCheckpointSeq != p2Seq {
+		t.Fatalf("accepted request must bind P2 (%d), got %+v", p2Seq, last.Request)
+	}
+}
+
+// TestReviewStyle_DegradedNonRewriteFinalNewCandidateRecoversFinal 验证测试 2：
+// 非返工 final degraded + P2 → 恢复 final_pending → accepted_revised，
+// 不降级 initial、不加 epoch。
+func TestReviewStyle_DegradedNonRewriteFinalNewCandidateRecoversFinal(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	draft := mechCleanDraft("第一章正文。")
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	d1 := domain.DigestDraft(draft)
+	basis := ComputeBasisDigest(st, 1, "test-v1")
+	p1, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", d1,
+		domain.PolishCheckpointMeta{InputDigest: d1, PolisherModel: "mimo-polisher", Stage: "draft", Changed: false},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "c1", d1); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: d1, BasisDigest: basis,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: p1.Seq}},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: d1, BasisDigest: basis,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: p1.Seq},
+				Result: &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "revise",
+					Findings: []domain.StyleReviewFinding{{
+						Dimension: "pacing", Category: "style", Severity: "warning", Evidence: "e",
+					}}}},
+			{Cycle: 3, Status: domain.ReviewStatusFinalPending, CreatedAt: now,
+				AttemptID: "final-attempt", DraftDigest: d1, BasisDigest: basis,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: p1.Seq}},
+			{Cycle: 4, Status: domain.ReviewStatusDegraded, CreatedAt: now,
+				AttemptID: "final-attempt", DraftDigest: d1, BasisDigest: basis,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: p1.Seq},
+				Error:   "critic returned invalid finding"},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+
+	d2, p2Seq := rePolishDraft(t, st, "精修后的修订版正文。")
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("non-rewrite final degraded with new candidate must recover as final: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if output.Verdict != "pass" || output.Status != string(domain.ReviewStatusAcceptedRev) {
+		t.Fatalf("expected accepted_revised, got verdict=%s status=%s", output.Verdict, output.Status)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if got := loaded.MaxEpoch(); got != 1 {
+		t.Fatalf("MaxEpoch = %d, want 1（final 恢复不开启新 epoch）", got)
+	}
+	if loaded.CurrentStatus() != domain.ReviewStatusAcceptedRev {
+		t.Fatalf("expected accepted_revised, got %s", loaded.CurrentStatus())
+	}
+	last := loaded.CurrentCycle()
+	if last.DraftDigest != d2 {
+		t.Fatalf("accepted digest = %s, want %s", last.DraftDigest, d2)
+	}
+	if last.Request == nil || last.Request.PolishCheckpointSeq != p2Seq {
+		t.Fatalf("accepted request must bind P2 (%d), got %+v", p2Seq, last.Request)
+	}
+	// 不降级 initial：degraded 后应直接是 final_pending → accepted_revised
+	if loaded.Cycles[4].Status != domain.ReviewStatusFinalPending {
+		t.Fatalf("cycle[4] = %s, want final_pending（恢复不降级为 initial）", loaded.Cycles[4].Status)
+	}
+}
+
+// TestReviewStyle_DegradedNonRewriteNoOpRePolishRecovers 验证测试 3：
+// 非返工 no-op re-polish（digest 相同但 R1 != P2）→ 仍同 epoch 重评（防 seq-only
+// 死锁——seq 变了但内容没变，不应拒绝或开新 epoch）。
+func TestReviewStyle_DegradedNonRewriteNoOpRePolishRecovers(t *testing.T) {
+	st, d1, _ := degradedBaseStore(t, "第一章正文。", false)
+
+	// no-op re-polish：内容不变（digest 仍为 D1），仅产生新 polish seq P2
+	if err := st.Drafts.SaveDraft(1, mechCleanDraft("第一章正文。")); err != nil {
+		t.Fatal(err)
+	}
+	// 注意：SaveDraft 后 digest 不变（同内容），直接用 D1 追加 polish
+	p2, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a2", d1,
+		domain.PolishCheckpointMeta{InputDigest: d1, PolisherModel: "mimo-polisher", Stage: "draft", Changed: false},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.AppendAlways(domain.ChapterScope(1), "consistency_check", "c2", d1); err != nil {
+		t.Fatal(err)
+	}
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("no-op re-polish (seq-only change) must still recover same epoch: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if output.Status != string(domain.ReviewStatusAcceptedInitial) {
+		t.Fatalf("expected accepted_initial, got %s", output.Status)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if got := loaded.MaxEpoch(); got != 1 {
+		t.Fatalf("MaxEpoch = %d, want 1（no-op re-polish 不开新 epoch）", got)
+	}
+	last := loaded.CurrentCycle()
+	if last.Request == nil || last.Request.PolishCheckpointSeq != p2.Seq {
+		t.Fatalf("accepted request must bind P2 (%d), got %+v", p2.Seq, last.Request)
+	}
+}
+
+// TestReviewStyle_DegradedNonRewriteLegacyOldDigestRecovers 验证测试 4：
+// legacy degraded（R=0、旧 digest ≠ 当前、有 polish）→ 非返工同 epoch 恢复。
+func TestReviewStyle_DegradedNonRewriteLegacyOldDigestRecovers(t *testing.T) {
+	st, _, _ := degradedBaseStore(t, "第一章正文。", true) // legacy（R=0）账本
+
+	d2, p2Seq := rePolishDraft(t, st, "精修后的新正文。")
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("legacy degraded with old digest must recover same epoch: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if output.Status != string(domain.ReviewStatusAcceptedInitial) {
+		t.Fatalf("expected accepted_initial, got %s", output.Status)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if got := loaded.MaxEpoch(); got != 1 {
+		t.Fatalf("MaxEpoch = %d, want 1（legacy 非返工恢复不开启新 epoch）", got)
+	}
+	last := loaded.CurrentCycle()
+	if last.DraftDigest != d2 {
+		t.Fatalf("accepted digest = %s, want %s", last.DraftDigest, d2)
+	}
+	if last.Request == nil || last.Request.PolishCheckpointSeq != p2Seq {
+		t.Fatalf("accepted request must bind P2 (%d), got %+v", p2Seq, last.Request)
+	}
+}
+
+// TestReviewStyle_DegradedNonRewriteE2ECommit 验证测试 7（端到端）：
+// degraded R1 → 重新 polish P2 → consistency C2 → review pass → accepted →
+// CheckCommitStyleGate + CheckPolishPipelineGate 均通过，commit 工具可提交。
+func TestReviewStyle_DegradedNonRewriteE2ECommit(t *testing.T) {
+	st, _, p1Seq := degradedBaseStore(t, "第一章正文。", false)
+
+	d2, p2Seq := rePolishDraft(t, st, "精修后的新正文。")
+	if p2Seq <= p1Seq {
+		t.Fatalf("P2 (%d) must be newer than R1 (%d)", p2Seq, p1Seq)
+	}
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("review after re-polish: %v", err)
+	}
+
+	// commit 门控（critic + pipeline 双闸）
+	if err := CheckCommitStyleGate(st, 1); err != nil {
+		t.Fatalf("CheckCommitStyleGate must pass after recovery: %v", err)
+	}
+	if err := CheckPolishPipelineGate(st, 1, "mimo-polisher"); err != nil {
+		t.Fatalf("CheckPolishPipelineGate must pass after recovery: %v", err)
+	}
+
+	// 端到端 commit 工具
+	commitTool := NewCommitChapterTool(st)
+	commitTool.SetPolishPipeline(&PolishPipelineConfig{ExpectedModel: "mimo-polisher"})
+	args, _ := json.Marshal(map[string]any{
+		"chapter": 1, "summary": "测试", "characters": []string{"主角"},
+		"key_events": []string{"事件"},
+	})
+	if _, err := commitTool.Execute(t.Context(), args); err != nil {
+		t.Fatalf("commit must succeed after degraded recovery (digest %s, seq %d): %v", d2, p2Seq, err)
+	}
+}
+
+// TestReviewStyle_DegradedRecoveryPreGates 验证测试 8（前置闸不被绕过）：
+// 8a：P2 后无新 consistency → 拒绝；8b：polish digest 不匹配（pipeline 启用）→
+// 拒绝；8c：机械 error → 拒绝。
+func TestReviewStyle_DegradedRecoveryPreGates(t *testing.T) {
+	t.Run("no new consistency after re-polish", func(t *testing.T) {
+		st, _, _ := degradedBaseStore(t, "第一章正文。", false)
+		// 重新 polish（P2、digest D2）但故意不追加 consistency C2
+		newText := mechCleanDraft("精修后的新正文。")
+		if err := st.Drafts.SaveDraft(1, newText); err != nil {
+			t.Fatal(err)
 		}
-		t.Logf("commit error (expected non-critic): %v", err)
+		d2 := domain.DigestDraft(newText)
+		if _, err := st.Checkpoints.AppendPolish(
+			domain.ChapterScope(1), "polish", "a2", d2,
+			domain.PolishCheckpointMeta{InputDigest: d2, PolisherModel: "mimo-polisher", Stage: "draft", Changed: true},
+		); err != nil {
+			t.Fatal(err)
+		}
+		tool := NewReviewStyleTool(st, newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+			panic("critic must not be called")
+		}), testCriticVersion)
+		_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+		if err == nil {
+			t.Fatal("review must reject when consistency checkpoint is stale after re-polish")
+		}
+		if !strings.Contains(err.Error(), "check_consistency") {
+			t.Fatalf("expected consistency hint, got: %v", err)
+		}
+	})
+
+	t.Run("polish digest mismatch with pipeline", func(t *testing.T) {
+		st, _, _ := degradedBaseStore(t, "第一章正文。", false)
+		newText := mechCleanDraft("精修后的新正文。")
+		if err := st.Drafts.SaveDraft(1, newText); err != nil {
+			t.Fatal(err)
+		}
+		d2 := domain.DigestDraft(newText)
+		// polish checkpoint 的 digest 与当前草稿不匹配（伪造的 P2）
+		other := domain.DigestDraft("别的正文。")
+		if _, err := st.Checkpoints.AppendPolish(
+			domain.ChapterScope(1), "polish", "a2", other,
+			domain.PolishCheckpointMeta{InputDigest: other, PolisherModel: "mimo-polisher", Stage: "draft", Changed: true},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Checkpoints.AppendAlways(domain.ChapterScope(1), "consistency_check", "c2", d2); err != nil {
+			t.Fatal(err)
+		}
+		tool := NewReviewStyleTool(st, newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+			panic("critic must not be called")
+		}), testCriticVersion)
+		tool.SetPipelineEnabled(true)
+		_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+		if err == nil {
+			t.Fatal("review must reject when latest polish digest does not match the draft")
+		}
+		if !strings.Contains(err.Error(), "polish") {
+			t.Fatalf("expected polish hint, got: %v", err)
+		}
+	})
+
+	t.Run("mechanical error blocks recovery", func(t *testing.T) {
+		st := store.NewStore(t.TempDir())
+		if err := st.Init(); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Progress.Init("test", 100); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+			t.Fatal(err)
+		}
+		// 带文学腔 error 的草稿（否定修正句 ≥3），不经 mechCleanDraft
+		dirty := "他不是怕死，而是怕疼。他不是退缩，而是等待。他不是沉默，而是蓄力。"
+		if err := st.Drafts.SaveDraft(1, dirty); err != nil {
+			t.Fatal(err)
+		}
+		digest := domain.DigestDraft(dirty)
+		basis := ComputeBasisDigest(st, 1, "test-v1")
+		if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "c1", digest); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().Format(time.RFC3339)
+		ledger := domain.StyleReviewLedger{
+			SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+			Cycles: []domain.StyleReviewEntry{
+				{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+					AttemptID: "a1", DraftDigest: digest, BasisDigest: basis,
+					Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"}},
+				{Cycle: 2, Status: domain.ReviewStatusDegraded, CreatedAt: now,
+					AttemptID: "a1", DraftDigest: digest, BasisDigest: basis,
+					Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"},
+					Error:   "critic returned invalid finding"},
+			},
+		}
+		if err := st.StyleReview.Save(ledger); err != nil {
+			t.Fatal(err)
+		}
+		tool := NewReviewStyleTool(st, newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+			panic("critic must not be called")
+		}), testCriticVersion)
+		_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+		if err == nil {
+			t.Fatal("review must reject when the draft carries literary-prose errors")
+		}
+		if !strings.Contains(err.Error(), "文学腔硬闸") {
+			t.Fatalf("expected literary-gate rejection, got: %v", err)
+		}
+	})
+}
+
+// ── C1-H3：exhausted 必须先 /style-override（M2-3） ───────────────────
+
+func TestReviewStyle_ExhaustedRequiresOverrideFirst(t *testing.T) {
+	draft := "# 一\nabc她心里骂自己丢人，真不要脸。"
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveFinalChapter(1, "旧终稿。"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 100, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.SetPendingRewrites([]int{1}, "重写"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.SetFlow(domain.FlowRewriting); err != nil {
+		t.Fatal(err)
+	}
+	digest := domain.DigestDraft(draft)
+	basisDigest := ComputeBasisDigest(st, 1, "test-v1")
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"}},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"},
+				Result: &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "e",
+					Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Evidence: "e"}}}},
+			{Cycle: 3, Status: domain.ReviewStatusFinalPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"}},
+			{Cycle: 4, Status: domain.ReviewStatusExhausted, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"},
+				Result: &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "e",
+					Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "error", Evidence: "e"}}}},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", digest,
+		domain.PolishCheckpointMeta{InputDigest: digest, PolisherModel: "mimo-polisher", Stage: "rewrite", Changed: false},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.AppendAlways(domain.ChapterScope(1), "consistency_check", "a2", digest); err != nil {
+		t.Fatal(err)
+	}
+
+	// 返工章节 + exhausted：直接 review 被拒（必须先 /style-override）
+	tool := NewReviewStyleTool(st, newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		panic("critic must not be called")
+	}), testCriticVersion)
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("exhausted must require override before re-review (even in rewrite queue)")
+	}
+	if !strings.Contains(err.Error(), "style-override") {
+		t.Errorf("expected /style-override hint, got: %v", err)
+	}
+
+	// 覆盖后（overridden，保留 epoch 与 polish seq 语义）→ 可开启新 epoch
+	now2 := time.Now().Format(time.RFC3339)
+	if err := st.StyleReview.Update(1, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
+		if cur == nil {
+			return nil, fmt.Errorf("ledger disappeared")
+		}
+		cur.Cycles = append(cur.Cycles, domain.StyleReviewEntry{
+			Cycle:       len(cur.Cycles) + 1,
+			Status:      domain.ReviewStatusOverridden,
+			CreatedAt:   now2,
+			AttemptID:   "override-1",
+			Request:     &domain.StyleReviewRequest{Prompt: "override-v1", PolishCheckpointSeq: 0},
+			DraftDigest: digest,
+			BasisDigest: basisDigest,
+			Epoch:       cur.MaxEpoch(),
+			Override: &domain.StyleReviewOverride{
+				Actor: "user", Reason: "测试覆盖",
+				DraftDigest: digest, BasisDigest: basisDigest, OverriddenAt: now2,
+			},
+		})
+		return cur, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool2 := NewReviewStyleTool(st, critic, testCriticVersion)
+	if _, err := tool2.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("review after override should open new epoch: %v", err)
+	}
+	ledger2, _ := st.StyleReview.Load(1)
+	if got := ledger2.MaxEpoch(); got != 2 {
+		t.Fatalf("MaxEpoch = %d, want 2（override 后开启新 epoch）", got)
 	}
 }
 
@@ -958,7 +1807,7 @@ func TestReviewStyle_ContextCancellation(t *testing.T) {
 // re-review is not available for terminal statuses, so we must not claim it is.
 
 func TestReviewStyle_TerminalBasisChangeAllowsCommit(t *testing.T) {
-	draft := "正文。"
+	draft := "正文。她心里骂自己丢人，真不要脸。"
 	st := setupCriticStore(t, 1, draft)
 	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
 		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
@@ -1619,7 +2468,7 @@ func TestReviewStyle_TooManyFindingsDegraded_Initial(t *testing.T) {
 // ── 41. More than 3 findings (final attempt) → degraded ───────────────
 
 func TestReviewStyle_TooManyFindingsDegraded_Final(t *testing.T) {
-	draft := "正文。"
+	draft := mechCleanDraft("正文。")
 	st := setupCriticStore(t, 1, draft)
 	draftDigest := domain.DigestDraft(draft)
 	basisDigest := ComputeBasisDigest(st, 1, testCriticVersion)
@@ -2202,7 +3051,7 @@ func TestReviewStyle_StagnationSameFindingsLeadsToExhausted(t *testing.T) {
 // ── 50. Stagnation: override recovers from exhausted ─────────────────────
 
 func TestReviewStyle_OverrideAfterStagnationExhausted(t *testing.T) {
-	st := setupCriticStore(t, 1, "正文。一些句子。")
+	st := setupCriticStore(t, 1, "正文。一些句子。她心里骂自己丢人，真不要脸。")
 	draft, _, _ := st.Drafts.LoadChapterContent(1)
 
 	// Production shape: uses "problem" and "revision" (not "suggestion")
@@ -2283,5 +3132,600 @@ func TestReviewStyle_OverrideAfterStagnationExhausted(t *testing.T) {
 	})
 	if _, err := commitTool.Execute(t.Context(), commitArgs); err != nil {
 		t.Fatalf("commit after override should succeed: %v", err)
+	}
+}
+
+// ── 51. Critic empty output → auto retry → success ────────────────────
+//
+// 空输出（含仅空白）是瞬态故障：callCritic 应自动重试（指数退避），
+// 重试成功即正常返回，不进入 degraded。
+
+func TestReviewStyle_EmptyOutputRetryThenSuccess(t *testing.T) {
+	oldMax, oldBase := criticEmptyRetryMax, criticEmptyRetryBase
+	criticEmptyRetryMax, criticEmptyRetryBase = 3, time.Millisecond
+	defer func() { criticEmptyRetryMax, criticEmptyRetryBase = oldMax, oldBase }()
+
+	st := setupCriticStore(t, 1, "第一章正文。")
+	callCount := 0
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		callCount++
+		switch callCount {
+		case 1:
+			return &agentcore.LLMResponse{Message: criticText("")}, nil // 空输出
+		case 2:
+			return &agentcore.LLMResponse{Message: criticText("   \n\t  ")}, nil // 仅空白
+		}
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if output.Verdict != "pass" {
+		t.Fatalf("verdict = %q, want pass (retry should recover)", output.Verdict)
+	}
+	if output.Degraded {
+		t.Fatal("should not be degraded after successful retry")
+	}
+	if callCount != 3 {
+		t.Errorf("expected 3 critic calls (1 empty + 1 whitespace + 1 success), got %d", callCount)
+	}
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusAcceptedInitial {
+		t.Fatalf("expected accepted_initial after retry success, got %s", ledger.CurrentStatus())
+	}
+}
+
+// ── 52. Critic empty output → retries exhausted → degraded ────────────
+
+func TestReviewStyle_EmptyOutputExhaustedDegraded(t *testing.T) {
+	oldMax, oldBase := criticEmptyRetryMax, criticEmptyRetryBase
+	criticEmptyRetryMax, criticEmptyRetryBase = 3, time.Millisecond
+	defer func() { criticEmptyRetryMax, criticEmptyRetryBase = oldMax, oldBase }()
+
+	st := setupCriticStore(t, 1, "正文。")
+	callCount := 0
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		callCount++
+		return &agentcore.LLMResponse{Message: criticText("")}, nil // 始终空输出
+	})
+
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if !output.Degraded {
+		t.Fatal("expected degraded after all retries exhausted")
+	}
+	if callCount != 3 {
+		t.Errorf("expected 3 critic calls (all empty), got %d", callCount)
+	}
+	if !strings.Contains(output.Error, "空输出") {
+		t.Errorf("error %q should mention empty output", output.Error)
+	}
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusDegraded {
+		t.Fatalf("expected degraded, got %s", ledger.CurrentStatus())
+	}
+}
+
+// ── 53. Mutation guard: degraded allows draft/edit（解锁兜底）──────────
+
+func TestReviewStyle_MutationGuardAllowsDuringDegraded(t *testing.T) {
+	st := setupCriticStore(t, 1, "第一章正文。")
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return nil, assertAnError("critic simulated failure")
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusDegraded {
+		t.Fatalf("expected degraded ledger, got %s", ledger.CurrentStatus())
+	}
+
+	// degraded 状态：draft_chapter 必须被允许（评审调用故障，非评审结论）
+	draftTool := NewDraftChapterTool(st, testContract)
+	_, err := draftTool.Execute(t.Context(), json.RawMessage(`{
+		"chapter":1,"content":"degraded 后重写的草稿内容。","mode":"write"
+	}`))
+	if err != nil {
+		if strings.Contains(err.Error(), "评审") || strings.Contains(err.Error(), "critic") {
+			t.Fatalf("mutation guard incorrectly blocked draft during degraded: %v", err)
+		}
+		t.Logf("draft_chapter error (expected non-guard): %v", err)
+	}
+}
+
+// ── 54. review_style: degraded → 新初评 attempt → 恢复 ─────────────────
+
+func TestReviewStyle_RecoverFromDegraded_Initial(t *testing.T) {
+	draft := mechCleanDraft("正文。")
+	st := setupCriticStore(t, 1, draft)
+	draftDigest := domain.DigestDraft(draft)
+	basisDigest := ComputeBasisDigest(st, 1, testCriticVersion)
+
+	// 预写入 initial_pending → degraded
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1",
+				Request:     &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"},
+				DraftDigest: draftDigest, BasisDigest: basisDigest},
+			{Cycle: 2, Status: domain.ReviewStatusDegraded,
+				CreatedAt: "2026-07-25T11:00:00Z", AttemptID: "a1",
+				Request:     &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"},
+				Error:       "critic returned empty output",
+				DraftDigest: draftDigest, BasisDigest: basisDigest},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	// 修改草稿 + 新一致性检查点
+	newDraft := draft + "\n根据故障恢复重新起草。"
+	if err := st.Drafts.SaveDraft(1, newDraft); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	newDigest := domain.DigestDraft(newDraft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a2", newDigest); err != nil {
+		t.Fatalf("Append checkpoint: %v", err)
+	}
+
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute on degraded recovery: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if output.Verdict != "pass" {
+		t.Fatalf("verdict = %q, want pass", output.Verdict)
+	}
+	if output.Status != string(domain.ReviewStatusAcceptedInitial) {
+		t.Fatalf("status = %q, want %q", output.Status, domain.ReviewStatusAcceptedInitial)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if len(loaded.Cycles) != 4 {
+		t.Fatalf("expected 4 cycles, got %d", len(loaded.Cycles))
+	}
+	expected := []domain.StyleReviewStatus{
+		domain.ReviewStatusInitialPending,
+		domain.ReviewStatusDegraded,
+		domain.ReviewStatusInitialPending,
+		domain.ReviewStatusAcceptedInitial,
+	}
+	for i, s := range expected {
+		if loaded.Cycles[i].Status != s {
+			t.Errorf("cycle[%d].status = %q, want %q", i, loaded.Cycles[i].Status, s)
+		}
+	}
+}
+
+// ── 55. review_style: degraded（终审失败）→ 新终审 attempt → 恢复 ───────
+
+func TestReviewStyle_RecoverFromDegraded_Final(t *testing.T) {
+	draft := mechCleanDraft("正文。")
+	st := setupCriticStore(t, 1, draft)
+	draftDigest := domain.DigestDraft(draft)
+	basisDigest := ComputeBasisDigest(st, 1, testCriticVersion)
+
+	// 预写入 initial_pending → revision_open → final_pending → degraded
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1",
+				Request:     &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"},
+				DraftDigest: draftDigest, BasisDigest: basisDigest},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				CreatedAt: "2026-07-25T11:00:00Z", AttemptID: "a1",
+				Request: &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictRevise, Evidence: "revise",
+					Findings: []domain.StyleReviewFinding{{
+						Dimension: "pacing", Category: "style", Severity: "warning", Evidence: "e",
+					}},
+				},
+				DraftDigest: draftDigest, BasisDigest: basisDigest},
+			{Cycle: 3, Status: domain.ReviewStatusFinalPending,
+				CreatedAt: "2026-07-25T12:00:00Z", AttemptID: "final-attempt",
+				Request:     &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"},
+				DraftDigest: draftDigest, BasisDigest: basisDigest},
+			{Cycle: 4, Status: domain.ReviewStatusDegraded,
+				CreatedAt: "2026-07-25T13:00:00Z", AttemptID: "final-attempt",
+				Request:     &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"},
+				Error:       "critic returned empty output",
+				DraftDigest: draftDigest, BasisDigest: basisDigest},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	// 修改草稿 + 新一致性检查点
+	newDraft := draft + "\n终审故障后重新修改。"
+	if err := st.Drafts.SaveDraft(1, newDraft); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	newDigest := domain.DigestDraft(newDraft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a2", newDigest); err != nil {
+		t.Fatalf("Append checkpoint: %v", err)
+	}
+
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute on degraded final recovery: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if output.Verdict != "pass" {
+		t.Fatalf("verdict = %q, want pass", output.Verdict)
+	}
+	if output.Status != string(domain.ReviewStatusAcceptedRev) {
+		t.Fatalf("status = %q, want %q", output.Status, domain.ReviewStatusAcceptedRev)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if len(loaded.Cycles) != 6 {
+		t.Fatalf("expected 6 cycles, got %d", len(loaded.Cycles))
+	}
+	expected := []domain.StyleReviewStatus{
+		domain.ReviewStatusInitialPending,
+		domain.ReviewStatusRevisionOpen,
+		domain.ReviewStatusFinalPending,
+		domain.ReviewStatusDegraded,
+		domain.ReviewStatusFinalPending,
+		domain.ReviewStatusAcceptedRev,
+	}
+	for i, s := range expected {
+		if loaded.Cycles[i].Status != s {
+			t.Errorf("cycle[%d].status = %q, want %q", i, loaded.Cycles[i].Status, s)
+		}
+	}
+}
+
+// ── 56. 其他 terminal 状态仍拒绝新评审（degraded 特判不扩散）────────────
+
+func TestReviewStyle_AcceptedInitialStillBlocksNewReview(t *testing.T) {
+	st := setupCriticStore(t, 1, "正文。")
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("First review: %v", err)
+	}
+	// accepted_initial 是最终权威：第二次 review_style 必须被拒绝
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("accepted_initial must still block a new review")
+	}
+	if !strings.Contains(err.Error(), "已终结") {
+		t.Errorf("error %q should mention review already terminated", err.Error())
+	}
+}
+
+// ── 57. legacy degraded（R=0）的 digest 分流（中等 3） ──────────────────
+
+// TestReviewStyle_DegradedLegacyNewCandidateOpensNewEpoch 验证 legacy（R=0，
+// 无 PolishCheckpointSeq 绑定）degraded 条目绑定 digest ≠ 当前草稿且存在新 polish
+// 候选 → 旧候选：返工队列章节开启新 epoch 重新评审（此前无条件视为同候选 retry）。
+func TestReviewStyle_DegradedLegacyNewCandidateOpensNewEpoch(t *testing.T) {
+	draft := "# 一\nabc返工草稿她心里骂自己丢人，真不要脸。"
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveFinalChapter(1, "旧终稿。"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 100, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.SetPendingRewrites([]int{1}, "重写"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.SetFlow(domain.FlowRewriting); err != nil {
+		t.Fatal(err)
+	}
+	// degraded 绑定的是旧候选 digest（≠ 当前草稿），且无 seq 绑定（legacy R=0）
+	oldDigest := domain.DigestDraft("旧候选正文。")
+	basisDigest := ComputeBasisDigest(st, 1, "test-v1")
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: oldDigest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"}},
+			{Cycle: 2, Status: domain.ReviewStatusDegraded, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: oldDigest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"},
+				Error:   "critic call failed"},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+	// 当前候选（digest = 当前草稿）的最新 polish + consistency
+	digest := domain.DigestDraft(draft)
+	if _, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", digest,
+		domain.PolishCheckpointMeta{InputDigest: digest, PolisherModel: "mimo-polisher", Stage: "rewrite", Changed: false},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.AppendAlways(domain.ChapterScope(1), "consistency_check", "a2", digest); err != nil {
+		t.Fatal(err)
+	}
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if got := loaded.MaxEpoch(); got != 2 {
+		t.Fatalf("MaxEpoch = %d, want 2（legacy degraded 旧候选开启新 epoch）", got)
+	}
+	if loaded.Cycles[2].Status != domain.ReviewStatusInitialPending || loaded.Cycles[2].EpochValue() != 2 {
+		t.Fatalf("cycle[2] = %s epoch %d, want initial_pending epoch 2", loaded.Cycles[2].Status, loaded.Cycles[2].EpochValue())
+	}
+	if loaded.Cycles[3].Status != domain.ReviewStatusAcceptedInitial || loaded.Cycles[3].EpochValue() != 2 {
+		t.Fatalf("cycle[3] = %s epoch %d, want accepted_initial epoch 2", loaded.Cycles[3].Status, loaded.Cycles[3].EpochValue())
+	}
+}
+
+// TestReviewStyle_DegradedLegacySameDigestRetriesSameEpoch 验证 legacy（R=0）
+// degraded 且绑定 digest == 当前草稿 → 同候选 retry，不开启新 epoch。
+func TestReviewStyle_DegradedLegacySameDigestRetriesSameEpoch(t *testing.T) {
+	draft := "# 一\nabc她心里骂自己丢人，真不要脸。"
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	digest := domain.DigestDraft(draft)
+	basisDigest := ComputeBasisDigest(st, 1, "test-v1")
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"}},
+			{Cycle: 2, Status: domain.ReviewStatusDegraded, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"},
+				Error:   "critic call failed"},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+	// 存在 polish 候选（digest 与 degraded 绑定一致）→ 同候选 retry
+	if _, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", digest,
+		domain.PolishCheckpointMeta{InputDigest: digest, PolisherModel: "mimo-polisher", Stage: "draft", Changed: false},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.AppendAlways(domain.ChapterScope(1), "consistency_check", "a2", digest); err != nil {
+		t.Fatal(err)
+	}
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if got := loaded.MaxEpoch(); got != 1 {
+		t.Fatalf("MaxEpoch = %d, want 1（legacy degraded 同 digest retry 不开启新 epoch）", got)
+	}
+	if len(loaded.Cycles) != 4 {
+		t.Fatalf("cycles = %d, want 4（degraded + retry initial_pending + accepted）", len(loaded.Cycles))
+	}
+}
+
+// ── C2：accepted 前置机械规则闸（文学腔硬闸死锁防护，阻断 1） ──────────
+// 场景：Critic 对仍带文学腔 error 的草稿给出 pass → review_style 必须在任何
+// 账本写入（pending 创建 / accepted 落盘）前拒绝（ErrToolPrecondition）——
+// 账本保持为空或 revision_open，不得进入 terminal 或留下 pending（pending 会
+// 被 mutation guard 锁定，导致用户无法修改草稿）。
+
+// TestReviewStyle_MechanicalErrorBlocksAccepted 验证带文学腔 error 的草稿：
+// 评审被拒、账本保持为空（不创建 pending、不调用 critic）；修改草稿消除
+// 违例后重新评审可正常 accepted。
+func TestReviewStyle_MechanicalErrorBlocksAccepted(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	// 否定修正句 ≥3（12 类硬闸第 1 类）——手动建 store，不经 mechCleanDraft 包装
+	draft := "他不是怕死，而是怕疼。他不是退缩，而是等待。他不是沉默，而是蓄力。"
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	digest := domain.DigestDraft(draft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a1", digest); err != nil {
+		t.Fatal(err)
+	}
+
+	criticCalled := false
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		criticCalled = true
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("review_style must reject when draft carries literary-prose errors")
+	}
+	if !strings.Contains(err.Error(), "文学腔硬闸") || !strings.Contains(err.Error(), "不能接受评审结果") {
+		t.Fatalf("expected literary-gate rejection, got: %v", err)
+	}
+	if criticCalled {
+		t.Fatal("critic must not be invoked for a draft failing the mechanical gate")
+	}
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger != nil && !ledger.IsEmpty() {
+		t.Fatalf("ledger must stay empty after gate rejection, got status %s", ledger.CurrentStatus())
+	}
+
+	// 修改草稿消除否定修正句（含自评关键词）→ 重新 check_consistency → accepted
+	fixed := "他推开窗，夜色扑面而来。她心里骂自己丢人，真不要脸。"
+	if err := st.Drafts.SaveDraft(1, fixed); err != nil {
+		t.Fatal(err)
+	}
+	fixedDigest := domain.DigestDraft(fixed)
+	if _, err := st.Checkpoints.AppendAlways(domain.ChapterScope(1), "consistency_check", "a2", fixedDigest); err != nil {
+		t.Fatal(err)
+	}
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("review after fixing the draft should succeed: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if output.Verdict != "pass" || output.Status != string(domain.ReviewStatusAcceptedInitial) {
+		t.Fatalf("expected accepted_initial after fix, got verdict=%s status=%s", output.Verdict, output.Status)
+	}
+	ledger, _ = st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusAcceptedInitial {
+		t.Fatalf("expected accepted_initial after fix, got %s", ledger.CurrentStatus())
+	}
+}
+
+// TestReviewStyle_MechanicalErrorBlocksAcceptedRev 验证终审 pass（AcceptedRev）
+// 同样被闸拦截：预置 initial_pending → revision_open → final_pending，critic
+// pass → 拒绝且账本停留在 final_pending。
+func TestReviewStyle_MechanicalErrorBlocksAcceptedRev(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	draft := "他不是怕死，而是怕疼。他不是退缩，而是等待。他不是沉默，而是蓄力。"
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	digest := domain.DigestDraft(draft)
+	basisDigest := ComputeBasisDigest(st, 1, testCriticVersion)
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"}},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"},
+				Result: &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "revise",
+					Findings: []domain.StyleReviewFinding{{
+						Dimension: "pacing", Category: "style", Severity: "warning", Evidence: "e",
+					}}}},
+			{Cycle: 3, Status: domain.ReviewStatusFinalPending, CreatedAt: now,
+				AttemptID: "final-attempt", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"}},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a1", digest); err != nil {
+		t.Fatal(err)
+	}
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("final review must reject accepted when draft carries literary-prose errors")
+	}
+	if !strings.Contains(err.Error(), "文学腔硬闸") {
+		t.Fatalf("expected literary-gate rejection, got: %v", err)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if loaded.CurrentStatus() != domain.ReviewStatusFinalPending {
+		t.Fatalf("ledger must stay final_pending (not terminal), got %s", loaded.CurrentStatus())
+	}
+	if len(loaded.Cycles) != 3 {
+		t.Fatalf("cycles = %d, want 3（闸前账本原样保留）", len(loaded.Cycles))
+	}
+}
+
+// TestReviewStyle_MechanicalCleanAccepted 验证机械干净的草稿不受闸影响：
+// 普通 pass 评审正常写入 accepted（闸只拦 error，不误伤）。
+func TestReviewStyle_MechanicalCleanAccepted(t *testing.T) {
+	st := setupCriticStore(t, 1, "正文。")
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("clean draft must pass review: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if output.Status != string(domain.ReviewStatusAcceptedInitial) {
+		t.Fatalf("expected accepted_initial, got %s", output.Status)
+	}
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusAcceptedInitial {
+		t.Fatalf("expected accepted_initial, got %s", ledger.CurrentStatus())
 	}
 }

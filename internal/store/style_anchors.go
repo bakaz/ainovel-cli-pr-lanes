@@ -14,7 +14,7 @@ import (
 type ManualFileStatus int
 
 const (
-	StatusNotExist    ManualFileStatus = iota
+	StatusNotExist ManualFileStatus = iota
 	StatusEmptyValid
 	StatusValid
 	StatusCorrupted
@@ -124,7 +124,7 @@ func (s *StyleAnchorsStore) LoadManual() LoadManualResult {
 // 未知字段 → 返回描述列表（非空即为 corrupted）。
 func checkNewFormatUnknownFields(raw map[string]any) []string {
 	knownTop := map[string]bool{"version": true, "anchors": true, "include_auto": true}
-	knownAnchor := map[string]bool{"id": true, "excerpt": true, "applies_to": true, "provenance": true}
+	knownAnchor := map[string]bool{"id": true, "excerpt": true, "note": true, "applies_to": true, "provenance": true}
 	knownAppliesTo := map[string]bool{"chapter_ranges": true}
 	knownProvenance := map[string]bool{"source_chapter": true, "source_digest": true}
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -13,6 +14,7 @@ import (
 	"github.com/voocel/agentcore/subagent"
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/errs"
+	"github.com/voocel/ainovel-cli/internal/rules"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -24,17 +26,41 @@ import (
 // text so the critic knows which portion it sees.
 const maxCriticRunes = 12000
 
+// ── Critic empty-output retry ────────────────────────────────────────
+//
+// Production observations: the critic model (deepseek-v4-flash via the
+// go1 zen proxy) intermittently returns an empty output (63/65 chapters
+// succeed, i.e. the failure is transient). An empty output is NOT a review
+// verdict, so callCritic retries with exponential backoff before falling
+// back to the degraded terminal state. Only empty/whitespace-only output
+// triggers a retry — runner errors and non-empty (but malformed) outputs
+// are returned immediately.
+//
+// Both knobs are package-level vars so tests can shrink the backoff.
+var (
+	// criticEmptyRetryMax 是 critic 空输出时的最大总尝试次数（1 次初始调用 + 3 次重试）。
+	criticEmptyRetryMax = 4
+	// criticEmptyRetryBase 是空输出重试的指数退避基数：2s → 4s → 8s。
+	criticEmptyRetryBase = 2 * time.Second
+)
+
 // ReviewStyleTool 是状态化风格评审工具。
 // 非 ReadOnly，非 ConcurrencySafe。Writer 可调用。
 type ReviewStyleTool struct {
 	store            *store.Store
 	criticRunner     *subagent.Runner
 	criticPromptHash string // sha256 前缀：实际批评者提示词内容的可溯源标识
+	// pipelineEnabled 是精修流水线开关（BuildWorkers 注入）：开启时要求评审前存在
+	// 与当前草稿 digest 匹配的 polish checkpoint（精修先于评审的时序保证）。
+	pipelineEnabled bool
 }
 
 func NewReviewStyleTool(s *store.Store, criticRunner *subagent.Runner, criticPromptHash string) *ReviewStyleTool {
 	return &ReviewStyleTool{store: s, criticRunner: criticRunner, criticPromptHash: criticPromptHash}
 }
+
+// SetPipelineEnabled 设置精修流水线开关（BuildWorkers 注入）。
+func (t *ReviewStyleTool) SetPipelineEnabled(v bool) { t.pipelineEnabled = v }
 
 func (t *ReviewStyleTool) Name() string { return "review_style" }
 func (t *ReviewStyleTool) Description() string {
@@ -136,6 +162,37 @@ func (t *ReviewStyleTool) Execute(ctx context.Context, args json.RawMessage) (js
 			a.Chapter, errs.ErrToolPrecondition)
 	}
 
+	// ── 3.5 校验精修流水线检查点（pipeline 启用时） ──
+	// 精修必须先于评审：commit gate 要求 polish checkpoint 早于当前 critic pass，
+	// 这里在评审发起侧提前拦截，避免"critic revise 后正文又被改 → 直接评审 →
+	// 终态账本锁死"的流程死结（terminal 状态拒绝新评审）。
+	if t.pipelineEnabled && !polishCheckpointMatches(t.store, a.Chapter, draftDigest) {
+		return nil, fmt.Errorf("pipeline：章节 %d 缺少与当前草稿匹配的 polish 记录，请先调用 polish_draft 再评审: %w",
+			a.Chapter, errs.ErrToolPrecondition)
+	}
+
+	// ── 3.6 顺序绑定（存在 polish checkpoint 时，无论 pipeline 开关） ──
+	// 要求最新 consistency checkpoint 的 Seq > 最新 polish checkpoint 的 Seq，
+	// 证明 polish → consistency → critic 的执行顺序。polish_draft 与 check_consistency
+	// 每次执行都追加新 checkpoint（AppendAlways/AppendPolish 不做 digest 去重），
+	// seq 单调递增，顺序绑定因此可机械判定。
+	if polishCP := t.store.Checkpoints.LatestByStep(domain.ChapterScope(a.Chapter), "polish"); polishCP != nil {
+		if consistencyCP == nil || consistencyCP.Seq <= polishCP.Seq {
+			return nil, fmt.Errorf("章节 %d 的 consistency 检查点未晚于 polish 检查点（顺序必须是 polish_draft → check_consistency → review_style），请先调用 check_consistency: %w",
+				a.Chapter, errs.ErrToolPrecondition)
+		}
+	}
+
+	// ── 3.7 机械规则前置闸（C2 文学腔硬闸死锁防护） ──
+	// 草稿存在 error 级文学腔违例时直接拒绝本次评审（不创建 pending、不调用
+	// critic）：账本保持为空或 revision_open——pending 状态会被 mutation guard
+	// 锁定（禁止修改草稿），若评审已发起才拦截，用户将无法修改带违例的草稿，
+	// 造成新的死锁。写入 accepted 前另有 append 侧闸（checkMechanicalGate）
+	// 纵深防御（草稿在 pending 期间被 guard 锁定，正常流程不会触发）。
+	if err := t.checkMechanicalGate(a.Chapter); err != nil {
+		return nil, err
+	}
+
 	// ── 4. 加载账本 ──
 	ledger, err := t.store.StyleReview.Load(a.Chapter)
 	if err != nil {
@@ -153,10 +210,38 @@ func (t *ReviewStyleTool) Execute(ctx context.Context, args json.RawMessage) (js
 	} else {
 		currentStatus = ledger.CurrentStatus()
 	}
+	// 当前评审周期代数：同一 epoch 内按 V2 状态机流转；返工队列章节可从旧
+	// terminal/exhausted 开启新 epoch 重新评审。
+	epoch := 1
+	inRewriteQueue := isCompletedAndInRewriteQueue(t.store, a.Chapter)
+	if ledger != nil && !ledger.IsEmpty() {
+		epoch = ledger.MaxEpoch()
+	}
+	// 评审发起时绑定到的最新 polish checkpoint seq（0 = 未走精修流水线，legacy）。
+	var polishSeq int64
+	if cp := t.store.Checkpoints.LatestByStep(domain.ChapterScope(a.Chapter), "polish"); cp != nil {
+		polishSeq = cp.Seq
+	}
 
-	if currentStatus.IsTerminal() {
+	// degraded 是"评审调用故障"（瞬态技术故障，非评审结论）——允许发起新 attempt
+	// 重新评审（同 epoch 流转；候选更新后的分流见下方 degraded 分支）。其余
+	// terminal 状态（accepted_initial/accepted_revised/overridden）是"当前 epoch 的
+	// 评审权威"：返工队列章节可以从旧 terminal 开启新 epoch，进入 initial_pending
+	// （D1 有意设计：返工走完整评审周期 initial → revise → final，而不是直接终审），
+	// 非返工章节拒绝新评审。exhausted 必须先经 /style-override 覆盖（覆盖后账本变
+	// 为 overridden terminal）才能开启新周期——返工章节同样不例外（与 engine 派发
+	// 前拦截一致，C1-H3）。
+	if currentStatus.IsTerminal() && currentStatus != domain.ReviewStatusDegraded {
+		if inRewriteQueue {
+			epoch = epoch + 1 // 新 epoch：旧 terminal 权威不跨代延续
+			return t.executeInitialReview(ctx, a.Chapter, content, wordCount, draftDigest, basisDigest, basis, ledger, epoch, polishSeq)
+		}
 		return nil, fmt.Errorf("章节 %d 风格评审已终结（%s），不能再发起新的评审: %w",
 			a.Chapter, currentStatus, errs.ErrToolPrecondition)
+	}
+	if currentStatus == domain.ReviewStatusExhausted {
+		return nil, fmt.Errorf("章节 %d 风格评审已耗尽（exhausted），必须先通过 /style-override 覆盖后才能继续（返工章节同样不例外）: %w",
+			a.Chapter, errs.ErrToolPrecondition)
 	}
 
 	if currentStatus == domain.ReviewStatusRevisionOpen {
@@ -169,18 +254,73 @@ func (t *ReviewStyleTool) Execute(ctx context.Context, args json.RawMessage) (js
 
 	switch currentStatus {
 	case "", domain.ReviewStatusInitialPending:
-		return t.executeInitialReview(ctx, a.Chapter, content, wordCount, draftDigest, basisDigest, basis, ledger)
+		return t.executeInitialReview(ctx, a.Chapter, content, wordCount, draftDigest, basisDigest, basis, ledger, epoch, polishSeq)
 	case domain.ReviewStatusRevisionOpen, domain.ReviewStatusFinalPending:
-		return t.executeFinalReview(ctx, a.Chapter, content, wordCount, draftDigest, basisDigest, basis, ledger)
+		return t.executeFinalReview(ctx, a.Chapter, content, wordCount, draftDigest, basisDigest, basis, ledger, epoch, polishSeq)
+	case domain.ReviewStatusDegraded:
+		// C2 degraded 恢复语义（oracle 设计）：候选身份判定与恢复策略解耦——
+		// "候选是否更新"只决定返工章节是否开新 epoch，不再作为非返工章节能否
+		// 恢复的拦截条件（旧实现会拒绝非返工章节的旧候选重评，导致
+		// degraded → 重新 polish → 无法评审 → commit digest 不匹配 → 死锁）。
+		//
+		// sameCandidate：有 seq 绑定（R>0）时按 R == P 判定；legacy（R=0）且
+		// 存在 polish 候选时按 degraded 绑定 digest 是否仍为当前草稿判定；
+		// 无 polish 候选（R=0 且 P=0）时恒为同候选（纯评审调用故障重试）。
+		degradedEntry := ledger.CurrentCycle()
+		degradedSeq := int64(0)
+		degradedDigest := ""
+		if degradedEntry != nil {
+			degradedDigest = degradedEntry.DraftDigest
+			if degradedEntry.Request != nil {
+				degradedSeq = degradedEntry.Request.PolishCheckpointSeq
+			}
+		}
+		sameCandidate := degradedEntry != nil
+		switch {
+		case degradedSeq > 0:
+			sameCandidate = degradedSeq == polishSeq
+		case polishSeq > 0:
+			sameCandidate = degradedDigest != "" && degradedDigest == draftDigest
+		default:
+			// 无 polish 候选：纯评审调用故障重试，视为同候选。
+		}
+		if inRewriteQueue && !sameCandidate {
+			// 返工章节旧候选：开启新 epoch（MaxEpoch+1），按 initial review 完整
+			// 重评（D1 设计：返工走 initial → revise → final 完整周期）。
+			epoch = epoch + 1
+			return t.executeInitialReview(ctx, a.Chapter, content, wordCount, draftDigest, basisDigest, basis, ledger, epoch, polishSeq)
+		}
+		// 同候选，或非返工章节（即使重新 polish、候选已变化）→ 在当前 epoch 恢复：
+		// degraded 前的周期是 final_pending → 继续终审；否则 → 重新初评。
+		// 新 attempt 的 Request 绑定当前最新 polish seq（P2），保证评审对象是
+		// 当前精修版本，commit gate 的 digest/seq 绑定随后可通过。
+		if degradedRecoversAsFinal(ledger) {
+			return t.executeFinalReview(ctx, a.Chapter, content, wordCount, draftDigest, basisDigest, basis, ledger, epoch, polishSeq)
+		}
+		return t.executeInitialReview(ctx, a.Chapter, content, wordCount, draftDigest, basisDigest, basis, ledger, epoch, polishSeq)
 	default:
 		return nil, fmt.Errorf("章节 %d 帐本状态 %q 不支持 review_style: %w",
 			a.Chapter, currentStatus, errs.ErrToolPrecondition)
 	}
 }
 
+// degradedRecoversAsFinal 判断 degraded 状态恢复时新 attempt 的类型：
+// 若账本最后一个周期（degraded）的前一个周期是 final_pending，说明是终审调用
+// 失败，恢复时应继续终审；否则视为初评失败，恢复为初评。
+func degradedRecoversAsFinal(ledger *domain.StyleReviewLedger) bool {
+	if ledger == nil || ledger.IsEmpty() {
+		return false
+	}
+	cycles := ledger.Cycles
+	if len(cycles) < 2 {
+		return false
+	}
+	return cycles[len(cycles)-2].Status == domain.ReviewStatusFinalPending
+}
+
 // ── Initial review ───────────────────────────────────────────────────
 
-func (t *ReviewStyleTool) executeInitialReview(ctx context.Context, chapter int, content string, wordCount int, draftDigest, basisDigest string, basis domain.ReviewBasis, ledger *domain.StyleReviewLedger) (json.RawMessage, error) {
+func (t *ReviewStyleTool) executeInitialReview(ctx context.Context, chapter int, content string, wordCount int, draftDigest, basisDigest string, basis domain.ReviewBasis, ledger *domain.StyleReviewLedger, epoch int, polishSeq int64) (json.RawMessage, error) {
 	now := time.Now().Format(time.RFC3339)
 	criticModel := t.loadCriticModelName()
 
@@ -209,13 +349,19 @@ func (t *ReviewStyleTool) executeInitialReview(ctx context.Context, chapter int,
 		}
 	}
 
+	// 注：无需同步 pending 周期 digest——C2 机械闸在创建 pending 之前（Execute
+	// 3.7）拦截，闸拒绝不会留下 pending；而 pending 存在期间 mutation guard
+	// 锁定草稿（禁止修改），复用 attempt 时草稿 digest 必然与 pending 一致，
+	// 结果落盘不会触发 draft_digest changed 校验拒绝。
+
 	if attemptID == "" {
 		attemptID = fmt.Sprintf("initial-%d-%d", chapter, time.Now().UnixNano())
 		request = &domain.StyleReviewRequest{
-			Prompt:       t.criticPromptHash,
-			Model:        criticModel,
-			IncludeBasis: true,
-			RequestedAt:  now,
+			Prompt:              t.criticPromptHash,
+			Model:               criticModel,
+			IncludeBasis:        true,
+			RequestedAt:         now,
+			PolishCheckpointSeq: polishSeq,
 		}
 		pendingEntry = domain.StyleReviewEntry{
 			Cycle:       1,
@@ -225,6 +371,7 @@ func (t *ReviewStyleTool) executeInitialReview(ctx context.Context, chapter int,
 			Request:     request,
 			DraftDigest: draftDigest,
 			BasisDigest: basisDigest,
+			Epoch:       epoch,
 		}
 
 		pendingLedger := domain.StyleReviewLedger{
@@ -246,6 +393,24 @@ func (t *ReviewStyleTool) executeInitialReview(ctx context.Context, chapter int,
 				if cur.CurrentStatus() == domain.ReviewStatusInitialPending {
 					return nil, nil
 				}
+				if cur.CurrentStatus() == domain.ReviewStatusDegraded {
+					// degraded（评审调用故障，非评审结论）后允许发起新的初评 attempt，
+					// 追加一个新的 initial_pending 周期。Epoch 沿用调用方传入的
+					// pendingEntry.Epoch：当前候选 retry 同 epoch；旧候选（C1-H3 分流）
+					// 为 MaxEpoch()+1 开启新 epoch。
+					pendingEntry.Cycle = len(cur.Cycles) + 1
+					cur.Cycles = append(cur.Cycles, pendingEntry)
+					return cur, nil
+				}
+				if (cur.CurrentStatus().IsTerminal() || cur.CurrentStatus() == domain.ReviewStatusExhausted) &&
+					isCompletedAndInRewriteQueue(t.store, chapter) {
+					// C1：返工队列章节从旧 terminal 开启新 epoch 重新评审
+					// （D1：进入 initial_pending，走完整评审周期）。
+					pendingEntry.Cycle = len(cur.Cycles) + 1
+					pendingEntry.Epoch = cur.MaxEpoch() + 1
+					cur.Cycles = append(cur.Cycles, pendingEntry)
+					return cur, nil
+				}
 				return nil, fmt.Errorf("unexpected ledger state: %s", cur.CurrentStatus())
 			}); err != nil {
 				return nil, fmt.Errorf("append initial pending: %w", err)
@@ -258,7 +423,7 @@ func (t *ReviewStyleTool) executeInitialReview(ctx context.Context, chapter int,
 	if degradedErr != nil {
 		finalReq := request
 		if finalReq == nil {
-			finalReq = &domain.StyleReviewRequest{Prompt: t.criticPromptHash, Model: criticModel}
+			finalReq = &domain.StyleReviewRequest{Prompt: t.criticPromptHash, Model: criticModel, PolishCheckpointSeq: polishSeq}
 		}
 		return t.appendDegraded(chapter, attemptID, pendingEntry.DraftDigest, pendingEntry.BasisDigest, finalReq, degradedErr)
 	}
@@ -268,7 +433,7 @@ func (t *ReviewStyleTool) executeInitialReview(ctx context.Context, chapter int,
 
 // ── Final review ─────────────────────────────────────────────────────
 
-func (t *ReviewStyleTool) executeFinalReview(ctx context.Context, chapter int, content string, wordCount int, draftDigest, basisDigest string, basis domain.ReviewBasis, ledger *domain.StyleReviewLedger) (json.RawMessage, error) {
+func (t *ReviewStyleTool) executeFinalReview(ctx context.Context, chapter int, content string, wordCount int, draftDigest, basisDigest string, basis domain.ReviewBasis, ledger *domain.StyleReviewLedger, epoch int, polishSeq int64) (json.RawMessage, error) {
 	now := time.Now().Format(time.RFC3339)
 	criticModel := t.loadCriticModelName()
 
@@ -291,13 +456,17 @@ func (t *ReviewStyleTool) executeFinalReview(ctx context.Context, chapter int, c
 		}
 	}
 
+	// 注：无需同步 pending 周期 digest——与 executeInitialReview 同因（C2 机械
+	// 闸在 pending 创建前拦截；pending 期间 mutation guard 锁定草稿）。
+
 	if attemptID == "" {
 		attemptID = fmt.Sprintf("final-%d-%d", chapter, time.Now().UnixNano())
 		request = &domain.StyleReviewRequest{
-			Prompt:       t.criticPromptHash,
-			Model:        criticModel,
-			IncludeBasis: true,
-			RequestedAt:  now,
+			Prompt:              t.criticPromptHash,
+			Model:               criticModel,
+			IncludeBasis:        true,
+			RequestedAt:         now,
+			PolishCheckpointSeq: polishSeq,
 		}
 
 		if err := t.store.StyleReview.Update(chapter, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
@@ -313,6 +482,7 @@ func (t *ReviewStyleTool) executeFinalReview(ctx context.Context, chapter int, c
 				Request:     request,
 				DraftDigest: draftDigest,
 				BasisDigest: basisDigest,
+				Epoch:       epoch,
 			})
 			return cur, nil
 		}); err != nil {
@@ -334,6 +504,47 @@ func (t *ReviewStyleTool) executeFinalReview(ctx context.Context, chapter int, c
 }
 
 // ── Critic invocation and result validation ──────────────────────────
+
+// runCriticWithEmptyRetry 调用 critic runner，仅在输出为空（空串/仅空白）时
+// 自动重试，指数退避（2s/4s/8s），最多 criticEmptyRetryMax 次。
+//
+// 只对"空输出"这种瞬态故障重试：runner 错误与非空输出（即使 JSON 解析失败或
+// 校验失败）立即返回，绝不为 critic 合法返回的 revise/pass 结论增加延迟。
+// 返回合并后的输出文本（Output 优先，空时回退 TerminalResult）。
+func (t *ReviewStyleTool) runCriticWithEmptyRetry(ctx context.Context, chapter int, taskText string) (string, error) {
+	var lastErr error
+	for attempt := 1; attempt <= criticEmptyRetryMax; attempt++ {
+		if attempt > 1 {
+			// 指数退避：2s → 4s → 8s
+			delay := criticEmptyRetryBase * time.Duration(1<<(attempt-2))
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return "", fmt.Errorf("critic retry aborted: %w: %w", ctx.Err(), lastErr)
+			}
+		}
+
+		runResult, err := t.criticRunner.Run(ctx, "style_critic", taskText)
+		if err != nil {
+			return "", fmt.Errorf("critic call failed: %w", err)
+		}
+
+		outputText := runResult.Output
+		if outputText == "" && runResult.TerminalResult != nil {
+			outputText = string(runResult.TerminalResult)
+		}
+		if strings.TrimSpace(outputText) != "" {
+			return outputText, nil
+		}
+
+		lastErr = fmt.Errorf("critic returned empty output (attempt %d/%d)", attempt, criticEmptyRetryMax)
+		slog.Warn("critic 返回空输出，准备重试", "module", "tools", "chapter", chapter,
+			"attempt", attempt, "max", criticEmptyRetryMax)
+	}
+	// 重试耗尽：空输出是瞬态故障（非评审结论），提示可重试或走重写/打磨队列/人工干预。
+	return "", fmt.Errorf("%w；连续 %d 次空输出（瞬态故障），可稍后重新 check_consistency + review_style 重试，或走重写/打磨队列、人工干预",
+		lastErr, criticEmptyRetryMax)
+}
 
 // callCritic invokes the critic subagent, parses the production JSON shape,
 // validates all enums, and returns a domain.StyleReviewResult only if every
@@ -382,30 +593,22 @@ func (t *ReviewStyleTool) callCritic(ctx context.Context, chapter int, content s
 请严格按样式批评者提示词中定义的 JSON 格式输出（含 mandatory strength.evidence）。`,
 		chapter, wordCount, truncNote, draftForCritic, basisPayload)
 
-	runResult, err := t.criticRunner.Run(ctx, "style_critic", taskText)
+	// ── Invoke the critic with empty-output retry ──
+	// 空输出（空串/仅空白）是瞬态故障，自动重试（2s/4s/8s 指数退避）；
+	// 重试耗尽仍为空才返回错误 → 由调用方映射为 degraded。runner 错误与
+	// 非空输出（即使解析失败）不做重试。
+	outputText, err := t.runCriticWithEmptyRetry(ctx, chapter, taskText)
 	if err != nil {
-		return nil, fmt.Errorf("critic call failed: %w", err)
-	}
-
-	outputText := runResult.Output
-	if outputText == "" && runResult.TerminalResult != nil {
-		outputText = string(runResult.TerminalResult)
-	}
-	if outputText == "" {
-		return nil, fmt.Errorf("critic returned empty output")
+		return nil, err
 	}
 
 	// ── Decode production shape ──
+	// runCriticWithEmptyRetry 已统一 Output / TerminalResult 取文本，
+	// 此处只需解析合并后的 outputText。
 	var co criticOutput
 	parseErr := json.Unmarshal([]byte(outputText), &co)
 	if parseErr != nil {
-		if runResult.TerminalResult != nil {
-			if err2 := json.Unmarshal(runResult.TerminalResult, &co); err2 != nil {
-				return nil, fmt.Errorf("critic output decode failed: output=%q err=%w", truncateForLog(outputText, 200), parseErr)
-			}
-		} else {
-			return nil, fmt.Errorf("critic output decode failed: output=%q err=%w", truncateForLog(outputText, 200), parseErr)
-		}
+		return nil, fmt.Errorf("critic output decode failed: output=%q err=%w", truncateForLog(outputText, 200), parseErr)
 	}
 
 	// ── Validations before any ledger mutation ──
@@ -467,6 +670,44 @@ func (t *ReviewStyleTool) callCritic(ctx context.Context, chapter int, content s
 
 // ── Append results ───────────────────────────────────────────────────
 
+// checkMechanicalGate 重算 12 类文学腔硬闸（rules.CheckLiteraryProse，与
+// commit_chapter 的 CheckLiteraryProseGate 完全同一规则集、同一严重度判定——
+// 被接受的草稿必然能过 commit 硬闸，死锁从根上消除）。存在 error 级违例 →
+// ErrToolPrecondition，引导先修改草稿并重新 check_consistency。
+//
+// 双重调用点：
+//  1. Execute 前置闸（3.7）：创建 pending / 调用 critic 之前拦截——账本保持
+//     为空或 revision_open。pending 状态会被 mutation guard 锁定（禁止修改
+//     草稿），若评审已发起才拦截，用户将无法修改带违例的草稿，制造新死锁。
+//  2. append 侧纵深防御（accepted 落盘前）：草稿在 pending 期间被 guard 锁定，
+//     正常流程不会触发；兜底任何绕过前置闸的路径。
+//
+// 为什么只闸 12 类硬闸而非 check_consistency 的全部 error 违规：
+//   - 死锁链的阻断点是 commit 的文学腔硬闸（CheckLiteraryProseGate）；
+//     review 闸门只需保证"accepted ⇒ 可提交"即可闭环。
+//   - check_consistency 其余 error（如 chapter_words 字数 3000-6000 上下界、
+//     用户规则违例）不是 commit 阻断项——review 若拦截它们，critic 模式下
+//     短章/长章将永远无法 accepted（commit 需 terminal 评审），制造新的死锁。
+//
+// 死锁防护：Critic 一旦对仍带文学腔 error 的草稿给出 pass（accepted_*），
+// terminal 快照权威会禁止一切修改（mutation guard），commit 又被文学腔硬闸
+// 拒绝，/style-override 只接受 exhausted——章节即被永久锁死。此闸保证
+// "被接受的草稿"文学腔硬闸必然干净。
+func (t *ReviewStyleTool) checkMechanicalGate(chapter int) error {
+	content, _, err := t.store.Drafts.LoadChapterContent(chapter)
+	if err != nil {
+		return fmt.Errorf("load chapter content for mechanical gate: %w: %w", errs.ErrStoreRead, err)
+	}
+	if content == "" {
+		return fmt.Errorf("章节 %d 无草稿: %w", chapter, errs.ErrToolPrecondition)
+	}
+	if !hasErrorViolations(rules.CheckLiteraryProse(content)) {
+		return nil
+	}
+	return fmt.Errorf("章节 %d 存在 error 级文学腔硬闸违例，不能接受评审结果：请先修改草稿并重新 check_consistency，再 review_style: %w",
+		chapter, errs.ErrToolPrecondition)
+}
+
 func (t *ReviewStyleTool) appendInitialResult(chapter int, attemptID string, request *domain.StyleReviewRequest, result *domain.StyleReviewResult, draftDigest, basisDigest string) (json.RawMessage, error) {
 	var nextStatus domain.StyleReviewStatus
 	switch result.Verdict {
@@ -476,6 +717,13 @@ func (t *ReviewStyleTool) appendInitialResult(chapter int, attemptID string, req
 		nextStatus = domain.ReviewStatusRevisionOpen
 	default:
 		return t.appendDegraded(chapter, attemptID, draftDigest, basisDigest, request, fmt.Errorf("unexpected verdict %q", result.Verdict))
+	}
+
+	// C2 死锁防护：accepted 落盘前重算机械规则，error 级违例 → 拒绝（账本保持 pending）。
+	if nextStatus == domain.ReviewStatusAcceptedInitial {
+		if err := t.checkMechanicalGate(chapter); err != nil {
+			return nil, err
+		}
 	}
 
 	now := time.Now().Format(time.RFC3339)
@@ -493,6 +741,7 @@ func (t *ReviewStyleTool) appendInitialResult(chapter int, attemptID string, req
 			Result:      result,
 			DraftDigest: draftDigest,
 			BasisDigest: basisDigest,
+			Epoch:       cur.MaxEpoch(),
 		})
 		return cur, nil
 	}); err != nil {
@@ -511,6 +760,13 @@ func (t *ReviewStyleTool) appendFinalResult(chapter int, attemptID string, reque
 		nextStatus = domain.ReviewStatusRevisionOpen // V2: loop back to revision_open by default
 	default:
 		return nil, fmt.Errorf("unexpected verdict %q for final review", result.Verdict)
+	}
+
+	// C2 死锁防护：accepted 落盘前重算机械规则，error 级违例 → 拒绝（账本保持 pending）。
+	if nextStatus == domain.ReviewStatusAcceptedRev {
+		if err := t.checkMechanicalGate(chapter); err != nil {
+			return nil, err
+		}
 	}
 
 	now := time.Now().Format(time.RFC3339)
@@ -546,6 +802,7 @@ func (t *ReviewStyleTool) appendFinalResult(chapter int, attemptID string, reque
 			Result:      result,
 			DraftDigest: draftDigest,
 			BasisDigest: basisDigest,
+			Epoch:       cur.MaxEpoch(),
 		})
 		return cur, nil
 	}); err != nil {
@@ -579,6 +836,7 @@ func (t *ReviewStyleTool) appendDegraded(chapter int, attemptID string, draftDig
 			return nil, nil
 		}
 		entry.Cycle = len(cur.Cycles) + 1
+		entry.Epoch = cur.MaxEpoch()
 		cur.Cycles = append(cur.Cycles, entry)
 		return cur, nil
 	}); err != nil {
@@ -725,6 +983,8 @@ func loadChapterContract(st *store.Store, chapter int) *domain.ChapterContract {
 // loadAnchorExcerpts 加载与当前章节匹配的锚点 excerpts（bounded projection）。
 // 使用与 Writer context 相同的章节过滤逻辑（ToInjectionView），
 // 截断使用 rune-safe 方式，永不 byte-slice。
+// 单条投影上限 200 runes；总预算 3000 runes（= 15 条 × 200），
+// 与 schema 的 15 条/15000 字符上限保持同步，超出后追加省略标记。
 func loadAnchorExcerpts(st *store.Store, chapter int) []string {
 	result := st.StyleAnchors.LoadManual()
 	if result.Anchors == nil {
@@ -742,7 +1002,7 @@ func loadAnchorExcerpts(st *store.Store, chapter int) []string {
 		}
 		excerpts = append(excerpts, snippet)
 		totalRunes += utf8.RuneCountInString(snippet)
-		if totalRunes > 2000 {
+		if totalRunes > 3000 {
 			excerpts = append(excerpts, "...(more)")
 			break
 		}

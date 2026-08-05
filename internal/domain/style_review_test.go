@@ -771,6 +771,70 @@ func TestValidateLedger_TerminalBlocksSubsequent(t *testing.T) {
 	}
 }
 
+// ── Degraded retry: new attempt after degraded (transient call failure) ──
+
+// degraded 是评审调用故障（瞬态），允许在其后追加新的 initial_pending attempt，
+// 完成初评（accepted_initial）后账本仍然合法。
+func TestValidateLedger_DegradedAllowsNewInitialAttempt(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, mkEntry(2, ReviewStatusDegraded, ReviewVerdictPass))
+	l.Cycles = append(l.Cycles, mkEntry(3, ReviewStatusInitialPending, ReviewVerdictPass))
+	l.Cycles = append(l.Cycles, mkEntry(4, ReviewStatusAcceptedInitial, ReviewVerdictPass))
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("degraded → new initial attempt → accepted_initial should be valid: %v", err)
+	}
+}
+
+// 终审失败降级后，允许追加新的 final_pending attempt，完成终审（accepted_revised）。
+func TestValidateLedger_DegradedAllowsNewFinalAttempt(t *testing.T) {
+	l := validFlow(ReviewStatusFinalPending) // cycles 1-3: initial_pending → revision_open → final_pending
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 4, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T13:00:00Z",
+		AttemptID:   "a2",
+		Request:     &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+		Error:       "critic returned empty output",
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 5, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T14:00:00Z",
+		AttemptID:   "a3",
+		Request:     &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 6, Status: ReviewStatusAcceptedRev, CreatedAt: "2026-07-25T15:00:00Z",
+		AttemptID:   "a3",
+		Request:     &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("degraded → new final attempt → accepted_revised should be valid: %v", err)
+	}
+}
+
+// degraded 后必须接 pending attempt，直接跳到 terminal（accepted_initial）非法。
+func TestValidateLedger_DegradedRejectsDirectTerminalFollowup(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, mkEntry(2, ReviewStatusDegraded, ReviewVerdictPass))
+	l.Cycles = append(l.Cycles, mkEntry(3, ReviewStatusAcceptedInitial, ReviewVerdictPass))
+	err := ValidateLedger(l)
+	if err == nil {
+		t.Fatal("degraded → accepted_initial directly must be invalid (missing new attempt)")
+	}
+}
+
+// 其他 terminal 状态（accepted_initial）仍不得有后续周期。
+func TestValidateLedger_AcceptedInitialStillTerminal(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, mkEntry(2, ReviewStatusAcceptedInitial, ReviewVerdictPass))
+	l.Cycles = append(l.Cycles, mkEntry(3, ReviewStatusInitialPending, ReviewVerdictPass))
+	err := ValidateLedger(l)
+	if err == nil {
+		t.Fatal("accepted_initial must remain terminal (no subsequent cycles)")
+	}
+}
+
 // ── Digest helpers ──────────────────────────────────────────────────
 
 func TestDigestDraft_Format(t *testing.T) {
@@ -868,8 +932,6 @@ func mkEntry(cycle int, status StyleReviewStatus, verdict StyleReviewVerdict) St
 	}
 	return e
 }
-
-
 
 // validFlow builds a multi-cycle critic-mode ledger following the V1 graph
 // up through the given terminal status.
@@ -1135,5 +1197,118 @@ func TestDetectStagnation_NilResult(t *testing.T) {
 	ledger := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic}
 	if DetectFinalReviewStagnation(ledger, nil) {
 		t.Fatal("nil result → no stagnation")
+	}
+}
+
+// ── Epoch state machine: 禁止倒退/跳号/负数 ────────────────────────────
+
+// TestValidateLedger_EpochRegressionRejected 验证 epoch 倒退被拒绝：
+// epoch 2 的 terminal 之后不允许出现 epoch 1 的周期。
+func TestValidateLedger_EpochRegressionRejected(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			mkEntry(1, ReviewStatusInitialPending, ReviewVerdictPass),
+			mkEntry(2, ReviewStatusAcceptedInitial, ReviewVerdictPass),
+			mkEntry(3, ReviewStatusInitialPending, ReviewVerdictPass),
+		},
+	}
+	l.Cycles[0].Epoch = 2
+	l.Cycles[1].Epoch = 2
+	l.Cycles[2].Epoch = 1 // 倒退：2 → 1
+	err := ValidateLedger(l)
+	if err == nil {
+		t.Fatal("epoch regression must be rejected")
+	}
+	if !strings.Contains(err.Error(), "regression") && !strings.Contains(err.Error(), "epoch") {
+		t.Errorf("expected epoch regression error, got: %v", err)
+	}
+}
+
+// TestValidateLedger_EpochJumpRejected 验证 epoch 跳号被拒绝：
+// 新 epoch 必须 == 旧 epoch + 1（禁止 1 → 3 跳过 2）。
+func TestValidateLedger_EpochJumpRejected(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			mkEntry(1, ReviewStatusInitialPending, ReviewVerdictPass),
+			mkEntry(2, ReviewStatusAcceptedInitial, ReviewVerdictPass),
+			mkEntry(3, ReviewStatusInitialPending, ReviewVerdictPass),
+		},
+	}
+	l.Cycles[0].Epoch = 1
+	l.Cycles[1].Epoch = 1
+	l.Cycles[2].Epoch = 3 // 跳号：1 → 3
+	err := ValidateLedger(l)
+	if err == nil {
+		t.Fatal("epoch jump must be rejected")
+	}
+	if !strings.Contains(err.Error(), "epoch") {
+		t.Errorf("expected epoch transition error, got: %v", err)
+	}
+}
+
+// TestValidateLedger_NegativeEpochRejected 验证负数 epoch 被拒绝。
+func TestValidateLedger_NegativeEpochRejected(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles[0].Epoch = -1
+	err := ValidateLedger(l)
+	if err == nil {
+		t.Fatal("negative epoch must be rejected")
+	}
+	if !strings.Contains(err.Error(), "epoch") {
+		t.Errorf("expected epoch error, got: %v", err)
+	}
+}
+
+// TestValidateLedger_NewEpochFromTerminalValid 验证合法的 epoch 边界：
+// 返工队列章节从旧 epoch 的 terminal（accepted_initial）开启新 epoch（+1）初评合法。
+func TestValidateLedger_NewEpochFromTerminalValid(t *testing.T) {
+	l := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			mkEntry(1, ReviewStatusInitialPending, ReviewVerdictPass),
+			mkEntry(2, ReviewStatusAcceptedInitial, ReviewVerdictPass),
+			mkEntry(3, ReviewStatusInitialPending, ReviewVerdictPass),
+		},
+	}
+	l.Cycles[0].Epoch = 1
+	l.Cycles[1].Epoch = 1
+	l.Cycles[2].Epoch = 2 // accepted_initial(epoch 1) → initial_pending(epoch 2)：合法
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("new epoch from terminal should be valid: %v", err)
+	}
+}
+
+// ── Stagnation: 不跨 epoch ────────────────────────────────────────────
+
+// TestDetectStagnation_CrossEpochNotDetected 验证 stagnation 只扫描同 EpochValue 的
+// cycle：新 epoch 的终审结果与旧 epoch 相同的 finding signature 不触发 exhausted
+// （旧 epoch 权威不跨代延续）。
+func TestDetectStagnation_CrossEpochNotDetected(t *testing.T) {
+	d := testDraft
+	b := testBasis
+	reqInit := &StyleReviewRequest{Prompt: "init", Model: "m"}
+	reqFinal := &StyleReviewRequest{Prompt: "final review", Model: "m"}
+	findA := []StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Problem: "问题A", Suggestion: "改法A"}}
+	findB := []StyleReviewFinding{{Dimension: "hook", Category: "plot", Severity: "error", Problem: "问题B", Suggestion: "改法B"}}
+	revResult := func(f []StyleReviewFinding) *StyleReviewResult {
+		return &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "e", Findings: f}
+	}
+	ledger := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			// epoch 1：initial → revise(findA) → final → revise(findA) → exhausted(findA)
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: reqInit, DraftDigest: d, BasisDigest: b, Epoch: 1},
+			{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z", AttemptID: "a1", Request: reqInit, Result: revResult(findA), DraftDigest: d, BasisDigest: b, Epoch: 1},
+			{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z", AttemptID: "a2", Request: reqFinal, DraftDigest: d, BasisDigest: b, Epoch: 1},
+			{Cycle: 4, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T13:00:00Z", AttemptID: "a2", Request: reqFinal, Result: revResult(findA), DraftDigest: d, BasisDigest: b, Epoch: 1},
+			{Cycle: 5, Status: ReviewStatusExhausted, CreatedAt: "2026-07-25T14:00:00Z", AttemptID: "a2", Request: reqFinal, Result: revResult(findA), DraftDigest: d, BasisDigest: b, Epoch: 1},
+			// epoch 2：initial → revise(findB) → final（当前评审将产出 findA）
+			{Cycle: 6, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T15:00:00Z", AttemptID: "a3", Request: reqInit, DraftDigest: d, BasisDigest: b, Epoch: 2},
+			{Cycle: 7, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T16:00:00Z", AttemptID: "a3", Request: reqInit, Result: revResult(findB), DraftDigest: d, BasisDigest: b, Epoch: 2},
+			{Cycle: 8, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T17:00:00Z", AttemptID: "a4", Request: reqFinal, DraftDigest: d, BasisDigest: b, Epoch: 2},
+		},
+	}
+	// 当前终审结果与 epoch 1 的 findA 相同——但跨 epoch，不得判为停滞。
+	result := revResult(findA)
+	if DetectFinalReviewStagnation(ledger, result) {
+		t.Fatal("cross-epoch identical findings must NOT trigger stagnation")
 	}
 }

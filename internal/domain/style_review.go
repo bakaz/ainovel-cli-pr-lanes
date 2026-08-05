@@ -47,12 +47,14 @@ const (
 //
 //	initial_pending ──accepted_initial──→ [terminal]
 //	initial_pending ──revision_open──────→ final_pending (via next review_style call)
-//	initial_pending ──degraded───────────→ [terminal]
+//	initial_pending ──degraded───────────→ initial_pending (retry: degraded is a transient
+//	                                         call failure, not a review verdict)
 //	revision_open ──final_pending────────→ (via edit→check_consistency→review_style)
 //	final_pending ──accepted_revised─────→ [terminal]
 //	final_pending ──revision_open────────→ (loop: revise → edit → check → final_pending → revise → ...)
 //	final_pending ──exhausted────────────→ (stagnation: repeated identical final findings)
-//	final_pending ──degraded─────────────→ [terminal]
+//	final_pending ──degraded─────────────→ final_pending (retry: degraded is a transient
+//	                                         call failure, not a review verdict)
 //	exhausted ──overridden───────────────→ [terminal]
 
 func (s StyleReviewStatus) Valid() bool {
@@ -103,6 +105,11 @@ var v1Transitions = map[StyleReviewStatus]map[StyleReviewStatus]bool{
 		ReviewStatusExhausted:   true,
 		ReviewStatusDegraded:    true,
 	},
+	ReviewStatusDegraded: {
+		// degraded 是评审调用故障（瞬态），允许在其后发起新的评审 attempt 重试。
+		ReviewStatusInitialPending: true,
+		ReviewStatusFinalPending:   true,
+	},
 	ReviewStatusExhausted: {
 		ReviewStatusOverridden: true,
 	},
@@ -122,6 +129,11 @@ var v2Transitions = map[StyleReviewStatus]map[StyleReviewStatus]bool{
 		ReviewStatusAcceptedRev:  true,
 		ReviewStatusRevisionOpen: true, // V2: revise → revision_open (loop)
 		ReviewStatusDegraded:     true,
+	},
+	ReviewStatusDegraded: {
+		// degraded 是评审调用故障（瞬态），允许在其后发起新的评审 attempt 重试。
+		ReviewStatusInitialPending: true,
+		ReviewStatusFinalPending:   true,
 	},
 	ReviewStatusExhausted: {
 		ReviewStatusOverridden: true, // legacy only
@@ -243,6 +255,10 @@ type StyleReviewRequest struct {
 	Model        string `json:"model,omitempty"`
 	IncludeBasis bool   `json:"include_basis,omitempty"`
 	RequestedAt  string `json:"requested_at,omitempty"`
+	// PolishCheckpointSeq 本次评审发起时绑定到的 polish checkpoint seq（该章最新
+	// "polish" step 的 checkpoint seq）。用于 commit gate 的 seq 绑定校验：评审依据的
+	// polish 不得晚于当前 polish candidate。0 = legacy（未走精修流水线）。
+	PolishCheckpointSeq int64 `json:"polish_checkpoint_seq,omitempty"`
 }
 
 const maxReviewRequestPromptBytes = 8 << 10
@@ -350,6 +366,9 @@ func isStrictAdjacentFinalRevise(ledger *StyleReviewLedger, i int) bool {
 // the same issues despite an edit attempt.  When true the caller should
 // produce exhausted instead of looping back to revision_open.
 //
+// C1（epoch 隔离）：只扫描与当前评审周期相同 EpochValue() 的历史 cycle——stagnation
+// 绑定当前 epoch，旧 epoch 的相同 finding 不触发新返工周期的 exhausted。
+//
 // Only strictly adjacent final cycles are compared — the initial
 // initial_pending → revision_open never triggers exhaustion.
 //
@@ -363,9 +382,14 @@ func DetectFinalReviewStagnation(ledger *StyleReviewLedger, currentResult *Style
 	if currentSig == "" {
 		return false
 	}
+	// 当前评审周期 = 账本最大 epoch（新结果即将追加到该 epoch）。
+	epoch := ledger.MaxEpoch()
 	// Scan backwards for the most recent revision_open that was produced by a
-	// strict adjacent final_pending → revision_open transition.
+	// strict adjacent final_pending → revision_open transition in the SAME epoch.
 	for i := len(ledger.Cycles) - 1; i >= 0; i-- {
+		if ledger.Cycles[i].EpochValue() != epoch {
+			continue
+		}
 		if isStrictAdjacentFinalRevise(ledger, i) {
 			entry := ledger.Cycles[i]
 			if entry.Result != nil {
@@ -400,6 +424,20 @@ type StyleReviewEntry struct {
 	Error       string               `json:"error,omitempty"`
 	Override    *StyleReviewOverride `json:"override,omitempty"`
 	CreatedAt   string               `json:"created_at"` // RFC3339
+	// Epoch 评审周期代数：同一 epoch 内按 V2 状态机流转；返工队列章节可从旧 epoch
+	// 的 terminal 状态（accepted/revised/overridden；exhausted 须先经 /style-override
+	// 覆盖为 overridden）开启新 epoch（Epoch = 旧 max + 1）重新评审。
+	// 0 = legacy（读取时归一化为 1，见 StyleReviewStore.loadUnlocked）。
+	Epoch int `json:"epoch,omitempty"`
+}
+
+// EpochValue 返回归一化后的 epoch：仅 0（legacy 数据/未设置）视为 1；
+// 负数按非法数据处理（由 ValidateLedger 拒绝，不在本方法归一化）。
+func (e StyleReviewEntry) EpochValue() int {
+	if e.Epoch == 0 {
+		return 1
+	}
+	return e.Epoch
 }
 
 // ── StyleReviewLedger ───────────────────────────────────────────────
@@ -431,6 +469,21 @@ func (l *StyleReviewLedger) CurrentStatus() StyleReviewStatus {
 		return c.Status
 	}
 	return ""
+}
+
+// MaxEpoch 返回账本当前最大 epoch（归一化：无周期或全为 0 时返回 1）。
+// 返工队列章节开启新评审周期时 Epoch = MaxEpoch + 1。
+func (l *StyleReviewLedger) MaxEpoch() int {
+	max := 1
+	if l == nil {
+		return max
+	}
+	for _, c := range l.Cycles {
+		if e := c.EpochValue(); e > max {
+			max = e
+		}
+	}
+	return max
 }
 
 // IsUnderReview 返回当前是否处于活跃评审中。空账本返回 false。
@@ -539,7 +592,7 @@ func isValidRFC3339(s string) bool {
 func requestEqual(a, b StyleReviewRequest) bool {
 	return a.Prompt == b.Prompt && a.PromptTrunc == b.PromptTrunc &&
 		a.Model == b.Model && a.IncludeBasis == b.IncludeBasis &&
-		a.RequestedAt == b.RequestedAt
+		a.RequestedAt == b.RequestedAt && a.PolishCheckpointSeq == b.PolishCheckpointSeq
 }
 
 func resultEqual(a, b StyleReviewResult) bool {
@@ -564,7 +617,7 @@ func overrideEqual(a, b StyleReviewOverride) bool {
 func EntriesEqual(a, b StyleReviewEntry) bool {
 	if a.Cycle != b.Cycle || a.Status != b.Status || a.AttemptID != b.AttemptID ||
 		a.DraftDigest != b.DraftDigest || a.BasisDigest != b.BasisDigest ||
-		a.Error != b.Error || a.CreatedAt != b.CreatedAt {
+		a.Error != b.Error || a.CreatedAt != b.CreatedAt || a.Epoch != b.Epoch {
 		return false
 	}
 	if (a.Request == nil) != (b.Request == nil) {
@@ -628,6 +681,10 @@ func validateCycleRules(l *StyleReviewLedger) error {
 		}
 		if !cycle.Status.Valid() {
 			return fmt.Errorf("ledger: cycle[%d] invalid status %q", i, cycle.Status)
+		}
+		// C1-H3：epoch 负数非法（只有 0 允许被读取层归一化为 1）。
+		if cycle.Epoch < 0 {
+			return fmt.Errorf("ledger: cycle[%d] epoch must not be negative, got %d", i, cycle.Epoch)
 		}
 		if !isValidRFC3339(cycle.CreatedAt) {
 			return fmt.Errorf("ledger: cycle[%d] created_at not RFC3339: %q", i, cycle.CreatedAt)
@@ -859,6 +916,22 @@ func validateCycleRules(l *StyleReviewLedger) error {
 	// ── 2. V2 transition edges ──
 	for i := 0; i < len(l.Cycles)-1; i++ {
 		from, to := l.Cycles[i].Status, l.Cycles[i+1].Status
+		fromEpoch, toEpoch := l.Cycles[i].EpochValue(), l.Cycles[i+1].EpochValue()
+		if toEpoch > fromEpoch {
+			// 新 epoch 边界：仅允许从旧 epoch 的 terminal / exhausted 状态开启新一轮
+			// 初评（Epoch = 旧 max + 1），且只允许 +1（禁止跳号如 1→99）。
+			// 同一 epoch 内不允许跨越状态机。
+			if to == ReviewStatusInitialPending && (from.IsTerminal() || from == ReviewStatusExhausted) && toEpoch == fromEpoch+1 {
+				continue
+			}
+			return fmt.Errorf("ledger: invalid epoch transition %q(epoch %d) → %q(epoch %d) at cycles [%d]→[%d]",
+				from, fromEpoch, to, toEpoch, i, i+1)
+		}
+		if toEpoch < fromEpoch {
+			// C1-H3：epoch 禁止倒退。
+			return fmt.Errorf("ledger: epoch regression %q(epoch %d) → %q(epoch %d) at cycles [%d]→[%d]",
+				from, fromEpoch, to, toEpoch, i, i+1)
+		}
 		if !isValidV2Transition(from, to) {
 			return fmt.Errorf("ledger: invalid V2 transition %q → %q at cycles [%d]→[%d]", from, to, i, i+1)
 		}
@@ -867,6 +940,21 @@ func validateCycleRules(l *StyleReviewLedger) error {
 	// ── 3. Terminality ──
 	for i, cycle := range l.Cycles {
 		if i < len(l.Cycles)-1 && cycle.Status.IsTerminal() {
+			next := l.Cycles[i+1]
+			// 新 epoch 边界：terminal 周期后允许开启新 epoch（旧 epoch 权威不跨代延续）。
+			if next.EpochValue() > cycle.EpochValue() {
+				continue
+			}
+			// degraded 是"评审调用故障"（瞬态技术故障，而非评审结论），允许在其后
+			// 追加一个新的评审 attempt（initial_pending/final_pending）以便重试。
+			// 其他 terminal 状态（accepted_initial/accepted_revised/overridden）是
+			// 最终评审权威，不得再有后续周期。
+			if cycle.Status == ReviewStatusDegraded {
+				nextStatus := next.Status
+				if nextStatus == ReviewStatusInitialPending || nextStatus == ReviewStatusFinalPending {
+					continue
+				}
+			}
 			return fmt.Errorf("ledger: cycle[%d] is terminal %q but has subsequent cycles", i, cycle.Status)
 		}
 	}

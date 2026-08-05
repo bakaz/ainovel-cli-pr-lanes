@@ -194,7 +194,7 @@ func TestConflictsWithLongReturnsNil(t *testing.T) {
 			},
 		},
 		{
-			name: "different taboos not a hard conflict",
+			name:    "different taboos not a hard conflict",
 			long:    &StyleRulesLong{Taboos: []string{"避免解释"}},
 			current: &StyleRulesCurrent{Volume: 1, Arc: 1, Taboos: []string{"避免描述"}},
 		},
