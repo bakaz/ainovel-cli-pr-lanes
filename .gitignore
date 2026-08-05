@@ -56,3 +56,7 @@ workspace/
 .slim/deepwork/
 .tools/
 workspace_archived/
+
+# 本地文风素材目录（不入库）
+文风素材/
+文风素材2/

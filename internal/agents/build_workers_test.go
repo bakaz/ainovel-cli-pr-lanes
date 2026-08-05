@@ -558,8 +558,18 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 	if ac.PromptCacheKey == "" || ac.PromptCacheKey == runnerAgentCacheKey(t, runner, "writer") {
 		t.Error("polisher cache key must be independent from writer")
 	}
-	if ac.MaxTurns != 1 {
-		t.Errorf("polisher MaxTurns = %d, want 1", ac.MaxTurns)
+	if ac.MaxTurns != 3 {
+		t.Errorf("polisher MaxTurns = %d, want 3 (1 initial + up to 2 length recoveries)", ac.MaxTurns)
+	}
+	// length 截断 recovery 必须要求整章重输出（默认续写提示会让尾段覆盖草稿）
+	if ac.LengthRecoveryPrompt == "" {
+		t.Error("polisher LengthRecoveryPrompt must be set (restart from chapter title, full chapter)")
+	} else if !strings.Contains(ac.LengthRecoveryPrompt, "重新输出完整的精修后章节") {
+		t.Errorf("polisher LengthRecoveryPrompt should require a full re-output, got %q", ac.LengthRecoveryPrompt)
+	}
+	// mimo-v2.5 真实 max output = 131072：显式覆盖默认 65536，避免 thinking 截断
+	if ac.MaxTokens != 131072 {
+		t.Errorf("polisher MaxTokens = %d, want 131072 (mimo-v2.5 real max output)", ac.MaxTokens)
 	}
 	if len(ac.StopAfterTools) != 0 {
 		t.Errorf("polisher StopAfterTools = %v, want empty (no tools)", ac.StopAfterTools)
@@ -579,6 +589,26 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 	}
 	if !toolInList(writerAC.Tools, "polish_draft") {
 		t.Error("writer should have polish_draft tool when pipeline enabled")
+	}
+	// 其他 agent 不设置 LengthRecoveryPrompt：保持 agentcore 默认 recovery 行为
+	// （style_critic 不在主 runner 注册表，它走独立 criticRunner，此处不查）
+	if writerAC.LengthRecoveryPrompt != "" {
+		t.Errorf("writer LengthRecoveryPrompt = %q, want empty (default behavior)", writerAC.LengthRecoveryPrompt)
+	}
+	if writerAC.MaxTokens != 0 {
+		t.Errorf("writer MaxTokens = %d, want 0 (default behavior)", writerAC.MaxTokens)
+	}
+	for _, name := range []string{"architect_short", "architect_long", "editor"} {
+		other, ok := runner.AgentConfig(name)
+		if !ok {
+			t.Fatalf("agent %s missing", name)
+		}
+		if other.LengthRecoveryPrompt != "" {
+			t.Errorf("%s LengthRecoveryPrompt = %q, want empty (default behavior)", name, other.LengthRecoveryPrompt)
+		}
+		if other.MaxTokens != 0 {
+			t.Errorf("%s MaxTokens = %d, want 0 (default behavior)", name, other.MaxTokens)
+		}
 	}
 
 	// polisher 模型 = 配置的 roles.polisher
