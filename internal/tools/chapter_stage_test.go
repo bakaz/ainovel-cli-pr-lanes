@@ -2,6 +2,7 @@ package tools
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,15 @@ func polishCP(seq int64, digest, stage, model string) *domain.Checkpoint {
 // polishCPAt 构造 OccurredAt 受控的 polish checkpoint（legacy 容差测试用）。
 func polishCPAt(seq int64, digest, stage string, at time.Time) *domain.Checkpoint {
 	return &domain.Checkpoint{Seq: seq, Scope: domain.ChapterScope(1), Step: "polish", Digest: digest, Stage: stage, OccurredAt: at}
+}
+
+// degradedPolishCP 构造 degraded polish checkpoint（polisher 失败降级记录，
+// Degraded=true + ErrorCategory=stream_idle）。
+func degradedPolishCP(seq int64, digest, stage, model string) *domain.Checkpoint {
+	cp := polishCP(seq, digest, stage, model)
+	cp.Degraded = true
+	cp.ErrorCategory = "stream_idle"
+	return cp
 }
 
 // mkLedger 构造指定终态的单章 critic 账本（循环结构合法）。
@@ -522,6 +532,89 @@ func TestComputeChapterStage(t *testing.T) {
 			required:   ChapterActionPolish,
 			nextAction: "polish_draft",
 		},
+		// 24c. degraded polish + digest 匹配 + consistency 未晚于 polish →
+		// needs_post_polish_check（degraded 视为合法 polish 记录，不再 needs_polish）
+		{
+			name: "degraded polish stale consistency -> needs_post_polish_check",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d,
+				LatestConsistency: consistencyCP(6, d), LatestPolish: degradedPolishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageNeedsPostPolishCheck,
+			allowed:    []ChapterAction{ChapterActionCheck},
+			required:   ChapterActionCheck,
+			nextAction: "check_consistency",
+		},
+		// 24d. degraded polish + 后续 check 已通过 → needs_review（推进链继续）
+		{
+			name: "degraded polish fresh post check -> needs_review",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d,
+				LatestConsistency: consistencyCP(8, d), LatestPolish: degradedPolishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageNeedsReview,
+			allowed:    []ChapterAction{ChapterActionReview},
+			required:   ChapterActionReview,
+			nextAction: "review_style",
+		},
+		// 24e. degraded polish 跳过 ExpectedPolisherModel 检查（根本没调模型）：
+		// 即使模型字段与配置不一致也不判 needs_polish（对照 23a）
+		{
+			name: "degraded polish skips model check -> needs_review",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d, ExpectedPolisherModel: "new-model",
+				LatestConsistency: consistencyCP(8, d), LatestPolish: degradedPolishCP(7, d, "draft", "old-model"),
+			},
+			want:       ChapterStageNeedsReview,
+			allowed:    []ChapterAction{ChapterActionReview},
+			required:   ChapterActionReview,
+			nextAction: "review_style",
+		},
+		// 24f. degraded polish 的 stage 检查仍然生效（重写队列期望 rewrite，
+		// 实际 draft）→ needs_polish（重新精修新候选）
+		{
+			name: "degraded polish stage mismatch -> needs_polish",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				DraftExists: true, DraftDigest: d2, FinalExists: true, FinalDigest: final,
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: degradedPolishCP(7, d2, "draft", ""),
+			},
+			want:       ChapterStageNeedsPolish,
+			allowed:    []ChapterAction{ChapterActionPolish},
+			required:   ChapterActionPolish,
+			nextAction: "polish_draft",
+		},
+		// 24g. degraded polish 的 digest 与当前草稿不匹配（degraded 后草稿又被
+		// 修改）→ needs_polish（对"新 digest"重新精修是合法新周期，非死锁）
+		{
+			name: "degraded polish stale digest -> needs_polish",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d2,
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: degradedPolishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageNeedsPolish,
+			allowed:    []ChapterAction{ChapterActionPolish},
+			required:   ChapterActionPolish,
+			nextAction: "polish_draft",
+		},
+		// 24h. 端到端：degraded polish + degraded 账本绑定（R==P）→ needs_commit
+		{
+			name: "degraded polish degraded ledger bound -> needs_commit",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d,
+				ReviewLedger:      mkLedgerBound(domain.ReviewStatusDegraded, d, 7),
+				LatestConsistency: consistencyCP(8, d), LatestPolish: degradedPolishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageNeedsCommit,
+			allowed:    []ChapterAction{ChapterActionCommit},
+			required:   ChapterActionCommit,
+			nextAction: "commit_chapter",
+		},
 		// 25a. legacy review binding（seq==0，同秒）→ needs_commit
 		{
 			name: "legacy binding same second -> needs_commit",
@@ -839,5 +932,148 @@ func TestResolveChapterStage_StoreReadError(t *testing.T) {
 	}
 	if !errors.Is(err, errs.ErrStoreRead) {
 		t.Fatalf("expected ErrStoreRead in chain, got %v", err)
+	}
+}
+
+// ── 改动 2：polish 后 edit（digest 变化）的专门 reason ─────────────────
+
+// TestComputeChapterStage_PostPolishEditReason 验证核心纠错场景：polish 后
+// writer 又 edit 草稿导致 digest 与最后一次 polish checkpoint 不一致时，
+// needs_polish 的 reason 必须给出专门提示（精修后又被修改 + 恢复序列），
+// 而不是笼统的"需要精修当前草稿"；对照场景（无 polish/模型不符/阶段不符）
+// 不得误报。
+func TestComputeChapterStage_PostPolishEditReason(t *testing.T) {
+	const critic = domain.StyleQualityCritic
+	d := dig("draft-content")     // polish checkpoint 记录的 output digest
+	d3 := dig("draft-after-edit") // polish 后又被编辑的当前草稿 digest
+
+	// 核心场景：LatestPolish.OutputDigest(=Digest)=d != 当前草稿 d3。
+	in := ChapterStageInput{
+		PipelineEnabled: true, StyleReviewMode: critic,
+		DraftExists: true, DraftDigest: d3,
+		LatestConsistency: consistencyCP(8, d3), LatestPolish: polishCP(7, d, "draft", ""),
+	}
+	got := ComputeChapterStage(in)
+	if got.Stage != ChapterStageNeedsPolish {
+		t.Fatalf("stage = %s, want needs_polish", got.Stage)
+	}
+	if !strings.Contains(got.Reason, "精修后又被修改") {
+		t.Fatalf("reason 必须标注 polish 后被修改，got %q", got.Reason)
+	}
+	for _, want := range []string{"check_consistency", "polish_draft", "不要直接 commit"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Fatalf("reason 必须含恢复序列 %q，got %q", want, got.Reason)
+		}
+	}
+	// RequiredNextAction 传播同一 reason（模型决策依据唯一来源）。
+	na := got.RequiredNextAction()
+	if na == nil || na.Action != "polish_draft" || !strings.Contains(na.Reason, "精修后又被修改") {
+		t.Fatalf("RequiredNextAction 必须携带专门 reason，got %+v", na)
+	}
+
+	// 对照 1：尚无 polish 记录（首次精修）→ 常规 reason，不得误报。
+	inFirst := ChapterStageInput{
+		PipelineEnabled: true, StyleReviewMode: critic,
+		DraftExists: true, DraftDigest: d,
+		LatestConsistency: consistencyCP(1, d),
+	}
+	if g := ComputeChapterStage(inFirst); g.Stage != ChapterStageNeedsPolish ||
+		strings.Contains(g.Reason, "精修后又被修改") {
+		t.Fatalf("首次精修不得误报 post-polish edit：stage=%s reason=%q", g.Stage, g.Reason)
+	}
+
+	// 对照 2：digest 匹配但 polisher 模型不符 → needs_polish 且不得误报。
+	inModel := ChapterStageInput{
+		PipelineEnabled: true, StyleReviewMode: critic,
+		DraftExists: true, DraftDigest: d, ExpectedPolisherModel: "new-model",
+		LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "draft", "old-model"),
+	}
+	if g := ComputeChapterStage(inModel); g.Stage != ChapterStageNeedsPolish ||
+		strings.Contains(g.Reason, "精修后又被修改") {
+		t.Fatalf("模型不符不得误报 post-polish edit：stage=%s reason=%q", g.Stage, g.Reason)
+	}
+
+	// 对照 3：digest 匹配但 polish stage 不符（rewrite 队列实际记录 draft）→ 不得误报。
+	inStage := ChapterStageInput{
+		PipelineEnabled: true, StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+		DraftExists: true, DraftDigest: d, FinalExists: true, FinalDigest: dig("final-content"),
+		LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "draft", ""),
+	}
+	if g := ComputeChapterStage(inStage); g.Stage != ChapterStageNeedsPolish ||
+		strings.Contains(g.Reason, "精修后又被修改") {
+		t.Fatalf("stage 不符不得误报 post-polish edit：stage=%s reason=%q", g.Stage, g.Reason)
+	}
+}
+
+// ── 改动 1：action-specific recovery 文案 ─────────────────────────────
+
+// TestChapterTransitionError_ActionSpecificRecovery 验证 recovery 按 required
+// action 区分：check/polish/review 给完整调用示例；edit_chapter 必须引导先
+// read_chapter 取逐字 old_string；draft_chapter 必须引导先取上下文再给完整正文
+// （不得输出缺参的不完整调用示例）。
+func TestChapterTransitionError_ActionSpecificRecovery(t *testing.T) {
+	base := func(required ChapterAction) *ChapterTransitionError {
+		return &ChapterTransitionError{
+			Chapter: 3, Stage: ChapterStageNeedsPolish,
+			Attempted: ChapterActionCommit, Required: required,
+			Allowed: []ChapterAction{required}, Reason: "r",
+		}
+	}
+	// 单参直达工具：完整调用示例。
+	for _, a := range []ChapterAction{ChapterActionCheck, ChapterActionPolish, ChapterActionReview} {
+		msg := base(a).Error()
+		want := fmt.Sprintf("下一步：调用 %s({\"chapter\":3})", a)
+		if !strings.Contains(msg, want) {
+			t.Fatalf("%s recovery 缺少 %q：\n%s", a, want, msg)
+		}
+		if !strings.Contains(msg, "required_next_action") {
+			t.Fatalf("%s recovery 必须保留 required_next_action 指引：\n%s", a, msg)
+		}
+	}
+	// edit_chapter：先读草稿取逐字 old_string。
+	emsg := base(ChapterActionEdit).Error()
+	for _, want := range []string{"read_chapter(chapter=3, source='draft')", "old_string", "逐字一致", "edit_chapter"} {
+		if !strings.Contains(emsg, want) {
+			t.Fatalf("edit recovery 缺少 %q：\n%s", want, emsg)
+		}
+	}
+	if strings.Contains(emsg, "调用 edit_chapter({\"chapter\":3})，然后严格执行") {
+		t.Fatalf("edit_chapter 不得给出缺参的不完整调用示例：\n%s", emsg)
+	}
+	// draft_chapter：先取上下文再提供完整正文。
+	dmsg := base(ChapterActionDraft).Error()
+	for _, want := range []string{"read_chapter", "novel_context", "draft_chapter", "content", "mode"} {
+		if !strings.Contains(dmsg, want) {
+			t.Fatalf("draft recovery 缺少 %q：\n%s", want, dmsg)
+		}
+	}
+}
+
+// ── 改动 3：needs_commit reason 携带 commit 参数提示 ──────────────────
+
+// TestComputeChapterStage_NeedsCommitArgsHint 验证 needs_commit 的 reason
+// 附带 commit_chapter 必传参数提示，帮助模型一次提交成功。
+func TestComputeChapterStage_NeedsCommitArgsHint(t *testing.T) {
+	const critic = domain.StyleQualityCritic
+	d := dig("draft-content")
+	in := ChapterStageInput{
+		PipelineEnabled: true, StyleReviewMode: critic,
+		DraftExists: true, DraftDigest: d,
+		ReviewLedger:      mkLedgerBound(domain.ReviewStatusAcceptedInitial, d, 7),
+		LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "draft", ""),
+	}
+	got := ComputeChapterStage(in)
+	if got.Stage != ChapterStageNeedsCommit {
+		t.Fatalf("stage = %s, want needs_commit", got.Stage)
+	}
+	for _, want := range []string{"summary", "characters", "key_events", "world_state_mode"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Fatalf("needs_commit reason 缺少 %q：%q", want, got.Reason)
+		}
+	}
+	// RequiredNextAction 传播同一 reason。
+	na := got.RequiredNextAction()
+	if na == nil || na.Action != "commit_chapter" || !strings.Contains(na.Reason, "world_state_mode") {
+		t.Fatalf("RequiredNextAction 必须携带 commit 参数提示，got %+v", na)
 	}
 }

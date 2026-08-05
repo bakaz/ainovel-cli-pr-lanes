@@ -91,6 +91,8 @@ func (cs *CheckpointStore) append(scope domain.Scope, step, artifact, digest str
 		cp.PolisherModel = polishMeta.PolisherModel
 		cp.Stage = polishMeta.Stage
 		cp.Changed = polishMeta.Changed
+		cp.Degraded = polishMeta.Degraded
+		cp.ErrorCategory = polishMeta.ErrorCategory
 	}
 
 	data, err := json.Marshal(cp)

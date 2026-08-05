@@ -140,6 +140,12 @@ func freshConsistency(cp *domain.Checkpoint, draftDigest string) bool {
 // digest 匹配 + stage 场景匹配（重写队列期望 "rewrite"，其余期望 "draft"）
 // + 显式配置 polisher 模型时模型必须一致（ExpectedPolisherModel 空 = 不检查）。
 // no-op（Changed=false）同样合法——防模型为改而改。
+//
+// degraded polish checkpoint（Degraded=true，精修失败降级记录，正文未变）同样视为
+// 合法 polish 记录：digest 匹配 + stage 匹配即可，跳过 ExpectedPolisherModel 检查
+// ——degraded 根本没调用模型（模型字段仅审计用）。这是"degraded → post-polish
+// check → review"推进链的 FSM 侧开关：degraded 后不再判 needs_polish，杜绝
+// "polish 失败 → 永远 needs_polish → 无脑重派同一章"的生产死锁（ch71 类）。
 func validPolish(in ChapterStageInput, cp *domain.Checkpoint) bool {
 	if cp == nil || !domain.IsValidDigest(cp.Digest) || cp.Digest != in.DraftDigest {
 		return false
@@ -150,6 +156,9 @@ func validPolish(in ChapterStageInput, cp *domain.Checkpoint) bool {
 	}
 	if cp.Stage != expectedStage {
 		return false
+	}
+	if cp.Degraded {
+		return true
 	}
 	if in.ExpectedPolisherModel != "" && cp.PolisherModel != in.ExpectedPolisherModel {
 		return false
@@ -232,8 +241,24 @@ func needsReviewDecision(reason string) ChapterStageDecision {
 	return decision(ChapterStageNeedsReview, []ChapterAction{ChapterActionReview}, ChapterActionReview, reason)
 }
 
+// commitArgsHint 是 needs_commit reason 的固定后缀：commit_chapter 参数多，
+// 模型若不知道必传参数会反复被工具拒参。world_state_mode 仅在重写已完成章节
+// （PendingRewrites 队列）时必传。
+const commitArgsHint = " commit_chapter 需要 summary/characters/key_events 等参数；world_state_mode 仅在重写已完成章节时必传（preserve=纯文风重写/replace=剧情重写）。"
+
 func needsCommitDecision(reason string) ChapterStageDecision {
-	return decision(ChapterStageNeedsCommit, []ChapterAction{ChapterActionCommit}, ChapterActionCommit, reason)
+	return decision(ChapterStageNeedsCommit, []ChapterAction{ChapterActionCommit}, ChapterActionCommit, reason+commitArgsHint)
+}
+
+// postPolishEdit 判断当前草稿是否在最后一次 polish 之后又被修改过：
+// 最后一次 polish checkpoint 存在且 digest（即 output_digest，见
+// domain.Checkpoint 注释）合法但与当前草稿 digest 不一致。
+// 这是生产日志中 needs_polish 反复拒绝的最大错误源——writer 在 polish 后
+// 继续 edit 草稿，导致 polish checkpoint digest 失效、commit 被拒。
+func postPolishEdit(in ChapterStageInput) bool {
+	return in.LatestPolish != nil &&
+		domain.IsValidDigest(in.LatestPolish.Digest) &&
+		in.LatestPolish.Digest != in.DraftDigest
 }
 
 // ── ComputeChapterStage：纯函数状态机计算器 ──────────────────────────
@@ -321,8 +346,12 @@ func ComputeChapterStage(in ChapterStageInput) ChapterStageDecision {
 			if terminalCurrent {
 				return blockedDecision("终审候选缺少合法 polish 绑定，正文已锁定", "显式开启新的重写/评审周期")
 			}
+			reason := "首次 consistency 已通过，需要精修当前草稿"
+			if postPolishEdit(in) {
+				reason = "草稿在精修后又被修改（digest 与最后一次 polish 记录不一致）：必须重新 check_consistency → polish_draft → check_consistency → 再 review/commit，不要直接 commit"
+			}
 			return decision(ChapterStageNeedsPolish,
-				[]ChapterAction{ChapterActionPolish}, ChapterActionPolish, "首次 consistency 已通过，需要精修当前草稿")
+				[]ChapterAction{ChapterActionPolish}, ChapterActionPolish, reason)
 		}
 		if in.LatestConsistency.Seq <= in.LatestPolish.Seq {
 			return decision(ChapterStageNeedsPostPolishCheck,
@@ -479,6 +508,26 @@ type ChapterTransitionError struct {
 	Recovery  string
 }
 
+// recoveryHint 按 required action 生成 action-specific 的 recovery 文案。
+// check_consistency/polish_draft/review_style 是单参直达工具，直接给完整调用示例；
+// edit_chapter/draft_chapter 需要多参/正文——若只给 {"chapter":N} 是不完整调用，
+// 模型照抄必再错（生产日志最大错误源之一），因此给出"先取数、再调用"的指引。
+// blocked 阶段不走本函数（见 Error()），Recovery 字段已含升级人工的文案。
+func recoveryHint(required ChapterAction, chapter int) string {
+	switch required {
+	case ChapterActionCheck, ChapterActionPolish, ChapterActionReview:
+		return fmt.Sprintf("调用 %s({\"chapter\":%d})，然后严格执行其 required_next_action。", required, chapter)
+	case ChapterActionEdit:
+		return fmt.Sprintf("先 read_chapter(chapter=%d, source='draft') 读取当前草稿，从草稿中精确复制唯一的 old_string（含空白），再调用 edit_chapter({\"chapter\":%d, \"old_string\":..., \"new_string\":...})；old_string 必须与草稿逐字一致。",
+			chapter, chapter)
+	case ChapterActionDraft:
+		return fmt.Sprintf("先 read_chapter(chapter=%d, source='draft')/novel_context 获取上下文，再调用 draft_chapter({\"chapter\":%d, \"content\":\"完整正文\", \"mode\":\"write\"|\"append\"})。",
+			chapter, chapter)
+	default:
+		return "根据 reason 提示执行正确的下一步动作，然后严格执行其 required_next_action。"
+	}
+}
+
 func (e *ChapterTransitionError) Error() string {
 	required := string(e.Required)
 	if required == "" {
@@ -496,8 +545,8 @@ func (e *ChapterTransitionError) Error() string {
 	if allowedStr == "" {
 		allowedStr = "none"
 	}
-	return fmt.Sprintf("code=chapter_fsm_transition_denied chapter=%d stage=%s attempted=%s required=%s allowed=[%s] reason=%s 下一步：调用 %s({\"chapter\":%d})，然后严格执行其 required_next_action。",
-		e.Chapter, e.Stage, e.Attempted, required, allowedStr, e.Reason, e.Required, e.Chapter)
+	return fmt.Sprintf("code=chapter_fsm_transition_denied chapter=%d stage=%s attempted=%s required=%s allowed=[%s] reason=%s 下一步：%s",
+		e.Chapter, e.Stage, e.Attempted, required, allowedStr, e.Reason, recoveryHint(e.Required, e.Chapter))
 }
 
 func (e *ChapterTransitionError) Unwrap() error { return errs.ErrToolPrecondition }

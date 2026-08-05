@@ -301,6 +301,8 @@ func CheckLiteraryProseGate(st *store.Store, chapter int) error {
 
 // polishCheckpointMatches 返回章节是否存在 digest 与当前草稿匹配的 polish checkpoint。
 // 供 commit gate / review_style / check_consistency 共用同一"fresh polish"判定。
+// degraded polish checkpoint（精修失败降级记录，Digest=当前草稿）同样匹配——
+// degraded 后允许 review（review_style 前置检查的 degraded 识别即由此实现）。
 func polishCheckpointMatches(st *store.Store, chapter int, currentDraftDigest string) bool {
 	cp := st.Checkpoints.LatestByStep(domain.ChapterScope(chapter), "polish")
 	return cp != nil && domain.IsValidDigest(cp.Digest) && cp.Digest == currentDraftDigest
@@ -329,6 +331,12 @@ func polishCheckpointMatches(st *store.Store, chapter int, currentDraftDigest st
 //     （无 bypass）——返工路径必须经新 epoch 的 critic 终验后才允许 commit。
 //
 // no-op 允许：changed=false 的 checkpoint 同样满足 fresh 校验（防模型为改而改）。
+//
+// degraded 允许：Degraded=true 的 checkpoint（polisher 失败降级记录，正文未变）同样
+// 满足 fresh 校验；其 polisher 模型检查被跳过（未调用模型，模型字段仅审计用），
+// 但 digest/stage/seq 绑定校验原样执行——degraded 后 review 绑定的正是该记录，
+// R == P 自然成立。这使"polish 失败 → 降级 → check → review → commit"成为
+// 可接受终态，消除永远 needs_polish 的死锁。
 func CheckPolishPipelineGate(st *store.Store, chapter int, expectedPolisherModel string) error {
 	content, _, err := st.Drafts.LoadChapterContent(chapter)
 	if err != nil {
@@ -352,7 +360,9 @@ func CheckPolishPipelineGate(st *store.Store, chapter int, expectedPolisherModel
 
 	// 2. polisher model 一致性（显式配置 roles.polisher 时）。checkpoint 未记录
 	//    polisher 模型（空）同样拒绝——配置了模型就必须能对上，fail-closed。
-	if expectedPolisherModel != "" && polishCP.PolisherModel != expectedPolisherModel {
+	//    degraded checkpoint（polisher 调用失败降级，未调用模型）跳过模型一致性
+	//    检查：其模型字段仅审计用（可能为 unknown/空），不代表配置漂移。
+	if expectedPolisherModel != "" && !polishCP.Degraded && polishCP.PolisherModel != expectedPolisherModel {
 		if polishCP.PolisherModel == "" {
 			return fmt.Errorf("pipeline：章节 %d 的 polish checkpoint 未记录 polisher 模型，与当前配置的 polisher 模型 %s 不一致，请重新调用 polish_draft: %w",
 				chapter, expectedPolisherModel, errs.ErrToolPrecondition)
@@ -421,7 +431,7 @@ func CheckPolishPipelineGate(st *store.Store, chapter int, expectedPolisherModel
 						return fmt.Errorf("pipeline：章节 %d 绑定的 polish checkpoint seq %d 摘要与当前草稿不匹配，请重新执行 polish_draft → check_consistency → review_style: %w",
 							chapter, boundSeq, errs.ErrToolPrecondition)
 					}
-					if expectedPolisherModel != "" && bound.PolisherModel != expectedPolisherModel {
+					if expectedPolisherModel != "" && !bound.Degraded && bound.PolisherModel != expectedPolisherModel {
 						if bound.PolisherModel == "" {
 							return fmt.Errorf("pipeline：章节 %d 绑定的 polish checkpoint seq %d 未记录 polisher 模型，与当前配置的 polisher 模型 %s 不一致，请重新调用 polish_draft: %w",
 								chapter, boundSeq, expectedPolisherModel, errs.ErrToolPrecondition)

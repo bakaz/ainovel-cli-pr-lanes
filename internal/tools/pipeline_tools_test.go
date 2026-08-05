@@ -70,6 +70,46 @@ func TestReviewStyle_PipelineAllowsWithFreshPolish(t *testing.T) {
 	}
 }
 
+// TestReviewStyle_PipelineAllowsWithDegradedPolish 验证 degraded polish checkpoint
+// （polisher 失败降级记录，Digest=当前草稿）同样满足 review_style 的 fresh polish
+// 前置检查（step 5：degraded 后允许 review）——顺序绑定（consistency seq > polish
+// seq）原样生效，评审正常进行。
+func TestReviewStyle_PipelineAllowsWithDegradedPolish(t *testing.T) {
+	draft := "# 一\nabc她心里骂自己丢人，真不要脸。"
+	st := setupCriticStore(t, 1, draft)
+	digest := domain.DigestDraft(draft)
+	if _, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", digest,
+		domain.PolishCheckpointMeta{InputDigest: digest, PolisherModel: "", Stage: "draft", Changed: false, Degraded: true, ErrorCategory: "stream_idle"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	// degraded 后必须重新 check_consistency（consistency seq > polish seq）
+	if _, err := st.Checkpoints.AppendAlways(
+		domain.ChapterScope(1), "consistency_check", "a2", digest,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	tool.SetPipelineEnabled(true)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("review after degraded polish should proceed: %v", err)
+	}
+	var output StyleReviewOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.Verdict != "pass" {
+		t.Errorf("verdict = %q, want pass", output.Verdict)
+	}
+}
+
 // TestReviewStyle_PipelineOrderingRejectsCheckBeforePolish 验证顺序绑定：
 // consistency checkpoint 的 seq 不晚于 polish checkpoint（如 polish 之后未重新
 // check_consistency）→ 评审被拒，引导先 check_consistency。

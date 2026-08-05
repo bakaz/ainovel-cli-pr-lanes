@@ -1203,3 +1203,214 @@ func TestPolishGate_LegacyMissingTimeTolerated(t *testing.T) {
 		t.Fatalf("legacy 绑定时间缺失应按已绑定放行（与 FSM 一致），got: %v", err)
 	}
 }
+
+// ── 14. degraded polish checkpoint（Oracle 方案第 3 步） ────────────────
+//
+// degraded 记录（polisher 失败降级，正文未变、Digest=当前草稿）在 commit gate 中
+// 同样满足 fresh 校验；模型一致性检查被跳过（未调用模型）；digest/stage/seq 绑定
+// 校验原样执行——degraded 后 review 绑定的正是该记录，R == P 自然成立。
+
+// TestPolishGate_DegradedCheckpointPasses 验证 degraded polish checkpoint +
+// 绑定评审（R==P）→ gate 通过。checkpoint 未记录 polisher 模型（空）也不拒绝——
+// degraded 跳过模型一致性检查（对照 TestPolishGate_EmptyCheckpointModelRejected）。
+func TestPolishGate_DegradedCheckpointPasses(t *testing.T) {
+	draft := "精修失败但正文未变的草稿。她心里骂自己丢人，真不要脸。"
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	digest := domain.DigestDraft(draft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a1", digest); err != nil {
+		t.Fatal(err)
+	}
+	// degraded polish checkpoint：Digest=当前草稿、Degraded=true、ErrorCategory=stream_idle、
+	// PolisherModel 为空（未调用模型）
+	dcp, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", digest,
+		domain.PolishCheckpointMeta{InputDigest: digest, PolisherModel: "", Stage: "draft", Changed: false, Degraded: true, ErrorCategory: "stream_idle"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 评审绑定该 degraded 记录的 seq（R == P）
+	basisDigest := ComputeBasisDigest(st, 1, "test-v1")
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: dcp.Seq}},
+			{Cycle: 2, Status: domain.ReviewStatusDegraded, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: dcp.Seq},
+				Error:   "critic call failed"},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CheckPolishPipelineGate(st, 1, "mimo-polisher"); err != nil {
+		t.Fatalf("degraded polish checkpoint must pass the gate (model check skipped): %v", err)
+	}
+}
+
+// TestPolishGate_DegradedStaleDigestRejects 验证 degraded checkpoint 的 fresh
+// 校验仍然生效：Digest 与当前草稿不匹配 → 拒绝并要求重新 polish_draft。
+func TestPolishGate_DegradedStaleDigestRejects(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, "当前草稿。她心里骂自己丢人，真不要脸。"); err != nil {
+		t.Fatal(err)
+	}
+	currentDigest := domain.DigestDraft("当前草稿。她心里骂自己丢人，真不要脸。")
+	// degraded checkpoint 绑定的是旧 digest（草稿在 degraded 后又被修改）
+	if _, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+		domain.PolishCheckpointMeta{InputDigest: currentDigest, PolisherModel: "", Stage: "draft", Changed: false, Degraded: true, ErrorCategory: "stream_idle"},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	err := CheckPolishPipelineGate(st, 1, "mimo-polisher")
+	if err == nil {
+		t.Fatal("degraded checkpoint with stale digest must be rejected (fresh check still applies)")
+	}
+	if !strings.Contains(err.Error(), "重新调用 polish_draft") {
+		t.Errorf("expected re-polish hint, got: %v", err)
+	}
+}
+
+// TestPolishGate_DegradedStageMismatchRejects 验证 degraded checkpoint 的 stage
+// 检查仍然生效：重写队列章节的 degraded 记录 stage=draft → 拒绝（期望 rewrite）。
+func TestPolishGate_DegradedStageMismatchRejects(t *testing.T) {
+	draft := "重写草稿。她心里骂自己丢人，真不要脸。"
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveFinalChapter(1, "旧终稿。"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 100, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.SetPendingRewrites([]int{1}, "打磨"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.SetFlow(domain.FlowPolishing); err != nil {
+		t.Fatal(err)
+	}
+	digest := domain.DigestDraft(draft)
+	dcp, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", digest,
+		domain.PolishCheckpointMeta{InputDigest: digest, PolisherModel: "", Stage: "draft", Changed: false, Degraded: true, ErrorCategory: "max_turns"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 评审绑定该 degraded 记录（stage=draft 与重写场景不匹配）
+	basisDigest := ComputeBasisDigest(st, 1, "test-v1")
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: dcp.Seq}},
+			{Cycle: 2, Status: domain.ReviewStatusDegraded, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: dcp.Seq},
+				Error:   "critic call failed"},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+
+	err = CheckPolishPipelineGate(st, 1, "mimo-polisher")
+	if err == nil {
+		t.Fatal("degraded checkpoint with wrong stage must be rejected (stage check still applies)")
+	}
+	if !strings.Contains(err.Error(), "stage") && !strings.Contains(err.Error(), "rewrite") {
+		t.Errorf("expected stage mismatch rejection, got: %v", err)
+	}
+}
+
+// TestCommitChapter_DegradedPipelinePasses 集成：degraded polish → check →
+// degraded 账本绑定 → commit 工具整体放行（账本留痕，允许跳过 polish 提交）。
+func TestCommitChapter_DegradedPipelinePasses(t *testing.T) {
+	draft := "精修失败但正文未变的草稿。她心里骂自己丢人，真不要脸。"
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	digest := domain.DigestDraft(draft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a1", digest); err != nil {
+		t.Fatal(err)
+	}
+	dcp, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", digest,
+		domain.PolishCheckpointMeta{InputDigest: digest, PolisherModel: "", Stage: "draft", Changed: false, Degraded: true, ErrorCategory: "stream_idle"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	basisDigest := ComputeBasisDigest(st, 1, "test-v1")
+	now := time.Now().Format(time.RFC3339)
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: dcp.Seq}},
+			{Cycle: 2, Status: domain.ReviewStatusDegraded, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: dcp.Seq},
+				Error:   "critic call failed"},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+
+	commitTool := NewCommitChapterTool(st)
+	commitTool.SetPolishPipeline(&PolishPipelineConfig{ExpectedModel: "mimo-polisher"})
+	args, _ := json.Marshal(map[string]any{
+		"chapter": 1, "summary": "测试", "characters": []string{"主角"},
+		"key_events": []string{"事件"},
+	})
+	if _, err := commitTool.Execute(t.Context(), args); err != nil {
+		t.Fatalf("commit with degraded polish checkpoint should succeed (账本留痕放行): %v", err)
+	}
+}

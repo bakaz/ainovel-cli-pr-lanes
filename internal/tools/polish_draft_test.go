@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -643,11 +644,13 @@ func TestPolishDraft_LengthRecoveryThinkingOnly(t *testing.T) {
 	polishCheckpointOf(t, st, 1) // 存在即通过
 }
 
-// TestPolishDraft_LengthRecoveryExhaustedFailClosed：连续三轮 length 截断 →
-// 只调用 3 次、返回 MaxTurnsError（fail-closed）、不保存草稿、不写 polish checkpoint。
+// TestPolishDraft_LengthRecoveryExhaustedDegraded：连续三轮 length 截断 →
+// 只调用 3 次、返回 MaxTurnsError → 降级为 degraded polish checkpoint
+// （ErrorCategory=max_turns）：草稿保持原样（不保存半章），但写入绑定当前草稿
+// digest 的 degraded 记录，FSM 可继续 post-polish check → review，不再死锁。
 // MaxTurns=3 比 agentcore 内部 recovery 预算（defaultMaxLengthRecoveries=3）更保守：
 // 第 4 次调用前即报错，不会走到 StopGuard 放行截断结果。
-func TestPolishDraft_LengthRecoveryExhaustedFailClosed(t *testing.T) {
+func TestPolishDraft_LengthRecoveryExhaustedDegraded(t *testing.T) {
 	draft := strings.Repeat("这是原始草稿。", 30)
 
 	st := setupPolishStore(t, 1, draft)
@@ -658,23 +661,46 @@ func TestPolishDraft_LengthRecoveryExhaustedFailClosed(t *testing.T) {
 	}, 3, testRecoveryPrompt)
 	tool := newEnabledPolishTool(st, polisher)
 
-	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
-	if err == nil {
-		t.Fatal("expected error after consecutive length truncations")
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
 	}
-	if !errors.Is(err, agentcore.ErrMaxTurns) {
-		t.Errorf("err = %v, want agentcore.ErrMaxTurns", err)
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !output.Degraded {
+		t.Fatalf("expected degraded output after MaxTurns exhaustion, got %+v", output)
+	}
+	if output.ErrorCategory != "max_turns" {
+		t.Errorf("error_category = %q, want max_turns", output.ErrorCategory)
+	}
+	if output.Changed {
+		t.Error("degraded must report changed=false (正文未变)")
+	}
+	if output.OutputDigest != domain.DigestDraft(draft) {
+		t.Errorf("output_digest = %s, want digest of original draft", output.OutputDigest)
 	}
 	if calls != 3 {
-		t.Errorf("polisher calls = %d, want 3 (1 initial + 2 recoveries, then fail-closed)", calls)
+		t.Errorf("polisher calls = %d, want 3 (1 initial + 2 recoveries, then MaxTurns)", calls)
 	}
-	// fail-closed：草稿保持原样，不落 polish checkpoint
+	// 草稿保持原样（不保存半章/尾段），但 degraded polish checkpoint 已落盘
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != draft {
 		t.Errorf("draft must remain unchanged after failure")
 	}
-	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
-		t.Error("no polish checkpoint should exist after MaxTurns failure")
+	cp := polishCheckpointOf(t, st, 1)
+	if !cp.Degraded {
+		t.Fatal("expected degraded polish checkpoint after MaxTurns failure")
+	}
+	if cp.ErrorCategory != "max_turns" {
+		t.Errorf("checkpoint error_category = %q, want max_turns", cp.ErrorCategory)
+	}
+	if cp.Digest != domain.DigestDraft(draft) {
+		t.Errorf("checkpoint digest = %s, want current draft digest", cp.Digest)
+	}
+	if cp.Changed {
+		t.Error("degraded checkpoint must have changed=false")
 	}
 }
 
@@ -737,7 +763,8 @@ func TestPolishDraft_LengthTwiceThenComplete(t *testing.T) {
 
 // TestPolishDraft_MaxTurnsErrorNoOuterRetry：复现生产旧配置（MaxTurns=1）下
 // length 截断 → MaxTurnsError 的传播路径。runner 错误必须立即返回，不进入空输出
-// 重试循环（调用次数不得因 polisherEmptyRetryMax=4 而翻倍）。
+// 重试循环（调用次数不得因 polisherEmptyRetryMax=4 而翻倍）；随后降级为 degraded
+// polish checkpoint（ErrorCategory=max_turns）。
 func TestPolishDraft_MaxTurnsErrorNoOuterRetry(t *testing.T) {
 	oldMax, oldBase := polisherEmptyRetryMax, polisherEmptyRetryBase
 	polisherEmptyRetryMax, polisherEmptyRetryBase = 4, time.Millisecond
@@ -745,7 +772,8 @@ func TestPolishDraft_MaxTurnsErrorNoOuterRetry(t *testing.T) {
 		polisherEmptyRetryMax, polisherEmptyRetryBase = oldMax, oldBase
 	}()
 
-	st := setupPolishStore(t, 1, strings.Repeat("这是原始草稿。", 30))
+	draft := strings.Repeat("这是原始草稿。", 30)
+	st := setupPolishStore(t, 1, draft)
 	calls := 0
 	// MaxTurns=1、无专用 recovery prompt：与生产故障（55 章 rewrite 卡死）同构
 	polisher := newMockPolisherCfg(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
@@ -754,12 +782,16 @@ func TestPolishDraft_MaxTurnsErrorNoOuterRetry(t *testing.T) {
 	}, 1, "")
 	tool := newEnabledPolishTool(st, polisher)
 
-	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
-	if err == nil {
-		t.Fatal("expected MaxTurns error")
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
 	}
-	if !errors.Is(err, agentcore.ErrMaxTurns) {
-		t.Errorf("err = %v, want agentcore.ErrMaxTurns", err)
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !output.Degraded || output.ErrorCategory != "max_turns" {
+		t.Fatalf("expected degraded(max_turns) output, got %+v", output)
 	}
 	// 关键断言：max_turns 错误不触发空输出重试，调用次数不乘以 polisherEmptyRetryMax
 	if calls != 1 {
@@ -828,6 +860,276 @@ func TestPolishDraft_MaxTokensPassthrough(t *testing.T) {
 	//（WithMaxTokens 已由 callLLM 追加进 CallOptions）
 	if got := model.maxTokens; got != 131072 {
 		t.Errorf("resolved per-call MaxTokens = %d, want 131072 (WithMaxTokens passthrough)", got)
+	}
+}
+
+// ── 12. degraded polish checkpoint（Oracle 方案第 3 步） ────────────────
+//
+// polisher 经有限重试仍失败（可恢复类错误）→ 不原样失败，而是写入绑定当前草稿
+// digest 的 degraded polish checkpoint（正文未变），FSM 据此推进 post-polish check
+// → review → commit，消除"polish 失败 → 永远 needs_polish → 无脑重派同一章"
+// 的生产死锁（ch71 类）。
+
+// TestPolishDraft_DegradedOnStreamIdle：mock polisher 连续返回 stream idle 超时
+// → 写 degraded checkpoint（Digest=当前草稿、Degraded=true、ErrorCategory=stream_idle）
+// → 返回成功摘要含 Degraded=true。
+func TestPolishDraft_DegradedOnStreamIdle(t *testing.T) {
+	const draft = "她站在窗前。这个句子很长很长，长到读起来非常累，一点都不顺口。"
+	st := setupPolishStore(t, 1, draft)
+	calls := 0
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
+		return nil, fmt.Errorf("provider stream idle timeout: %w", agentcore.ErrProviderStreamIdle)
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !output.Degraded {
+		t.Fatalf("expected degraded output, got %+v", output)
+	}
+	if output.ErrorCategory != "stream_idle" {
+		t.Errorf("error_category = %q, want stream_idle", output.ErrorCategory)
+	}
+	if !output.Polished {
+		t.Error("degraded output must still report polished=true (工具完成留痕，调用方继续推进)")
+	}
+	if output.Changed {
+		t.Error("degraded must report changed=false (正文未变)")
+	}
+	if output.InputDigest != domain.DigestDraft(draft) || output.OutputDigest != domain.DigestDraft(draft) {
+		t.Errorf("degraded digests must both equal current draft digest, got in=%s out=%s",
+			output.InputDigest, output.OutputDigest)
+	}
+	if output.Stage != "draft" {
+		t.Errorf("stage = %q, want draft", output.Stage)
+	}
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1 (runner error returns immediately)", calls)
+	}
+
+	// degraded checkpoint：Digest=当前草稿、Degraded=true、ErrorCategory=stream_idle
+	cp := polishCheckpointOf(t, st, 1)
+	if !cp.Degraded {
+		t.Fatal("expected degraded polish checkpoint")
+	}
+	if cp.ErrorCategory != "stream_idle" {
+		t.Errorf("checkpoint error_category = %q, want stream_idle", cp.ErrorCategory)
+	}
+	if cp.Digest != domain.DigestDraft(draft) {
+		t.Errorf("checkpoint digest = %s, want current draft digest", cp.Digest)
+	}
+	if cp.InputDigest != domain.DigestDraft(draft) {
+		t.Errorf("checkpoint input_digest = %s, want current draft digest", cp.InputDigest)
+	}
+	if cp.Changed {
+		t.Error("degraded checkpoint must have changed=false")
+	}
+	// 草稿保持原样（degraded 不保存任何新正文）
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Errorf("draft must remain unchanged after degraded, got %q", snippet(saved))
+	}
+}
+
+// TestPolishDraft_DegradedOnProviderTimeout：provider timeout（DeadlineExceeded
+// 分类）→ ErrorCategory=timeout。
+func TestPolishDraft_DegradedOnProviderTimeout(t *testing.T) {
+	const draft = "需要精修的草稿。她心里骂自己丢人，真不要脸。"
+	st := setupPolishStore(t, 1, draft)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return nil, fmt.Errorf("provider deadline exceeded: %w", context.DeadlineExceeded)
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !output.Degraded || output.ErrorCategory != "timeout" {
+		t.Fatalf("expected degraded(timeout) output, got %+v", output)
+	}
+	cp := polishCheckpointOf(t, st, 1)
+	if !cp.Degraded || cp.ErrorCategory != "timeout" {
+		t.Fatalf("expected degraded(timeout) checkpoint, got degraded=%v category=%q", cp.Degraded, cp.ErrorCategory)
+	}
+}
+
+// TestPolishDraft_DegradedOnNetworkError：network 类错误（IsFailoverEligible）→
+// ErrorCategory=network。
+func TestPolishDraft_DegradedOnNetworkError(t *testing.T) {
+	const draft = "需要精修的草稿。她心里骂自己丢人，真不要脸。"
+	st := setupPolishStore(t, 1, draft)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return nil, fmt.Errorf("dial tcp: connection refused: %w", agentcore.ErrProviderNetwork)
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !output.Degraded || output.ErrorCategory != "network" {
+		t.Fatalf("expected degraded(network) output, got %+v", output)
+	}
+}
+
+// TestPolishDraft_DegradedRewriteStage：重写队列章节降级 → stage=rewrite。
+func TestPolishDraft_DegradedRewriteStage(t *testing.T) {
+	const draft = "已完成的终稿文本。"
+	st := setupPolishStore(t, 1, draft)
+	if err := st.Drafts.SaveFinalChapter(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 100, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.SetPendingRewrites([]int{1}, "打磨"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.SetFlow(domain.FlowPolishing); err != nil {
+		t.Fatal(err)
+	}
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return nil, agentcore.ErrProviderStreamIdle
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !output.Degraded || output.Stage != "rewrite" {
+		t.Fatalf("expected degraded output with stage=rewrite, got %+v", output)
+	}
+	cp := polishCheckpointOf(t, st, 1)
+	if !cp.Degraded || cp.Stage != "rewrite" {
+		t.Fatalf("expected degraded rewrite checkpoint, got degraded=%v stage=%q", cp.Degraded, cp.Stage)
+	}
+}
+
+// TestPolishDraft_NoDegradeOnCanceled：context.Canceled（用户取消/Host 关闭）→
+// 不可降级：原样返回错误，不写 degraded checkpoint。
+func TestPolishDraft_NoDegradeOnCanceled(t *testing.T) {
+	const draft = "需要精修的草稿。她心里骂自己丢人，真不要脸。"
+	st := setupPolishStore(t, 1, draft)
+	calls := 0
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
+		return nil, context.Canceled
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("expected error for context.Canceled (不可降级)")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled in chain", err)
+	}
+	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
+		t.Error("no degraded checkpoint should exist after context.Canceled")
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Error("draft must remain unchanged")
+	}
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1", calls)
+	}
+}
+
+// TestPolishDraft_NoDegradeOnContentFilter：content filter / 安全拒绝 → 不可降级：
+// 原样返回错误，不写 degraded checkpoint（安全拒绝不能静默绕过）。
+func TestPolishDraft_NoDegradeOnContentFilter(t *testing.T) {
+	const draft = "需要精修的草稿。她心里骂自己丢人，真不要脸。"
+	st := setupPolishStore(t, 1, draft)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return nil, agentcore.ErrProviderContentFilter
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("expected error for content filter (不可降级)")
+	}
+	if !errors.Is(err, agentcore.ErrProviderContentFilter) {
+		t.Errorf("err = %v, want ErrProviderContentFilter in chain", err)
+	}
+	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
+		t.Error("no degraded checkpoint should exist after content filter rejection")
+	}
+}
+
+// TestPolishDraft_DegradedOnlyOnce：同一 digest 已有 degraded 记录后再次 polish
+// 失败 → 不重复降级（原样返回错误），账本只有一条 degraded 记录。防
+// "降级 → 重派 → 再降级"的自循环（正常流程中 FSM 在 degraded 后已不再允许
+// polish_draft，本守卫是纵深防御）。
+func TestPolishDraft_DegradedOnlyOnce(t *testing.T) {
+	const draft = "需要精修的草稿。她心里骂自己丢人，真不要脸。"
+	st := setupPolishStore(t, 1, draft)
+	calls := 0
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
+		return nil, agentcore.ErrProviderStreamIdle
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	// 第一次：降级成功
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("first Execute: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !output.Degraded {
+		t.Fatalf("first call must degrade, got %+v", output)
+	}
+
+	// 第二次（同一 digest 再次失败）：不重复降级，原样返回错误
+	_, err = tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("second failure on same digest must NOT degrade again (must return error)")
+	}
+	if !errors.Is(err, agentcore.ErrProviderStreamIdle) {
+		t.Errorf("second err = %v, want ErrProviderStreamIdle in chain", err)
+	}
+	if calls != 2 {
+		t.Errorf("polisher calls = %d, want 2 (one per Execute)", calls)
+	}
+	// 账本中只有一条 polish 记录，且为 degraded
+	all := st.Checkpoints.All()
+	var polishCount int
+	for _, cp := range all {
+		if cp.Scope.Matches(domain.ChapterScope(1)) && cp.Step == "polish" {
+			polishCount++
+			if !cp.Degraded {
+				t.Error("the single polish checkpoint must be degraded")
+			}
+		}
+	}
+	if polishCount != 1 {
+		t.Errorf("polish checkpoints = %d, want exactly 1 (no repeated degradation)", polishCount)
 	}
 }
 

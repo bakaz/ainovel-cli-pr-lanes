@@ -87,6 +87,16 @@ type Checkpoint struct {
 	PolisherModel string `json:"polisher_model,omitempty"` // 执行精修的 polisher 模型名
 	Stage         string `json:"stage,omitempty"`          // "draft"（初稿精修）或 "rewrite"（返工队列精修）
 	Changed       bool   `json:"changed,omitempty"`        // 精修是否实际改动正文（false=no-op，允许）
+	// Degraded=true 表示这是一条"降级精修记录"：polisher 经有限重试仍失败
+	// （stream idle / provider timeout / network 类 / MaxTurns 等可恢复类错误），
+	// 正文未变、Digest 绑定当前草稿。degraded 记录是"精修不可用"的留痕——
+	// FSM/commit gate 将其视为合法 polish 记录以推进 post-polish check → review，
+	// 消除"polish 必须成功才可推进"导致的永久 needs_polish 死锁。默认 false 兼容
+	// 既有数据。
+	Degraded bool `json:"degraded,omitempty"`
+	// ErrorCategory 是降级原因的稳定分类（stream_idle/max_turns/timeout/network/
+	// rate_limit/overloaded，与 agentcore.ErrorKind 同义），仅审计用，不影响判定。
+	ErrorCategory string `json:"error_category,omitempty"`
 }
 
 // PolishCheckpointMeta 是 polish 步骤 checkpoint 的附加元数据。
@@ -96,4 +106,6 @@ type PolishCheckpointMeta struct {
 	PolisherModel string
 	Stage         string
 	Changed       bool
+	Degraded      bool
+	ErrorCategory string
 }

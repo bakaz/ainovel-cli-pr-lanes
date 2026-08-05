@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -108,6 +109,13 @@ type PolishDraftOutput struct {
 	Error         string `json:"error,omitempty"`
 	// NextStep 明确精修后的强制下一步（FSM：polish → check_consistency → review）。
 	NextStep string `json:"next_step,omitempty"`
+	// Degraded=true 表示精修失败已降级记录（正文未变）：polisher 经有限重试仍失败
+	// （可恢复类错误），写入了绑定当前草稿 digest 的 degraded polish checkpoint。
+	// 调用方应继续执行 post-polish check → review，而不是重试 polish。
+	Degraded bool `json:"degraded,omitempty"`
+	// ErrorCategory 是降级原因的稳定分类（stream_idle/max_turns/timeout/network/
+	// rate_limit/overloaded），审计用。
+	ErrorCategory string `json:"error_category,omitempty"`
 }
 
 func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
@@ -156,7 +164,9 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 	taskText := t.buildPolishTask(a.Chapter, content, wordCount)
 	outputText, err := t.runPolisherWithEmptyRetry(ctx, a.Chapter, taskText)
 	if err != nil {
-		return nil, err
+		// 可降级错误（stream idle / provider timeout / network 类 / MaxTurns）→
+		// 写 degraded polish checkpoint 后返回成功摘要；不可降级原样返回。
+		return t.handlePolisherFailure(a.Chapter, inputDigest, wordCount, err)
 	}
 
 	// ── 6. 校验：非空 / UTF-8 / 最短长度（防"好的，已完成精修"式短文本被当正文保存）/
@@ -201,11 +211,7 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 	}
 
 	// ── 8. 写 polish checkpoint（input_digest/output_digest/polisher_model/stage/changed） ──
-	stage := "draft"
-	progress, pErr := t.store.Progress.Load()
-	if pErr == nil && progress != nil && slices.Contains(progress.PendingRewrites, a.Chapter) {
-		stage = "rewrite"
-	}
+	stage := polishStageForChapter(t.store, a.Chapter)
 	changed := outputDigest != inputDigest
 	polisherModel := t.loadPolisherModelName()
 	if _, err := t.store.Checkpoints.AppendPolish(
@@ -310,6 +316,115 @@ func (t *PolishDraftTool) runPolisherWithEmptyRetry(ctx context.Context, chapter
 	}
 	return "", fmt.Errorf("%w；连续 %d 次空输出（瞬态故障），可稍后重新调用 polish_draft 重试",
 		lastErr, polisherEmptyRetryMax)
+}
+
+// polishStageForChapter 判定精修 stage：重写/打磨队列章节 → "rewrite"，其余 → "draft"。
+// 与 buildPolishTask/写 checkpoint 共用同一判定，保证 normal 与 degraded 路径一致。
+func polishStageForChapter(st *store.Store, chapter int) string {
+	stage := "draft"
+	progress, pErr := st.Progress.Load()
+	if pErr == nil && progress != nil && slices.Contains(progress.PendingRewrites, chapter) {
+		stage = "rewrite"
+	}
+	return stage
+}
+
+// classifyPolishDegradableError 分类 polisher 经有限重试后仍失败的错误：返回
+// （ErrorCategory, 是否可降级）。可降级 → 写入 degraded polish checkpoint 后
+// 推进流水线；不可降级 → 原样返回错误。
+//
+// 可降级（瞬态/可恢复类，agentcore 错误分类，见 .slim/forks/agentcore/errors.go）：
+//   - stream idle 超时：errors.Is(err, agentcore.ErrProviderStreamIdle)
+//   - provider timeout / network / rate_limit / overloaded：
+//     agentcore.IsFailoverEligible（含 stream idle，已先单独判定）
+//   - polisher MaxTurns：errors.Is(err, agentcore.ErrMaxTurns)
+//     （长度截断 recovery 预算耗尽——正文从未被接受，降级留痕优于失败重派）
+//
+// 不可降级（必须原样失败，绝不写 degraded）：
+//   - context.Canceled（用户取消 / Host 关闭）
+//   - content filter / 安全拒绝（ErrProviderContentFilter）
+//   - 其余未分类错误（含空输出重试耗尽、auth、quota、context_overflow）
+func classifyPolishDegradableError(err error) (string, bool) {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return "", false
+	}
+	if errors.Is(err, agentcore.ErrProviderContentFilter) {
+		return "", false
+	}
+	if errors.Is(err, agentcore.ErrMaxTurns) {
+		return "max_turns", true
+	}
+	if errors.Is(err, agentcore.ErrProviderStreamIdle) {
+		return "stream_idle", true
+	}
+	if agentcore.IsFailoverEligible(err) {
+		if reason := agentcore.FailoverReason(err); reason != "" {
+			return reason, true
+		}
+		return "provider", true
+	}
+	return "", false
+}
+
+// handlePolisherFailure 处理 polisher 经有限重试后仍失败的情况：
+//
+// 可降级错误 → 写入绑定当前草稿 digest 的 degraded polish checkpoint（正文不变），
+// 返回成功摘要（Degraded:true + ErrorCategory + 下一步必须 check_consistency）。
+// 这是"degraded polish checkpoint"（Oracle 方案第 3 步）：FSM 将 degraded 记录视作
+// 合法 polish 记录 → 强制 post-polish check → review → commit，消除生产故障
+// "polish 连续失败 → 永远 needs_polish → commit 被拒 → 无脑重派同一章烧钱"
+// （ch71 类死锁）——失败有了可接受终态。
+//
+// 不可降级错误 → 原样返回（无任何 checkpoint 落盘，状态不变）。
+//
+// 降级只允许一次：同一 digest 已存在 degraded polish 记录时不再重复降级（原样返回
+// 错误）——正常情况下 FSM 在 degraded 后已不允许再次 polish_draft（stage 为
+// needs_post_polish_check），本守卫是纵深防御，防"降级 → 重派 → 再降级"自循环。
+func (t *PolishDraftTool) handlePolisherFailure(chapter int, inputDigest string, wordCount int, err error) (json.RawMessage, error) {
+	category, degradable := classifyPolishDegradableError(err)
+	if !degradable {
+		return nil, err
+	}
+	if cp := t.store.Checkpoints.LatestByStep(domain.ChapterScope(chapter), "polish"); cp != nil && cp.Degraded && cp.Digest == inputDigest {
+		return nil, err
+	}
+
+	polisherModel := t.loadPolisherModelName()
+	stage := polishStageForChapter(t.store, chapter)
+	if _, aErr := t.store.Checkpoints.AppendPolish(
+		domain.ChapterScope(chapter), "polish",
+		fmt.Sprintf("drafts/%02d.draft.md", chapter),
+		inputDigest,
+		domain.PolishCheckpointMeta{
+			InputDigest:   inputDigest,
+			PolisherModel: polisherModel,
+			Stage:         stage,
+			Changed:       false,
+			Degraded:      true,
+			ErrorCategory: category,
+		},
+	); aErr != nil {
+		// checkpoint/store 写失败不可降级：原样返回（账本未留痕，状态不变）。
+		return nil, fmt.Errorf("checkpoint polish (degraded): %w", aErr)
+	}
+	slog.Warn("polisher 失败已降级为 degraded polish checkpoint", "module", "tools", "chapter", chapter,
+		"category", category, "digest", inputDigest, "err", err)
+
+	return json.Marshal(PolishDraftOutput{
+		Chapter:       chapter,
+		Polished:      true,
+		Changed:       false,
+		Degraded:      true,
+		ErrorCategory: category,
+		InputDigest:   inputDigest,
+		OutputDigest:  inputDigest,
+		PolisherModel: polisherModel,
+		Stage:         stage,
+		WordCount:     wordCount,
+		Reason: fmt.Sprintf("polisher 经有限重试仍失败（%s），已写入 degraded polish checkpoint，正文未变（digest=%s）",
+			category, inputDigest),
+		NextStep: "精修失败已降级记录（正文未变）。下一步**必须**调用 check_consistency 重新核验；通过后按 required_next_action 继续（review_style → terminal → commit_chapter）",
+	})
 }
 
 // loadPolisherModelName 从 polisher runner 的注册配置读取当前模型名。
