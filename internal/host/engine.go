@@ -76,6 +76,15 @@ type engine struct {
 	repeats int
 	// 失败重试:同指令键仅重试一次,再败问 Arbiter。
 	failedKey string
+	// maxTurnsRetries:max_turns 失败的有界反思重试计数(key=agent+task)。
+	// 与 failedKey 互斥:max_turns 错误不走首败免费重试,直接进反思通道;
+	// 成功即清零(与 failedKey 同位置),计数达 maxTurnsRetryLimit 后交
+	// Arbiter 失败裁定。
+	maxTurnsRetries map[string]int
+	// pendingReflection:待注入下一轮派发的失败反思包(key=agent+task)。
+	// runWorker 派发时拼进实际任务文本(一次性消费);不进 inst.Task,
+	// 保持 trackDeadlock 的 key 稳定。
+	pendingReflection map[string]string
 }
 
 // deadlockConsultAt / deadlockAbortAt:repeats 达到前者问 Arbiter,达到后者硬熔断。
@@ -84,6 +93,10 @@ const (
 	deadlockConsultAt = 3
 	deadlockAbortAt   = 5
 )
+
+// maxTurnsRetryLimit:max_turns 失败后的有界反思重试次数(lib-1 调研:
+// 业界标准为带失败摘要的有界重试 ≤2 次,再送 Arbiter 失败裁定)。
+const maxTurnsRetryLimit = 2
 
 // controlOp 是干预裁定中修改控制状态的动作(边界提交;RFC §3)。
 // text/facts 保留原始咨询上下文:dispatch 对账失败时以新事实重询。
@@ -115,6 +128,8 @@ func (e *engine) start(initial *flow.Instruction) bool {
 		e.deferGateForNext = false
 	}
 	e.lastKey, e.repeats, e.failedKey = "", 0, ""
+	e.maxTurnsRetries = map[string]int{}
+	e.pendingReflection = map[string]string{}
 	go e.run(ctx)
 	return true
 }
@@ -549,10 +564,19 @@ func (e *engine) runWorker(ctx context.Context, inst *flow.Instruction) error {
 	runCtx := agentcore.WithToolProgress(ctx, func(p agentcore.ProgressPayload) {
 		e.observer.workerProgress(p)
 	})
-	_, err := e.workers.Run(runCtx, inst.Agent, inst.Task)
+	// 反思重试注入:max_turns 失败后,把失败反思包拼进本次实际派发的任务文本
+	// (不进 inst.Task,保持 trackDeadlock 的 key 稳定;一次性消费)。
+	// Runner.Run 只接收 agent+task,Reason 不进 worker 提示,故必须在此合并。
+	task := inst.Task
+	if refl := e.takePendingReflection(inst.Agent, inst.Task); refl != "" {
+		task = task + "\n\n[上一次执行反思] " + refl
+	}
+	_, err := e.workers.Run(runCtx, inst.Agent, task)
 	if err == nil {
-		// 成功即清失败追踪:同键的下一次失败重新享有"先重试一次"额度。
+		// 成功即清失败追踪:同键的下一次失败重新享有"先重试一次"额度;
+		// max_turns 反思计数与待注入包同步清零,下次失败重新享有全额额度。
 		e.failedKey = ""
+		e.clearMaxTurnsState(inst.Agent + "\x00" + inst.Task)
 	}
 	e.observer.dispatchFinish(inst.Agent, err != nil)
 	return err
@@ -601,6 +625,13 @@ func (e *engine) handleWorkerError(ctx context.Context, inst *flow.Instruction, 
 		return true
 	}
 
+	// max_turns 不消耗 failedKey 首败免费重试:失败原因已知(轮次耗尽),
+	// 纯重放无意义——直接走带反思的有界重试通道(≤2 次 → Arbiter),
+	// 避免 "polish 超时 / FSM 循环" 型失败无限重烧预算。
+	if errors.Is(werr, agentcore.ErrMaxTurns) {
+		return e.handleMaxTurnsRetry(ctx, inst, werr)
+	}
+
 	key := inst.Agent + "\x00" + inst.Task
 	if e.failedKey != key {
 		// 首败:原指令重试一次(下一轮 Route 重算,事实驱动天然幂等)。
@@ -608,6 +639,14 @@ func (e *engine) handleWorkerError(ctx context.Context, inst *flow.Instruction, 
 		return false
 	}
 	e.failedKey = ""
+	return e.arbitrateWorkerFailure(ctx, inst, werr)
+}
+
+// arbitrateWorkerFailure 走 Arbiter worker_failure 裁定(首败免费重试与
+// max_turns 反思额度均耗尽后的共同出口):retry 返回 false 继续循环,
+// reroute 改派新指令,abort 暂停。返回 stop=true 表示应停止循环。
+func (e *engine) arbitrateWorkerFailure(ctx context.Context, inst *flow.Instruction, werr error) (stop bool) {
+	msg := werr.Error()
 	facts := e.failureFacts("worker_failure", inst, msg)
 	decision, err := runObservedDecision(e.observer, "失败裁定", func() (arbiter.FailureDecision, error) {
 		return arbiter.DecideFailure(ctx, e.arbiterModel, e.failurePrompt, facts)
@@ -630,6 +669,120 @@ func (e *engine) handleWorkerError(ctx context.Context, inst *flow.Instruction, 
 		e.pauseWithNotify(notify.KindWorkerFailure, "失败裁定: "+decision.Reason+contentFilterAdvice(werr))
 		return true
 	}
+}
+
+// handleMaxTurnsRetry 带反思的有界重试通道(max_turns 专用):
+//   - 跳过 failedKey 首败免费重试——失败原因已知(轮次耗尽),纯重放无意义;
+//   - 计数 < maxTurnsRetryLimit:构造失败反思包(FSM stage / required action /
+//     草稿状态 / 策略提示),经 Reason 与 pendingReflection 注入下一轮重派;
+//   - 计数 >= maxTurnsRetryLimit:清计数,交 Arbiter 失败裁定(retry/reroute/abort)。
+//
+// 反思通道自身有上界(≤2 次),不会无限重烧预算;每次注入同时重置僵局计数——
+// 反思重试视作新的尝试窗口,deadlock 咨询(repeats>=3)不会在通道内提前介入,
+// 对其它无进展循环的熔断照常工作。返回 stop=true 表示应停止循环。
+func (e *engine) handleMaxTurnsRetry(ctx context.Context, inst *flow.Instruction, werr error) (stop bool) {
+	key := inst.Agent + "\x00" + inst.Task
+	if e.maxTurnsRetries == nil {
+		e.maxTurnsRetries = map[string]int{}
+		e.pendingReflection = map[string]string{}
+	}
+	if e.maxTurnsRetries[key] >= maxTurnsRetryLimit {
+		// 反思额度耗尽:清计数,交 Arbiter 失败裁定。
+		e.clearMaxTurnsState(key)
+		return e.arbitrateWorkerFailure(ctx, inst, werr)
+	}
+	e.maxTurnsRetries[key]++
+	refl := e.buildMaxTurnsReflection(inst, e.maxTurnsRetries[key], werr)
+	e.pendingReflection[key] = refl
+	// 反思重试视作新的尝试窗口:重置僵局计数(通道 ≤2 次自身上界,
+	// 不需要 repeats 兜底)。
+	e.lastKey, e.repeats = "", 0
+	// 下一轮优先重派同一任务;反思摘要进 Reason(事件/日志可见),不进 Task,
+	// 保持 trackDeadlock 的 key 稳定;反思包同时经 pendingReflection 拼进
+	// 实际任务文本,writer 才能看到(Runner.Run 只接收 agent+task)。
+	e.mu.Lock()
+	e.next = &flow.Instruction{
+		Agent: inst.Agent, Task: inst.Task, Chapter: inst.Chapter,
+		Reason: fmt.Sprintf("反思重试(%d/%d): %s", e.maxTurnsRetries[key], maxTurnsRetryLimit, refl),
+	}
+	e.mu.Unlock()
+	return false
+}
+
+// buildMaxTurnsReflection 组装带反思的失败摘要,注入 max_turns 反思重试轮:
+// 上次失败原因 / FSM stage 与 required action / 草稿状态 / 按失败类型的
+// 策略提示 / 预算提示。全部字段 best-effort:store 读失败即省略,不阻断重派。
+func (e *engine) buildMaxTurnsReflection(inst *flow.Instruction, retry int, werr error) string {
+	var b strings.Builder
+	b.WriteString("上次执行未完成,原因: 达到轮次上限(max turns reached)")
+	if inst.Chapter > 0 {
+		fmt.Fprintf(&b, "; 目标章节: 第 %d 章", inst.Chapter)
+		var stage tools.ChapterStage
+		var required tools.ChapterAction
+		if d, err := tools.ResolveChapterStage(e.store, inst.Chapter, tools.ChapterFSMConfig{Enabled: true}); err == nil {
+			stage, required = d.Stage, d.Required
+			if d.Reason != "" {
+				fmt.Fprintf(&b, "; 流水线判定: %s", d.Reason)
+			}
+		}
+		if draft, err := e.store.Drafts.LoadDraft(inst.Chapter); err == nil {
+			if draft == "" {
+				b.WriteString("; 草稿尚未生成")
+			} else {
+				b.WriteString("; 草稿已存在")
+			}
+		}
+		if stage != "" {
+			fmt.Fprintf(&b, "; 流水线阶段: %s", stage)
+			if required != "" {
+				fmt.Fprintf(&b, ", 当前要求的动作: %s", required)
+			}
+		}
+		// 按失败类型的策略提示。
+		b.WriteString("; 策略提示: ")
+		switch stage {
+		case tools.ChapterStageNeedsPolish, tools.ChapterStageNeedsPostPolishCheck,
+			tools.ChapterStageNeedsReview, tools.ChapterStageRevisionOpen:
+			b.WriteString("疑似卡在精修/评审循环——直接提交当前最佳草稿,不要再次进入修订循环")
+		case tools.ChapterStageNeedsEdit, tools.ChapterStageDraftDirty,
+			tools.ChapterStageNeedsDraft, tools.ChapterStageRewriteNotStarted:
+			b.WriteString("若某工具反复失败,跳过该工具改用替代路径")
+		default:
+			b.WriteString("直接收敛到提交,不要重复已完成的步骤")
+		}
+	}
+	// 预算提示:仍以配置的轮次上限执行,提示尽早收敛到提交。
+	limit := 45
+	var mte *agentcore.MaxTurnsError
+	if errors.As(werr, &mte) && mte.Limit > 0 {
+		limit = mte.Limit
+	}
+	fmt.Fprintf(&b, "; 预算提示: 本轮仍以 %d 轮为上限(反思重试第 %d/%d 次),请在轮次耗尽前收敛到提交",
+		limit, retry, maxTurnsRetryLimit)
+	return b.String()
+}
+
+// clearMaxTurnsState 清空指定 key 的反思计数与待注入反思包。
+func (e *engine) clearMaxTurnsState(key string) {
+	if e.maxTurnsRetries != nil {
+		delete(e.maxTurnsRetries, key)
+	}
+	if e.pendingReflection != nil {
+		delete(e.pendingReflection, key)
+	}
+}
+
+// takePendingReflection 取出并消费待注入的失败反思包(不存在返回空串)。
+func (e *engine) takePendingReflection(agent, task string) string {
+	if e.pendingReflection == nil {
+		return ""
+	}
+	key := agent + "\x00" + task
+	refl := e.pendingReflection[key]
+	if refl != "" {
+		delete(e.pendingReflection, key)
+	}
+	return refl
 }
 
 // contentFilterAdvice 给内容审核拦截的暂停附上用户可执行的出路。
@@ -669,6 +822,14 @@ func (e *engine) failureFacts(kind string, inst *flow.Instruction, errMsg string
 		f.Phase = string(p.Phase)
 		f.NextChapter = p.NextChapter()
 		f.PendingQueue = p.PendingRewrites
+	}
+	// writer 目标章的 FSM 阶段与要求动作(ResolveChapterStage 现场解析;
+	// 读失败或非 writer 任务时留空,best-effort 不阻断裁定)。
+	if inst.Chapter > 0 {
+		if d, err := tools.ResolveChapterStage(e.store, inst.Chapter, tools.ChapterFSMConfig{Enabled: true}); err == nil {
+			f.Stage = string(d.Stage)
+			f.RequiredAction = string(d.Required)
+		}
 	}
 	return f
 }

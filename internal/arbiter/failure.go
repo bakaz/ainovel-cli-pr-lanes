@@ -21,6 +21,11 @@ type FailureFacts struct {
 	NextChapter   int      `json:"next_chapter,omitempty"`
 	PendingQueue  []int    `json:"pending_rewrites,omitempty"`
 	FoundationGap []string `json:"foundation_missing,omitempty"`
+	// Stage / RequiredAction 是 writer 目标章(inst.Chapter>0)的章节流水线
+	// FSM 阶段与要求动作,由 Engine 经 ResolveChapterStage 现场解析;
+	// 读失败或非 writer 任务时为空。供 Arbiter 判断"卡在哪个环节"。
+	Stage          string `json:"stage,omitempty"`
+	RequiredAction string `json:"required_action,omitempty"`
 }
 
 // FailureDecision 失败/僵局裁定。

@@ -450,6 +450,312 @@ func failNTimesGuard() agentcore.StopGuard {
 	}
 }
 
+// ── max_turns 有界反思重试 ──────────────────────────────────────────
+
+// planCallMsg 构造一次合法的 plan_chapter 调用消息(脚本 writer 最小工具调用)。
+func planCallMsg(chapter int) agentcore.Message {
+	return testToolCallMsg("plan_chapter", map[string]any{
+		"chapter": chapter, "title": fmt.Sprintf("第%d章", chapter),
+		"goal": "推进主线", "conflict": "主角遇阻", "hook": "悬念收尾",
+		"style_goal": map[string]any{
+			"focal_filter": "f", "prose_movement": "p", "detail_strategy": "d",
+			"rhythm": "r", "variation_from_recent": "v",
+		},
+	})
+}
+
+// stuckThenCommitState 追踪"前 N 次派发卡轮次、之后正常提交"的 writer 状态
+// (每章独立计数:章切换时复位——验证"成功即清零"预算复位语义)。
+type stuckThenCommitState struct {
+	lastChapter int
+	stuckRuns   int
+	inStuck     bool
+}
+
+// TestEngine_MaxTurnsReflectiveRetryThenArbiter max_turns 有界反思重试通道:
+// writer 每轮都撞轮次上限 → 跳过 failedKey 免费重试,注入反思包重派 2 次
+// (反思文本进入实际任务,Reason 承载摘要)→ 第 3 次失败反思额度耗尽 →
+// Arbiter worker_failure 裁定 abort → 暂停 + 审计。
+func TestEngine_MaxTurnsReflectiveRetryThenArbiter(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("反思重试试书", 2); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("phase: %v", err)
+	}
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{{Chapter: 1, Title: "一", CoreEvent: "s"}}); err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+
+	var gotReflection string
+	// writer 只调 plan_chapter → MaxTurns=1 恒触发 max_turns 错误;
+	// 顺带捕获注入反思包后的实际任务文本。
+	stuck := &scriptedChatModel{fn: func(msgs []agentcore.Message) agentcore.Message {
+		if gotReflection == "" {
+			for _, m := range msgs {
+				if m.Role == agentcore.RoleUser && strings.Contains(m.TextContent(), "[上一次执行反思]") {
+					gotReflection = m.TextContent()
+					break
+				}
+			}
+		}
+		return planCallMsg(1)
+	}}
+	writer := subagent.Config{
+		Name: "writer", Description: "stuck writer",
+		Model: stuck, SystemPrompt: "test", MaxTurns: 1,
+		Tools: []agentcore.Tool{tools.NewPlanChapterTool(st, nil)},
+	}
+	// Arbiter:反思额度耗尽后 worker_failure 裁定 abort。
+	var arbCalls atomic.Int32
+	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		arbCalls.Add(1)
+		return testTextMsg(`{"action":"abort","reason":"writer 反复轮次耗尽,暂停人工介入"}`)
+	}}
+	e, events, done := newTestEngine(t, st, subagent.NewRunner(writer), arb)
+	// critic 模式让 FSM 阶段有意义(无草稿 → needs_draft)。
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("style mode: %v", err)
+	}
+
+	if !e.start(nil) {
+		t.Fatal("engine start")
+	}
+	waitEngineDone(t, done)
+
+	// 原发 1 次 + 反思重试 2 次 = 3 次派发,之后 Arbiter 裁定暂停。
+	// (DISPATCH 事件开始/完成各一条,按 Running 开始态计数,每条派发恰好一条。)
+	var dispatches, maxTurnsErrors int
+	for _, ev := range *events {
+		switch {
+		case ev.Category == "DISPATCH" && ev.Running():
+			dispatches++
+		case ev.Category == "ERROR" && strings.Contains(ev.Summary, "max turns"):
+			maxTurnsErrors++
+		}
+	}
+	if dispatches != 3 {
+		t.Fatalf("应派发 3 次(1 原发 + 2 反思重试), got %d", dispatches)
+	}
+	if maxTurnsErrors != 3 {
+		t.Fatalf("应记录 3 次 max_turns 失败, got %d", maxTurnsErrors)
+	}
+	if got := arbCalls.Load(); got != 1 {
+		t.Fatalf("Arbiter 应只被咨询 1 次(worker_failure), got %d", got)
+	}
+	if e.failedKey != "" {
+		t.Fatalf("max_turns 不得消耗 failedKey 免费重试, failedKey=%q", e.failedKey)
+	}
+	recs, err := st.Decisions.Recent(10)
+	if err != nil {
+		t.Fatalf("decisions: %v", err)
+	}
+	var found bool
+	for _, r := range recs {
+		if r.Kind == "worker_failure" && r.Decider == "arbiter" {
+			found = true
+			if !strings.Contains(string(r.Decision), "abort") {
+				t.Fatalf("裁定内容应含 abort: %s", r.Decision)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("worker_failure 裁定必须落盘: %+v", recs)
+	}
+	// 反思包注入验证:重派轮的实际任务文本含失败原因/FSM stage/草稿状态。
+	for _, want := range []string{"max turns", "needs_draft", "草稿尚未生成", "预算提示"} {
+		if !strings.Contains(gotReflection, want) {
+			t.Fatalf("反思包应包含 %q, got: %s", want, gotReflection)
+		}
+	}
+}
+
+// TestEngine_MaxTurnsRetryBudgetResetsOnSuccess 反思预算"成功即清零":
+// 两章书每章先撞 2 次 max_turns(反思重试)再成功提交 → 每章各享全额
+// 2 次反思额度,完本后反思状态清空。
+func TestEngine_MaxTurnsRetryBudgetResetsOnSuccess(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("预算复位试书", 2); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("phase: %v", err)
+	}
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "第一章", CoreEvent: "开端"},
+		{Chapter: 2, Title: "第二章", CoreEvent: "终局"},
+	}); err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+
+	// 每章:前 2 次派发只调 plan_chapter(轮次耗尽),第 3 次起完整提交。
+	stuck := &stuckThenCommitState{}
+	model := &scriptedChatModel{fn: func(msgs []agentcore.Message) agentcore.Message {
+		chapter, toolResults := 0, 0
+		for _, m := range msgs {
+			if m.Role == agentcore.RoleUser {
+				if match := chapterRe.FindStringSubmatch(m.TextContent()); match != nil {
+					chapter, _ = strconv.Atoi(match[1])
+				}
+			}
+			if m.Role == agentcore.RoleTool {
+				toolResults++
+			}
+		}
+		if toolResults == 0 {
+			// 新一轮派发起点:按章计 stuck 次数(每章独立 2 次额度)。
+			if chapter != stuck.lastChapter {
+				stuck.lastChapter, stuck.stuckRuns = chapter, 0
+			}
+			stuck.stuckRuns++
+			stuck.inStuck = stuck.stuckRuns <= 2
+		}
+		if stuck.inStuck {
+			return planCallMsg(chapter)
+		}
+		switch toolResults {
+		case 0:
+			return planCallMsg(chapter)
+		case 1:
+			return testToolCallMsg("draft_chapter", map[string]any{
+				"chapter": chapter, "mode": "write",
+				"content": strings.Repeat(fmt.Sprintf("第%d章的正文段落,主角在黑暗中摸索前行。她心里骂自己丢人,真不要脸。", chapter), 20),
+			})
+		case 2:
+			return testToolCallMsg("check_consistency", map[string]any{"chapter": chapter})
+		default:
+			return testToolCallMsg("commit_chapter", map[string]any{
+				"chapter": chapter, "summary": fmt.Sprintf("第%d章摘要", chapter),
+				"characters": []string{"主角"}, "key_events": []string{"推进"},
+				"hook_type": "crisis", "world_state_mode": "preserve",
+			})
+		}
+	}}
+	writer := subagent.Config{
+		Name: "writer", Description: "stuck then commit writer",
+		Model: model, SystemPrompt: "test", MaxTurns: 6,
+		Tools: []agentcore.Tool{
+			tools.NewPlanChapterTool(st, nil), tools.NewDraftChapterTool(st, nil),
+			tools.NewCheckConsistencyTool(st), tools.NewCommitChapterTool(st),
+		},
+		StopAfterTools: []string{"commit_chapter"},
+	}
+	e, events, done := newTestEngine(t, st, subagent.NewRunner(writer), nil)
+
+	if !e.start(nil) {
+		t.Fatal("engine start")
+	}
+	waitEngineDone(t, done)
+
+	progress, err := st.Progress.Load()
+	if err != nil || progress == nil {
+		t.Fatalf("load progress: %v", err)
+	}
+	if progress.Phase != domain.PhaseComplete || len(progress.CompletedChapters) != 2 {
+		t.Fatalf("两章应写满完本: phase=%s completed=%v", progress.Phase, progress.CompletedChapters)
+	}
+	// 每章 3 次派发(2 反思重试 + 1 成功提交),共 6 次;4 次 max_turns 失败。
+	// (DISPATCH 事件开始/完成各一条,按 Running 开始态计数。)
+	var dispatches, maxTurnsErrors int
+	for _, ev := range *events {
+		switch {
+		case ev.Category == "DISPATCH" && ev.Running():
+			dispatches++
+		case ev.Category == "ERROR" && strings.Contains(ev.Summary, "max turns"):
+			maxTurnsErrors++
+		}
+	}
+	if dispatches != 6 {
+		t.Fatalf("每章应 3 次派发(共 6), got %d", dispatches)
+	}
+	if maxTurnsErrors != 4 {
+		t.Fatalf("每章应 2 次 max_turns 失败(共 4), got %d", maxTurnsErrors)
+	}
+	// 成功即清零:完本后反思计数与待注入包必须清空(上面 4 次失败已证明
+	// 每章独立获得 2 次额度,即上一章成功提交后计数被清零)。
+	if len(e.maxTurnsRetries) != 0 || len(e.pendingReflection) != 0 {
+		t.Fatalf("成功提交后反思状态必须清零: retries=%v reflections=%v", e.maxTurnsRetries, e.pendingReflection)
+	}
+}
+
+// TestEngine_MaxTurnsReflectionInjectedAndBudgetBoundary 直接验证反思通道:
+// 反思包注入 Reason(失败原因 + FSM stage,Task 不变保 deadlock key 稳定)、
+// 计数 ≤2、额度耗尽后交 Arbiter(abort → 暂停)、不触碰 failedKey。
+func TestEngine_MaxTurnsReflectionInjectedAndBudgetBoundary(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("反思边界试书", 2); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("phase: %v", err)
+	}
+	var arbCalls atomic.Int32
+	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		arbCalls.Add(1)
+		return testTextMsg(`{"action":"abort","reason":"反思额度耗尽,暂停"}`)
+	}}
+	e, _, _ := newTestEngine(t, st, subagent.NewRunner(), arb)
+	// critic 模式让 FSM 阶段有意义(无草稿 → needs_draft)。
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("style mode: %v", err)
+	}
+
+	inst := &flow.Instruction{Agent: "writer", Task: "写第 1 章", Chapter: 1}
+	werr := &agentcore.MaxTurnsError{Limit: 45}
+	key := inst.Agent + "\x00" + inst.Task
+
+	if stop := e.handleMaxTurnsRetry(t.Context(), inst, werr); stop {
+		t.Fatal("第 1 次失败应进入反思重试而非停止")
+	}
+	if e.maxTurnsRetries[key] != 1 {
+		t.Fatalf("反思计数应为 1, got %d", e.maxTurnsRetries[key])
+	}
+	e.mu.Lock()
+	next := e.next
+	e.mu.Unlock()
+	if next == nil || next.Task != inst.Task || next.Chapter != inst.Chapter {
+		t.Fatalf("反思重试必须原样重派同一任务(Task 不变,deadlock key 稳定): %+v", next)
+	}
+	for _, want := range []string{"max turns", "needs_draft", "反思重试(1/2)"} {
+		if !strings.Contains(next.Reason, want) {
+			t.Fatalf("Reason 应包含 %q, got: %s", want, next.Reason)
+		}
+	}
+	if e.pendingReflection[key] == "" {
+		t.Fatal("反思包必须排入待注入(pendingReflection)")
+	}
+	if e.failedKey != "" {
+		t.Fatalf("max_turns 不得设置 failedKey(免费重试通道), got %q", e.failedKey)
+	}
+
+	if stop := e.handleMaxTurnsRetry(t.Context(), inst, werr); stop {
+		t.Fatal("第 2 次失败应进入反思重试而非停止")
+	}
+	if e.maxTurnsRetries[key] != 2 {
+		t.Fatalf("反思计数应为 2, got %d", e.maxTurnsRetries[key])
+	}
+
+	if stop := e.handleMaxTurnsRetry(t.Context(), inst, werr); !stop {
+		t.Fatal("第 3 次失败反思额度耗尽应交 Arbiter 并暂停")
+	}
+	if got := arbCalls.Load(); got != 1 {
+		t.Fatalf("Arbiter 应只咨询 1 次, got %d", got)
+	}
+	if _, ok := e.maxTurnsRetries[key]; ok {
+		t.Fatal("额度耗尽后计数必须清除")
+	}
+}
+
 // TestEngine_RetriesUnfinishedPlanStart 启动裁定失败后的自愈路径:StartPrompt 已落盘、
 // PlanStart 缺位(启动时模型故障)→ 引擎起动时现场补裁 → 固化 PlanStartRecord → 派发规划师。
 // 规划师不落盘 → 走既有僵局路径停机,证明补裁后引擎回到正常轨道。
