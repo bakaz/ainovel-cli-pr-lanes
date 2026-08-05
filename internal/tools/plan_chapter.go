@@ -25,7 +25,7 @@ func NewPlanChapterTool(store *store.Store, contract *projectprofile.SceneBeatCo
 
 func (t *PlanChapterTool) Name() string { return "plan_chapter" }
 func (t *PlanChapterTool) Description() string {
-	return "保存章节写作构思。Agent 自主决定规划粒度，不强制场景拆分"
+	return "保存章节写作构思。Agent 自主决定规划粒度，不强制场景拆分。style_goal 必须传单个对象，不要用数组包裹"
 }
 func (t *PlanChapterTool) Label() string { return "规划章节" }
 
@@ -50,7 +50,7 @@ func (t *PlanChapterTool) Schema() map[string]any {
 		schema.Property("hook_goal", schema.String("可选：章末希望驱动的追读欲望或悬念目标")),
 		schema.Property("style_goal", map[string]any{
 			"type":        "object",
-			"description": "本章风格目标：必须提供全部五个正向指导字段（每个字段 ≤200 字）。字段名固定：focal_filter, prose_movement, detail_strategy, rhythm, variation_from_recent",
+			"description": "本章风格目标：必须提供全部五个正向指导字段（每个字段 ≤200 字）。字段名固定：focal_filter, prose_movement, detail_strategy, rhythm, variation_from_recent。必须传单个对象，不要用数组包裹（如 `[{\"focal_filter\": ...}]`）或 JSON 字符串",
 			"properties": map[string]any{
 				"focal_filter":          schema.String("视角/焦点过滤：POV 选择、信息披露策略（≤200 字）"),
 				"prose_movement":        schema.String("叙述推进方式：场景流、过渡风格（≤200 字）"),
