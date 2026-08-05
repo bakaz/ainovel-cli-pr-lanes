@@ -135,11 +135,14 @@ type RoleConfig struct {
 // knownRoles 支持的可配置角色名。Arbiter 当前不开放角色级配置，
 // 统一使用顶层默认模型（host.arbiterModel 用 models.Default）。
 // critic 配置为可选，未配时回落默认模型。
+// polisher 配置为可选，未配时回落默认模型；配置存在即视为启用精修流水线
+// （另见 Config.ChapterPipelineEnabled）。
 var knownRoles = map[string]bool{
 	"architect": true,
 	"writer":    true,
 	"editor":    true,
 	"critic":    true,
+	"polisher":  true,
 }
 
 // Config 小说应用配置。
@@ -169,6 +172,13 @@ type Config struct {
 	// 或把大窗口模型钉在更小的值上提前触发压缩（1M 名义窗口在 200k+ 通常已注意力衰退）。
 	// 仅影响压缩阈值，不改变 LLM API 实际请求长度；配置值由用户自负其责。
 	ContextWindow int `json:"context_window,omitempty"`
+
+	// ChapterPipeline 章节精修流水线模式。""（默认）= 不启用（行为与旧版本一致，
+	// 不强制 polish_draft、不做 pipeline commit 校验）；"ds_mimo_critic" = Writer
+	// 单次 Run 内经 polish_draft 工具嵌套调用独立 polisher runner（Mimo），随后
+	// check_consistency → review_style（critic）→ 12 类硬闸 → commit_chapter。
+	// 显式配置 roles.polisher 角色同样视为启用（见 ChapterPipelineEnabled）。
+	ChapterPipeline string `json:"chapter_pipeline,omitempty"`
 
 	// Budget 单本书的成本预算政策；book_usd > 0 才启用。
 	Budget BudgetConfig `json:"budget,omitzero"`
@@ -252,7 +262,7 @@ func (c *Config) ValidateBase() error {
 			return err
 		}
 		if !knownRoles[role] {
-			return fmt.Errorf("unknown role %q in roles config (valid: architect/writer/editor/critic): %w", role, errs.ErrConfig)
+			return fmt.Errorf("unknown role %q in roles config (valid: architect/writer/editor/critic/polisher): %w", role, errs.ErrConfig)
 		}
 		if rc.Provider == "" || rc.Model == "" {
 			return fmt.Errorf("role %q must have both provider and model: %w", role, errs.ErrConfig)
@@ -277,6 +287,11 @@ func (c *Config) ValidateBase() error {
 				return err
 			}
 		}
+	}
+
+	// 校验章节精修流水线模式
+	if c.ChapterPipeline != "" && c.ChapterPipeline != "ds_mimo_critic" {
+		return fmt.Errorf("unknown chapter_pipeline %q (valid: ds_mimo_critic): %w", c.ChapterPipeline, errs.ErrConfig)
 	}
 
 	// 校验预算政策
@@ -389,6 +404,19 @@ func (c Config) ResolveContextWindow(modelName string) (int, ContextWindowSource
 		return rw, CtxWindowRegistry
 	}
 	return DefaultContextWindow, CtxWindowDefault
+}
+
+// ChapterPipelineEnabled 报告精修流水线是否启用：
+// 显式配置 chapter_pipeline="ds_mimo_critic"，或 roles 中显式配置了 polisher 角色。
+// 未启用时行为与旧版本一致（不强制 polish_draft、不做 pipeline commit 校验）。
+func (c Config) ChapterPipelineEnabled() bool {
+	if c.ChapterPipeline == "ds_mimo_critic" {
+		return true
+	}
+	if _, ok := c.Roles["polisher"]; ok {
+		return true
+	}
+	return false
 }
 
 // ResolveReasoningEffort 返回某角色生效的推理强度原始串（off/low/medium/high/xhigh/max 或空）。

@@ -90,7 +90,7 @@
 
   // 可选。按角色覆盖默认模型；未配的角色使用上面的 model。
   // reasoning_effort 也可按角色覆盖；未配时继承顶层 reasoning_effort。
-  // 角色：architect / writer / editor / critic。critic 未配时回落默认模型。
+  // 角色：architect / writer / editor / critic / polisher。critic / polisher 未配时回落默认模型。
   // fallbacks 在主模型失败时按序尝试。
   // 注意：这里的 provider 同样是"指针"，必须指向 providers 里存在的 key。
   // "roles": {
@@ -102,6 +102,12 @@
   //   },
   //   "architect": { "provider": "openrouter", "model": "google/gemini-3.1-pro" }
   // },
+
+  // 可选。章节精修流水线模式。""（默认）= 不启用（行为与旧版本一致）；
+  // "ds_mimo_critic" = Writer 单次 Run 内经 polish_draft 工具嵌套调用独立 polisher
+  // runner（roles.polisher，通常配 Mimo），随后 check_consistency → review_style
+  // （critic）→ commit。显式配置 roles.polisher 角色同样视为启用本流水线。
+  // "chapter_pipeline": "ds_mimo_critic"
 
   // 写作风格：default / suspense / fantasy / romance。
   "style": "default"

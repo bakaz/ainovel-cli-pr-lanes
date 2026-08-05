@@ -120,6 +120,99 @@ func TestCriticRole_UnconfiguredFallsBack(t *testing.T) {
 	}
 }
 
+// TestPolisherRole_ValidateAndFallback 验证 polisher 角色可通过校验且未配置时回落默认模型。
+func TestPolisherRole_ValidateAndFallback(t *testing.T) {
+	// polisher 显式配置应通过校验
+	cfg := Config{
+		Provider:  "openrouter",
+		ModelName: "default-model",
+		Providers: map[string]ProviderConfig{
+			"openrouter": {APIKey: "sk-test-123456"},
+		},
+		Roles: map[string]RoleConfig{
+			"polisher": {Provider: "openrouter", Model: "mimo-polisher"},
+		},
+	}
+	if err := cfg.ValidateBase(); err != nil {
+		t.Fatalf("polisher 角色配置应通过校验: %v", err)
+	}
+
+	// polisher 显式配置 → ModelSet.ForRole 返回该角色模型（非默认）
+	ms, err := NewModelSet(cfg)
+	if err != nil {
+		t.Fatalf("NewModelSet: %v", err)
+	}
+	if ms.ForRole("polisher") == ms.Default {
+		t.Fatal("显式配置 polisher 时 ForRole 不应返回默认模型")
+	}
+
+	// polisher 未配置时回落到默认 —— ModelSet 的 ForRole 逻辑已覆盖
+	unconfigured := Config{
+		Provider:  "openrouter",
+		ModelName: "default-model",
+		Providers: map[string]ProviderConfig{
+			"openrouter": {Type: "openai", APIKey: "sk-test-123456"},
+		},
+		Roles: map[string]RoleConfig{},
+	}
+	ms2, err := NewModelSet(unconfigured)
+	if err != nil {
+		t.Fatalf("NewModelSet: %v", err)
+	}
+	if ms2.ForRole("polisher") != ms2.Default {
+		t.Fatal("polisher 未配置时应返回默认模型的同一实例")
+	}
+}
+
+// TestChapterPipeline_ValidationAndDetection 验证 chapter_pipeline 开关的校验与启用判定。
+func TestChapterPipeline_ValidationAndDetection(t *testing.T) {
+	base := func() Config {
+		return Config{
+			Provider:  "openrouter",
+			ModelName: "test-model",
+			Providers: map[string]ProviderConfig{
+				"openrouter": {APIKey: "sk-test-123456"},
+			},
+		}
+	}
+
+	// 1. 非法 pipeline 值拒绝
+	bad := base()
+	bad.ChapterPipeline = "unknown_pipeline"
+	if err := bad.ValidateBase(); err == nil {
+		t.Fatal("非法 chapter_pipeline 应被拒绝")
+	}
+
+	// 2. 合法值通过校验
+	ok := base()
+	ok.ChapterPipeline = "ds_mimo_critic"
+	if err := ok.ValidateBase(); err != nil {
+		t.Fatalf("chapter_pipeline=ds_mimo_critic 应通过校验: %v", err)
+	}
+
+	// 3. 启用判定：显式开关
+	if !ok.ChapterPipelineEnabled() {
+		t.Fatal("chapter_pipeline=ds_mimo_critic 应视为启用精修流水线")
+	}
+
+	// 4. 启用判定：roles.polisher 显式配置（无显式开关）
+	byRole := base()
+	byRole.Roles = map[string]RoleConfig{
+		"polisher": {Provider: "openrouter", Model: "mimo-polisher"},
+	}
+	if !byRole.ChapterPipelineEnabled() {
+		t.Fatal("显式配置 roles.polisher 应视为启用精修流水线")
+	}
+	if err := byRole.ValidateBase(); err != nil {
+		t.Fatalf("roles.polisher 配置应通过校验: %v", err)
+	}
+
+	// 5. 默认关闭：无开关、无 polisher 角色 → 不启用（旧项目行为不变）
+	if base().ChapterPipelineEnabled() {
+		t.Fatal("默认配置不应启用精修流水线")
+	}
+}
+
 func TestValidateBaseNotifyEventsMatchRuntimeContract(t *testing.T) {
 	validConfig := func(events []string) Config {
 		return Config{

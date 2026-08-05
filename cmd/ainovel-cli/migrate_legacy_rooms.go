@@ -18,9 +18,10 @@ import (
 // --config（可选）指定配置文件路径，不影响迁移目标。
 //
 // 退出码约定：
-//   0 — migrated / cleaned_up / already_exists / no_legacy_rooms（成功无操作）
-//   1 — 系统级错误（IO、config 解析失败、无效 workspace、store 错误）
-//   2 — 参数用法错误
+//
+//	0 — migrated / cleaned_up / already_exists / no_legacy_rooms（成功无操作）
+//	1 — 系统级错误（IO、config 解析失败、无效 workspace、store 错误）
+//	2 — 参数用法错误
 func migrateLegacyRooms(argv []string) int {
 	var configPath, outputDir string
 	for i := 0; i < len(argv); i++ {
