@@ -586,7 +586,7 @@ func (h *Host) handleIntervention(text string) {
 	h.doIntervention(text, false)
 }
 
-func (h *Host) doIntervention(text string, restart bool) {
+func (h *Host) doIntervention(text string, restart bool) InterventionOutcome {
 	h.interMu.Lock()
 	defer h.interMu.Unlock()
 
@@ -607,7 +607,7 @@ func (h *Host) doIntervention(text string, restart bool) {
 			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Level: "warn",
 				Summary: "干预跳过 (test hook): " + err.Error()})
 			clearPending()
-			return
+			return InterventionOutcome{OK: false, Failure: err}
 		}
 	}
 
@@ -645,7 +645,7 @@ func (h *Host) doIntervention(text string, restart bool) {
 		// 已当面告知 → 清除 pending(否则下次 Resume 会自动重放同一条失败干预)。
 		h.emitEvent(newInterventionFailureEvent(derr))
 		clearPending()
-		return
+		return InterventionOutcome{OK: false, Failure: derr}
 	}
 
 	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "裁定: " + decision.Reason, Level: "info"})
@@ -671,7 +671,7 @@ func (h *Host) doIntervention(text string, restart bool) {
 			if err := h.engine.applyControlOp(context.Background(), op); err != nil {
 				h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Level: "warn",
 					Summary: "干预动作执行失败,已保留;恢复/继续时将自动重试"})
-				return
+				return InterventionOutcome{OK: false, Failure: fmt.Errorf("干预动作执行失败，已保留: %w", err)}
 			}
 			// reopen/dispatch 表达了继续创作的意图,拉起引擎。
 			if decision.Reopen != nil || decision.Dispatch != nil {
@@ -683,7 +683,7 @@ func (h *Host) doIntervention(text string, restart bool) {
 		// 保留 PendingSteer:恢复/继续时整条重放重新裁定。
 		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Level: "warn",
 			Summary: "部分干预动作未成功,干预已保留;恢复/继续时自动重试"})
-		return
+		return InterventionOutcome{OK: false, Failure: fmt.Errorf("部分干预动作未成功，干预已保留；恢复/继续时自动重试")}
 	}
 	// 动作已成功应用/入队,清除崩溃保护(入队后引擎侧失败或退出竞态由 engine
 	// 回存 PendingSteer 兜底)。
@@ -692,14 +692,17 @@ func (h *Host) doIntervention(text string, restart bool) {
 	if restart && !h.engine.isRunning() {
 		if err := h.budget.Refuse(); err != nil {
 			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: err.Error(), Level: "warn"})
-			return
+			return InterventionOutcome{OK: true, EngineRunning: false, Failure: err}
 		}
 		h.refreshWriterRestore()
 		if !h.startEngineLocked(nil) {
 			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Level: "warn",
 				Summary: "Engine 正在完成上一轮停止；干预已保存，请稍后继续"})
+			return InterventionOutcome{OK: true, EngineRunning: false,
+				Failure: fmt.Errorf("Engine 正在完成上一轮停止，干预已保存")}
 		}
 	}
+	return InterventionOutcome{OK: true, EngineRunning: h.engine.isRunning()}
 }
 
 func newInterventionFailureEvent(err error) Event {
@@ -720,8 +723,39 @@ func (h *Host) arbiterModel() agentcore.ChatModel {
 	return newUsageTrackedModel(h.models.Default, h.usage.Record)
 }
 
+// InterventionOutcome 一次干预处理的结果（同步调用方用；TUI 异步路径忽略）。
+// 调用方据此区分三种语义：engine_started（OK 且 EngineRunning）、
+// intervention_failed（!OK）、no_run（OK 但 EngineRunning=false）。
+type InterventionOutcome struct {
+	// OK 为 true 表示裁定成功且动作（规则/控制态）已应用。
+	OK bool
+	// Failure 干预失败原因（OK=false 时非 nil）；OK=true 但引擎未启动时为未启动原因。
+	Failure error
+	// EngineRunning 干预处理结束后引擎是否处于运行状态。
+	EngineRunning bool
+}
+
 // Continue 停机后用户在输入框输入时调用:干预裁定 + 确保引擎重新运行。
 func (h *Host) Continue(text string) error {
+	if err := h.continueGuard(text); err != nil {
+		return err
+	}
+	go h.doIntervention(text, true)
+	return nil
+}
+
+// ContinueAndWait 是 Continue 的同步变体：阻塞直到干预裁定、动作应用与引擎
+// 启动尝试全部完成（不 fire-and-forget）。headless 自动化据此区分
+// engine_started / intervention_failed / no_run。
+func (h *Host) ContinueAndWait(text string) (InterventionOutcome, error) {
+	if err := h.continueGuard(text); err != nil {
+		return InterventionOutcome{}, err
+	}
+	return h.doIntervention(text, true), nil
+}
+
+// continueGuard 是 Continue / ContinueAndWait 共享的前置校验与事件回显。
+func (h *Host) continueGuard(text string) error {
 	if err := h.checkMigrationGate(); err != nil {
 		return err
 	}
@@ -744,7 +778,6 @@ func (h *Host) Continue(text string) error {
 	}
 
 	h.emitEvent(Event{Time: time.Now(), Category: "USER", Summary: "[继续] " + text, Level: "info"})
-	go h.doIntervention(text, true)
 	return nil
 }
 
@@ -913,20 +946,28 @@ func (h *Host) StyleReviewOverride(chapter int, reason string) error {
 	basisDigest := tools.ComputeBasisDigest(h.store, chapter, overrideVersion)
 
 	// 4. Append-only 覆盖
+	//    C1-H3：overridden 条目保留 exhausted 条目的 Epoch 与 Request.PolishCheckpointSeq
+	//    ——commit gate 以当前 terminal 条目为权威读取绑定 seq，若覆盖丢掉了绑定，
+	//    gate 会回退 legacy 时间比较导致判定错误。
 	now := time.Now().Format(time.RFC3339)
 	if err := h.store.StyleReview.Update(chapter, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
 		if cur == nil {
 			return nil, fmt.Errorf("账本已消失")
 		}
 		nextCycle := len(cur.Cycles) + 1
+		var boundSeq int64
+		if prev := cur.CurrentCycle(); prev != nil && prev.Request != nil {
+			boundSeq = prev.Request.PolishCheckpointSeq
+		}
 		cur.Cycles = append(cur.Cycles, domain.StyleReviewEntry{
 			Cycle:       nextCycle,
 			Status:      domain.ReviewStatusOverridden,
 			CreatedAt:   now,
 			AttemptID:   fmt.Sprintf("override-%d-%d", chapter, time.Now().UnixNano()),
-			Request:     &domain.StyleReviewRequest{Prompt: overrideVersion},
+			Request:     &domain.StyleReviewRequest{Prompt: overrideVersion, PolishCheckpointSeq: boundSeq},
 			DraftDigest: draftDigest,
 			BasisDigest: basisDigest,
+			Epoch:       cur.MaxEpoch(),
 			// Override 记录用户干预的审计轨迹
 			Override: &domain.StyleReviewOverride{
 				Actor:        "user",
@@ -1271,7 +1312,6 @@ func (h *Host) Snapshot() UISnapshot {
 		snap.NovelName = strings.TrimSpace(progress.NovelName)
 		snap.Phase = string(progress.Phase)
 		snap.Flow = string(progress.Flow)
-		snap.CurrentChapter = progress.CurrentChapter
 		snap.TotalChapters = progress.TotalChapters
 		snap.CompletedCount = len(progress.CompletedChapters)
 		snap.TotalWordCount = progress.TotalWordCount
@@ -1301,7 +1341,6 @@ func (h *Host) Snapshot() UISnapshot {
 	if h.observer != nil {
 		snap.Agents = h.observer.agentSnapshots()
 	}
-	h.fillContextStatus(&snap)
 	snap.StatusLabel = deriveStatusLabel(snap)
 
 	// 恢复标签
@@ -1314,12 +1353,6 @@ func (h *Host) Snapshot() UISnapshot {
 
 	return snap
 }
-
-// fillContextStatus 填充上下文健康度信息。
-// 主循环无常驻 LLM 上下文；Worker 的上下文健康度经进度中继
-// (ProgressContext)进入 observer 的 per-agent 快照,由 Agents 面板展示。
-// 汇总字段留空,面板按 per-agent 数据渲染。
-func (h *Host) fillContextStatus(_ *UISnapshot) {}
 
 // fillDetails 填充详情区:设定、角色、最近 commit/review/摘要。
 func (h *Host) fillDetails(snap *UISnapshot, progress *domain.Progress) {
@@ -1394,6 +1427,34 @@ func (h *Host) fillDetails(snap *UISnapshot, progress *domain.Progress) {
 			}
 		}
 	}
+
+	// 世界状态:时间线 / 伏笔 / 关系。
+	// 单项读错误吞掉不阻塞 snapshot;仅当全部装载失败才关掉 WorldLoaded(空守卫)。
+	loadedWorld := 0
+	if timeline, err := h.store.World.LoadTimeline(); err == nil {
+		loadedWorld++
+		// 按章号倒序取最近 5 条(同章按事件时间倒序)
+		sort.Slice(timeline, func(i, j int) bool {
+			if timeline[i].Chapter != timeline[j].Chapter {
+				return timeline[i].Chapter > timeline[j].Chapter
+			}
+			return timeline[i].Time > timeline[j].Time
+		})
+		for i := 0; i < len(timeline) && len(snap.RecentTimeline) < 5; i++ {
+			snap.RecentTimeline = append(snap.RecentTimeline,
+				fmt.Sprintf("第%d章: %s", timeline[i].Chapter, truncate(timeline[i].Event, 30)))
+		}
+	}
+	if active, err := h.store.World.LoadActiveForeshadow(); err == nil {
+		loadedWorld++
+		// ForeshadowEntry 无 Stale/停滞状态字段,只填打开数,停滞数保持 0
+		snap.ForeshadowOpen = len(active)
+	}
+	if rel, err := h.store.World.LoadRelationships(); err == nil {
+		loadedWorld++
+		snap.RelationshipCount = len(rel)
+	}
+	snap.WorldLoaded = loadedWorld > 0
 }
 
 func deriveStatusLabel(s UISnapshot) string {
@@ -1492,7 +1553,7 @@ func (h *Host) SwitchModel(role, provider, model string) error {
 
 // concreteThinkingRoles 是可应用推理强度的具体角色（与 agents.ApplyThinking 路由一致）。
 // 调 default 时按各角色 ResolveReasoningEffort 逐个重新应用。
-var concreteThinkingRoles = []string{"architect", "writer", "editor"}
+var concreteThinkingRoles = []string{"architect", "writer", "editor", "polisher"}
 
 // CurrentThinking 返回某角色当前生效的推理强度原始串（供 /model 面板同步当前值）。
 func (h *Host) CurrentThinking(role string) string {

@@ -424,6 +424,7 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		ev := host.Event(msg)
 		m.applyEvent(ev)
 		m.refreshEventViewport()
+		m.refreshStateViewport()
 		return m, listenEvents(m.runtime), true
 	case bootstrapMsg:
 		// 先回放历史事件再处理错误：Resume 被拒（如预算上限）是常规路径，
@@ -625,7 +626,6 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			m.streamRounds = append(m.streamRounds, "")
 		}
 		m.trimStreamRounds()
-		m.streamRound = len(m.streamRounds)
 		m.refreshStreamViewport()
 		if m.streamScroll {
 			m.streamVP.GotoBottom()
@@ -775,6 +775,11 @@ func (m *Model) applyEvent(ev host.Event) {
 			if ev.Summary != "" {
 				existing.Summary = ev.Summary
 			}
+			// Category 允许 finish 事件覆盖（TOOL → REVIEW/CHECK 归类迁移），
+			// 否则 fix-3 B5 的 finish Category 替换对 TUI 不可见。
+			if ev.Category != "" && ev.Category != existing.Category {
+				existing.Category = ev.Category
+			}
 			return
 		}
 	}
@@ -814,11 +819,9 @@ func (m *Model) resetOutputPanels() {
 	m.eventIndex = make(map[string]int)
 	m.viewport.SetContent("")
 	m.viewport.GotoTop()
-	m.streamBuf.Reset()
 	m.streamRounds = nil
 	m.streamVP.SetContent("")
 	m.streamVP.GotoTop()
-	m.streamRound = 0
 }
 
 func (m *Model) applyRuntimeReplay(items []domain.RuntimeQueueItem) {
@@ -846,7 +849,6 @@ func (m *Model) applyRuntimeReplay(items []domain.RuntimeQueueItem) {
 		}
 	}
 	m.trimStreamRounds()
-	m.streamRound = len(m.streamRounds)
 	m.refreshEventViewport()
 	m.refreshStreamViewport()
 }

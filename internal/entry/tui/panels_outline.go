@@ -242,6 +242,30 @@ func renderDetailContent(snap host.UISnapshot, contentW int) string {
 		}
 	}
 
+	if snap.LastCheckpointName != "" {
+		b.WriteString(cardTitleStyle.Render("~ 最近检查点 ~"))
+		b.WriteString("\n")
+		writeWrapped(&b, snap.LastCheckpointName, contentW, cardContentStyle)
+		b.WriteString("\n")
+	}
+
+	if snap.WorldLoaded && (len(snap.RecentTimeline) > 0 || snap.ForeshadowOpen > 0 ||
+		snap.ForeshadowStale > 0 || snap.RelationshipCount > 0) {
+		b.WriteString(cardTitleStyle.Render("~ 世界状态 ~"))
+		b.WriteString("\n")
+		for _, t := range snap.RecentTimeline {
+			writeBulletWrapped(&b, t, contentW, cardContentStyle)
+		}
+		if snap.ForeshadowOpen > 0 || snap.ForeshadowStale > 0 {
+			writeBulletWrapped(&b, fmt.Sprintf("伏笔 打开 %d / 停滞 %d", snap.ForeshadowOpen, snap.ForeshadowStale),
+				contentW, cardContentStyle)
+		}
+		if snap.RelationshipCount > 0 {
+			writeBulletWrapped(&b, fmt.Sprintf("关系 %d 条", snap.RelationshipCount), contentW, cardContentStyle)
+		}
+		b.WriteString("\n")
+	}
+
 	return b.String()
 }
 

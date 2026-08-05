@@ -119,13 +119,14 @@ type agentExtractor struct {
 }
 
 type agentState struct {
-	name    string
-	state   string
-	tool    string
-	summary string
-	turn    int
-	context AgentContextSnapshot
-	updated time.Time
+	name     string
+	state    string
+	tool     string
+	summary  string
+	turn     int
+	taskKind string
+	context  AgentContextSnapshot
+	updated  time.Time
 }
 
 func newObserver(s *storepkg.Store, emitEv func(Event), emitD func(string), emitC func()) *observer {
@@ -159,6 +160,7 @@ func (o *observer) dispatchStart(agent, task string) {
 	o.updateAgent(agent, func(a *agentState) {
 		a.state = "working"
 		a.tool = ""
+		a.taskKind = o.taskKindForDispatch(agent)
 		a.summary = fmt.Sprintf("engine → %s", summary)
 	})
 	id := nextEventID()
@@ -174,6 +176,46 @@ func (o *observer) dispatchStart(agent, task string) {
 		Summary:  summary,
 		Level:    "info",
 	})
+}
+
+// taskKindForDispatch 按 agent + 当前进度 flow 映射 AgentSnapshot.TaskKind
+// （B4）。flow 来源为 store.Progress.Load() 的 .Flow；store 为 nil 或读取
+// 失败时按空 flow 处理（非 writer/editor 的 agent 不依赖 flow）。
+func (o *observer) taskKindForDispatch(agent string) string {
+	flow := ""
+	if o.store != nil && o.store.Progress != nil {
+		if p, err := o.store.Progress.Load(); err == nil && p != nil {
+			flow = string(p.Flow)
+		}
+	}
+	return taskKindForAgentFlow(agent, flow)
+}
+
+// taskKindForAgentFlow 按 agent + flow 映射 TaskKind 展示标签（B4）。
+func taskKindForAgentFlow(agent, flow string) string {
+	switch agent {
+	case "architect_short", "architect_long":
+		return "foundation_plan"
+	case "writer":
+		switch flow {
+		case "writing":
+			return "chapter_write"
+		case "rewriting":
+			return "chapter_rewrite"
+		case "polishing":
+			return "chapter_polish"
+		}
+	case "editor":
+		switch flow {
+		case "reviewing":
+			return "chapter_review"
+		case "rewriting":
+			return "chapter_rewrite"
+		}
+	case "polisher":
+		return "chapter_polish"
+	}
+	return ""
 }
 
 // dispatchFinish 把 DISPATCH 行落成完成态并复位 Worker 状态;
@@ -294,6 +336,7 @@ func (o *observer) agentSnapshots() []AgentSnapshot {
 		snaps = append(snaps, AgentSnapshot{
 			Name:      a.name,
 			State:     a.state,
+			TaskKind:  a.taskKind,
 			Summary:   a.summary,
 			Tool:      a.tool,
 			Turn:      a.turn,

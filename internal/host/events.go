@@ -49,7 +49,6 @@ type UISnapshot struct {
 	StatusLabel          string
 	Phase                string
 	Flow                 string
-	CurrentChapter       int
 	TotalChapters        int
 	CompletedCount       int
 	TotalWordCount       int
@@ -119,6 +118,13 @@ type UISnapshot struct {
 	LastReviewSummary  string
 	LastCheckpointName string
 	RecentSummaries    []string
+
+	// 世界状态
+	RecentTimeline    []string // 最近时间线条目（章节X: 事件摘要）
+	ForeshadowOpen    int      // 打开的伏笔数
+	ForeshadowStale   int      // 停滞的伏笔数（超过阈值未结算）
+	RelationshipCount int      // 当前关系条数
+	WorldLoaded       bool     // 标记 fillDetails 成功装载世界数据（空守卫）
 }
 
 // OutlineSnapshot 是大纲条目的展示摘要。

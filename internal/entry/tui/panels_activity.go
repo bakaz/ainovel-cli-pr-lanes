@@ -108,6 +108,31 @@ func renderEventLine(ev host.Event, width, spinnerFrame int) string {
 		}
 		return line
 
+	case ev.Category == "REVIEW" || ev.Category == "CHECK":
+		// save_review 完成事件 → REVIEW（金黄），check_consistency → CHECK（健康绿）。
+		// 三态与 DISPATCH 一致：进行中 spinner / 失败红 ✕ / 完成态 ✦(评审) ✓(检查)。
+		var icon string
+		switch {
+		case running:
+			icon = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(runningSpinner(spinnerFrame))
+		case ev.Failed:
+			icon = lipgloss.NewStyle().Foreground(colorError).Bold(true).Render("✕")
+		case ev.Category == "REVIEW":
+			icon = lipgloss.NewStyle().Foreground(colorReview).Bold(true).Render("✦")
+		default:
+			icon = lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("✓")
+		}
+		sumColor := colorReview
+		if ev.Category == "CHECK" {
+			sumColor = colorSuccess
+		}
+		sum := lipgloss.NewStyle().Foreground(sumColor).Render(truncate(ev.Summary, maxSumW))
+		line := tsStr + " " + indent + icon + " " + sum
+		if !running {
+			line += durStr
+		}
+		return line
+
 	case ev.Category == "ERROR":
 		icon := lipgloss.NewStyle().Foreground(colorError).Bold(true).Render("✕")
 		errStyle := lipgloss.NewStyle().Foreground(colorError)

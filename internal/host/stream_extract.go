@@ -30,6 +30,9 @@ var toolDisplays = map[string]toolDisplay{
 	"save_foundation":     {header: "✻ 设定"},
 	"read_chapter":        {header: "✻ 读章节"},
 	"check_consistency":   {header: "✻ 一致性检查"},
+	// args 只有 {chapter}，正文由 #1 fork 转发到流面板，这里只显示标题。
+	"polish_draft":        {header: "✻ 文风精修"},
+	"review_style":        {header: "✻ 风格评审"},
 	"novel_context":       {header: "✻ 查询上下文"},
 }
 

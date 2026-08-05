@@ -7,10 +7,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/ainovel-cli/internal/diag"
+	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/errclass"
+	storepkg "github.com/voocel/ainovel-cli/internal/store"
 )
 
 // testObserver 创建测试用 observer。
@@ -1119,5 +1122,220 @@ func TestObserverRetryScopedCleanup(t *testing.T) {
 	// streamOwner 应保留为 writer（architect_long 不是 owner）
 	if o.streamOwner != "writer" {
 		t.Errorf("streamOwner should remain %q after architect_long retry, got %q", "writer", o.streamOwner)
+	}
+}
+
+// ── B4: TaskKind 填充 ─────────────────────────────────────────────────────
+
+// TestTaskKindForAgentFlow 验证 agent+flow → TaskKind 的映射规则（B4）。
+func TestTaskKindForAgentFlow(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent string
+		flow  string
+		want  string
+	}{
+		{"architect_short", "architect_short", "", "foundation_plan"},
+		{"architect_short with flow", "architect_short", "writing", "foundation_plan"},
+		{"architect_long", "architect_long", "", "foundation_plan"},
+		{"writer writing", "writer", "writing", "chapter_write"},
+		{"writer rewriting", "writer", "rewriting", "chapter_rewrite"},
+		{"writer polishing", "writer", "polishing", "chapter_polish"},
+		{"writer reviewing", "writer", "reviewing", ""},
+		{"writer unknown flow", "writer", "steering", ""},
+		{"writer empty flow", "writer", "", ""},
+		{"editor reviewing", "editor", "reviewing", "chapter_review"},
+		{"editor rewriting", "editor", "rewriting", "chapter_rewrite"},
+		{"editor writing", "editor", "writing", ""},
+		{"polisher", "polisher", "", "chapter_polish"},
+		{"polisher rewriting", "polisher", "rewriting", "chapter_polish"},
+		{"unknown agent", "architect", "", ""},
+		{"empty agent", "", "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := taskKindForAgentFlow(tc.agent, tc.flow)
+			if got != tc.want {
+				t.Errorf("taskKindForAgentFlow(%q, %q) = %q, want %q", tc.agent, tc.flow, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestObserverDispatchStartSetsTaskKind 验证 dispatchStart 把 taskKind 写入
+// agentState，并最终出现在 agentSnapshots 的 AgentSnapshot.TaskKind。
+// flow 通过真实 store.Progress 落盘读取。
+func TestObserverDispatchStartSetsTaskKind(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent string
+		flow  domain.FlowState
+		want  string
+	}{
+		{"architect_short", "architect_short", "", "foundation_plan"},
+		{"architect_long", "architect_long", "", "foundation_plan"},
+		{"writer writing", "writer", domain.FlowWriting, "chapter_write"},
+		{"writer rewriting", "writer", domain.FlowRewriting, "chapter_rewrite"},
+		{"writer polishing", "writer", domain.FlowPolishing, "chapter_polish"},
+		{"writer no flow", "writer", "", ""},
+		{"editor reviewing", "editor", domain.FlowReviewing, "chapter_review"},
+		{"editor rewriting", "editor", domain.FlowRewriting, "chapter_rewrite"},
+		{"polisher", "polisher", "", "chapter_polish"},
+		{"unknown agent", "unknown", domain.FlowWriting, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []Event
+			o := testObserver(&events)
+			if tc.flow != "" {
+				s := storepkg.NewStore(t.TempDir())
+				if err := s.Progress.Init("test", 10); err != nil {
+					t.Fatalf("Progress.Init: %v", err)
+				}
+				if err := s.Progress.SetFlow(tc.flow); err != nil {
+					t.Fatalf("Progress.SetFlow(%s): %v", tc.flow, err)
+				}
+				o.store = s
+			}
+			o.dispatchStart(tc.agent, "task")
+			snaps := o.agentSnapshots()
+			if len(snaps) != 1 {
+				t.Fatalf("agentSnapshots() = %d entries, want 1", len(snaps))
+			}
+			if snaps[0].TaskKind != tc.want {
+				t.Errorf("TaskKind = %q, want %q (agent=%s flow=%s)", snaps[0].TaskKind, tc.want, tc.agent, tc.flow)
+			}
+		})
+	}
+}
+
+// ── B4: ProgressTurnCounter ────────────────────────────────────────────────
+
+// TestObserverTurnCounterUpdatesTurn 验证 ProgressTurnCounter 只更新
+// agentState.turn，不发 UI 事件。
+func TestObserverTurnCounterUpdatesTurn(t *testing.T) {
+	var events []Event
+	o := testObserver(&events)
+
+	o.handleToolUpdate(agentcore.Event{
+		Type: agentcore.EventToolExecUpdate,
+		Progress: &agentcore.ProgressPayload{
+			Kind:  agentcore.ProgressTurnCounter,
+			Agent: "writer",
+			Turn:  3,
+		},
+	})
+
+	if len(events) != 0 {
+		t.Fatalf("turn counter should not emit events, got %d", len(events))
+	}
+	snaps := o.agentSnapshots()
+	if len(snaps) != 1 {
+		t.Fatalf("agentSnapshots() = %d entries, want 1", len(snaps))
+	}
+	if snaps[0].Name != "writer" || snaps[0].Turn != 3 {
+		t.Errorf("snapshot = %+v, want writer with Turn=3", snaps[0])
+	}
+}
+
+// ── B5: REVIEW / CHECK 事件归类 ────────────────────────────────────────────
+
+// TestObserverToolEndReviewCheckCategories 验证 ProgressToolEnd 的 finish
+// 事件按 Tool 归类：save_review→REVIEW，check_consistency→CHECK，其余保持 TOOL。
+func TestObserverToolEndReviewCheckCategories(t *testing.T) {
+	tests := []struct {
+		name string
+		tool string
+		want string
+	}{
+		{"save_review", "save_review", "REVIEW"},
+		{"check_consistency", "check_consistency", "CHECK"},
+		{"draft_chapter", "draft_chapter", "TOOL"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []Event
+			o := testObserver(&events)
+
+			// 先注入一个进行中的 TOOL 调用
+			start := time.Now()
+			o.mapMu.Lock()
+			o.toolStarts["editor"] = &activeCall{id: "e1", start: start, summary: tc.tool, depth: 1}
+			o.mapMu.Unlock()
+
+			o.handleToolUpdate(agentcore.Event{
+				Type: agentcore.EventToolExecUpdate,
+				Progress: &agentcore.ProgressPayload{
+					Kind:  agentcore.ProgressToolEnd,
+					Agent: "editor",
+					Tool:  tc.tool,
+				},
+			})
+
+			// finishEv 与 start 同 ID
+			var finishEv *Event
+			for i := range events {
+				if events[i].ID == "e1" {
+					finishEv = &events[i]
+				}
+			}
+			if finishEv == nil {
+				t.Fatalf("no finish event with id e1, events=%+v", events)
+			}
+			if finishEv.Category != tc.want {
+				t.Errorf("Category = %q, want %q (tool=%s)", finishEv.Category, tc.want, tc.tool)
+			}
+		})
+	}
+}
+
+// TestObserverToolErrorReviewCheckCategories 验证错误态 ProgressToolError 的
+// finish 事件同样按 Tool 归类（B5）。
+func TestObserverToolErrorReviewCheckCategories(t *testing.T) {
+	tests := []struct {
+		name string
+		tool string
+		want string
+	}{
+		{"save_review", "save_review", "REVIEW"},
+		{"check_consistency", "check_consistency", "CHECK"},
+		{"draft_chapter", "draft_chapter", "TOOL"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []Event
+			o := testObserver(&events)
+
+			start := time.Now()
+			o.mapMu.Lock()
+			o.toolStarts["editor"] = &activeCall{id: "e2", start: start, summary: tc.tool, depth: 1}
+			o.mapMu.Unlock()
+
+			o.handleToolUpdate(agentcore.Event{
+				Type: agentcore.EventToolExecUpdate,
+				Progress: &agentcore.ProgressPayload{
+					Kind:    agentcore.ProgressToolError,
+					Agent:   "editor",
+					Tool:    tc.tool,
+					Message: "boom",
+				},
+			})
+
+			var finishEv *Event
+			for i := range events {
+				if events[i].ID == "e2" {
+					finishEv = &events[i]
+				}
+			}
+			if finishEv == nil {
+				t.Fatalf("no failed finish event with id e2, events=%+v", events)
+			}
+			if !finishEv.Failed {
+				t.Errorf("finish event should be Failed")
+			}
+			if finishEv.Category != tc.want {
+				t.Errorf("Category = %q, want %q (tool=%s)", finishEv.Category, tc.want, tc.tool)
+			}
+		})
 	}
 }

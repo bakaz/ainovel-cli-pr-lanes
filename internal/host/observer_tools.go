@@ -21,6 +21,11 @@ func (o *observer) handleToolUpdate(ev agentcore.Event) {
 		return
 	}
 	switch ev.Progress.Kind {
+	case agentcore.ProgressTurnCounter:
+		// 轮次计数仅更新 agent 侧栏的 turn 数字，不需要行展示事件。
+		o.updateAgent(ev.Progress.Agent, func(a *agentState) {
+			a.turn = ev.Progress.Turn
+		})
 	case agentcore.ProgressToolDelta:
 		if ev.Progress.Delta != "" {
 			o.handleSubagentDelta(ev.Progress)
@@ -96,6 +101,8 @@ func (o *observer) handleToolUpdate(ev agentcore.Event) {
 			Depth:      call.depth,
 			Duration:   time.Since(call.start),
 		}
+		// B5：save_review / check_consistency 的完成事件归入 REVIEW / CHECK。
+		finishEv.Category = toolFinishCategory(ev.Progress.Tool, finishEv.Category)
 		o.emitEv(finishEv)
 		o.persistEvent(finishEv)
 	case agentcore.ProgressThinking:
@@ -223,6 +230,8 @@ func (o *observer) handleToolUpdate(ev agentcore.Event) {
 				Depth:      call.depth,
 				Duration:   time.Since(call.start),
 			}
+			// B5：错误态同样识别 save_review / check_consistency 归类。
+			finishEv.Category = toolFinishCategory(ev.Progress.Tool, finishEv.Category)
 			o.emitEv(finishEv)
 			o.persistEvent(finishEv)
 		}
@@ -281,6 +290,19 @@ func retryFallbackDelay(attempt int) time.Duration {
 		return 60 * time.Second
 	}
 	return delay
+}
+
+// toolFinishCategory 把工具完成事件的展示 Category 按工具名归类：
+// save_review → REVIEW，check_consistency → CHECK，其余保持原值（TOOL）。
+// 错误态（ProgressToolError）同样走此归类，保证 finish 事件与持久化一致。
+func toolFinishCategory(tool, fallback string) string {
+	switch tool {
+	case "save_review":
+		return "REVIEW"
+	case "check_consistency":
+		return "CHECK"
+	}
+	return fallback
 }
 
 func dispatchSummary(agent, task string) string {
