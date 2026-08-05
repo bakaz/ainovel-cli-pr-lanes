@@ -678,6 +678,63 @@ func TestPolishDraft_LengthRecoveryExhaustedFailClosed(t *testing.T) {
 	}
 }
 
+// TestPolishDraft_LengthTwiceThenComplete：连续两次 length 截断（两轮半章输出）
+// 后在第三次调用完整输出（StopReason=stop）→ 最终保存的是完整章，不是半章、
+// 不是两段拼接。MaxTurns=3 恰好覆盖 1 次初始 + 2 次 recovery，是
+// length-recovery 精确变体（1×length→complete 与 3×length→fail-closed 之间的边界）。
+func TestPolishDraft_LengthTwiceThenComplete(t *testing.T) {
+	const draft = "这是第三章的原始草稿，句子冗长拖沓，需要精修。"
+	half := strings.Repeat("这是第一次被截断的半章正文，精修尚未完成，后面还有大量内容没有输出。", 30)
+	full := strings.Repeat("这是第三次输出的完整精修章节正文，覆盖了从开头到结尾的全部内容，句式干净利落。", 40)
+
+	st := setupPolishStore(t, 3, draft)
+	calls := 0
+	polisher := newMockPolisherCfg(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
+		switch i {
+		case 0, 1:
+			// 前两轮：均被 max_tokens 截断，只输出半章
+			return &agentcore.LLMResponse{Message: polisherLengthText(half)}, nil
+		default:
+			// 第三轮：完整输出整章（StopReason=stop）
+			return &agentcore.LLMResponse{Message: polisherText(full)}, nil
+		}
+	}, 3, testRecoveryPrompt)
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":3}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !output.Polished {
+		t.Fatalf("expected success after two length recoveries, got %+v", output)
+	}
+	if calls != 3 {
+		t.Fatalf("polisher calls = %d, want 3 (length → length → complete)", calls)
+	}
+
+	// 保存的必须是第三轮完整章：不是第一/二轮半章，也不是两段拼接
+	saved, _, err := st.Drafts.LoadChapterContent(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved != full {
+		t.Fatalf("saved draft = %q..., want full chapter (not half/concatenated); len saved=%d want=%d",
+			snippet(saved), len(saved), len(full))
+	}
+	if output.OutputDigest != domain.DigestDraft(full) {
+		t.Errorf("output_digest = %s, want digest of full chapter", output.OutputDigest)
+	}
+	cp := polishCheckpointOf(t, st, 3)
+	if cp.Digest != domain.DigestDraft(full) {
+		t.Errorf("checkpoint digest = %s, want digest of full chapter", cp.Digest)
+	}
+}
+
 // TestPolishDraft_MaxTurnsErrorNoOuterRetry：复现生产旧配置（MaxTurns=1）下
 // length 截断 → MaxTurnsError 的传播路径。runner 错误必须立即返回，不进入空输出
 // 重试循环（调用次数不得因 polisherEmptyRetryMax=4 而翻倍）。
