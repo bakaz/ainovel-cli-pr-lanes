@@ -3,12 +3,14 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/errs"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -110,11 +112,12 @@ func TestCommitChapterAllowsPendingRewrite(t *testing.T) {
 
 	tool := NewCommitChapterTool(store)
 	args, err := json.Marshal(map[string]any{
-		"chapter":         2,
-		"summary":         "正确提交",
-		"characters":      []string{"主角"},
-		"key_events":      []string{"完成重写"},
-		"timeline_events": []any{},
+		"chapter":          2,
+		"summary":          "正确提交",
+		"characters":       []string{"主角"},
+		"key_events":       []string{"完成重写"},
+		"world_state_mode": "preserve",
+		"timeline_events":  []any{},
 	})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
@@ -335,10 +338,11 @@ func TestCommitChapterNonLayeredRecompletesAfterRework(t *testing.T) {
 	}
 	tool := NewCommitChapterTool(s)
 	args, _ := json.Marshal(map[string]any{
-		"chapter":    2,
-		"summary":    "返工后摘要",
-		"characters": []string{"主角"},
-		"key_events": []string{"清理"},
+		"chapter":          2,
+		"summary":          "返工后摘要",
+		"characters":       []string{"主角"},
+		"key_events":       []string{"清理"},
+		"world_state_mode": "preserve",
 	})
 	raw, err := tool.Execute(context.Background(), args)
 	if err != nil {
@@ -428,6 +432,7 @@ func TestCommitChapterLayeredReopenRecompletesDespiteOpenThread(t *testing.T) {
 	tool := NewCommitChapterTool(s)
 	args, _ := json.Marshal(map[string]any{
 		"chapter": 2, "summary": "返工摘要", "characters": []string{"主角"}, "key_events": []string{"清理"},
+		"world_state_mode": "preserve",
 	})
 	raw, err := tool.Execute(context.Background(), args)
 	if err != nil {
@@ -481,10 +486,11 @@ func TestCommitChapterRejectsPolishWithoutDraftChange(t *testing.T) {
 
 	tool := NewCommitChapterTool(s)
 	args, _ := json.Marshal(map[string]any{
-		"chapter":    2,
-		"summary":    "假装打磨了",
-		"characters": []string{"主角"},
-		"key_events": []string{"无改动"},
+		"chapter":          2,
+		"summary":          "假装打磨了",
+		"characters":       []string{"主角"},
+		"key_events":       []string{"无改动"},
+		"world_state_mode": "preserve",
 	})
 	_, err := tool.Execute(context.Background(), args)
 	if err == nil {
@@ -876,5 +882,268 @@ func TestCommitChapterLayeredNoAutoCompleteWithOpenThreads(t *testing.T) {
 	}
 	if p, _ := s.Progress.Load(); p.Phase == domain.PhaseComplete {
 		t.Fatal("活跃长线未收束时不应自动完结")
+	}
+}
+
+// ── 批次 4：重写提交 world_state_mode 安全闸门 ───────────────────────────
+//
+// 背景：剧情级重写（PendingRewrites 路径）曾静默丢弃 4 组世界状态变更
+// （TimelineEvents/ForeshadowUpdates/RelationshipChanges/StateChanges），
+// 正文与世界账本永久失配且无报错。本批次强制重写提交显式声明
+// world_state_mode（preserve/replace）：
+//   - 缺失或非法值 → Precondition 拒绝（不写终稿、不 drain 队列）；
+//   - preserve → 现有 executeRewriteCommit 行为（4 组世界状态变更一律不应用）；
+//   - replace → 无可重放历史时显式拒绝（世界状态重放能力尚未就绪）。
+
+// rewriteModeStore 构造重写队列基础 store：第 2 章已完成并入队，草稿已改为
+// draftText（≠ 终稿 finalText）。
+func rewriteModeStore(t *testing.T, finalText, draftText string) *store.Store {
+	t.Helper()
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 10); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Drafts.SaveDraft(2, finalText); err != nil {
+		t.Fatalf("SaveDraft(final): %v", err)
+	}
+	if err := s.Drafts.SaveFinalChapter(2, finalText); err != nil {
+		t.Fatalf("SaveFinalChapter: %v", err)
+	}
+	if err := s.Progress.MarkChapterComplete(2, len([]rune(finalText)), "mystery", "quest"); err != nil {
+		t.Fatalf("MarkChapterComplete: %v", err)
+	}
+	if err := s.Progress.SetPendingRewrites([]int{2}, "测试重写"); err != nil {
+		t.Fatalf("SetPendingRewrites: %v", err)
+	}
+	if err := s.Progress.SetFlow(domain.FlowRewriting); err != nil {
+		t.Fatalf("SetFlow: %v", err)
+	}
+	if err := s.Drafts.SaveDraft(2, draftText); err != nil {
+		t.Fatalf("SaveDraft(rework): %v", err)
+	}
+	return s
+}
+
+// TestCommitChapterRewritePreserveKeepsWorldState 验证 preserve 重写提交后
+// 四类世界账本（Timeline/Foreshadow/Relationship/State）一律不更新——
+// 即使模型在参数里附带 4 组世界状态字段（纯文风重写模型可能产出的噪声）。
+func TestCommitChapterRewritePreserveKeepsWorldState(t *testing.T) {
+	const final = "已提交的终稿。她心里骂自己丢人，真不要脸。"
+	s := rewriteModeStore(t, final, "返工后的草稿。她心里骂自己丢人，真不要脸。")
+
+	// 世界账本已有第 2 章的原始记录（章节首次提交时写入）。
+	seededTimeline := []domain.TimelineEvent{{Chapter: 2, Time: "午后", Event: "林墨遇袭", Characters: []string{"林墨"}}}
+	seededState := []domain.StateChange{{Chapter: 2, Entity: "林墨", Field: "境界", OldValue: "凡人", NewValue: "练气"}}
+	seededForeshadow := []domain.ForeshadowUpdate{{ID: "f1", Action: "plant", Description: "黑影身份"}}
+	seededRelationships := []domain.RelationshipEntry{{CharacterA: "林墨", CharacterB: "李清砚", Relation: "师从", Chapter: 2}}
+	if err := s.World.AppendTimelineEvents(seededTimeline); err != nil {
+		t.Fatalf("seed timeline: %v", err)
+	}
+	if err := s.World.AppendStateChanges(seededState); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	if err := s.World.UpdateForeshadow(2, seededForeshadow); err != nil {
+		t.Fatalf("seed foreshadow: %v", err)
+	}
+	if err := s.World.UpdateRelationships(seededRelationships); err != nil {
+		t.Fatalf("seed relationships: %v", err)
+	}
+
+	tool := NewCommitChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter": 2, "summary": "重写摘要", "characters": []string{"林墨"}, "key_events": []string{"重写"},
+		"world_state_mode":     "preserve",
+		"timeline_events":      []domain.TimelineEvent{{Chapter: 2, Time: "子夜", Event: "重写后事件", Characters: []string{"林墨"}}},
+		"state_changes":        []domain.StateChange{{Chapter: 2, Entity: "林墨", Field: "境界", OldValue: "练气", NewValue: "金丹"}},
+		"foreshadow_updates":   []domain.ForeshadowUpdate{{ID: "f2", Action: "plant", Description: "重写伏笔"}},
+		"relationship_changes": []domain.RelationshipEntry{{CharacterA: "林墨", CharacterB: "李清砚", Relation: "决裂", Chapter: 2}},
+	})
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("Execute preserve rewrite: %v", err)
+	}
+
+	events, _ := s.World.LoadTimeline()
+	if len(events) != 1 || events[0].Event != "林墨遇袭" {
+		t.Fatalf("preserve 后 timeline 应保持原状，got %+v", events)
+	}
+	changes, _ := s.World.LoadStateChanges()
+	if len(changes) != 1 || changes[0].NewValue != "练气" {
+		t.Fatalf("preserve 后 state changes 应保持原状，got %+v", changes)
+	}
+	ledger, _ := s.World.LoadForeshadowLedger()
+	if len(ledger) != 1 || ledger[0].ID != "f1" {
+		t.Fatalf("preserve 后 foreshadow 账本应保持原状，got %+v", ledger)
+	}
+	rels, _ := s.World.LoadRelationships()
+	if len(rels) != 1 || rels[0].Relation != "师从" {
+		t.Fatalf("preserve 后 relationship 账本应保持原状，got %+v", rels)
+	}
+	progress, _ := s.Progress.Load()
+	if len(progress.PendingRewrites) != 0 {
+		t.Fatalf("preserve 提交应 drain 队列，got %v", progress.PendingRewrites)
+	}
+}
+
+// TestCommitChapterRewriteMissingModeRejected 验证缺失 world_state_mode 的
+// 重写提交被 Precondition 拒绝：不写终稿、不 drain PendingRewrites、不切 flow。
+func TestCommitChapterRewriteMissingModeRejected(t *testing.T) {
+	const final = "已提交的终稿。她心里骂自己丢人，真不要脸。"
+	s := rewriteModeStore(t, final, "返工后的草稿。她心里骂自己丢人，真不要脸。")
+
+	tool := NewCommitChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter": 2, "summary": "重写摘要", "characters": []string{"主角"}, "key_events": []string{"重写"},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("缺失 world_state_mode 的重写提交必须被拒绝")
+	}
+	if !errors.Is(err, errs.ErrToolPrecondition) {
+		t.Fatalf("应为 Precondition 错误，got %v", err)
+	}
+	if !strings.Contains(err.Error(), "world_state_mode") || !strings.Contains(err.Error(), "第 2 章") {
+		t.Fatalf("错误消息应包含 chapter 与 world_state_mode，got %v", err)
+	}
+	if text, _ := s.Drafts.LoadChapterText(2); text != final {
+		t.Fatalf("拒绝后终稿不应被覆盖，got %q", text)
+	}
+	progress, _ := s.Progress.Load()
+	if len(progress.PendingRewrites) != 1 || progress.PendingRewrites[0] != 2 {
+		t.Fatalf("拒绝后 PendingRewrites 应保持 [2]，got %v", progress.PendingRewrites)
+	}
+	if progress.Flow != domain.FlowRewriting {
+		t.Fatalf("拒绝后 flow 应保持 rewriting，got %s", progress.Flow)
+	}
+}
+
+// TestCommitChapterRewriteInvalidModeRejected 验证非法 world_state_mode 值
+// 被 Precondition 拒绝（消息含 mode 值），且无任何写入。
+func TestCommitChapterRewriteInvalidModeRejected(t *testing.T) {
+	const final = "已提交的终稿。她心里骂自己丢人，真不要脸。"
+	s := rewriteModeStore(t, final, "返工后的草稿。她心里骂自己丢人，真不要脸。")
+
+	tool := NewCommitChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter": 2, "summary": "重写摘要", "characters": []string{"主角"}, "key_events": []string{"重写"},
+		"world_state_mode": "merge",
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("非法 world_state_mode 的重写提交必须被拒绝")
+	}
+	if !errors.Is(err, errs.ErrToolPrecondition) {
+		t.Fatalf("应为 Precondition 错误，got %v", err)
+	}
+	if !strings.Contains(err.Error(), `world_state_mode="merge"`) {
+		t.Fatalf("错误消息应包含 world_state_mode 值，got %v", err)
+	}
+	if text, _ := s.Drafts.LoadChapterText(2); text != final {
+		t.Fatalf("拒绝后终稿不应被覆盖，got %q", text)
+	}
+	if progress, _ := s.Progress.Load(); len(progress.PendingRewrites) != 1 {
+		t.Fatalf("拒绝后 PendingRewrites 应保持 [2]，got %v", progress.PendingRewrites)
+	}
+}
+
+// TestCommitChapterRewriteMissingModeZeroSideEffects 验证缺失 world_state_mode 的
+// 重写提交失败时零副作用（发布阻断 2）：不写入 rule_violations（literary gate
+// 未执行）、不追加 commit checkpoint、不清除残留 PendingCommit（恢复信号保持
+// 原样）。回归：mode 校验曾位于 literary gate 与 PendingCommit 清理之后
+// （commit_chapter.go 183-188），缺失 mode 时已产生部分写入；修复后校验提前
+// 到一切写副作用之前。
+func TestCommitChapterRewriteMissingModeZeroSideEffects(t *testing.T) {
+	const final = "已提交的终稿。她心里骂自己丢人，真不要脸。"
+	// 草稿用 dirtyProse：若 literary gate 先于 mode 校验执行，会把命中句落盘。
+	s := rewriteModeStore(t, final, dirtyProse)
+	// 残留 PendingCommit：若 mode 校验被推迟到 IsChapterCompleted 分支之后，
+	// 会被清除并追加 commit checkpoint。
+	if err := s.Signals.SavePendingCommit(domain.PendingCommit{
+		Chapter: 2, Stage: domain.CommitStageProgressMarked, Summary: "半提交摘要",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewCommitChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter": 2, "summary": "重写摘要", "characters": []string{"主角"}, "key_events": []string{"重写"},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("缺失 world_state_mode 的重写提交必须被拒绝")
+	}
+	if !errors.Is(err, errs.ErrToolPrecondition) {
+		t.Fatalf("应为 Precondition 错误，got %v", err)
+	}
+	if !strings.Contains(err.Error(), "world_state_mode") {
+		t.Fatalf("错误消息应包含 world_state_mode，got %v", err)
+	}
+
+	// 零副作用断言
+	if v := s.World.LoadRuleViolations(2); len(v) != 0 {
+		t.Fatalf("mode 缺失失败不得写入 rule_violations，got %+v", v)
+	}
+	if cp := s.Checkpoints.LatestByStep(domain.ChapterScope(2), "commit"); cp != nil {
+		t.Fatal("mode 缺失失败不得追加 commit checkpoint")
+	}
+	if pending, _ := s.Signals.LoadPendingCommit(); pending == nil || pending.Chapter != 2 {
+		t.Fatal("mode 缺失失败不得清除残留 PendingCommit（恢复信号应保持原样）")
+	}
+	if text, _ := s.Drafts.LoadChapterText(2); text != final {
+		t.Fatalf("拒绝后终稿不应被覆盖，got %q", text)
+	}
+	progress, _ := s.Progress.Load()
+	if len(progress.PendingRewrites) != 1 || progress.PendingRewrites[0] != 2 {
+		t.Fatalf("拒绝后 PendingRewrites 应保持 [2]，got %v", progress.PendingRewrites)
+	}
+}
+
+// TestCommitChapterRewriteReplaceRejected 验证 world_state_mode="replace" 在
+// 无可重放历史时被显式拒绝：不产生部分写入（终稿不变、队列不 drain、
+// 时间线不被替换/追加）。
+func TestCommitChapterRewriteReplaceRejected(t *testing.T) {
+	const final = "已提交的终稿。她心里骂自己丢人，真不要脸。"
+	s := rewriteModeStore(t, final, "返工后的草稿。她心里骂自己丢人，真不要脸。")
+
+	// 重写前账本已有第 2 章的原始记录。
+	seededTimeline := []domain.TimelineEvent{{Chapter: 2, Time: "午后", Event: "林墨遇袭", Characters: []string{"林墨"}}}
+	if err := s.World.AppendTimelineEvents(seededTimeline); err != nil {
+		t.Fatalf("seed timeline: %v", err)
+	}
+
+	tool := NewCommitChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter": 2, "summary": "剧情重写摘要", "characters": []string{"林墨"}, "key_events": []string{"剧情变化"},
+		"world_state_mode":     "replace",
+		"timeline_events":      []domain.TimelineEvent{{Chapter: 2, Time: "子夜", Event: "重写后事件", Characters: []string{"林墨"}}},
+		"state_changes":        []domain.StateChange{{Chapter: 2, Entity: "林墨", Field: "境界", OldValue: "练气", NewValue: "金丹"}},
+		"foreshadow_updates":   []domain.ForeshadowUpdate{{ID: "f2", Action: "plant", Description: "重写伏笔"}},
+		"relationship_changes": []domain.RelationshipEntry{{CharacterA: "林墨", CharacterB: "李清砚", Relation: "决裂", Chapter: 2}},
+	})
+	_, err := tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("replace（无可重放历史）必须被显式拒绝")
+	}
+	if !errors.Is(err, errs.ErrToolPrecondition) {
+		t.Fatalf("应为 Precondition 错误，got %v", err)
+	}
+	for _, want := range []string{"第 2 章", `world_state_mode="replace"`, "重放", "preserve"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误消息应包含 %q，got %v", want, err)
+		}
+	}
+
+	// 不产生部分写入：终稿不变、队列不 drain、时间线不被替换/追加。
+	if text, _ := s.Drafts.LoadChapterText(2); text != final {
+		t.Fatalf("拒绝后终稿不应被覆盖，got %q", text)
+	}
+	if progress, _ := s.Progress.Load(); len(progress.PendingRewrites) != 1 {
+		t.Fatalf("拒绝后 PendingRewrites 应保持 [2]，got %v", progress.PendingRewrites)
+	}
+	events, _ := s.World.LoadTimeline()
+	if len(events) != 1 || events[0].Event != "林墨遇袭" {
+		t.Fatalf("拒绝后 timeline 不得被替换或追加，got %+v", events)
 	}
 }

@@ -414,7 +414,8 @@ func TestPipeline_RewriteQueueFullCycle63Recovery(t *testing.T) {
 	commitTool.SetPolishPipeline(&PolishPipelineConfig{ExpectedModel: "mock-polisher-model"})
 	args, _ := json.Marshal(map[string]any{
 		"chapter": 1, "summary": "返工提交", "characters": []string{"主角"},
-		"key_events": []string{"事件"},
+		"key_events":       []string{"事件"},
+		"world_state_mode": "preserve",
 	})
 	if _, err := commitTool.Execute(t.Context(), args); err != nil {
 		t.Fatalf("commit after full 63 chain should pass: %v", err)
@@ -429,5 +430,253 @@ func TestPipeline_RewriteQueueFullCycle63Recovery(t *testing.T) {
 	finalText, _ := st.Drafts.LoadChapterText(1)
 	if finalText == "" {
 		t.Fatal("final chapter should have been overwritten")
+	}
+}
+
+// ── FSM 完整链路（规格第 14.2 节全链路单测） ──────────────────────────
+// draft → check → polish → check → critic revise → edit → check → polish → check
+// → critic pass → commit。每个节点先尝试非法后继动作：必须被 chapter_fsm 拦截
+// （错误含 stage/attempted/required）且无副作用（checkpoint 数、账本周期数、
+// 草稿、终稿均不变，mock 模型调用数不增），随后执行正确动作继续推进。
+
+// fsmSnapshot 是"无副作用"断言的事实快照。
+type fsmSnapshot struct {
+	cpCount int
+	cycles  int
+	draft   string
+	final   string
+}
+
+func snapshotChapterFSM(st *store.Store, chapter int) fsmSnapshot {
+	draft, _ := st.Drafts.LoadDraft(chapter)
+	final, _ := st.Drafts.LoadChapterText(chapter)
+	cpCount := len(st.Checkpoints.All())
+	cycles := 0
+	if l, _ := st.StyleReview.Load(chapter); l != nil {
+		cycles = len(l.Cycles)
+	}
+	return fsmSnapshot{cpCount: cpCount, cycles: cycles, draft: draft, final: final}
+}
+
+func assertFSMSnapshotEqual(t *testing.T, before, after fsmSnapshot, stage string) {
+	t.Helper()
+	if before != after {
+		t.Errorf("side effects detected at stage %s: before=%+v after=%+v", stage, before, after)
+	}
+}
+
+// rejectFSM 断言非法后继动作被 chapter_fsm 拦截且无副作用。
+func rejectFSM(t *testing.T, st *store.Store, before fsmSnapshot, tool agentcore.Tool, args json.RawMessage, stage, attempted, required string, chapter int) {
+	t.Helper()
+	_, err := tool.Execute(t.Context(), args)
+	if err == nil {
+		t.Fatalf("stage %s: %s must be rejected, got nil error", stage, attempted)
+	}
+	msg := err.Error()
+	for _, want := range []string{"code=chapter_fsm_transition_denied", "stage=" + stage, "attempted=" + attempted, "required=" + required} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("stage %s: error %q missing %q", stage, msg, want)
+		}
+	}
+	assertFSMSnapshotEqual(t, before, snapshotChapterFSM(st, chapter), stage+" / "+attempted)
+}
+
+// TestPipeline_FSMFullCycle 是启用 FSM 的完整链路（mock critic/polisher）。
+func TestPipeline_FSMFullCycle(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	savePermissiveUserRules(t, st)
+
+	cfg := ChapterFSMConfig{Enabled: true, PipelineEnabled: true, ExpectedPolisherModel: "mock-polisher-model"}
+
+	// 真实工具装配（mock critic/polisher），六工具全部注入 FSM 配置。
+	polisherCalls, criticCalls := 0, 0
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		polisherCalls++
+		switch i {
+		case 0:
+			return &agentcore.LLMResponse{Message: polisherText("第一章初稿正文已经过精修，句子更凝练。她心里骂自己丢人，真不要脸。")}, nil
+		default:
+			return &agentcore.LLMResponse{Message: polisherText("第一章初稿正文二轮修改后再度精修，节奏明快。她心里骂自己丢人，真不要脸。")}, nil
+		}
+	})
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		criticCalls++
+		if i == 0 {
+			return &agentcore.LLMResponse{Message: criticText(productionReviseJSON())}, nil
+		}
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+
+	draftTool := NewDraftChapterTool(st, testContract)
+	checkTool := NewCheckConsistencyTool(st)
+	polishTool := newEnabledPolishTool(st, polisher)
+	reviewTool := NewReviewStyleTool(st, critic, testCriticVersion)
+	editTool := NewEditChapterTool(st)
+	commitTool := NewCommitChapterTool(st)
+	commitTool.SetPolishPipeline(&PolishPipelineConfig{ExpectedModel: "mock-polisher-model"})
+	for _, tl := range []ChapterFSMConfigurable{draftTool, checkTool, polishTool, reviewTool, editTool, commitTool} {
+		tl.SetChapterFSMConfig(cfg)
+	}
+
+	d1 := "第一章初稿正文。她心里骂自己丢人，真不要脸。"
+
+	// ── 节点 0：needs_draft — commit 非法，draft 合法 ──
+	snap := snapshotChapterFSM(st, 1)
+	rejectFSM(t, st, snap, commitTool, commitArgs(1), "needs_draft", "commit_chapter", "draft_chapter", 1)
+	if _, err := draftTool.Execute(t.Context(), json.RawMessage(`{"chapter":1,"content":"`+d1+`","mode":"write"}`)); err != nil {
+		t.Fatalf("draft (needs_draft) must pass: %v", err)
+	}
+
+	// ── 节点 1：draft_dirty — polish/commit 非法（polisher 0 调用），check 合法 ──
+	snap = snapshotChapterFSM(st, 1)
+	rejectFSM(t, st, snap, polishTool, json.RawMessage(`{"chapter":1}`), "draft_dirty", "polish_draft", "check_consistency", 1)
+	rejectFSM(t, st, snap, commitTool, commitArgs(1), "draft_dirty", "commit_chapter", "check_consistency", 1)
+	if polisherCalls != 0 {
+		t.Fatalf("polisher must not be called in draft_dirty, got %d", polisherCalls)
+	}
+	out1, err := checkTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("check (draft_dirty) must pass: %v", err)
+	}
+	var res1 map[string]any
+	if err := json.Unmarshal(out1, &res1); err != nil {
+		t.Fatal(err)
+	}
+	act1, _ := res1["required_next_action"].(map[string]any)
+	if act1 == nil || act1["action"] != ActionPolishDraft {
+		t.Fatalf("required_next_action after clean check = %v, want %s", act1, ActionPolishDraft)
+	}
+
+	// ── 节点 2：needs_polish — draft/edit/check/commit/review 非法，polish 合法 ──
+	snap = snapshotChapterFSM(st, 1)
+	rejectFSM(t, st, snap, draftTool, json.RawMessage(`{"chapter":1,"content":"越权重写","mode":"write"}`), "needs_polish", "draft_chapter", "polish_draft", 1)
+	rejectFSM(t, st, snap, editTool, json.RawMessage(`{"chapter":1,"old_string":"初稿正文","new_string":"越权修改"}`), "needs_polish", "edit_chapter", "polish_draft", 1)
+	rejectFSM(t, st, snap, checkTool, json.RawMessage(`{"chapter":1}`), "needs_polish", "check_consistency", "polish_draft", 1)
+	rejectFSM(t, st, snap, commitTool, commitArgs(1), "needs_polish", "commit_chapter", "polish_draft", 1)
+	rejectFSM(t, st, snap, reviewTool, json.RawMessage(`{"chapter":1}`), "needs_polish", "review_style", "polish_draft", 1)
+	if criticCalls != 0 {
+		t.Fatalf("critic must not be called in needs_polish, got %d", criticCalls)
+	}
+	if _, err := polishTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("polish (needs_polish) must pass: %v", err)
+	}
+	if polisherCalls != 1 {
+		t.Fatalf("polisher calls = %d, want 1", polisherCalls)
+	}
+
+	// ── 节点 3：polish 已产生新候选（digest 变 → consistency stale → draft_dirty）
+	// — review/commit 非法（critic 0 调用），check 合法 ──
+	snap = snapshotChapterFSM(st, 1)
+	rejectFSM(t, st, snap, reviewTool, json.RawMessage(`{"chapter":1}`), "draft_dirty", "review_style", "check_consistency", 1)
+	rejectFSM(t, st, snap, commitTool, commitArgs(1), "draft_dirty", "commit_chapter", "check_consistency", 1)
+	if criticCalls != 0 {
+		t.Fatalf("critic must not be called before post-polish check, got %d", criticCalls)
+	}
+	if _, err := checkTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("check (post-polish) must pass: %v", err)
+	}
+
+	// ── 节点 4：needs_review — commit 非法，review 合法（revise → revision_open） ──
+	snap = snapshotChapterFSM(st, 1)
+	rejectFSM(t, st, snap, commitTool, commitArgs(1), "needs_review", "commit_chapter", "review_style", 1)
+	outRev, err := reviewTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("review (needs_review) must pass: %v", err)
+	}
+	var rev StyleReviewOutput
+	if err := json.Unmarshal(outRev, &rev); err != nil {
+		t.Fatal(err)
+	}
+	if rev.Verdict != "revise" || rev.Status != string(domain.ReviewStatusRevisionOpen) {
+		t.Fatalf("first review = %s/%s, want revise/revision_open", rev.Verdict, rev.Status)
+	}
+
+	// ── 节点 5：revision_open — check/polish/review/commit 非法，edit 合法 ──
+	snap = snapshotChapterFSM(st, 1)
+	rejectFSM(t, st, snap, checkTool, json.RawMessage(`{"chapter":1}`), "revision_open", "check_consistency", "edit_chapter", 1)
+	rejectFSM(t, st, snap, polishTool, json.RawMessage(`{"chapter":1}`), "revision_open", "polish_draft", "edit_chapter", 1)
+	rejectFSM(t, st, snap, reviewTool, json.RawMessage(`{"chapter":1}`), "revision_open", "review_style", "edit_chapter", 1)
+	rejectFSM(t, st, snap, commitTool, commitArgs(1), "revision_open", "commit_chapter", "edit_chapter", 1)
+	if _, err := editTool.Execute(t.Context(), json.RawMessage(`{"chapter":1,"old_string":"已经过精修","new_string":"已经过二轮修改"}`)); err != nil {
+		t.Fatalf("edit (revision_open) must pass: %v", err)
+	}
+
+	// ── 节点 6：draft_dirty（修订后 digest 变）— review/polish/commit 非法，check 合法 ──
+	snap = snapshotChapterFSM(st, 1)
+	rejectFSM(t, st, snap, reviewTool, json.RawMessage(`{"chapter":1}`), "draft_dirty", "review_style", "check_consistency", 1)
+	rejectFSM(t, st, snap, polishTool, json.RawMessage(`{"chapter":1}`), "draft_dirty", "polish_draft", "check_consistency", 1)
+	rejectFSM(t, st, snap, commitTool, commitArgs(1), "draft_dirty", "commit_chapter", "check_consistency", 1)
+	if criticCalls != 1 {
+		t.Fatalf("critic calls = %d, want 1（修订后未复检不得再评审）", criticCalls)
+	}
+	if _, err := checkTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("check (draft_dirty after edit) must pass: %v", err)
+	}
+
+	// ── 节点 7：needs_polish（polish stale）→ polish 合法（P2） ──
+	snap = snapshotChapterFSM(st, 1)
+	rejectFSM(t, st, snap, reviewTool, json.RawMessage(`{"chapter":1}`), "needs_polish", "review_style", "polish_draft", 1)
+	if _, err := polishTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("polish #2 must pass: %v", err)
+	}
+	if polisherCalls != 2 {
+		t.Fatalf("polisher calls = %d, want 2", polisherCalls)
+	}
+
+	// ── 节点 8：polish #2 后 digest 再变 → draft_dirty；commit 非法，check 合法 ──
+	snap = snapshotChapterFSM(st, 1)
+	rejectFSM(t, st, snap, commitTool, commitArgs(1), "draft_dirty", "commit_chapter", "check_consistency", 1)
+	if _, err := checkTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("check #4 must pass: %v", err)
+	}
+
+	// ── 节点 9：needs_review → review 合法（pass → accepted_revised → needs_commit） ──
+	snap = snapshotChapterFSM(st, 1)
+	rejectFSM(t, st, snap, commitTool, commitArgs(1), "needs_review", "commit_chapter", "review_style", 1)
+	outPass, err := reviewTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("final review must pass: %v", err)
+	}
+	var pass StyleReviewOutput
+	if err := json.Unmarshal(outPass, &pass); err != nil {
+		t.Fatal(err)
+	}
+	if pass.Verdict != "pass" || pass.Status != string(domain.ReviewStatusAcceptedRev) {
+		t.Fatalf("final review = %s/%s, want pass/accepted_revised", pass.Verdict, pass.Status)
+	}
+
+	// ── 节点 10：needs_commit — draft/edit/polish/check 非法，commit 合法 ──
+	snap = snapshotChapterFSM(st, 1)
+	rejectFSM(t, st, snap, draftTool, json.RawMessage(`{"chapter":1,"content":"越权重写","mode":"write"}`), "needs_commit", "draft_chapter", "commit_chapter", 1)
+	rejectFSM(t, st, snap, editTool, json.RawMessage(`{"chapter":1,"old_string":"再度精修","new_string":"越权修改"}`), "needs_commit", "edit_chapter", "commit_chapter", 1)
+	rejectFSM(t, st, snap, polishTool, json.RawMessage(`{"chapter":1}`), "needs_commit", "polish_draft", "commit_chapter", 1)
+	rejectFSM(t, st, snap, checkTool, json.RawMessage(`{"chapter":1}`), "needs_commit", "check_consistency", "commit_chapter", 1)
+	if polisherCalls != 2 || criticCalls != 2 {
+		t.Fatalf("mock calls drifted: polisher=%d critic=%d", polisherCalls, criticCalls)
+	}
+	if _, err := commitTool.Execute(t.Context(), commitArgs(1)); err != nil {
+		t.Fatalf("commit (needs_commit) must pass: %v", err)
+	}
+
+	// 终态：final 已写、章节完成、账本 terminal。
+	finalText, _ := st.Drafts.LoadChapterText(1)
+	if finalText == "" {
+		t.Fatal("final chapter must be written")
+	}
+	if !st.Progress.IsChapterCompleted(1) {
+		t.Fatal("chapter must be completed after commit")
+	}
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger == nil || !ledger.CurrentStatus().IsTerminal() {
+		t.Fatalf("ledger must be terminal after full cycle, got %v", ledger)
 	}
 }

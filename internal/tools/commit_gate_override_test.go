@@ -318,6 +318,8 @@ func TestCommitGate_RewriteQueueStaleDigestRejects(t *testing.T) {
 	args, _ := json.Marshal(map[string]any{
 		"chapter": 1, "summary": "重写提交", "characters": []string{"主角"},
 		"key_events": []string{"事件"},
+		// 批次 4：mode 校验先于 gate 执行，需显式声明才能到达 freshness 校验。
+		"world_state_mode": "preserve",
 	})
 	_, err := commitTool.Execute(t.Context(), args)
 	if err == nil {

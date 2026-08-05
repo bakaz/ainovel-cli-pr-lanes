@@ -309,10 +309,11 @@ func TestEditChapterWorksWithCommitValidation(t *testing.T) {
 
 	commitTool := NewCommitChapterTool(s)
 	commitArgs, _ := json.Marshal(map[string]any{
-		"chapter":    2,
-		"summary":    "打磨后摘要",
-		"characters": []string{"主角"},
-		"key_events": []string{"完成打磨"},
+		"chapter":          2,
+		"summary":          "打磨后摘要",
+		"characters":       []string{"主角"},
+		"key_events":       []string{"完成打磨"},
+		"world_state_mode": "preserve",
 	})
 	if _, err := commitTool.Execute(context.Background(), commitArgs); err != nil {
 		t.Fatalf("commit_chapter after edit: %v", err)

@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"slices"
+	"log/slog"
 
 	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/ainovel-cli/internal/domain"
@@ -20,7 +20,12 @@ type CheckConsistencyTool struct {
 	store *store.Store
 	// pipelineEnabled 是精修流水线开关（BuildWorkers 注入）：开启时若草稿缺少
 	// 与当前 digest 匹配的 polish checkpoint，required_next_action 建议 polish_draft。
+	// 与 fsmConfig.PipelineEnabled 同源（SetPipelineEnabled 同步两者）。
 	pipelineEnabled bool
+	// fsmConfig 是章节流水线强制状态机配置（BuildWorkers 注入）；Enabled 时
+	// Execute 入口调用 RequireChapterAction 强制顺序（ReadOnly=true 也强制：
+	// 阻止 clean check 后重复 check、needs_polish/needs_commit 时重复 check）。
+	fsmConfig ChapterFSMConfig
 }
 
 func NewCheckConsistencyTool(store *store.Store) *CheckConsistencyTool {
@@ -28,7 +33,16 @@ func NewCheckConsistencyTool(store *store.Store) *CheckConsistencyTool {
 }
 
 // SetPipelineEnabled 设置精修流水线开关（BuildWorkers 注入）。
-func (t *CheckConsistencyTool) SetPipelineEnabled(v bool) { t.pipelineEnabled = v }
+func (t *CheckConsistencyTool) SetPipelineEnabled(v bool) {
+	t.pipelineEnabled = v
+	t.fsmConfig.PipelineEnabled = v
+}
+
+// SetChapterFSMConfig 注入章节流水线强制状态机配置（BuildWorkers 调用）。
+func (t *CheckConsistencyTool) SetChapterFSMConfig(cfg ChapterFSMConfig) { t.fsmConfig = cfg }
+
+// FSMConfig 返回注入的章节流水线配置（构建/测试诊断用）。
+func (t *CheckConsistencyTool) FSMConfig() ChapterFSMConfig { return t.fsmConfig }
 
 func (t *CheckConsistencyTool) Name() string { return "check_consistency" }
 func (t *CheckConsistencyTool) Description() string {
@@ -56,6 +70,12 @@ func (t *CheckConsistencyTool) Execute(_ context.Context, args json.RawMessage) 
 	}
 	if a.Chapter <= 0 {
 		return nil, fmt.Errorf("chapter must be > 0: %w", errs.ErrToolArgs)
+	}
+
+	// 章节流水线强制状态机（Enabled 时）：draft_dirty/needs_post_polish_check
+	// 允许 check；needs_polish/needs_review/needs_commit 等阶段拒绝重复 check。
+	if err := RequireChapterAction(t.store, a.Chapter, ChapterActionCheck, t.fsmConfig); err != nil {
+		return nil, fmt.Errorf("check_consistency: %w", err)
 	}
 
 	result := map[string]any{"chapter": a.Chapter}
@@ -114,81 +134,20 @@ func (t *CheckConsistencyTool) Execute(_ context.Context, args json.RawMessage) 
 		return nil, fmt.Errorf("checkpoint consistency check: %w", err)
 	}
 
-	// ── 计算 required_next_action 辅助提示 ──
-	action := computeNextAction(t, a.Chapter, violations, digestStr)
-	if action != nil {
-		result["required_next_action"] = action
+	// ── 计算 required_next_action 辅助提示（唯一控制面：ChapterStage 决策） ──
+	// checkpoint 成功追加后再解析阶段：guard 用的是追加前的快照（拦截重复 check），
+	// 这里用追加后的快照（本次 check 已是状态事实）生成下一步建议。
+	decision, err := ResolveChapterStage(t.store, a.Chapter, t.fsmConfig)
+	if err != nil {
+		// Store 读失败：不伪装正常阶段——写入 pipeline_state_error 并记录日志，
+		// 主结果（digest/violations）仍然返回。
+		slog.Warn("resolve chapter pipeline stage failed", "module", "tools", "chapter", a.Chapter, "err", err)
+		result["pipeline_state_error"] = err.Error()
+	} else if next := decision.RequiredNextAction(); next != nil {
+		result["required_next_action"] = next
 	}
 
 	return json.Marshal(result)
-}
-
-// computeNextAction 加载运行元信息和风格评审账本，调用纯函数计算下一步建议。
-// 读取失败/异常时返回 nil（字段缺省，不阻塞 check_consistency 主结果）。
-func computeNextAction(t *CheckConsistencyTool, chapter int, violations []rules.Violation, digestStr string) *RequiredNextAction {
-	meta, err := t.store.RunMeta.Load()
-	if err != nil || meta == nil {
-		return nil
-	}
-
-	ledger, lerr := t.store.StyleReview.Load(chapter)
-	if lerr != nil {
-		return nil
-	}
-
-	// rewrite queue 检测：直接加载 Progress（不复用吞错的 boolean helper）
-	inRewriteQueue := false
-	progress, pErr := t.store.Progress.Load()
-	if pErr != nil {
-		return nil
-	}
-	if progress != nil {
-		inRewriteQueue = slices.Contains(progress.CompletedChapters, chapter) &&
-			slices.Contains(progress.PendingRewrites, chapter)
-	}
-
-	// 精修流水线（pipeline 启用时）：草稿缺少 fresh polish checkpoint → 建议 polish_draft。
-	// 覆盖两类场景：初稿写完后直接 check（应先 polish_draft）；critic revise 后正文被改
-	// （commit gate 会拒绝 stale checkpoint，这里提前引导重跑 polish_draft）。
-	if t.pipelineEnabled && !hasErrorViolations(violations) && !polishCheckpointMatches(t.store, chapter, digestStr) {
-		return &RequiredNextAction{
-			Action: ActionPolishDraft,
-			Reason: fmt.Sprintf("第 %d 章缺少与当前草稿匹配的 polish 记录，请先调用 polish_draft 精修后再继续", chapter),
-		}
-	}
-
-	// rewrite 队列需要终稿 digest 来判断草稿是否实际变更
-	var finalDigest string
-	if inRewriteQueue {
-		finalContent, fErr := t.store.Drafts.LoadChapterText(chapter)
-		if fErr != nil {
-			return nil
-		}
-		if finalContent != "" {
-			h := sha256.Sum256([]byte(finalContent))
-			finalDigest = fmt.Sprintf("sha256:%x", h[:])
-		}
-	}
-
-	// pipeline 启用时把最新 polish checkpoint seq 传给下一步建议（R == latest P
-	// 绑定，与 CheckPolishPipelineGate 的严格绑定一致）；关闭时传 nil（不绑定）。
-	var binding *PolishPipelineBinding
-	if t.pipelineEnabled {
-		if cp := t.store.Checkpoints.LatestByStep(domain.ChapterScope(chapter), "polish"); cp != nil {
-			binding = &PolishPipelineBinding{LatestPolishSeq: cp.Seq}
-		}
-	}
-
-	return ComputeRequiredNextAction(
-		meta.StyleReviewMode,
-		chapter,
-		hasErrorViolations(violations),
-		digestStr,
-		ledger,
-		inRewriteQueue,
-		finalDigest,
-		binding,
-	)
 }
 
 // computeMechanicalViolations 计算章节草稿的机械违规集：rules.Lint（内置产品底线）

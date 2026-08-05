@@ -1116,3 +1116,90 @@ func TestPolishGate_OrderingRejectsUsesPatchedOccurredAt(t *testing.T) {
 		t.Errorf("expected ordering rejection, got: %v", err)
 	}
 }
+
+// stripLastCheckpointOccurredAt 把 checkpoints.jsonl 最后一条 checkpoint 的
+// occurred_at 字段删掉（模拟 legacy checkpoint 无完成时间），重建 store 使其
+// 从磁盘重新加载（time.Time 缺省为零值）。
+func stripLastCheckpointOccurredAt(t *testing.T, dir string) *store.Store {
+	t.Helper()
+	path := filepath.Join(dir, "meta", "checkpoints.jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	var cp map[string]any
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &cp); err != nil {
+		t.Fatal(err)
+	}
+	delete(cp, "occurred_at")
+	out, err := json.Marshal(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines[len(lines)-1] = string(out)
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return store.NewStore(dir)
+}
+
+// TestPolishGate_LegacyMissingTimeTolerated legacy（R=0）绑定时间缺失时按已绑定
+// 放行（fail-open，与 FSM 的 reviewBindsPolish 共用同一 helper，规格 §4）：
+// 不因无法比较墙钟时间而拒绝旧账本提交（避免 legacy 账本突然死锁）。
+// 说明：ledger 存储层强制 created_at 为合法 RFC3339（无法构造缺失时间的账本），
+// 因此缺失侧通过 polish checkpoint 的零 OccurredAt 模拟——helper 的 fail-open
+// 分支（CreatedAt=="" 或 OccurredAt 零值）两侧共享，FSM 侧缺失 CreatedAt 的
+// 场景由 chapter_stage_test.go 的 25c 用例覆盖。
+func TestPolishGate_LegacyMissingTimeTolerated(t *testing.T) {
+	draft := "正文。她心里骂自己丢人，真不要脸。"
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatal(err)
+	}
+	digest := domain.DigestDraft(draft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a1", digest); err != nil {
+		t.Fatal(err)
+	}
+	basisDigest := ComputeBasisDigest(st, 1, "test-v1")
+	now := time.Now().Format(time.RFC3339)
+	// legacy 条目：R=0（Request 无 PolishCheckpointSeq），时间戳存在但墙钟比较
+	// 因 polish 侧时间缺失而无法进行。
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"}},
+			{Cycle: 2, Status: domain.ReviewStatusAcceptedInitial, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model"},
+				Result:  &domain.StyleReviewResult{Verdict: domain.ReviewVerdictPass, Evidence: "ok"}},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Checkpoints.AppendPolish(
+		domain.ChapterScope(1), "polish", "a1", digest,
+		domain.PolishCheckpointMeta{InputDigest: digest, PolisherModel: "mimo-polisher", Stage: "draft", Changed: false},
+	); err != nil {
+		t.Fatal(err)
+	}
+	// polish checkpoint 的 occurred_at 缺失 → 墙钟比较无法进行，按已绑定放行。
+	st = stripLastCheckpointOccurredAt(t, dir)
+
+	if err := CheckPolishPipelineGate(st, 1, "mimo-polisher"); err != nil {
+		t.Fatalf("legacy 绑定时间缺失应按已绑定放行（与 FSM 一致），got: %v", err)
+	}
+}

@@ -1,0 +1,843 @@
+package tools
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/errs"
+	"github.com/voocel/ainovel-cli/internal/store"
+)
+
+// ── 纯 FSM 表驱动测试（规格第 14.1 节，25+ 用例） ─────────────────────
+
+// dig 生成一个合法的 sha256 digest（确定性）。
+func dig(s string) string { return domain.DigestDraft(s) }
+
+// consistencyCP 构造 consistency_check checkpoint。
+func consistencyCP(seq int64, digest string) *domain.Checkpoint {
+	return &domain.Checkpoint{Seq: seq, Scope: domain.ChapterScope(1), Step: "consistency_check", Digest: digest, OccurredAt: time.Now()}
+}
+
+// polishCP 构造 polish checkpoint（OccurredAt = 当前时刻）。
+func polishCP(seq int64, digest, stage, model string) *domain.Checkpoint {
+	return &domain.Checkpoint{Seq: seq, Scope: domain.ChapterScope(1), Step: "polish", Digest: digest, Stage: stage, PolisherModel: model, OccurredAt: time.Now()}
+}
+
+// polishCPAt 构造 OccurredAt 受控的 polish checkpoint（legacy 容差测试用）。
+func polishCPAt(seq int64, digest, stage string, at time.Time) *domain.Checkpoint {
+	return &domain.Checkpoint{Seq: seq, Scope: domain.ChapterScope(1), Step: "polish", Digest: digest, Stage: stage, OccurredAt: at}
+}
+
+// mkLedger 构造指定终态的单章 critic 账本（循环结构合法）。
+func mkLedger(status domain.StyleReviewStatus, digest string) *domain.StyleReviewLedger {
+	return &domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: buildCycles(status, digest),
+	}
+}
+
+// mkLedgerBound 构造 terminal 账本，并把全部请求的 PolishCheckpointSeq 设为 seq。
+func mkLedgerBound(status domain.StyleReviewStatus, digest string, seq int64) *domain.StyleReviewLedger {
+	l := mkLedger(status, digest)
+	for i := range l.Cycles {
+		if l.Cycles[i].Request != nil {
+			l.Cycles[i].Request.PolishCheckpointSeq = seq
+		}
+	}
+	return l
+}
+
+// mkLedgerAt 构造 terminal 账本并把全部条目 CreatedAt 设为给定时刻
+// （legacy seq==0 的 wall-clock 绑定测试用）。
+func mkLedgerAt(status domain.StyleReviewStatus, digest, createdAt string) *domain.StyleReviewLedger {
+	l := mkLedger(status, digest)
+	for i := range l.Cycles {
+		l.Cycles[i].CreatedAt = createdAt
+	}
+	return l
+}
+
+// mkLedgerNilRequest 构造 terminal 账本并把全部条目 Request 置 nil
+// （legacy 条目可能缺失 Request；pipeline 关闭时不得因此拒绝绑定）。
+func mkLedgerNilRequest(status domain.StyleReviewStatus, digest string) *domain.StyleReviewLedger {
+	l := mkLedger(status, digest)
+	for i := range l.Cycles {
+		l.Cycles[i].Request = nil
+	}
+	return l
+}
+
+func buildCycles(target domain.StyleReviewStatus, digest string) []domain.StyleReviewEntry {
+	req := &domain.StyleReviewRequest{Prompt: "p", Model: "m"}
+	basis := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	revise := &domain.StyleReviewResult{
+		Verdict: domain.ReviewVerdictRevise, Evidence: "r",
+		Findings: []domain.StyleReviewFinding{
+			{Dimension: "pacing", Severity: "warning", Category: "style", Evidence: "s"},
+		},
+	}
+	pass := &domain.StyleReviewResult{Verdict: domain.ReviewVerdictPass, Evidence: "g"}
+	switch target {
+	case domain.ReviewStatusInitialPending:
+		return []domain.StyleReviewEntry{{
+			Cycle: 1, Status: domain.ReviewStatusInitialPending,
+			AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req,
+		}}
+	case domain.ReviewStatusRevisionOpen:
+		return []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req, Result: revise},
+		}
+	case domain.ReviewStatusFinalPending:
+		return []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req, Result: revise},
+			{Cycle: 3, Status: domain.ReviewStatusFinalPending,
+				AttemptID: "a2", DraftDigest: digest, BasisDigest: basis, Request: req},
+		}
+	case domain.ReviewStatusAcceptedInitial:
+		return []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req},
+			{Cycle: 2, Status: domain.ReviewStatusAcceptedInitial,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req, Result: pass},
+		}
+	case domain.ReviewStatusAcceptedRev:
+		return []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req, Result: revise},
+			{Cycle: 3, Status: domain.ReviewStatusFinalPending,
+				AttemptID: "a2", DraftDigest: digest, BasisDigest: basis, Request: req},
+			{Cycle: 4, Status: domain.ReviewStatusAcceptedRev,
+				AttemptID: "a2", DraftDigest: digest, BasisDigest: basis, Request: req, Result: pass},
+		}
+	case domain.ReviewStatusDegraded:
+		return []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req},
+			{Cycle: 2, Status: domain.ReviewStatusDegraded,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req, Error: "API"},
+		}
+	case domain.ReviewStatusOverridden:
+		return []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req},
+			{Cycle: 2, Status: domain.ReviewStatusOverridden,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req,
+				Override: &domain.StyleReviewOverride{
+					Actor: "u", Reason: "manual",
+					DraftDigest: digest, BasisDigest: basis,
+					OverriddenAt: "2026-07-26T00:00:00Z",
+				}},
+		}
+	case domain.ReviewStatusExhausted:
+		return []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis, Request: req, Result: revise},
+			{Cycle: 3, Status: domain.ReviewStatusFinalPending,
+				AttemptID: "a2", DraftDigest: digest, BasisDigest: basis, Request: req},
+			{Cycle: 4, Status: domain.ReviewStatusExhausted,
+				AttemptID: "a2", DraftDigest: digest, BasisDigest: basis, Request: req, Result: revise},
+		}
+	default:
+		return nil
+	}
+}
+
+// assertAllowedSet 断言 allowed 集合与期望完全一致。
+func assertAllowedSet(t *testing.T, got []ChapterAction, want ...ChapterAction) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("allowed = %v, want %v", got, want)
+	}
+	for _, w := range want {
+		found := false
+		for _, g := range got {
+			if g == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("allowed = %v, want contains %s", got, w)
+		}
+	}
+}
+
+// assertNextAction 断言 RequiredNextAction 的 action（wantAction 空 = 期望 nil）。
+func assertNextAction(t *testing.T, d ChapterStageDecision, wantAction string) {
+	t.Helper()
+	na := d.RequiredNextAction()
+	if wantAction == "" {
+		if na != nil {
+			t.Fatalf("RequiredNextAction = %+v, want nil", na)
+		}
+		return
+	}
+	if na == nil {
+		t.Fatalf("RequiredNextAction = nil, want action %q (stage=%s)", wantAction, d.Stage)
+	}
+	if na.Action != wantAction {
+		t.Fatalf("RequiredNextAction.action = %q, want %q; reason=%q", na.Action, wantAction, na.Reason)
+	}
+	if na.Reason == "" {
+		t.Fatal("RequiredNextAction.reason must not be empty")
+	}
+}
+
+func TestComputeChapterStage(t *testing.T) {
+	const (
+		critic = domain.StyleQualityCritic
+		off    = domain.StyleQualityOff
+	)
+	d := dig("draft-content")
+	d2 := dig("draft-v2")
+	final := dig("final-content")
+	now := time.Now()
+	nowRFC := now.Format(time.RFC3339)
+
+	tests := []struct {
+		name       string
+		in         ChapterStageInput
+		want       ChapterStage
+		allowed    []ChapterAction
+		required   ChapterAction
+		nextAction string // RequiredNextAction().Action；空 = 期望 nil
+	}{
+		// 1. 新章无 draft → needs_draft
+		{
+			name:       "new chapter no draft -> needs_draft",
+			in:         ChapterStageInput{StyleReviewMode: critic},
+			want:       ChapterStageNeedsDraft,
+			allowed:    []ChapterAction{ChapterActionDraft},
+			required:   ChapterActionDraft,
+			nextAction: "draft_chapter",
+		},
+		// 2. draft 存在无 check → draft_dirty
+		{
+			name:       "draft exists no check -> draft_dirty",
+			in:         ChapterStageInput{StyleReviewMode: critic, DraftExists: true, DraftDigest: d},
+			want:       ChapterStageDraftDirty,
+			allowed:    []ChapterAction{ChapterActionDraft, ChapterActionCheck},
+			required:   ChapterActionCheck,
+			nextAction: "check_consistency",
+		},
+		// 3. fresh check + mechanical error → needs_edit
+		{
+			name: "fresh check with mechanical error -> needs_edit",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, DraftExists: true, DraftDigest: d,
+				HasMechanicalErrors: true, LatestConsistency: consistencyCP(1, d),
+			},
+			want:       ChapterStageNeedsEdit,
+			allowed:    []ChapterAction{ChapterActionDraft},
+			required:   ChapterActionDraft,
+			nextAction: "draft_chapter",
+		},
+		// 4. fresh clean check + 无 polish → needs_polish
+		{
+			name: "fresh clean check without polish -> needs_polish",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d, LatestConsistency: consistencyCP(1, d),
+			},
+			want:       ChapterStageNeedsPolish,
+			allowed:    []ChapterAction{ChapterActionPolish},
+			required:   ChapterActionPolish,
+			nextAction: "polish_draft",
+		},
+		// 5. fresh polish + consistency seq 较旧 → needs_post_polish_check
+		{
+			name: "fresh polish with stale consistency seq -> needs_post_polish_check",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d,
+				LatestConsistency: consistencyCP(5, d), LatestPolish: polishCP(6, d, "draft", ""),
+			},
+			want:       ChapterStageNeedsPostPolishCheck,
+			allowed:    []ChapterAction{ChapterActionCheck},
+			required:   ChapterActionCheck,
+			nextAction: "check_consistency",
+		},
+		// 6. no-op polish 同 digest 新 seq → 仍需 post-polish check
+		{
+			name: "no-op polish same digest new seq -> needs_post_polish_check",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d,
+				LatestConsistency: consistencyCP(7, d), LatestPolish: polishCP(8, d, "draft", ""),
+			},
+			want:       ChapterStageNeedsPostPolishCheck,
+			allowed:    []ChapterAction{ChapterActionCheck},
+			required:   ChapterActionCheck,
+			nextAction: "check_consistency",
+		},
+		// 7. post-polish check 完成无 ledger → needs_review
+		{
+			name: "post-polish check done without ledger -> needs_review",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d,
+				LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageNeedsReview,
+			allowed:    []ChapterAction{ChapterActionReview},
+			required:   ChapterActionReview,
+			nextAction: "review_style",
+		},
+		// 8. initial_pending 当前 digest → needs_review
+		{
+			name: "initial_pending with current digest -> needs_review",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, DraftExists: true, DraftDigest: d,
+				ReviewLedger: mkLedger(domain.ReviewStatusInitialPending, d),
+			},
+			want:       ChapterStageNeedsReview,
+			allowed:    []ChapterAction{ChapterActionReview},
+			required:   ChapterActionReview,
+			nextAction: "review_style",
+		},
+		// 9. final_pending 当前 digest → needs_review
+		{
+			name: "final_pending with current digest -> needs_review",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, DraftExists: true, DraftDigest: d,
+				ReviewLedger: mkLedger(domain.ReviewStatusFinalPending, d),
+			},
+			want:       ChapterStageNeedsReview,
+			allowed:    []ChapterAction{ChapterActionReview},
+			required:   ChapterActionReview,
+			nextAction: "review_style",
+		},
+		// 10. pending digest mismatch → blocked
+		{
+			name: "pending digest mismatch -> blocked",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, DraftExists: true, DraftDigest: d2,
+				ReviewLedger: mkLedger(domain.ReviewStatusInitialPending, d),
+			},
+			want:       ChapterStageBlocked,
+			nextAction: "",
+		},
+		// 11. revision_open digest 未变 → revision_open
+		{
+			name: "revision_open digest unchanged -> revision_open",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, DraftExists: true, DraftDigest: d,
+				ReviewLedger: mkLedger(domain.ReviewStatusRevisionOpen, d),
+			},
+			want:       ChapterStageRevisionOpen,
+			allowed:    []ChapterAction{ChapterActionDraft, ChapterActionEdit},
+			required:   ChapterActionEdit,
+			nextAction: "edit_chapter",
+		},
+		// 12. revision_open digest 已变 + check stale → draft_dirty
+		{
+			name: "revision_open digest changed with stale check -> draft_dirty",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, DraftExists: true, DraftDigest: d2,
+				ReviewLedger: mkLedger(domain.ReviewStatusRevisionOpen, d),
+			},
+			want:       ChapterStageDraftDirty,
+			allowed:    []ChapterAction{ChapterActionDraft, ChapterActionEdit, ChapterActionCheck},
+			required:   ChapterActionCheck,
+			nextAction: "check_consistency",
+		},
+		// 13. 修订后 check→polish→check → needs_review
+		{
+			name: "revised then check/polish/check -> needs_review",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d2,
+				ReviewLedger:      mkLedger(domain.ReviewStatusRevisionOpen, d),
+				LatestConsistency: consistencyCP(9, d2), LatestPolish: polishCP(8, d2, "draft", ""),
+			},
+			want:       ChapterStageNeedsReview,
+			allowed:    []ChapterAction{ChapterActionReview},
+			required:   ChapterActionReview,
+			nextAction: "review_style",
+		},
+		// 14. terminal digest + polish seq 匹配 → needs_commit
+		{
+			name: "terminal digest with bound polish seq -> needs_commit",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d,
+				ReviewLedger:      mkLedgerBound(domain.ReviewStatusAcceptedInitial, d, 7),
+				LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageNeedsCommit,
+			allowed:    []ChapterAction{ChapterActionCommit},
+			required:   ChapterActionCommit,
+			nextAction: "commit_chapter",
+		},
+		// 15. rewrite old terminal digest stale → needs_review
+		{
+			name: "rewrite stale old terminal digest -> needs_review",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				DraftExists: true, DraftDigest: d2, FinalExists: true, FinalDigest: final,
+				ReviewLedger:      mkLedger(domain.ReviewStatusAcceptedInitial, d),
+				LatestConsistency: consistencyCP(1, d2),
+			},
+			want:       ChapterStageNeedsReview,
+			allowed:    []ChapterAction{ChapterActionReview},
+			required:   ChapterActionReview,
+			nextAction: "review_style",
+		},
+		// 16. rewrite terminal 当前 digest 匹配 → needs_commit
+		{
+			name: "rewrite terminal current digest -> needs_commit",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				DraftExists: true, DraftDigest: d2, FinalExists: true, FinalDigest: final,
+				ReviewLedger:      mkLedgerBound(domain.ReviewStatusAcceptedInitial, d2, 7),
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCP(7, d2, "rewrite", ""),
+			},
+			want:       ChapterStageNeedsCommit,
+			allowed:    []ChapterAction{ChapterActionCommit},
+			required:   ChapterActionCommit,
+			nextAction: "commit_chapter",
+		},
+		// 17. rewrite draft==final → rewrite_not_started
+		{
+			name: "rewrite draft equals final -> rewrite_not_started",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				DraftExists: true, DraftDigest: final, FinalExists: true, FinalDigest: final,
+			},
+			want:       ChapterStageRewriteNotStarted,
+			allowed:    []ChapterAction{ChapterActionDraft, ChapterActionEdit},
+			required:   ChapterActionEdit,
+			nextAction: "edit_chapter",
+		},
+		// 18. exhausted → blocked
+		{
+			name: "exhausted -> blocked",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, DraftExists: true, DraftDigest: d,
+				ReviewLedger: mkLedger(domain.ReviewStatusExhausted, d),
+			},
+			want:       ChapterStageBlocked,
+			nextAction: "",
+		},
+		// 19. completed 且不在 rewrite queue → complete
+		{
+			name:       "completed not in rewrite queue -> complete",
+			in:         ChapterStageInput{StyleReviewMode: critic, Completed: true},
+			want:       ChapterStageComplete,
+			nextAction: "",
+		},
+		// 20. pipeline on + critic off：check→polish→check→commit
+		{
+			name: "pipeline on critic off full chain -> needs_commit",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: off,
+				DraftExists: true, DraftDigest: d,
+				LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageNeedsCommit,
+			allowed:    []ChapterAction{ChapterActionCommit},
+			required:   ChapterActionCommit,
+			nextAction: "commit_chapter",
+		},
+		// 21. pipeline off + critic on：check→review→commit
+		{
+			name: "pipeline off critic on fresh check -> needs_review",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, DraftExists: true, DraftDigest: d,
+				LatestConsistency: consistencyCP(1, d),
+			},
+			want:       ChapterStageNeedsReview,
+			allowed:    []ChapterAction{ChapterActionReview},
+			required:   ChapterActionReview,
+			nextAction: "review_style",
+		},
+		// 22. pipeline off + critic off → disabled
+		{
+			name:       "pipeline off critic off -> disabled",
+			in:         ChapterStageInput{StyleReviewMode: off},
+			want:       ChapterStageDisabled,
+			nextAction: "",
+		},
+		// 23a. polish model mismatch（非 terminal）→ needs_polish
+		{
+			name: "polish model mismatch -> needs_polish",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d, ExpectedPolisherModel: "new-model",
+				LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "draft", "old-model"),
+			},
+			want:       ChapterStageNeedsPolish,
+			allowed:    []ChapterAction{ChapterActionPolish},
+			required:   ChapterActionPolish,
+			nextAction: "polish_draft",
+		},
+		// 23b. polish model mismatch（terminal 当前候选）→ blocked
+		{
+			name: "polish model mismatch on terminal candidate -> blocked",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d, ExpectedPolisherModel: "new-model",
+				ReviewLedger:      mkLedgerBound(domain.ReviewStatusAcceptedInitial, d, 7),
+				LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "draft", "old-model"),
+			},
+			want:       ChapterStageBlocked,
+			nextAction: "",
+		},
+		// 24a. polish stage mismatch（rewrite 队列期望 rewrite，实际 draft）→ needs_polish
+		{
+			name: "polish stage mismatch in rewrite queue -> needs_polish",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				DraftExists: true, DraftDigest: d2, FinalExists: true, FinalDigest: final,
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCP(7, d2, "draft", ""),
+			},
+			want:       ChapterStageNeedsPolish,
+			allowed:    []ChapterAction{ChapterActionPolish},
+			required:   ChapterActionPolish,
+			nextAction: "polish_draft",
+		},
+		// 24b. polish stage mismatch（非重写队列期望 draft，实际 rewrite）→ needs_polish
+		{
+			name: "polish stage mismatch outside rewrite queue -> needs_polish",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d,
+				LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "rewrite", ""),
+			},
+			want:       ChapterStageNeedsPolish,
+			allowed:    []ChapterAction{ChapterActionPolish},
+			required:   ChapterActionPolish,
+			nextAction: "polish_draft",
+		},
+		// 25a. legacy review binding（seq==0，同秒）→ needs_commit
+		{
+			name: "legacy binding same second -> needs_commit",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				DraftExists: true, DraftDigest: d2, FinalExists: true, FinalDigest: final,
+				ReviewLedger:      mkLedgerAt(domain.ReviewStatusAcceptedInitial, d2, nowRFC),
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCPAt(7, d2, "rewrite", now),
+			},
+			want:       ChapterStageNeedsCommit,
+			allowed:    []ChapterAction{ChapterActionCommit},
+			required:   ChapterActionCommit,
+			nextAction: "commit_chapter",
+		},
+		// 25b. legacy review binding（critic 早于 polish >1s）→ 未绑定 → needs_review
+		{
+			name: "legacy binding critic too early -> needs_review",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				DraftExists: true, DraftDigest: d2, FinalExists: true, FinalDigest: final,
+				ReviewLedger:      mkLedgerAt(domain.ReviewStatusAcceptedInitial, d2, now.Add(-2*time.Second).Format(time.RFC3339)),
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCPAt(7, d2, "rewrite", now),
+			},
+			want:       ChapterStageNeedsReview,
+			allowed:    []ChapterAction{ChapterActionReview},
+			required:   ChapterActionReview,
+			nextAction: "review_style",
+		},
+		// 25c. legacy review binding（时间缺失 → fail-open 视为已绑定，与
+		// CheckPolishPipelineGate 语义一致）→ needs_commit
+		{
+			name: "legacy binding missing timestamp tolerated -> needs_commit",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				DraftExists: true, DraftDigest: d2, FinalExists: true, FinalDigest: final,
+				// mkLedger 的条目 CreatedAt==""（legacy 账本可能缺失时间字段）
+				ReviewLedger:      mkLedger(domain.ReviewStatusAcceptedInitial, d2),
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCP(7, d2, "rewrite", ""),
+			},
+			want:       ChapterStageNeedsCommit,
+			allowed:    []ChapterAction{ChapterActionCommit},
+			required:   ChapterActionCommit,
+			nextAction: "commit_chapter",
+		},
+		// 附加：pipeline 关闭 + critic 开启 + terminal 周期 Request==nil → needs_commit
+		// （pipeline 关闭不要求 polish 绑定，legacy 条目缺失 Request 不得被拒绝）
+		{
+			name: "pipeline off critic on terminal nil request -> needs_commit",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, DraftExists: true, DraftDigest: d,
+				ReviewLedger:      mkLedgerNilRequest(domain.ReviewStatusAcceptedInitial, d),
+				LatestConsistency: consistencyCP(8, d),
+			},
+			want:       ChapterStageNeedsCommit,
+			allowed:    []ChapterAction{ChapterActionCommit},
+			required:   ChapterActionCommit,
+			nextAction: "commit_chapter",
+		},
+		// 附加：rewrite 队列无草稿 → rewrite_not_started（未播种）
+		{
+			name: "rewrite queue no draft seeded -> rewrite_not_started",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+			},
+			want:       ChapterStageRewriteNotStarted,
+			allowed:    []ChapterAction{ChapterActionDraft, ChapterActionEdit},
+			required:   ChapterActionEdit,
+			nextAction: "edit_chapter",
+		},
+		// 附加：degraded 候选未变化（绑定匹配）→ needs_commit
+		{
+			name: "degraded unchanged candidate -> needs_commit",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d,
+				ReviewLedger:      mkLedgerBound(domain.ReviewStatusDegraded, d, 7),
+				LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageNeedsCommit,
+			allowed:    []ChapterAction{ChapterActionCommit},
+			required:   ChapterActionCommit,
+			nextAction: "commit_chapter",
+		},
+		// 附加：degraded 候选已变化（digest 不匹配）→ needs_review
+		{
+			name: "degraded changed candidate -> needs_review",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d2,
+				ReviewLedger:      mkLedgerBound(domain.ReviewStatusDegraded, d, 7),
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCP(7, d2, "draft", ""),
+			},
+			want:       ChapterStageNeedsReview,
+			allowed:    []ChapterAction{ChapterActionReview},
+			required:   ChapterActionReview,
+			nextAction: "review_style",
+		},
+		// 附加：重写队列 + revision_open 已修改 + check 新鲜 + 有 error → needs_edit(edit)
+		{
+			name: "rewrite revision_open with mechanical error -> needs_edit edit",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				DraftExists: true, DraftDigest: d2, FinalExists: true, FinalDigest: final,
+				ReviewLedger:        mkLedger(domain.ReviewStatusRevisionOpen, d),
+				HasMechanicalErrors: true, LatestConsistency: consistencyCP(9, d2),
+			},
+			want:       ChapterStageNeedsEdit,
+			allowed:    []ChapterAction{ChapterActionDraft, ChapterActionEdit},
+			required:   ChapterActionEdit,
+			nextAction: "edit_chapter",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ComputeChapterStage(tc.in)
+			if got.Stage != tc.want {
+				t.Fatalf("stage = %s, want %s; reason=%q recovery=%q", got.Stage, tc.want, got.Reason, got.Recovery)
+			}
+			if tc.allowed != nil {
+				assertAllowedSet(t, got.Allowed, tc.allowed...)
+			}
+			if got.Required != tc.required {
+				t.Fatalf("required = %s, want %s", got.Required, tc.required)
+			}
+			assertNextAction(t, got, tc.nextAction)
+			if got.Stage == ChapterStageBlocked && got.Recovery == "" {
+				t.Fatal("blocked decision must carry recovery guidance")
+			}
+		})
+	}
+}
+
+// ── Allows 判定 ──────────────────────────────────────────────────────
+
+func TestChapterStageDecision_Allows(t *testing.T) {
+	d := ComputeChapterStage(ChapterStageInput{
+		StyleReviewMode: domain.StyleQualityCritic, DraftExists: true, DraftDigest: dig("x"),
+	})
+	if !d.Allows(ChapterActionDraft) || !d.Allows(ChapterActionCheck) {
+		t.Fatalf("draft_dirty should allow draft+check, got %v", d.Allowed)
+	}
+	if d.Allows(ChapterActionCommit) || d.Allows(ChapterActionPolish) || d.Allows(ChapterActionReview) {
+		t.Fatalf("draft_dirty must not allow commit/polish/review, got %v", d.Allowed)
+	}
+}
+
+// ── 绑定 helper 语义（规格 §4 一致性） ────────────────────────────────
+
+// TestReviewBindsPolish_MissingTimeFailOpen 验证 reviewBindsPolish 的时间缺失/
+// 解析失败 fail-open 语义（与 CheckPolishPipelineGate 的 legacy 回退一致）：
+// 无法比较墙钟时按"已绑定"处理，避免旧账本死锁；nil 与超窗仍拒绝。
+func TestReviewBindsPolish_MissingTimeFailOpen(t *testing.T) {
+	polish := polishCPAt(7, dig("x"), "draft", time.Now())
+	entry := &domain.StyleReviewEntry{Cycle: 1, DraftDigest: dig("x")} // CreatedAt==""
+
+	if !reviewBindsPolish(entry, polish) {
+		t.Fatal("缺失 CreatedAt 的 legacy 条目应视为已绑定（fail-open）")
+	}
+	entry.CreatedAt = "not-a-time"
+	if !reviewBindsPolish(entry, polish) {
+		t.Fatal("无法解析的 CreatedAt 应视为已绑定（fail-open）")
+	}
+	if reviewBindsPolish(nil, polish) || reviewBindsPolish(entry, nil) {
+		t.Fatal("nil 条目/polish 不应视为已绑定")
+	}
+	// 超窗（>1s）仍拒绝绑定（与 25b 用例一致）
+	entry.CreatedAt = time.Now().Add(-2 * time.Second).Format(time.RFC3339)
+	if reviewBindsPolish(entry, polish) {
+		t.Fatal("critic 早于 polish 超过 1 秒不应视为已绑定")
+	}
+}
+
+// TestReviewBindingValid_PipelineOffIgnoresNilRequest 直接验证 reviewBindingValid：
+// pipeline 关闭时不检查 Request/polish（只要求存在评审周期，旧行为）；pipeline
+// 开启时 nil Request 仍拒绝（绑定缺失）。
+func TestReviewBindingValid_PipelineOffIgnoresNilRequest(t *testing.T) {
+	cycle := &domain.StyleReviewEntry{Cycle: 1, DraftDigest: dig("x")}
+
+	inOff := ChapterStageInput{PipelineEnabled: false}
+	if !reviewBindingValid(inOff, cycle) {
+		t.Fatal("pipeline off 时 cycle.Request==nil 不得被拒绝")
+	}
+	if reviewBindingValid(inOff, nil) {
+		t.Fatal("pipeline off 时 cycle==nil 仍应拒绝")
+	}
+
+	inOn := ChapterStageInput{PipelineEnabled: true, LatestPolish: polishCP(7, dig("x"), "draft", "")}
+	if reviewBindingValid(inOn, cycle) {
+		t.Fatal("pipeline on 时 cycle.Request==nil 应拒绝（绑定缺失）")
+	}
+}
+
+// ── RequiredNextAction 边界（disabled/complete/blocked → nil） ────────
+func TestRequiredNextAction_NilForTerminalStages(t *testing.T) {
+	cases := []ChapterStageInput{
+		{StyleReviewMode: domain.StyleQualityOff},                                                                    // disabled
+		{StyleReviewMode: domain.StyleQualityCritic, Completed: true},                                                // complete
+		{StyleReviewMode: domain.StyleQualityCritic, ReviewLedger: mkLedger(domain.ReviewStatusExhausted, dig("x"))}, // blocked
+	}
+	for i, in := range cases {
+		if na := ComputeChapterStage(in).RequiredNextAction(); na != nil {
+			t.Fatalf("case %d: expected nil RequiredNextAction, got %+v", i, na)
+		}
+	}
+}
+
+// ── ChapterTransitionError 消息格式 ──────────────────────────────────
+
+func TestChapterTransitionError_Format(t *testing.T) {
+	err := &ChapterTransitionError{
+		Chapter:   56,
+		Stage:     ChapterStageNeedsPostPolishCheck,
+		Attempted: ChapterActionCommit,
+		Required:  ChapterActionCheck,
+		Allowed:   []ChapterAction{ChapterActionCheck},
+		Reason:    "polish 已产生新候选，必须重新检查",
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"code=chapter_fsm_transition_denied", "chapter=56", "stage=needs_post_polish_check",
+		"attempted=commit_chapter", "required=check_consistency", "allowed=[check_consistency]",
+		"下一步：调用 check_consistency({\"chapter\":56})",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error message missing %q:\n%s", want, msg)
+		}
+	}
+	if !errors.Is(err, errs.ErrToolPrecondition) {
+		t.Fatalf("ChapterTransitionError must unwrap to ErrToolPrecondition")
+	}
+
+	blocked := &ChapterTransitionError{
+		Chapter:   56,
+		Stage:     ChapterStageBlocked,
+		Attempted: ChapterActionEdit,
+		Reason:    "评审已耗尽",
+		Recovery:  "先执行 /style-override",
+	}
+	bmsg := blocked.Error()
+	for _, want := range []string{
+		"code=chapter_fsm_blocked", "chapter=56", "stage=blocked", "attempted=edit_chapter",
+		"required=none", "reason=评审已耗尽", "recovery=先执行 /style-override",
+	} {
+		if !strings.Contains(bmsg, want) {
+			t.Fatalf("blocked message missing %q:\n%s", want, bmsg)
+		}
+	}
+}
+
+// ── ResolveChapterStage / RequireChapterAction 快照加载 ──────────────
+
+func TestRequireChapterAction_DraftDirtyBlocksCommit(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	savePermissiveUserRules(t, st)
+	if err := st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, "# 一\nabc她心里骂自己丢人，真不要脸。"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := ChapterFSMConfig{Enabled: true}
+	// draft 允许、commit 拒绝。
+	if err := RequireChapterAction(st, 1, ChapterActionDraft, cfg); err != nil {
+		t.Fatalf("draft should be allowed in draft_dirty: %v", err)
+	}
+	err := RequireChapterAction(st, 1, ChapterActionCommit, cfg)
+	if err == nil {
+		t.Fatal("commit must be denied in draft_dirty")
+	}
+	if !errors.Is(err, errs.ErrToolPrecondition) {
+		t.Fatalf("denial must unwrap to ErrToolPrecondition, got %v", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"chapter=1", "stage=draft_dirty", "attempted=commit_chapter", "required=check_consistency",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("denial message missing %q:\n%s", want, msg)
+		}
+	}
+
+	// cfg.Enabled=false → 不拦截（standalone 旧行为）。
+	if err := RequireChapterAction(st, 1, ChapterActionCommit, ChapterFSMConfig{}); err != nil {
+		t.Fatalf("disabled FSM must not intercept: %v", err)
+	}
+}
+
+func TestRequireChapterAction_DisabledWhenOffMode(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	if err := st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityOff}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := ChapterFSMConfig{Enabled: true}
+	if err := RequireChapterAction(st, 1, ChapterActionCommit, cfg); err != nil {
+		t.Fatalf("off mode + pipeline off must be disabled (no interception): %v", err)
+	}
+}
+
+func TestResolveChapterStage_StoreReadError(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	if err := st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, "# 一\nabc她心里骂自己丢人，真不要脸。"); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, st.Dir(), "meta/progress.json", `{corrupt!!!`)
+
+	cfg := ChapterFSMConfig{Enabled: true}
+	err := RequireChapterAction(st, 1, ChapterActionDraft, cfg)
+	if err == nil {
+		t.Fatal("store read error must surface, not fake a stage")
+	}
+	if !errors.Is(err, errs.ErrStoreRead) {
+		t.Fatalf("expected ErrStoreRead in chain, got %v", err)
+	}
+}

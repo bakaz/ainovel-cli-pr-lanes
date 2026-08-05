@@ -48,6 +48,10 @@ type PolishDraftTool struct {
 	polisherRunner     *subagent.Runner
 	polisherPromptHash string // sha256 前缀：实际精修者提示词内容的可溯源标识
 	enabled            bool   // chapter pipeline 开关；关闭时工具返回 skipped（旧项目行为不变）
+	// fsmConfig 是章节流水线强制状态机配置（BuildWorkers 注入）；Enabled 时
+	// Execute 入口调用 RequireChapterAction 强制顺序（needs_polish 才允许精修，
+	// 保证非法 polish 不消耗模型调用）。
+	fsmConfig ChapterFSMConfig
 }
 
 func NewPolishDraftTool(s *store.Store, polisherRunner *subagent.Runner, polisherPromptHash string) *PolishDraftTool {
@@ -55,7 +59,16 @@ func NewPolishDraftTool(s *store.Store, polisherRunner *subagent.Runner, polishe
 }
 
 // SetEnabled 设置 chapter pipeline 开关。由 BuildWorkers 按配置注入。
-func (t *PolishDraftTool) SetEnabled(v bool) { t.enabled = v }
+func (t *PolishDraftTool) SetEnabled(v bool) {
+	t.enabled = v
+	t.fsmConfig.PipelineEnabled = v
+}
+
+// SetChapterFSMConfig 注入章节流水线强制状态机配置（BuildWorkers 调用）。
+func (t *PolishDraftTool) SetChapterFSMConfig(cfg ChapterFSMConfig) { t.fsmConfig = cfg }
+
+// FSMConfig 返回注入的章节流水线配置（构建/测试诊断用）。
+func (t *PolishDraftTool) FSMConfig() ChapterFSMConfig { return t.fsmConfig }
 
 // SetPolisherRunner 设置嵌套调用的 polisher runner 与提示词版本标识。
 // BuildWorkers 在完成 polisher 子代理装配后调用（runner 构造前工具实例已注入 writer 工具集）。
@@ -93,6 +106,8 @@ type PolishDraftOutput struct {
 	Skipped       bool   `json:"skipped,omitempty"`
 	Reason        string `json:"reason,omitempty"`
 	Error         string `json:"error,omitempty"`
+	// NextStep 明确精修后的强制下一步（FSM：polish → check_consistency → review）。
+	NextStep string `json:"next_step,omitempty"`
 }
 
 func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
@@ -116,7 +131,13 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 		})
 	}
 
-	// ── 2. 加载草稿 ──
+	// ── 2. 章节流水线强制状态机（Enabled 时）：needs_polish 才允许精修；
+	//    在加载草稿/启动 polisher 之前拦截，保证非法 polish 不消耗模型调用。 ──
+	if err := RequireChapterAction(t.store, a.Chapter, ChapterActionPolish, t.fsmConfig); err != nil {
+		return nil, fmt.Errorf("polish_draft: %w", err)
+	}
+
+	// ── 3. 加载草稿 ──
 	content, wordCount, err := t.store.Drafts.LoadChapterContent(a.Chapter)
 	if err != nil {
 		return nil, fmt.Errorf("load chapter content: %w: %w", errs.ErrStoreRead, err)
@@ -126,19 +147,19 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 	}
 	inputDigest := domain.DigestDraft(content)
 
-	// ── 3. 修改门禁：terminal 评审状态下的章节不允许精修（fail-fast，避免 polisher 空转） ──
+	// ── 4. 修改门禁：terminal 评审状态下的章节不允许精修（fail-fast，避免 polisher 空转） ──
 	if err := CheckStyleReviewMutationGuard(t.store, a.Chapter); err != nil {
 		return nil, fmt.Errorf("polish_draft: %w", err)
 	}
 
-	// ── 4. 构建任务 payload（草稿 + 评审依据 + 已给意见 + 重写 brief）并调用 polisher ──
+	// ── 5. 构建任务 payload（草稿 + 评审依据 + 已给意见 + 重写 brief）并调用 polisher ──
 	taskText := t.buildPolishTask(a.Chapter, content, wordCount)
 	outputText, err := t.runPolisherWithEmptyRetry(ctx, a.Chapter, taskText)
 	if err != nil {
 		return nil, err
 	}
 
-	// ── 5. 校验：非空 / UTF-8 / 最短长度（防"好的，已完成精修"式短文本被当正文保存）/
+	// ── 6. 校验：非空 / UTF-8 / 最短长度（防"好的，已完成精修"式短文本被当正文保存）/
 	// 最大长度 / 非纯 JSON / 非代码围栏整体包裹 ──
 	if strings.TrimSpace(outputText) == "" {
 		return nil, fmt.Errorf("polisher returned empty output: %w", errs.ErrToolPrecondition)
@@ -167,7 +188,7 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 		return nil, fmt.Errorf("polisher 输出被代码围栏整体包裹，拒绝落盘: %w", errs.ErrToolPrecondition)
 	}
 
-	// ── 6. 保存为草稿（与 draft_chapter 同路径：SaveDraft + draft checkpoint） ──
+	// ── 7. 保存为草稿（与 draft_chapter 同路径：SaveDraft + draft checkpoint） ──
 	outputDigest := domain.DigestDraft(outputText)
 	if err := t.store.Drafts.SaveDraft(a.Chapter, outputText); err != nil {
 		return nil, fmt.Errorf("save polished draft: %w: %w", errs.ErrStoreWrite, err)
@@ -179,7 +200,7 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 		return nil, fmt.Errorf("checkpoint draft after polish: %w", err)
 	}
 
-	// ── 7. 写 polish checkpoint（input_digest/output_digest/polisher_model/stage/changed） ──
+	// ── 8. 写 polish checkpoint（input_digest/output_digest/polisher_model/stage/changed） ──
 	stage := "draft"
 	progress, pErr := t.store.Progress.Load()
 	if pErr == nil && progress != nil && slices.Contains(progress.PendingRewrites, a.Chapter) {
@@ -201,7 +222,7 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 		return nil, fmt.Errorf("checkpoint polish: %w", err)
 	}
 
-	// ── 8. 摘要返回（不回传全文） ──
+	// ── 9. 摘要返回（不回传全文） ──
 	return json.Marshal(PolishDraftOutput{
 		Chapter:       a.Chapter,
 		Polished:      true,
@@ -211,6 +232,7 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 		PolisherModel: polisherModel,
 		Stage:         stage,
 		WordCount:     utf8.RuneCountInString(outputText),
+		NextStep:      "精修完成。下一步**必须**调用 check_consistency 重新核验；通过后按返回的 required_next_action 继续（review_style → terminal → commit_chapter）",
 	})
 }
 

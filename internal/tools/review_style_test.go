@@ -812,10 +812,18 @@ func TestReviewStyle_OffModeCommitNotBlocked(t *testing.T) {
 	}
 }
 
-// ── 17. Rewrite-queue bypass mutation ────────────────────────────────
+// ── 17. Rewrite-queue mutation guard：digest/status 感知（规格第 10 节） ──
+// 旧的"已完成 + 重写队列 → 无条件 bypass"已删除，替换为 6 个场景：
+//   1. 旧 accepted + draft==final（未开始重写）→ 允许
+//   2. revision_open → 允许（不要求 digest 已变化）
+//   3. 旧 terminal digest 不匹配当前返工草稿（stale）→ 允许（返工进行中）
+//   4. 当前候选已获 terminal 评审且 digest 匹配（draft!=final）→ 拒绝，只能 commit
+//   5. initial/final pending → 拒绝
+//   6. exhausted → 拒绝（必须先 /style-override）
 
-func TestReviewStyle_RewriteQueueBypassesMutationGuard(t *testing.T) {
-	draft := "已完成的终稿。"
+// rewriteQueueGuardStore 构造 critic 模式 + 已完成 + 重写队列的基础 store。
+func rewriteQueueGuardStore(t *testing.T, finalText string) *store.Store {
+	t.Helper()
 	st := store.NewStore(t.TempDir())
 	if err := st.Init(); err != nil {
 		t.Fatalf("Init: %v", err)
@@ -826,12 +834,10 @@ func TestReviewStyle_RewriteQueueBypassesMutationGuard(t *testing.T) {
 	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
 		t.Fatalf("SetStyleReviewMode: %v", err)
 	}
-
-	// 模拟章节已完成且在重写队列中
-	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+	if err := st.Drafts.SaveDraft(1, finalText); err != nil {
 		t.Fatalf("SaveDraft: %v", err)
 	}
-	if err := st.Drafts.SaveFinalChapter(1, draft); err != nil {
+	if err := st.Drafts.SaveFinalChapter(1, finalText); err != nil {
 		t.Fatalf("SaveFinalChapter: %v", err)
 	}
 	if err := st.Progress.MarkChapterComplete(1, 100, "", ""); err != nil {
@@ -843,42 +849,181 @@ func TestReviewStyle_RewriteQueueBypassesMutationGuard(t *testing.T) {
 	if err := st.Progress.SetFlow(domain.FlowRewriting); err != nil {
 		t.Fatalf("SetFlow: %v", err)
 	}
+	return st
+}
 
-	// 即使มี exhausted 账本，重写队列中的完成章节也应能 draft/edit
-	draftDigest := domain.DigestDraft(draft)
-	basisDigest := ComputeBasisDigest(st, 1, "test-v1")
-	ts := "2026-07-25T10:00:00Z"
-	exhaustedLedger := domain.StyleReviewLedger{
-		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
-		Cycles: []domain.StyleReviewEntry{
-			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: ts, AttemptID: "a1",
-				Request: &domain.StyleReviewRequest{Prompt: "test", Model: "test-model"}, DraftDigest: draftDigest, BasisDigest: basisDigest},
-			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, CreatedAt: ts, AttemptID: "a1",
-				Request: &domain.StyleReviewRequest{Prompt: "test", Model: "test-model"}, Result: &domain.StyleReviewResult{
-					Verdict: domain.ReviewVerdictRevise, Evidence: "e",
-					Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Evidence: "e"}},
-				}, DraftDigest: draftDigest, BasisDigest: basisDigest},
-			{Cycle: 3, Status: domain.ReviewStatusFinalPending, CreatedAt: ts, AttemptID: "a1",
-				Request: &domain.StyleReviewRequest{Prompt: "test", Model: "test-model"}, DraftDigest: draftDigest, BasisDigest: basisDigest},
-			{Cycle: 4, Status: domain.ReviewStatusExhausted, CreatedAt: ts, AttemptID: "a1",
-				Request: &domain.StyleReviewRequest{Prompt: "test", Model: "test-model"}, Result: &domain.StyleReviewResult{
-					Verdict: domain.ReviewVerdictRevise, Evidence: "e",
-					Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "error", Evidence: "e"}},
-				}, DraftDigest: draftDigest, BasisDigest: basisDigest},
-		},
+// rewriteLedger 构造指定状态的账本（绑定 digest）。
+func rewriteLedger(status domain.StyleReviewStatus, digest string, seq int64) domain.StyleReviewLedger {
+	const basis = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	req := &domain.StyleReviewRequest{Prompt: "test-v1", Model: "critic-model", PolishCheckpointSeq: seq}
+	now := "2026-07-25T10:00:00Z"
+	cycles := []domain.StyleReviewEntry{
+		{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+			AttemptID: "a1", DraftDigest: digest, BasisDigest: basis,
+			Request: req},
 	}
-	if err := st.StyleReview.Save(exhaustedLedger); err != nil {
+	switch status {
+	case domain.ReviewStatusAcceptedInitial:
+		cycles = append(cycles, domain.StyleReviewEntry{Cycle: 2, Status: domain.ReviewStatusAcceptedInitial, CreatedAt: now,
+			AttemptID: "a1", DraftDigest: digest, BasisDigest: basis,
+			Request: req, Result: &domain.StyleReviewResult{Verdict: domain.ReviewVerdictPass, Evidence: "ok"}})
+	case domain.ReviewStatusRevisionOpen:
+		cycles = append(cycles, domain.StyleReviewEntry{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, CreatedAt: now,
+			AttemptID: "a1", DraftDigest: digest, BasisDigest: basis,
+			Request: req, Result: &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "e",
+				Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Evidence: "e"}}}})
+	case domain.ReviewStatusFinalPending:
+		cycles = append(cycles,
+			domain.StyleReviewEntry{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis,
+				Request: req, Result: &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "e",
+					Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Evidence: "e"}}}},
+			domain.StyleReviewEntry{Cycle: 3, Status: domain.ReviewStatusFinalPending, CreatedAt: now,
+				AttemptID: "a2", DraftDigest: digest, BasisDigest: basis,
+				Request: req})
+	case domain.ReviewStatusExhausted:
+		cycles = append(cycles,
+			domain.StyleReviewEntry{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basis,
+				Request: req, Result: &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "e",
+					Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Evidence: "e"}}}},
+			domain.StyleReviewEntry{Cycle: 3, Status: domain.ReviewStatusFinalPending, CreatedAt: now,
+				AttemptID: "a2", DraftDigest: digest, BasisDigest: basis,
+				Request: req},
+			domain.StyleReviewEntry{Cycle: 4, Status: domain.ReviewStatusExhausted, CreatedAt: now,
+				AttemptID: "a2", DraftDigest: digest, BasisDigest: basis,
+				Request: req, Result: &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "stagnant",
+					Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "error", Evidence: "e"}}}})
+	}
+	return domain.StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic, Cycles: cycles}
+}
+
+// 场景 1：旧 accepted + draft==final（未开始重写）→ 允许开始修改。
+func TestReviewStyle_RewriteQueueGuard_OldAcceptedDraftEqualsFinal_Allowed(t *testing.T) {
+	final := "已完成的终稿。"
+	st := rewriteQueueGuardStore(t, final)
+	digest := domain.DigestDraft(final)
+	if err := st.StyleReview.Save(rewriteLedger(domain.ReviewStatusAcceptedInitial, digest, 0)); err != nil {
 		t.Fatalf("Save ledger: %v", err)
 	}
+	if err := CheckStyleReviewMutationGuard(st, 1); err != nil {
+		t.Fatalf("old accepted + draft==final must allow rewrite start: %v", err)
+	}
+}
 
-	// draft_chapter should pass (bypass mutation guard)
+// 场景 2：revision_open → 允许修改（不要求 digest 已变化）。
+func TestReviewStyle_RewriteQueueGuard_RevisionOpen_Allowed(t *testing.T) {
+	final := "已完成的终稿。"
+	st := rewriteQueueGuardStore(t, final)
+	digest := domain.DigestDraft(final)
+	if err := st.StyleReview.Save(rewriteLedger(domain.ReviewStatusRevisionOpen, digest, 0)); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+	if err := CheckStyleReviewMutationGuard(st, 1); err != nil {
+		t.Fatalf("revision_open must allow modification: %v", err)
+	}
+}
+
+// 场景 3：旧 terminal digest 不匹配当前返工草稿（stale）→ 允许继续返工。
+func TestReviewStyle_RewriteQueueGuard_StaleTerminalDraftChanged_Allowed(t *testing.T) {
+	final := "原始终稿内容。"
+	st := rewriteQueueGuardStore(t, final)
+	if err := st.Drafts.SaveDraft(1, final+"返工版本"); err != nil {
+		t.Fatalf("SaveDraft rework: %v", err)
+	}
+	oldDigest := domain.DigestDraft(final)
+	if err := st.StyleReview.Save(rewriteLedger(domain.ReviewStatusAcceptedInitial, oldDigest, 0)); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+	if err := CheckStyleReviewMutationGuard(st, 1); err != nil {
+		t.Fatalf("stale old terminal must allow ongoing rework: %v", err)
+	}
+}
+
+// 场景 4：当前候选已获 terminal 评审且 digest 匹配（draft!=final）→ 拒绝，只能 commit。
+func TestReviewStyle_RewriteQueueGuard_TerminalMatchesCurrent_Denied(t *testing.T) {
+	final := "原始终稿内容。"
+	st := rewriteQueueGuardStore(t, final)
+	rework := final + "返工版本"
+	if err := st.Drafts.SaveDraft(1, rework); err != nil {
+		t.Fatalf("SaveDraft rework: %v", err)
+	}
+	reworkDigest := domain.DigestDraft(rework)
+	if err := st.StyleReview.Save(rewriteLedger(domain.ReviewStatusAcceptedInitial, reworkDigest, 0)); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+	err := CheckStyleReviewMutationGuard(st, 1)
+	if err == nil {
+		t.Fatal("terminal digest==draft must deny modification")
+	}
+	if !strings.Contains(err.Error(), "只能 commit_chapter") {
+		t.Errorf("expected commit-only hint, got: %v", err)
+	}
+}
+
+// 场景 5：initial/final pending → 拒绝（有未完成评审）。
+func TestReviewStyle_RewriteQueueGuard_Pending_Denied(t *testing.T) {
+	for _, status := range []domain.StyleReviewStatus{domain.ReviewStatusInitialPending, domain.ReviewStatusFinalPending} {
+		t.Run(string(status), func(t *testing.T) {
+			final := "已完成的终稿。"
+			st := rewriteQueueGuardStore(t, final)
+			digest := domain.DigestDraft(final)
+			if err := st.StyleReview.Save(rewriteLedger(status, digest, 0)); err != nil {
+				t.Fatalf("Save ledger: %v", err)
+			}
+			err := CheckStyleReviewMutationGuard(st, 1)
+			if err == nil {
+				t.Fatalf("%s must deny modification", status)
+			}
+			if !strings.Contains(err.Error(), "未完成评审") {
+				t.Errorf("expected pending hint, got: %v", err)
+			}
+		})
+	}
+}
+
+// 场景 6：exhausted → 拒绝（必须先 /style-override），不能当作"允许开始重写"。
+func TestReviewStyle_RewriteQueueGuard_Exhausted_Denied(t *testing.T) {
+	final := "已完成的终稿。"
+	st := rewriteQueueGuardStore(t, final)
+	digest := domain.DigestDraft(final)
+	if err := st.StyleReview.Save(rewriteLedger(domain.ReviewStatusExhausted, digest, 0)); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+	err := CheckStyleReviewMutationGuard(st, 1)
+	if err == nil {
+		t.Fatal("exhausted must deny modification")
+	}
+	if !strings.Contains(err.Error(), "/style-override") {
+		t.Errorf("expected /style-override hint, got: %v", err)
+	}
+}
+
+// TestReviewStyle_RewriteQueueGuard_DraftToolPath 场景 4 的工具级验证：
+// draft_chapter 在 terminal 当前候选下被 mutation guard 拒绝（不写草稿）。
+func TestReviewStyle_RewriteQueueGuard_DraftToolPath(t *testing.T) {
+	final := "原始终稿内容。"
+	st := rewriteQueueGuardStore(t, final)
+	rework := final + "返工版本"
+	if err := st.Drafts.SaveDraft(1, rework); err != nil {
+		t.Fatalf("SaveDraft rework: %v", err)
+	}
+	reworkDigest := domain.DigestDraft(rework)
+	if err := st.StyleReview.Save(rewriteLedger(domain.ReviewStatusAcceptedInitial, reworkDigest, 0)); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
 	draftTool := NewDraftChapterTool(st, testContract)
 	_, err := draftTool.Execute(t.Context(), json.RawMessage(`{"chapter":1,"content":"新重写版本","mode":"write"}`))
-	if err != nil {
-		if strings.Contains(err.Error(), "评审") {
-			t.Fatalf("rewrite-queue should bypass mutation guard: %v", err)
-		}
-		t.Logf("draft error (expected): %v", err)
+	if err == nil {
+		t.Fatal("draft_chapter must be rejected when current candidate is terminal-reviewed")
+	}
+	if !strings.Contains(err.Error(), "只能 commit_chapter") {
+		t.Errorf("expected commit-only hint, got: %v", err)
+	}
+	// 无副作用：草稿未被覆盖
+	draft, _ := st.Drafts.LoadDraft(1)
+	if draft != rework {
+		t.Errorf("draft must stay untouched after rejection, got %q", draft)
 	}
 }
 
@@ -925,6 +1070,8 @@ func TestReviewStyle_RewriteQueueCommitRequiresCriticValidation(t *testing.T) {
 	args, _ := json.Marshal(map[string]any{
 		"chapter": 1, "summary": "重写提交", "characters": []string{"主角"},
 		"key_events": []string{"事件"},
+		// 批次 4：mode 校验先于 gate 执行，需显式声明才能到达 critic 校验。
+		"world_state_mode": "preserve",
 	})
 	_, err := commitTool.Execute(t.Context(), args)
 	if err == nil {

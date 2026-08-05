@@ -175,7 +175,7 @@ func scriptedWriterModel() *scriptedChatModel {
 			return testToolCallMsg("commit_chapter", map[string]any{
 				"chapter": chapter, "summary": fmt.Sprintf("第%d章摘要", chapter),
 				"characters": []string{"主角"}, "key_events": []string{"推进"},
-				"hook_type": "crisis",
+				"hook_type": "crisis", "world_state_mode": "preserve",
 			})
 		}
 	}}

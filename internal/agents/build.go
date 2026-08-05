@@ -208,12 +208,15 @@ func BuildWorkers(
 	// 组合：此时 commit 的 pipeline gate 仍要求 fresh polish checkpoint（现状保留），
 	// 但评审门控（CheckCommitStyleGate）不生效。
 	pipelineEnabled := cfg.ChapterPipelineEnabled()
+	// expectedPolisherModel 提升到 BuildWorkers 作用域：pipeline 开启且 Roles 显式
+	// 配置 polisher 时记录其当前模型名，供 commit gate 与章节 FSM（polish 绑定）
+	// 共用；空 = 未显式配置（跳过模型一致性校验）。
+	expectedPolisherModel := ""
 	if pipelineEnabled {
-		polisherModelName := ""
 		if _, ok := cfg.Roles["polisher"]; ok {
-			_, polisherModelName, _ = models.CurrentSelection("polisher")
+			_, expectedPolisherModel, _ = models.CurrentSelection("polisher")
 		}
-		ts.commitTool.SetPolishPipeline(&tools.PolishPipelineConfig{ExpectedModel: polisherModelName})
+		ts.commitTool.SetPolishPipeline(&tools.PolishPipelineConfig{ExpectedModel: expectedPolisherModel})
 	}
 	for _, list := range [][]agentcore.Tool{writerTools, polisherTools} {
 		for _, tl := range list {
@@ -293,6 +296,22 @@ func BuildWorkers(
 	polishDraft := tools.NewPolishDraftTool(store, nil, "")
 	polishDraft.SetEnabled(pipelineEnabled)
 	writerTools = append(writerTools, polishDraft)
+
+	// 统一注入章节流水线强制状态机配置（六工具：draft/edit/check/polish/review/commit）。
+	// 必须在 writer 工具集完整（含 review_style/polish_draft 追加）之后执行；
+	// plan_chapter 不进 FSM（写 plan 不改正文候选 digest）。六工具均实现
+	// ChapterFSMConfigurable；其余工具（novel_context/read_chapter 等）不实现，
+	// 类型断言自动跳过。
+	fsmCfg := tools.ChapterFSMConfig{
+		Enabled:               true,
+		PipelineEnabled:       pipelineEnabled,
+		ExpectedPolisherModel: expectedPolisherModel,
+	}
+	for _, tl := range writerTools {
+		if configurable, ok := tl.(tools.ChapterFSMConfigurable); ok {
+			configurable.SetChapterFSMConfig(fsmCfg)
+		}
+	}
 
 	architectStopGuardFactory := func(_, _ string) agentcore.StopGuard {
 		return guard.NewArchitectStopGuard(store, onGuardBlock)

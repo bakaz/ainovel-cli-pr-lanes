@@ -24,6 +24,9 @@ type CommitChapterTool struct {
 	// polishPipeline 是精修流水线的 commit 门控配置；nil = pipeline 关闭（不拦截）。
 	// 由 BuildWorkers 按配置注入（SetPolishPipeline）。
 	polishPipeline *PolishPipelineConfig
+	// fsmConfig 是章节流水线强制状态机配置（BuildWorkers 注入）；Enabled 时
+	// Execute 入口调用 RequireChapterAction 强制顺序（needs_commit 才允许提交）。
+	fsmConfig ChapterFSMConfig
 }
 
 // PolishPipelineConfig 是精修流水线的 commit 门控配置。
@@ -39,6 +42,12 @@ func NewCommitChapterTool(store *store.Store) *CommitChapterTool {
 
 // SetPolishPipeline 启用精修流水线 commit 门控（cfg 为 nil 时关闭）。
 func (t *CommitChapterTool) SetPolishPipeline(cfg *PolishPipelineConfig) { t.polishPipeline = cfg }
+
+// SetChapterFSMConfig 注入章节流水线强制状态机配置（BuildWorkers 调用）。
+func (t *CommitChapterTool) SetChapterFSMConfig(cfg ChapterFSMConfig) { t.fsmConfig = cfg }
+
+// FSMConfig 返回注入的章节流水线配置（构建/测试诊断用）。
+func (t *CommitChapterTool) FSMConfig() ChapterFSMConfig { return t.fsmConfig }
 
 // commitOutput 在 domain.CommitResult 之上嵌入扩展字段，保持 domain 包不依赖 rules。
 // 由于嵌入字段会被 JSON marshaler 提升（promoted），序列化结果等同于扁平结构。
@@ -101,6 +110,9 @@ func (t *CommitChapterTool) Schema() map[string]any {
 		))),
 		schema.Property("hook_type", schema.Enum("章末钩子类型", "crisis", "mystery", "desire", "emotion", "choice")),
 		schema.Property("dominant_strand", schema.Enum("本章主导叙事线", "quest", "fire", "constellation")),
+		schema.Property("world_state_mode", schema.Enum(
+			"重写/打磨已完成章节的提交必填：preserve=纯文风/节奏/色气重写（不改变剧情事实），不应用世界状态变更；replace=剧情变化重写，需世界状态重放支持（当前可能被拒绝，被拒绝时不得静默改剧情）。新章提交可省略。",
+			worldStateModePreserve, worldStateModeReplace)),
 		schema.Property("feedback", feedbackSchema),
 	)
 }
@@ -119,6 +131,7 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 		CastIntros          []domain.CastIntro         `json:"cast_intros"`
 		HookType            string                     `json:"hook_type"`
 		DominantStrand      string                     `json:"dominant_strand"`
+		WorldStateMode      string                     `json:"world_state_mode"`
 		Feedback            *domain.OutlineFeedback    `json:"feedback"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -126,6 +139,40 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 	}
 	if a.Chapter <= 0 {
 		return nil, fmt.Errorf("chapter must be > 0: %w", errs.ErrToolArgs)
+	}
+
+	// 章节流水线强制状态机（Enabled 时）：needs_commit 才允许提交；被拒时
+	// 不创建 pending commit、不写 final。现有 commit gates 保留（纵深防御）。
+	if err := RequireChapterAction(t.store, a.Chapter, ChapterActionCommit, t.fsmConfig); err != nil {
+		// 崩溃恢复窄路径：MarkChapterComplete 之后、ClearPendingCommit 之前崩溃时，
+		// 本章已完成且残留匹配 PendingCommit——FSM 判 complete 拒绝一切动作，
+		// 重试永远到不了下方 171-178 的既有恢复代码。此处先恢复（追加 commit
+		// checkpoint + 清除残留信号），再返回与既有 skip 路径一致的事实。
+		// 不写任何新正文（原提交已成功），恢复即终点；未命中该条件时保持原拒绝。
+		if t.store.Progress.IsChapterCompleted(a.Chapter) {
+			if pending, _ := t.store.Signals.LoadPendingCommit(); pending != nil && pending.Chapter == a.Chapter {
+				if cErr := t.appendCommitCheckpoint(a.Chapter); cErr != nil {
+					return nil, fmt.Errorf("checkpoint commit: %w: %w", errs.ErrStoreWrite, cErr)
+				}
+				if cErr := t.store.Signals.ClearPendingCommit(); cErr != nil {
+					return nil, fmt.Errorf("clear pending commit: %w: %w", errs.ErrStoreWrite, cErr)
+				}
+				progress, _ := t.store.Progress.Load()
+				return t.buildSkipResult(a.Chapter, progress)
+			}
+		}
+		return nil, fmt.Errorf("commit_chapter: %w", err)
+	}
+
+	// 批次 4 安全闸门：重写提交必须显式声明世界状态处理模式。识别
+	// completed + rewrite queue（重写路径入口）后立即校验——早于 literary gate
+	// （命中会落盘 rule_violations）与残留 PendingCommit 清理（会追加 checkpoint
+	// 并清除恢复信号），缺失 mode 的失败保证零副作用（无部分写入）。
+	// 校验通过后 executeRewriteCommit 不再重复校验。
+	if isCompletedAndInRewriteQueue(t.store, a.Chapter) {
+		if err := validateRewriteWorldStateMode(a.Chapter, a.WorldStateMode); err != nil {
+			return nil, err
+		}
 	}
 
 	// critic 模式 commit 闸门：校验一致性、账本状态、摘要匹配
@@ -158,6 +205,7 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 			_ = t.store.Signals.ClearPendingCommit()
 		}
 		// 打磨/重写路径：章节虽已完成，但仍在 pending_rewrites 中，允许覆盖并 drain 队列
+		// （world_state_mode 已在 Execute 入口校验，见上方批次 4 安全闸门）。
 		progress, _ := t.store.Progress.Load()
 		inRewriteQueue := progress != nil && slices.Contains(progress.PendingRewrites, a.Chapter)
 		if inRewriteQueue {
@@ -416,9 +464,57 @@ func (t *CommitChapterTool) checkRules(text string) []rules.Violation {
 	return append(violations, rules.CheckLiteraryGate(text, utf8.RuneCountInString(text), structured)...)
 }
 
+// 重写提交的世界状态处理模式（批次 4 安全闸门）。
+// 不能靠"数组为空"猜测语义：纯文风重写空数组=保持，剧情重写空数组=清除，语义相反，
+// 因此重写提交必须显式声明。缺失或非法值一律拒绝（Precondition），不静默提交。
+const (
+	worldStateModePreserve = "preserve"
+	worldStateModeReplace  = "replace"
+)
+
+// validateRewriteWorldStateMode 强制重写提交显式声明世界状态处理模式：
+//   - 缺失（""）或非法值 → ErrToolPrecondition 错误（不写终稿、不 drain PendingRewrites）。
+//   - "preserve" → 放行：executeRewriteCommit 现有行为，4 组世界状态变更
+//     （TimelineEvents/ForeshadowUpdates/RelationshipChanges/StateChanges）一律不应用。
+//   - "replace" → 一律显式拒绝（批次 4 范围内无可安全处理的章节）：
+//     按章替换时间线/状态并重放后续章节的世界状态重放能力（world-delta/baseline，
+//     批次 5）尚未就绪；Relationships/Foreshadow 是聚合快照（无发生章、删除后无法恢复），
+//     无可重放历史的章节 replace 无法安全执行。宁肯拒绝也不静默错误应用。
+//
+// 错误消息始终包含 chapter、world_state_mode 值、原因与恢复建议。
+func validateRewriteWorldStateMode(chapter int, mode string) error {
+	switch mode {
+	case "":
+		return fmt.Errorf(
+			"第 %d 章重写提交缺失 world_state_mode：纯文风重写必须传 %q，剧情变化重写必须传 %q。"+
+				"原因：不显式声明会静默丢弃世界状态变更（timeline/foreshadow/relationships/state 与正文失配且无报错）。"+
+				"恢复建议：补充 world_state_mode 后重试: %w",
+			chapter, worldStateModePreserve, worldStateModeReplace, errs.ErrToolPrecondition)
+	case worldStateModePreserve:
+		return nil
+	case worldStateModeReplace:
+		return fmt.Errorf(
+			"第 %d 章重写提交 world_state_mode=%q 被拒绝：剧情级重写需要世界状态重放能力（按章替换时间线/状态并重放后续章节），"+
+				"该能力尚未就绪（世界账本重放未实现；Relationships/Foreshadow 为聚合快照、无可重放历史，删除后无法恢复），"+
+				"直接替换会让世界账本与正文永久失配。恢复建议：改用 world_state_mode=%q 仅做纯文风重写（不改变剧情事实），"+
+				"或停下请人工处理世界账本后再提交；不要用空数组蒙混（preserve 下空数组=保持、replace 下空数组=清除，语义相反）: %w",
+			chapter, worldStateModeReplace, worldStateModePreserve, errs.ErrToolPrecondition)
+	default:
+		return fmt.Errorf(
+			"第 %d 章重写提交 world_state_mode=%q 非法：仅支持 %q 或 %q。恢复建议：修正 world_state_mode 后重试: %w",
+			chapter, mode, worldStateModePreserve, worldStateModeReplace, errs.ErrToolPrecondition)
+	}
+}
+
 // executeRewriteCommit 处理打磨/重写章节的提交：覆盖终稿与摘要、更新字数、drain 队列。
-// 跳过所有世界状态追加（timeline / foreshadow / relationship / state_changes）与弧边界检测，
-// 这些已在章节原始提交时应用。
+// 调用方（Execute）已通过 validateRewriteWorldStateMode 强制 world_state_mode：
+//   - preserve：跳过所有世界状态追加（timeline / foreshadow / relationship / state_changes），
+//     这些已在章节原始提交时应用——纯文风重写不改变剧情事实，账本无需变更。
+//   - replace：被安全闸门显式拒绝，不会走到本函数（世界状态重放能力未就绪）。
+//
+// 已知风险（登记，批次 5 范围）：本路径也不更新 CastIntros/配角名册
+// （主路径 4b 步 MergeAppearances 会累加 cast_ledger）——重写新增的次要角色
+// 不会进入配角账本；当前仅记录风险，不做实现。
 func (t *CommitChapterTool) executeRewriteCommit(
 	chapter int,
 	summary string,

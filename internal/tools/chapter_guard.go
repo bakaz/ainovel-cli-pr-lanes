@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/errs"
@@ -57,7 +56,11 @@ func isCompletedAndInRewriteQueue(st *store.Store, chapter int) bool {
 // 才允许 draft/edit。
 // pending（initial_pending/final_pending）以及 terminal 状态
 // （accepted_initial、accepted_revised、overridden）拒绝修改；exhausted 也拒绝修改。
-// 已完成且在 PendingRewrites 队列中的章节不受批评者门控（打磨/重写路径）。
+// 已完成且在 PendingRewrites 队列中的章节不再无条件豁免，改为 digest/status 感知
+// （见下方重写队列分支）：pending/exhausted 优先拒绝；原终稿未开始重写
+// （rewriteNotStarted）且账本为 terminal 时允许开始修改；revision_open/degraded
+// 允许；当前重写候选已获终态评审且 digest 匹配 → 正文已锁定，只允许 commit；
+// 旧 terminal digest 不匹配当前返工草稿 → 返工进行中，允许继续。
 //
 // degraded 是"评审调用故障"（如 critic 空输出的瞬态技术故障），不是评审结论：
 // 允许重新起草（draft/edit），随后 check_consistency + review_style 发起新 attempt
@@ -76,15 +79,70 @@ func CheckStyleReviewMutationGuard(st *store.Store, chapter int) error {
 		return nil // off 模式不拦截
 	}
 
-	// 已完成 + 重写队列中 → 跳过批评者门控
-	if isCompletedAndInRewriteQueue(st, chapter) {
-		return nil
-	}
-
 	ledger, err := st.StyleReview.Load(chapter)
 	if err != nil {
 		return fmt.Errorf("load style review ledger: %w: %w", errs.ErrStoreRead, err)
 	}
+
+	// 已完成 + 重写队列 → digest/status 感知豁免（不再无条件 bypass）：
+	// 场景 1. 原终稿未开始重写（draft=="" 或 Digest(draft)==Digest(final)）+ terminal
+	//          → 允许开始修改。
+	// 场景 2. revision_open → 必须允许修改（不要求 digest 已变化）。
+	// 场景 3. 当前候选已获 terminal 评审（draft!=final && digest 匹配）
+	//          → 正文已锁定，只允许 commit_chapter（或重新评审）。
+	// 场景 4. 旧 terminal digest 不匹配当前返工草稿 → 返工进行中，允许继续。
+	// 特别：exhausted 不是"允许开始重写"的 terminal，必须优先拒绝并要求
+	// /style-override，否则第一次修改后立即进入无法 review/commit 的死路。
+	if isCompletedAndInRewriteQueue(st, chapter) && ledger != nil && !ledger.IsEmpty() {
+		status := ledger.CurrentStatus()
+		cycle := ledger.CurrentCycle()
+
+		if status == domain.ReviewStatusInitialPending || status == domain.ReviewStatusFinalPending {
+			return fmt.Errorf("critic 模式：章节 %d 有未完成评审（%s），不能修改: %w",
+				chapter, status, errs.ErrToolPrecondition)
+		}
+		if status == domain.ReviewStatusExhausted {
+			return fmt.Errorf("critic 模式：章节 %d 评审已耗尽，必须先 /style-override，不能修改: %w",
+				chapter, errs.ErrToolPrecondition)
+		}
+
+		draft, dErr := st.Drafts.LoadDraft(chapter)
+		if dErr != nil {
+			return fmt.Errorf("load draft: %w: %w", errs.ErrStoreRead, dErr)
+		}
+		final, fErr := st.Drafts.LoadChapterText(chapter)
+		if fErr != nil {
+			return fmt.Errorf("load final chapter: %w: %w", errs.ErrStoreRead, fErr)
+		}
+		draftExists, finalExists := draft != "", final != ""
+		draftDigest := ""
+		if draftExists {
+			draftDigest = domain.DigestDraft(draft)
+		}
+		rewriteNotStarted := !draftExists || (finalExists && draftDigest == domain.DigestDraft(final))
+
+		if rewriteNotStarted && status.IsTerminal() {
+			return nil // 原终稿未开始重写：允许开始修改
+		}
+		if status == domain.ReviewStatusRevisionOpen {
+			return nil // 必须允许修改
+		}
+		if status == domain.ReviewStatusDegraded {
+			return nil // 保留技术故障恢复语义
+		}
+		terminalMatchesCurrent := status.IsTerminal() && cycle != nil &&
+			domain.IsValidDigest(cycle.DraftDigest) && cycle.DraftDigest == draftDigest
+		if terminalMatchesCurrent && !rewriteNotStarted {
+			return fmt.Errorf("critic 模式：章节 %d 当前重写候选已获终态评审（%s）且摘要匹配，正文已锁定；只能 commit_chapter: %w",
+				chapter, status, errs.ErrToolPrecondition)
+		}
+		if status.IsTerminal() {
+			return nil // 旧 terminal digest 不匹配当前返工草稿：返工进行中，允许继续
+		}
+		return fmt.Errorf("critic 模式：章节 %d 评审状态 %s 不允许修改: %w",
+			chapter, status, errs.ErrToolPrecondition)
+	}
+
 	if ledger == nil || ledger.IsEmpty() {
 		return nil // 尚无风格评审，允许首次起草
 	}
@@ -371,16 +429,15 @@ func CheckPolishPipelineGate(st *store.Store, chapter int, expectedPolisherModel
 						return fmt.Errorf("pipeline：章节 %d 的 polish 由模型 %s 完成，与当前配置的 polisher 模型 %s 不一致，请重新调用 polish_draft: %w",
 							chapter, bound.PolisherModel, expectedPolisherModel, errs.ErrToolPrecondition)
 					}
-				} else if curr.CreatedAt != "" && !polishCP.OccurredAt.IsZero() {
-					// legacy（R=0）：回退 wall-clock 比较。criticAt 来自 RFC3339
-					// （整秒精度，丢失小数秒），而 polishCP.OccurredAt 保留小数秒——
-					// 同秒内 Critic 实际晚于 polish 也可能被判更早，故容忍 1 秒
+				} else if !reviewBindsPolish(curr, polishCP) {
+					// legacy（R=0）：回退 wall-clock 比较（与 FSM 共用
+					// reviewBindsPolish，规格 §4）。criticAt 来自 RFC3339
+					// （整秒精度，丢失小数秒），而 polishCP.OccurredAt 保留小数秒
+					// ——同秒内 Critic 实际晚于 polish 也可能被判更早，故容忍 1 秒
 					// 窗口：critic 比 polish 早不超过 1 秒视为合法（同秒 + 边界）。
-					criticAt, perr := time.Parse(time.RFC3339, curr.CreatedAt)
-					if perr == nil && criticAt.Add(time.Second).Before(polishCP.OccurredAt) {
-						return fmt.Errorf("pipeline：章节 %d 的评审先于 polish 完成（评审对象不是精修后的正文），请重新执行 polish_draft → check_consistency → review_style: %w",
-							chapter, errs.ErrToolPrecondition)
-					}
+					// 时间缺失/解析失败按已绑定放行（legacy 账本兼容，避免旧账本死锁）。
+					return fmt.Errorf("pipeline：章节 %d 的评审先于 polish 完成（评审对象不是精修后的正文），请重新执行 polish_draft → check_consistency → review_style: %w",
+						chapter, errs.ErrToolPrecondition)
 				}
 			}
 		}

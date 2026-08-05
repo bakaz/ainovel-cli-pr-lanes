@@ -168,6 +168,7 @@ func TestLiteraryProseGateBlocksRewriteCommit(t *testing.T) {
 	tool := NewCommitChapterTool(s)
 	args, _ := json.Marshal(map[string]any{
 		"chapter": 2, "summary": "重写", "characters": []string{"林墨"}, "key_events": []string{"重写"},
+		"world_state_mode": "preserve",
 	})
 
 	// 脏的重写文本 → 拦下

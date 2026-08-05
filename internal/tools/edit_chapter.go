@@ -34,6 +34,10 @@ type editToolExecutor interface {
 type EditChapterTool struct {
 	store *store.Store
 	edit  editToolExecutor
+	// fsmConfig 是章节流水线强制状态机配置（BuildWorkers 注入）；Enabled 时
+	// Execute 入口调用 RequireChapterAction 强制顺序（guard 在 ensureDraft 之前，
+	// 保证被拒时不从 final 播种 draft）。
+	fsmConfig ChapterFSMConfig
 }
 
 func NewEditChapterTool(s *store.Store) *EditChapterTool {
@@ -42,6 +46,12 @@ func NewEditChapterTool(s *store.Store) *EditChapterTool {
 		edit:  agentcoretools.NewEdit(s.Dir(), nil),
 	}
 }
+
+// SetChapterFSMConfig 注入章节流水线强制状态机配置（BuildWorkers 调用）。
+func (t *EditChapterTool) SetChapterFSMConfig(cfg ChapterFSMConfig) { t.fsmConfig = cfg }
+
+// FSMConfig 返回注入的章节流水线配置（构建/测试诊断用）。
+func (t *EditChapterTool) FSMConfig() ChapterFSMConfig { return t.fsmConfig }
 
 func (t *EditChapterTool) Name() string  { return "edit_chapter" }
 func (t *EditChapterTool) Label() string { return "编辑章节" }
@@ -91,6 +101,12 @@ func (t *EditChapterTool) Execute(ctx context.Context, args json.RawMessage) (js
 	}
 	if a.OldString == a.NewString {
 		return nil, fmt.Errorf("old_string 与 new_string 相同，无需修改: %w", errs.ErrToolArgs)
+	}
+
+	// 章节流水线强制状态机（Enabled 时）：draft_dirty/needs_edit/revision_open
+	// 允许 edit；needs_polish/needs_review/needs_commit 等阶段拒绝越权修改。
+	if err := RequireChapterAction(t.store, a.Chapter, ChapterActionEdit, t.fsmConfig); err != nil {
+		return nil, fmt.Errorf("edit_chapter: %w", err)
 	}
 
 	// critic 模式变异守卫
@@ -172,7 +188,7 @@ func (t *EditChapterTool) Execute(ctx context.Context, args json.RawMessage) (js
 		"chapter_word_count":           chapterWordCount,
 		"word_count_delta":             wordCountDelta,
 		"requires_consistency_recheck": true,
-		"next_step":                    "edit 已落盘。每次 edit 后**必须**调 check_consistency 重新核验；通过后按 mode 执行（off 模式 check→commit，critic 模式需 review_style→terminal→commit）",
+		"next_step":                    "edit 已落盘。下一步**必须**调用 check_consistency 重新核验；通过后按返回的 required_next_action 依次执行（pipeline 下 polish_draft → check_consistency → review_style → commit_chapter；critic 模式须经 review_style 至 terminal 后再 commit）",
 	}
 	// replace_all 时变更范围是整体包络，只能提供单一保守上下文
 	if a.ReplaceAll {

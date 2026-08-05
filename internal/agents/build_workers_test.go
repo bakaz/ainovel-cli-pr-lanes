@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -787,4 +788,83 @@ func findNullTypePath(v any, path string) string {
 		}
 	}
 	return ""
+}
+
+// TestBuildWorkers_ChapterFSMWiring 验证 BuildWorkers 对 writer 六工具的统一 FSM
+// 配置注入：draft/edit/check/polish/review/commit 均实现 ChapterFSMConfigurable；
+// pipeline 开启 + roles.polisher 显式配置时注入 Enabled=true、PipelineEnabled=true、
+// ExpectedPolisherModel=roles.polisher 当前模型；pipeline 关闭时
+// PipelineEnabled=false、ExpectedPolisherModel 为空（Enabled 恒为 true）。
+func TestBuildWorkers_ChapterFSMWiring(t *testing.T) {
+	newRunner := func(chapterPipeline string, roles map[string]bootstrap.RoleConfig) *subagent.Runner {
+		dir := t.TempDir()
+		st := store.NewStore(dir)
+		if err := st.Init(); err != nil {
+			t.Fatal(err)
+		}
+		bundle := assets.Load("default", assets.LoadOptions{})
+		cfg := bootstrap.Config{
+			Provider:  "ollama",
+			ModelName: "dummy-model",
+			Providers: map[string]bootstrap.ProviderConfig{
+				"ollama": {BaseURL: "http://0.0.0.0:0"},
+			},
+			Style:           "default",
+			ChapterPipeline: chapterPipeline,
+			Roles:           roles,
+		}
+		models, err := bootstrap.NewModelSet(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runner, _, _, _ := BuildWorkers(cfg, st, models, bundle, nil, nil, projectprofile.NewCore4Contract())
+		return runner
+	}
+
+	fsmToolNames := []string{"draft_chapter", "edit_chapter", "check_consistency", "polish_draft", "review_style", "commit_chapter"}
+	checkInjected := func(t *testing.T, runner *subagent.Runner, want tools.ChapterFSMConfig) {
+		t.Helper()
+		writerAC, ok := runner.AgentConfig("writer")
+		if !ok {
+			t.Fatal("writer agent missing")
+		}
+		found := 0
+		for _, tl := range writerAC.Tools {
+			if !slices.Contains(fsmToolNames, tl.Name()) {
+				continue
+			}
+			found++
+			configurable, ok := tl.(tools.ChapterFSMConfigurable)
+			if !ok {
+				t.Fatalf("%s must implement tools.ChapterFSMConfigurable", tl.Name())
+			}
+			_ = configurable
+			getter, ok := tl.(interface{ FSMConfig() tools.ChapterFSMConfig })
+			if !ok {
+				t.Fatalf("%s must expose FSMConfig()", tl.Name())
+			}
+			if got := getter.FSMConfig(); got != want {
+				t.Errorf("%s FSMConfig = %+v, want %+v", tl.Name(), got, want)
+			}
+		}
+		if found != len(fsmToolNames) {
+			t.Fatalf("found %d FSM tools in writer toolset, want %d", found, len(fsmToolNames))
+		}
+	}
+
+	t.Run("pipeline_enabled_with_polisher_role", func(t *testing.T) {
+		runner := newRunner("ds_mimo_critic", map[string]bootstrap.RoleConfig{
+			"polisher": {Provider: "ollama", Model: "mimo-polisher"},
+		})
+		checkInjected(t, runner, tools.ChapterFSMConfig{
+			Enabled:               true,
+			PipelineEnabled:       true,
+			ExpectedPolisherModel: "mimo-polisher",
+		})
+	})
+
+	t.Run("pipeline_disabled", func(t *testing.T) {
+		runner := newRunner("", nil)
+		checkInjected(t, runner, tools.ChapterFSMConfig{Enabled: true})
+	})
 }

@@ -19,11 +19,20 @@ import (
 type DraftChapterTool struct {
 	store    *store.Store
 	contract *projectprofile.SceneBeatContract
+	// fsmConfig 是章节流水线强制状态机配置（BuildWorkers 注入）；Enabled 时
+	// Execute 入口调用 RequireChapterAction 强制顺序（draft/edit→check→polish→…）。
+	fsmConfig ChapterFSMConfig
 }
 
 func NewDraftChapterTool(store *store.Store, contract *projectprofile.SceneBeatContract) *DraftChapterTool {
 	return &DraftChapterTool{store: store, contract: contract}
 }
+
+// SetChapterFSMConfig 注入章节流水线强制状态机配置（BuildWorkers 调用）。
+func (t *DraftChapterTool) SetChapterFSMConfig(cfg ChapterFSMConfig) { t.fsmConfig = cfg }
+
+// FSMConfig 返回注入的章节流水线配置（构建/测试诊断用）。
+func (t *DraftChapterTool) FSMConfig() ChapterFSMConfig { return t.fsmConfig }
 
 func (t *DraftChapterTool) Name() string { return "draft_chapter" }
 func (t *DraftChapterTool) Description() string {
@@ -76,6 +85,11 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 	if err := EnsureChapterExpanded(t.store, a.Chapter); err != nil {
 		return nil, err
 	}
+	// 章节流水线强制状态机（Enabled 时）：needs_draft/draft_dirty/revision_open
+	// 允许 draft；needs_polish/needs_review/needs_commit 等阶段拒绝越权修改。
+	if err := RequireChapterAction(t.store, a.Chapter, ChapterActionDraft, t.fsmConfig); err != nil {
+		return nil, fmt.Errorf("draft_chapter: %w", err)
+	}
 	if err := CheckStyleReviewMutationGuard(t.store, a.Chapter); err != nil {
 		return nil, fmt.Errorf("draft_chapter: %w", err)
 	}
@@ -115,7 +129,7 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 			"chapter":    a.Chapter,
 			"mode":       "append",
 			"word_count": utf8.RuneCountInString(full),
-			"next_step":  "先 read_chapter(source=draft) 回读草稿，再调用 check_consistency，最后 commit_chapter",
+			"next_step":  "先 read_chapter(source=draft) 回读草稿，再调用 check_consistency；检查通过后按返回的 required_next_action 依次执行 polish_draft → check_consistency → review_style，最后 commit_chapter",
 		})
 	default: // write
 		if err := t.store.Drafts.SaveDraft(a.Chapter, a.Content); err != nil {
@@ -132,7 +146,7 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 			"chapter":    a.Chapter,
 			"mode":       "write",
 			"word_count": utf8.RuneCountInString(a.Content),
-			"next_step":  "先 read_chapter(source=draft) 回读草稿，再调用 check_consistency，最后 commit_chapter",
+			"next_step":  "先 read_chapter(source=draft) 回读草稿，再调用 check_consistency；检查通过后按返回的 required_next_action 依次执行 polish_draft → check_consistency → review_style，最后 commit_chapter",
 		})
 	}
 }

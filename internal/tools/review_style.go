@@ -52,7 +52,12 @@ type ReviewStyleTool struct {
 	criticPromptHash string // sha256 前缀：实际批评者提示词内容的可溯源标识
 	// pipelineEnabled 是精修流水线开关（BuildWorkers 注入）：开启时要求评审前存在
 	// 与当前草稿 digest 匹配的 polish checkpoint（精修先于评审的时序保证）。
+	// 与 fsmConfig.PipelineEnabled 同源（SetPipelineEnabled 同步两者）。
 	pipelineEnabled bool
+	// fsmConfig 是章节流水线强制状态机配置（BuildWorkers 注入）；Enabled 时
+	// Execute 入口调用 RequireChapterAction 强制顺序（needs_review 才允许评审，
+	// 保证非法评审不消耗模型调用）。
+	fsmConfig ChapterFSMConfig
 }
 
 func NewReviewStyleTool(s *store.Store, criticRunner *subagent.Runner, criticPromptHash string) *ReviewStyleTool {
@@ -60,7 +65,16 @@ func NewReviewStyleTool(s *store.Store, criticRunner *subagent.Runner, criticPro
 }
 
 // SetPipelineEnabled 设置精修流水线开关（BuildWorkers 注入）。
-func (t *ReviewStyleTool) SetPipelineEnabled(v bool) { t.pipelineEnabled = v }
+func (t *ReviewStyleTool) SetPipelineEnabled(v bool) {
+	t.pipelineEnabled = v
+	t.fsmConfig.PipelineEnabled = v
+}
+
+// SetChapterFSMConfig 注入章节流水线强制状态机配置（BuildWorkers 调用）。
+func (t *ReviewStyleTool) SetChapterFSMConfig(cfg ChapterFSMConfig) { t.fsmConfig = cfg }
+
+// FSMConfig 返回注入的章节流水线配置（构建/测试诊断用）。
+func (t *ReviewStyleTool) FSMConfig() ChapterFSMConfig { return t.fsmConfig }
 
 func (t *ReviewStyleTool) Name() string { return "review_style" }
 func (t *ReviewStyleTool) Description() string {
@@ -139,6 +153,12 @@ func (t *ReviewStyleTool) Execute(ctx context.Context, args json.RawMessage) (js
 			Skipped: true,
 			Reason:  "style review not enabled (mode must be 'critic')",
 		})
+	}
+
+	// ── 1.5 章节流水线强制状态机（Enabled 时）：needs_review 才允许评审；
+	//    在加载草稿/启动 critic 之前拦截，保证非法评审不消耗模型调用。 ──
+	if err := RequireChapterAction(t.store, a.Chapter, ChapterActionReview, t.fsmConfig); err != nil {
+		return nil, fmt.Errorf("review_style: %w", err)
 	}
 
 	// ── 2. 加载草稿 ──
