@@ -39,6 +39,7 @@ var modelRoleOptions = []modelRoleOption{
 	{Key: "architect", Label: "Architect"},
 	{Key: "writer", Label: "Writer"},
 	{Key: "editor", Label: "Editor"},
+	{Key: "polisher", Label: "Polisher"},
 }
 
 type thinkingOption struct{ Key, Label string }
@@ -119,7 +120,7 @@ func normalizeRoleKey(role string) string {
 	switch strings.ToLower(strings.TrimSpace(role)) {
 	case "", "default":
 		return "default"
-	case "architect", "writer", "editor":
+	case "architect", "writer", "editor", "polisher":
 		return strings.ToLower(strings.TrimSpace(role))
 	default:
 		return ""
