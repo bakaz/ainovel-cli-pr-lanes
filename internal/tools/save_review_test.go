@@ -563,3 +563,43 @@ func TestSaveReviewAllowsEscalationWithAffectedChapters(t *testing.T) {
 		t.Fatalf("Execute should succeed when affected_chapters is provided, got: %v", err)
 	}
 }
+
+// TestSaveReviewSchemaOmitsDimensionVerdict schema 减面回归：dimensions 项的
+// verdict 已从模型输入面删除（代码按 score 确定性推导），防止弱模型再传
+// 自相矛盾的 verdict。domain 持久化结构中的 Verdict 保留（计算后的结果）。
+func TestSaveReviewSchemaOmitsDimensionVerdict(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	tool := NewSaveReviewTool(s)
+
+	sch := tool.Schema()
+	props, ok := sch["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("schema missing properties")
+	}
+	dimensions, ok := props["dimensions"].(map[string]any)
+	if !ok {
+		t.Fatal("schema missing dimensions")
+	}
+	items, ok := dimensions["items"].(map[string]any)
+	if !ok {
+		t.Fatal("dimensions schema missing items")
+	}
+	dimProps, ok := items["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("dimension schema missing properties")
+	}
+
+	if _, ok := dimProps["verdict"]; ok {
+		t.Fatal("dimensions 项的 verdict 必须从模型输入 schema 删除（系统按 score 自动推导）")
+	}
+	// 该维度项仍要求 score 与 comment，推导所需输入完整
+	for _, key := range []string{"dimension", "score", "comment"} {
+		if _, ok := dimProps[key]; !ok {
+			t.Errorf("dimension schema 缺少字段 %q", key)
+		}
+	}
+	// 顶层审阅结论 verdict（accept/polish/rewrite）保留
+	if _, ok := props["verdict"]; !ok {
+		t.Fatal("顶层审阅 verdict（accept/polish/rewrite）必须保留")
+	}
+}

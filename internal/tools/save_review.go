@@ -43,7 +43,6 @@ func (t *SaveReviewTool) Schema() map[string]any {
 	dimensionSchema := schema.Object(
 		schema.Property("dimension", schema.Enum("维度", "consistency", "character", "pacing", "continuity", "foreshadow", "hook", "aesthetic")).Required(),
 		schema.Property("score", schema.Int("评分（0-100）")).Required(),
-		schema.Property("verdict", schema.Enum("维度结论（可省略：系统按 score 自动推导，≥80 pass / ≥60 warning / <60 fail）", "pass", "warning", "fail")),
 		schema.Property("comment", schema.String("该维度的简要结论；每个维度必填，aesthetic 必须引用原文或具体统计事实")).Required(),
 	)
 	return schema.Object(
@@ -69,7 +68,8 @@ func (t *SaveReviewTool) Execute(_ context.Context, args json.RawMessage) (json.
 		return nil, fmt.Errorf("chapter must be > 0")
 	}
 	// verdict 是 score 的纯函数（≥80 pass / ≥60 warning / <60 fail），由代码确定性推导——
-	// 不让 LLM 重复提供再校验一致性。既消除冗余，也根除"score=85 却给 warning"这类自相矛盾的参数。
+	// 模型输入侧（schema/prompt）已删除该字段；即使调用方传入，也会被覆写。
+	// 既消除冗余，也根除"score=85 却给 warning"这类自相矛盾的参数。
 	for i := range r.Dimensions {
 		r.Dimensions[i].Verdict = expectedDimensionVerdict(r.Dimensions[i].Score)
 	}

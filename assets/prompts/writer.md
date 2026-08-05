@@ -152,12 +152,12 @@
 - `summary`：200 字以内章节摘要
 - `characters`：本章出场角色正式名
 - `key_events`：关键事件
-- `timeline_events`：时间线事件
-- `foreshadow_updates`：伏笔操作，`plant` / `advance` / `resolve`
-- `relationship_changes`：人物关系变化
-- `state_changes`：角色或实体状态变化
-- `cast_intros`：本章首次引入的次要角色简介数组，每个 `{name, brief_role}`。详见上方"配角连续性"段。
-- `hook_type`：`crisis` / `mystery` / `desire` / `emotion` / `choice`
-- `dominant_strand`：`quest` / `fire` / `constellation`
+- `timeline_events`：时间线事件；有则必须报，无则省略或空数组，缺失不重试
+- `foreshadow_updates`：伏笔操作，`plant` / `advance` / `resolve`；有则必须报，无则省略或空数组，缺失不重试
+- `relationship_changes`：人物关系变化；有则必须报，无则省略或空数组，缺失不重试
+- `state_changes`：角色或实体状态变化；有则必须报，无则省略或空数组，缺失不重试
+- `cast_intros`：本章首次引入的次要角色简介数组，每个 `{name, brief_role}`。可选——没有新引入就省略，缺失不阻断提交。详见上方"配角连续性"段。
+- `hook_type`：`crisis` / `mystery` / `desire` / `emotion` / `choice`；有则必须报，缺失不重试
+- `dominant_strand`：`quest` / `fire` / `constellation`；有则必须报，缺失不重试
 - `world_state_mode`：重写/打磨已完成章节的提交**必填**：`"preserve"`（纯文风重写，不应用世界状态变更）或 `"replace"`（剧情变化重写，需世界状态重放支持，可能被拒绝）。新章提交可省略，详见上方"重写与打磨"段。
-- `feedback`：对后续大纲的建议，可选；必须传对象 `{"deviation":"...","suggestion":"..."}`，不要传字符串化 JSON（错误：`"{\"deviation\":\"...\"}"`）
+- `feedback`：对后续大纲的建议，可选——没有反馈就省略；有则必须传 JSON object（不是字符串），形状 `{"deviation":"...","suggestion":"..."}`；不要传字符串化 JSON（错误：`"{\"deviation\":\"...\"}"`）

@@ -310,6 +310,7 @@ func TestDraftChapterRejectsCompleted(t *testing.T) {
 	args, _ := json.Marshal(map[string]any{
 		"chapter": 1,
 		"content": "试图覆盖已提交的章节",
+		"mode":    "write", // 显式 mode（空串/未知值已被 TestDraftChapterRejectsInvalidMode 覆盖）
 	})
 	result, err := tool.Execute(context.Background(), args)
 	if err != nil {

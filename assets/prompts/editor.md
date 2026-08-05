@@ -112,7 +112,7 @@
   - 七个维度必须齐全：consistency/character/pacing/continuity/foreshadow/hook/aesthetic
   - dimension：维度名（consistency/character/pacing/continuity/foreshadow/hook/aesthetic）
   - score：0-100 分
-  - verdict：可省略，系统按 score 自动推导（≥80 pass / 60-79 warning / <60 fail）
+  - verdict：不要传——系统按 score 自动推导（≥80 pass / ≥60 warning / <60 fail）
   - comment：每个维度必填；aesthetic 维度必须引用原文或具体统计事实
 
 正确形状示例：

@@ -71,6 +71,11 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 	if a.Content == "" {
 		return nil, fmt.Errorf("content must not be empty: %w", errs.ErrToolArgs)
 	}
+	// mode 显式三分支（数据安全）：只接受 write/append，未知值或直接调用一律拒绝，
+	// 绝不静默走 write 覆盖已有草稿。
+	if a.Mode != "write" && a.Mode != "append" {
+		return nil, fmt.Errorf("draft_chapter: mode 必须是 write 或 append，收到 %q: %w", a.Mode, errs.ErrToolArgs)
+	}
 
 	// 预检：使用共享 ValidateOutlineEntry 验证目标章场景
 	if t.contract != nil {
@@ -110,6 +115,23 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 	}
 
 	switch a.Mode {
+	case "write":
+		if err := t.store.Drafts.SaveDraft(a.Chapter, a.Content); err != nil {
+			return nil, fmt.Errorf("save draft: %w", err)
+		}
+		if _, err := t.store.Checkpoints.AppendArtifact(
+			domain.ChapterScope(a.Chapter), "draft",
+			fmt.Sprintf("drafts/%02d.draft.md", a.Chapter),
+		); err != nil {
+			return nil, fmt.Errorf("checkpoint draft: %w", err)
+		}
+		return json.Marshal(map[string]any{
+			"written":    true,
+			"chapter":    a.Chapter,
+			"mode":       "write",
+			"word_count": utf8.RuneCountInString(a.Content),
+			"next_step":  "先 read_chapter(source=draft) 回读草稿，再调用 check_consistency；检查通过后按返回的 required_next_action 依次执行 polish_draft → check_consistency → review_style，最后 commit_chapter",
+		})
 	case "append":
 		if err := t.store.Drafts.AppendDraft(a.Chapter, a.Content); err != nil {
 			return nil, fmt.Errorf("append draft: %w", err)
@@ -131,22 +153,7 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 			"word_count": utf8.RuneCountInString(full),
 			"next_step":  "先 read_chapter(source=draft) 回读草稿，再调用 check_consistency；检查通过后按返回的 required_next_action 依次执行 polish_draft → check_consistency → review_style，最后 commit_chapter",
 		})
-	default: // write
-		if err := t.store.Drafts.SaveDraft(a.Chapter, a.Content); err != nil {
-			return nil, fmt.Errorf("save draft: %w", err)
-		}
-		if _, err := t.store.Checkpoints.AppendArtifact(
-			domain.ChapterScope(a.Chapter), "draft",
-			fmt.Sprintf("drafts/%02d.draft.md", a.Chapter),
-		); err != nil {
-			return nil, fmt.Errorf("checkpoint draft: %w", err)
-		}
-		return json.Marshal(map[string]any{
-			"written":    true,
-			"chapter":    a.Chapter,
-			"mode":       "write",
-			"word_count": utf8.RuneCountInString(a.Content),
-			"next_step":  "先 read_chapter(source=draft) 回读草稿，再调用 check_consistency；检查通过后按返回的 required_next_action 依次执行 polish_draft → check_consistency → review_style，最后 commit_chapter",
-		})
+	default: // 理论不可达（Execute 入口已校验），纵深防御：新增 mode 不得静默降级为 write
+		return nil, fmt.Errorf("draft_chapter: mode 必须是 write 或 append，收到 %q: %w", a.Mode, errs.ErrToolArgs)
 	}
 }
