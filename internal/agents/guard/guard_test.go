@@ -77,6 +77,41 @@ func TestSubAgentGuard_NormalStopStillBlocks(t *testing.T) {
 	}
 }
 
+// TestPolisherStopGuard_AllowsNormalEndTurn 验证 polisher 的 StopGuard 恒放行
+// 正常 end_turn：polisher 协议禁止自行 commit（评审与提交由调用方 writer 执行），
+// 产物是最终文本响应、由 polish_draft 工具校验落盘。若要求 commit checkpoint，
+// 每次正常结束都被拦截、连续空转后 escalate，polish_draft 永远失败
+// （实测 63 章 rewrite 死循环）。
+func TestPolisherStopGuard_AllowsNormalEndTurn(t *testing.T) {
+	guard := NewPolisherStopGuard()
+	info := agentcore.StopInfo{
+		TurnIndex: 1,
+		Message:   agentcore.Message{StopReason: agentcore.StopReasonStop},
+	}
+	d := guard(context.Background(), info)
+	if !d.Allow {
+		t.Fatalf("polisher normal end_turn must be allowed, got %#v", d)
+	}
+	if d.Escalate || d.InjectMessage != "" {
+		t.Fatalf("polisher normal end_turn must not escalate/inject, got %#v", d)
+	}
+}
+
+// TestPolisherStopGuard_HardStopStillEscalates 验证 polisher guard 对 provider
+// 拒答（safety/content_filter）仍立即升级，避免工具端空输出重试浪费 token。
+func TestPolisherStopGuard_HardStopStillEscalates(t *testing.T) {
+	guard := NewPolisherStopGuard()
+	for _, sr := range []agentcore.StopReason{"safety", "content_filter"} {
+		d := guard(context.Background(), agentcore.StopInfo{
+			TurnIndex: 1,
+			Message:   agentcore.Message{StopReason: sr},
+		})
+		if !d.Escalate {
+			t.Fatalf("stop_reason=%q must escalate, got %#v", sr, d)
+		}
+	}
+}
+
 // TestSubAgentGuard_ProgressBetweenBlocksResetsCounter 验证：两次拦截之间出现过
 // 新 checkpoint（模型被催后重新 draft 等）时 consecutive 重置——升级只惩罚毫无
 // 产物的连续空转，遵循"有进展即重置"语义（issue #75）。

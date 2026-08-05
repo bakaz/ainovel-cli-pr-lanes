@@ -55,13 +55,19 @@ func TestBuildWorkers_ToolComposition(t *testing.T) {
 		"edit_chapter", "check_consistency", "commit_chapter",
 	})
 
+	// ── polisher 工具集：空（纯文本转换的嵌套模型，任务文本已含全部上下文，
+	// 无任何读取/落盘/检查/提交工具） ──
+	if len(ts.Polisher) != 0 {
+		t.Errorf("polisher toolset must be empty, got %v", toolNames(ts.Polisher))
+	}
+
 	// ── editor 工具 ──
 	expectTools(t, "editor", ts.Editor, []string{
 		"novel_context", "read_chapter", "save_review",
 		"save_arc_summary", "save_volume_summary",
 	})
 
-	// 确认上下文工具实例不同（角色隔离）
+	// 确认上下文工具实例不同（角色隔离；polisher 无工具，不参与）
 	novelCtxNames := make(map[string]int)
 	for _, tools := range [][]agentcore.Tool{ts.ArchitectShort, ts.ArchitectLong, ts.Writer, ts.Editor} {
 		for _, tool := range tools {
@@ -70,9 +76,9 @@ func TestBuildWorkers_ToolComposition(t *testing.T) {
 			}
 		}
 	}
-	// 每个子代理都应有 novel_context（architect_short 和 architect_long 共享同一实例）
+	// 各子代理都应有 novel_context（architect_short 和 architect_long 共享同一实例）
 	if len(ts.ArchitectShort) == 0 || len(ts.ArchitectLong) == 0 || len(ts.Writer) == 0 || len(ts.Editor) == 0 {
-		t.Error("all agents must have tools")
+		t.Error("architect/writer/editor agents must have tools")
 	}
 
 	// novel_context 指针身份：architect_short/long 共享同一实例，与 writer/editor 隔离。
@@ -94,6 +100,7 @@ func TestBuildWorkers_ToolComposition(t *testing.T) {
 	t.Log("architect_long:", toolNames(ts.ArchitectLong))
 	t.Log("writer:", toolNames(ts.Writer))
 	t.Log("editor:", toolNames(ts.Editor))
+	t.Log("polisher:", toolNames(ts.Polisher))
 }
 
 func TestBuildWorkerToolsetsWiresTUILongApprovalIntoArchitect(t *testing.T) {
@@ -504,6 +511,127 @@ func TestBuildWorkers_V3GuidanceProductionWiring(t *testing.T) {
 			t.Error("Core4 prompt should not contain erotic_charge guidance")
 		}
 	})
+}
+
+// TestBuildWorkers_PolisherAgentWiring 验证 pipeline 开启时 BuildWorkers 组装
+// 独立的 polisher 子代理（独立 system prompt / cache key / 工具集）并把 polish_draft
+// 注入 writer 工具集；pipeline 关闭时 polisher 子代理仍注册（工具自身 skipped），
+// 但 commit 门控与工具强制不生效。
+func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	bundle := assets.Load("default", assets.LoadOptions{})
+	bundle.Voice = "VOICE"
+	cfg := bootstrap.Config{
+		Provider:  "ollama",
+		ModelName: "dummy-model",
+		Providers: map[string]bootstrap.ProviderConfig{
+			"ollama": {BaseURL: "http://0.0.0.0:0"},
+		},
+		Style:           "default",
+		ChapterPipeline: "ds_mimo_critic",
+		Roles: map[string]bootstrap.RoleConfig{
+			"polisher": {Provider: "ollama", Model: "mimo-polisher"},
+		},
+	}
+	models, err := bootstrap.NewModelSet(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner, _, _, _ := BuildWorkers(cfg, st, models, bundle, nil, nil, projectprofile.NewCore4Contract())
+
+	// polisher 子代理注册：独立 system prompt（polisher.md 内容）与 cache key
+	ac, ok := runner.AgentConfig("polisher")
+	if !ok {
+		t.Fatal("polisher agent missing from runner")
+	}
+	if !strings.Contains(ac.SystemPrompt, "文风精修师") {
+		t.Error("polisher system prompt should come from polisher.md")
+	}
+	if !strings.Contains(ac.SystemPrompt, "没有任何工具") {
+		t.Error("polisher prompt should state it has no tools")
+	}
+	if ac.PromptCacheKey == "" || ac.PromptCacheKey == runnerAgentCacheKey(t, runner, "writer") {
+		t.Error("polisher cache key must be independent from writer")
+	}
+	if ac.MaxTurns != 1 {
+		t.Errorf("polisher MaxTurns = %d, want 1", ac.MaxTurns)
+	}
+	if len(ac.StopAfterTools) != 0 {
+		t.Errorf("polisher StopAfterTools = %v, want empty (no tools)", ac.StopAfterTools)
+	}
+	// 工具集为空：纯文本转换的嵌套模型，无 review_style / commit_chapter 等任何工具
+	if len(ac.Tools) != 0 {
+		t.Errorf("polisher toolset must be empty, got %v", toolNames(ac.Tools))
+	}
+	if toolInList(ac.Tools, "review_style") || toolInList(ac.Tools, "commit_chapter") {
+		t.Error("polisher must not have review_style/commit_chapter")
+	}
+
+	// writer 工具集含 polish_draft（pipeline 开启）
+	writerAC, ok := runner.AgentConfig("writer")
+	if !ok {
+		t.Fatal("writer agent missing")
+	}
+	if !toolInList(writerAC.Tools, "polish_draft") {
+		t.Error("writer should have polish_draft tool when pipeline enabled")
+	}
+
+	// polisher 模型 = 配置的 roles.polisher
+	polisherModelName := bootstrap.ModelName(ac.Model)
+	if polisherModelName != "mimo-polisher" {
+		t.Errorf("polisher model = %q, want mimo-polisher", polisherModelName)
+	}
+}
+
+// runnerAgentCacheKey 取 runner 中某 agent 的 PromptCacheKey（测试辅助）。
+func runnerAgentCacheKey(t *testing.T, runner *subagent.Runner, name string) string {
+	t.Helper()
+	ac, ok := runner.AgentConfig(name)
+	if !ok {
+		t.Fatalf("agent %s missing", name)
+	}
+	return ac.PromptCacheKey
+}
+
+// TestBuildWorkers_PolisherPipelineDisabled 验证 pipeline 关闭时：
+// polisher 子代理仍注册（工具自身 skipped），writer 仍有 polish_draft 但 commit 门控不生效。
+func TestBuildWorkers_PolisherPipelineDisabled(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	bundle := assets.Load("default", assets.LoadOptions{})
+	cfg := bootstrap.Config{
+		Provider:  "ollama",
+		ModelName: "dummy-model",
+		Providers: map[string]bootstrap.ProviderConfig{
+			"ollama": {BaseURL: "http://0.0.0.0:0"},
+		},
+		Style: "default",
+	}
+	models, err := bootstrap.NewModelSet(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, _, _, _ := BuildWorkers(cfg, st, models, bundle, nil, nil, projectprofile.NewCore4Contract())
+
+	if _, ok := runner.AgentConfig("polisher"); !ok {
+		t.Fatal("polisher agent should still be registered when pipeline disabled")
+	}
+	writerAC, ok := runner.AgentConfig("writer")
+	if !ok {
+		t.Fatal("writer agent missing")
+	}
+	// polish_draft 始终注入 writer 工具集（工具内部按 enabled 开关返回 skipped）
+	if !toolInList(writerAC.Tools, "polish_draft") {
+		t.Error("writer should have polish_draft tool regardless of pipeline switch")
+	}
 }
 
 // TestBuildWorkers_ToolSchemasNoJSONNullType 回归：DeepSeek/OpenAI 兼容接口会拒绝

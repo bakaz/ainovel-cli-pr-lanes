@@ -149,7 +149,7 @@ func TestEngine_WorkerBoundaryOneSnapshot(t *testing.T) {
 		TotalChapters:     2,
 	})
 	// Draft needed by commit_chapter tool
-	if err := st.Drafts.SaveDraft(2, "# Ch2\nboundary test content."); err != nil {
+	if err := st.Drafts.SaveDraft(2, "# Ch2\nboundary test content. 她心里骂自己丢人，真不要脸。"); err != nil {
 		t.Fatal(err)
 	}
 

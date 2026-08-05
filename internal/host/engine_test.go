@@ -30,6 +30,47 @@ import (
 	"github.com/voocel/ainovel-cli/internal/tools"
 )
 
+// namedChatModel 实现 ModelNamer 的 scriptedChatModel 变体（P0 provenance 测试用）。
+type namedChatModel struct {
+	scriptedChatModel
+	name string
+}
+
+func (m *namedChatModel) ModelName() string { return m.name }
+
+// TestEngineRunWorker_RecordsWriterModel 验证 P0 provenance：Engine 在派发 writer 前
+// 把当前生效的作者模型记录到 RunMeta.LastAuthorModel（真实"最近一次正文写入"模型）。
+func TestEngineRunWorker_RecordsWriterModel(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("test", 10); err != nil {
+		t.Fatal(err)
+	}
+	model := &namedChatModel{name: "writer-ds-v1"}
+	model.fn = func(msgs []agentcore.Message) agentcore.Message {
+		return testTextMsg("done")
+	}
+	workers := subagent.NewRunner(subagent.Config{
+		Name: "writer", Description: "test writer", Model: model,
+		SystemPrompt: "test", MaxTurns: 1,
+	})
+	e, _, _ := newTestEngine(t, st, workers, nil)
+
+	inst := &flow.Instruction{Agent: "writer", Chapter: 1, Task: "写第 1 章"}
+	if err := e.runWorker(t.Context(), inst); err != nil {
+		t.Fatalf("runWorker: %v", err)
+	}
+	meta, err := st.RunMeta.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta == nil || meta.LastAuthorModel != "writer-ds-v1" {
+		t.Fatalf("LastAuthorModel = %v, want writer-ds-v1（派发时记录的真实作者模型）", meta.LastAuthorModel)
+	}
+}
+
 // scriptedChatModel 按回调产出响应的最小 ChatModel。
 type scriptedChatModel struct {
 	fn func(msgs []agentcore.Message) agentcore.Message
@@ -126,7 +167,7 @@ func scriptedWriterModel() *scriptedChatModel {
 		case 1:
 			return testToolCallMsg("draft_chapter", map[string]any{
 				"chapter": chapter, "mode": "write",
-				"content": strings.Repeat(fmt.Sprintf("第%d章的正文段落，主角在黑暗中摸索前行。", chapter), 20),
+				"content": strings.Repeat(fmt.Sprintf("第%d章的正文段落，主角在黑暗中摸索前行。她心里骂自己丢人，真不要脸。", chapter), 20),
 			})
 		case 2:
 			return testToolCallMsg("check_consistency", map[string]any{"chapter": chapter})
@@ -1269,13 +1310,13 @@ func exhaustedLedger(chapter int) *domain.StyleReviewLedger {
 				AttemptID: "a1", Request: &domain.StyleReviewRequest{Prompt: "p", Model: "m"}, DraftDigest: d, BasisDigest: d},
 			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
 				AttemptID: "a1", Request: &domain.StyleReviewRequest{Prompt: "p", Model: "m"},
-				Result:   &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "e", Findings: find},
+				Result:      &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "e", Findings: find},
 				DraftDigest: d, BasisDigest: d},
 			{Cycle: 3, Status: domain.ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z",
 				AttemptID: "a2", Request: &domain.StyleReviewRequest{Prompt: "final", Model: "m"}, DraftDigest: d, BasisDigest: d},
 			{Cycle: 4, Status: domain.ReviewStatusExhausted, CreatedAt: "2026-07-25T13:00:00Z",
 				AttemptID: "a2", Request: &domain.StyleReviewRequest{Prompt: "final", Model: "m"},
-				Result:   &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "e", Findings: find},
+				Result:      &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "e", Findings: find},
 				DraftDigest: d, BasisDigest: d},
 		},
 	}

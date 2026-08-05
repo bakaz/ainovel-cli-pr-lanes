@@ -329,7 +329,7 @@ func preflightCheck(files []FileEntry, targetRoot string) []FileError {
 
 			if fi.Mode()&os.ModeSymlink != 0 {
 				errors = append(errors, FileError{
-					Path:  fe.Path,
+					Path: fe.Path,
 					Error: fmt.Sprintf("parent component %q is a symlink",
 						strings.Join(parts[:i+1], "/")),
 				})
@@ -338,7 +338,7 @@ func preflightCheck(files []FileEntry, targetRoot string) []FileError {
 			}
 			if !fi.IsDir() {
 				errors = append(errors, FileError{
-					Path:  fe.Path,
+					Path: fe.Path,
 					Error: fmt.Sprintf("parent component %q is not a directory",
 						strings.Join(parts[:i+1], "/")),
 				})

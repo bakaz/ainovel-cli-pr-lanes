@@ -172,6 +172,29 @@ func writerBlockMsg(seen map[string]struct{}) string {
 	}
 }
 
+// NewPolisherStopGuard 是 polisher 子代理的 StopGuard：恒放行 end_turn。
+//
+// polisher 的产物是"最终文本响应"（整章打磨后正文），由 polish_draft 工具
+// 负责校验与落盘（空输出重试 / UTF-8 / 长度上限），因此不要求任何 checkpoint。
+// 不能复用 NewWriterStopGuard：polisher 协议禁止 commit_chapter（评审与提交由
+// 调用方 writer 执行），要求 commit checkpoint 会让每次正常结束都被拦截、连续
+// 空转后 escalate 终止，polish_draft 永远失败（实测 63 章 rewrite 死循环：
+// polish_draft 失败 → commit 缺 polish checkpoint 被拒 → 重试 polish_draft 再失败）。
+//
+// 保留 hard-stop 语义：provider 拒答（safety/content_filter）立即 escalate，
+// 避免工具端 4 次空输出重试浪费 token。
+func NewPolisherStopGuard() agentcore.StopGuard {
+	return func(_ context.Context, info agentcore.StopInfo) agentcore.StopDecision {
+		if _, hard := hardStopReasons[info.Message.StopReason]; hard {
+			slog.Error("subagent stop_guard 检测到不可恢复停机，立即升级",
+				"module", "agent.guard", "agent", "polisher",
+				"turn", info.TurnIndex, "stop_reason", info.Message.StopReason)
+			return agentcore.StopDecision{Allow: false, Escalate: true}
+		}
+		return agentcore.StopDecision{Allow: true}
+	}
+}
+
 // NewArchitectStopGuard 要求 architect 本轮至少落盘一次 save_foundation。
 // NewArchitectStopGuard 要求 architect 本轮至少落盘一次规划产出。
 //

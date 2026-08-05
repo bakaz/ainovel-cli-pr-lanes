@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/agentcore/llm"
 	"github.com/voocel/agentcore/subagent"
 
 	"github.com/voocel/ainovel-cli/internal/arbiter"
@@ -537,6 +538,13 @@ func (e *engine) runWorker(ctx context.Context, inst *flow.Instruction) error {
 		}
 	}
 
+	// P0 provenance：派发 writer 时把当前生效的作者模型记录到 RunMeta.LastAuthorModel
+	// （真实"最近一次正文写入"模型，落盘在写入工具/引擎派发侧；rewrite_brief 的
+	// candidate.author_model 据此取值，不再从 StyleReview 反推 critic 模型）。
+	if inst.Agent == "writer" {
+		e.recordWriterModel()
+	}
+
 	// Worker 进度经 ctx ToolProgress 中继到 observer。
 	runCtx := agentcore.WithToolProgress(ctx, func(p agentcore.ProgressPayload) {
 		e.observer.workerProgress(p)
@@ -548,6 +556,35 @@ func (e *engine) runWorker(ctx context.Context, inst *flow.Instruction) error {
 	}
 	e.observer.dispatchFinish(inst.Agent, err != nil)
 	return err
+}
+
+// recordWriterModel 在派发 writer 前把当前生效的作者模型名记录到 RunMeta。
+// 模型名从注册的 writer agent 配置读取（SwappableModel 反映运行时 /model 热切换）。
+// 记录失败只告警不阻断派发——provenance 是审计事实，不是执行前置条件。
+func (e *engine) recordWriterModel() {
+	cfg, ok := e.workers.AgentConfig("writer")
+	if !ok || cfg.Model == nil {
+		return
+	}
+	if name := modelNameOf(cfg.Model); name != "" {
+		if err := e.store.RunMeta.SetLastAuthorModel(name); err != nil {
+			slog.Warn("记录 writer 模型失败", "module", "engine", "err", err)
+		}
+	}
+}
+
+// modelNameOf 提取 ChatModel 的当前模型名：优先 ModelNamer，回退 Info()。
+// failoverModel（配置了 fallbacks 的角色）只实现 Info()，两者都覆盖。
+func modelNameOf(m agentcore.ChatModel) string {
+	if mn, ok := m.(agentcore.ModelNamer); ok {
+		if name := mn.ModelName(); name != "" {
+			return name
+		}
+	}
+	if info, ok := m.(interface{ Info() llm.ModelInfo }); ok {
+		return info.Info().Name
+	}
+	return ""
 }
 
 // handleWorkerError 错误分类(RFC §4):确定性错误直接暂停(重试与裁定都无意义);

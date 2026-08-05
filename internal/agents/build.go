@@ -113,6 +113,10 @@ type workerToolsets struct {
 	ArchitectLong  []agentcore.Tool
 	Writer         []agentcore.Tool
 	Editor         []agentcore.Tool
+	Polisher       []agentcore.Tool
+	// commitTool 是 Writer 列表使用的 commit_chapter 实例；
+	// BuildWorkers 在构建后按配置注入精修流水线门控（SetPolishPipeline）。
+	commitTool *tools.CommitChapterTool
 }
 
 func buildWorkerToolsets(store *store.Store, bundle assets.Bundle, style string, contract *projectprofile.SceneBeatContract) workerToolsets {
@@ -128,6 +132,7 @@ func buildWorkerToolsetsWithApproval(store *store.Store, bundle assets.Bundle, s
 	if askUser != nil {
 		saveFoundation.SetLongApproval(askUser, tools.DefaultLongApprovalTimeout)
 	}
+	commitTool := tools.NewCommitChapterTool(store)
 	return workerToolsets{
 		ArchitectShort: []agentcore.Tool{
 			architectCtx,
@@ -147,7 +152,7 @@ func buildWorkerToolsetsWithApproval(store *store.Store, bundle assets.Bundle, s
 			tools.NewDraftChapterTool(store, contract),
 			tools.NewEditChapterTool(store),
 			tools.NewCheckConsistencyTool(store),
-			tools.NewCommitChapterTool(store),
+			commitTool,
 		},
 		Editor: []agentcore.Tool{
 			editorCtx,
@@ -156,6 +161,10 @@ func buildWorkerToolsetsWithApproval(store *store.Store, bundle assets.Bundle, s
 			tools.NewSaveArcSummaryTool(store),
 			tools.NewSaveVolumeSummaryTool(store),
 		},
+		// Polisher 无工具：纯文本转换的嵌套模型，全部上下文（草稿全文 + 精修依据 +
+		// 既有 findings + rewrite brief）已由 polish_draft 的 buildPolishTask 塞进任务文本。
+		Polisher:   []agentcore.Tool{},
+		commitTool: commitTool,
 	}
 }
 
@@ -189,6 +198,30 @@ func BuildWorkers(
 	architectLongTools := ts.ArchitectLong
 	writerTools := ts.Writer
 	editorTools := ts.Editor
+	polisherTools := ts.Polisher
+
+	// 精修流水线开关（chapter_pipeline="ds_mimo_critic" 或 roles.polisher 显式配置）：
+	// 开启时注入 polish_draft 强制（工具 enabled + writer 协议）与 commit gate 校验
+	// （fresh polish checkpoint + 模型一致性 + seq 绑定）。未配置时所有工具保持旧行为。
+	// 与 StyleReviewMode 的关系（C1-H4）：pipeline 开关只控制 polish 工具与 pipeline
+	// commit gate，不强制 critic mode——两者独立。pipeline 启用 + mode=off 是可接受
+	// 组合：此时 commit 的 pipeline gate 仍要求 fresh polish checkpoint（现状保留），
+	// 但评审门控（CheckCommitStyleGate）不生效。
+	pipelineEnabled := cfg.ChapterPipelineEnabled()
+	if pipelineEnabled {
+		polisherModelName := ""
+		if _, ok := cfg.Roles["polisher"]; ok {
+			_, polisherModelName, _ = models.CurrentSelection("polisher")
+		}
+		ts.commitTool.SetPolishPipeline(&tools.PolishPipelineConfig{ExpectedModel: polisherModelName})
+	}
+	for _, list := range [][]agentcore.Tool{writerTools, polisherTools} {
+		for _, tl := range list {
+			if cc, ok := tl.(*tools.CheckConsistencyTool); ok {
+				cc.SetPipelineEnabled(pipelineEnabled)
+			}
+		}
+	}
 
 	// Provider failover 只记日志,不通知宿主
 	reportFailover := func(ev bootstrap.FailoverEvent) {
@@ -249,9 +282,17 @@ func BuildWorkers(
 	}
 	criticRunner := subagent.NewRunner(criticCfg)
 
-	// 把 review_style 注入 writer 工具集（传递 prompt 内容哈希作为版本标识）
+	// 把 review_style 注入 writer 工具集（传递 prompt 内容哈希作为版本标识）。
+	// polisher 无工具：评审与提交由流水线调用方在本工具返回后执行。
 	reviewStyle := tools.NewReviewStyleTool(store, criticRunner, criticPromptHash)
+	reviewStyle.SetPipelineEnabled(pipelineEnabled)
 	writerTools = append(writerTools, reviewStyle)
+
+	// 把 polish_draft 注入 writer 工具集（嵌套调用 polisher runner；pipeline 关闭时工具
+	// 返回 skipped）。必须在 writer subagent 配置之前完成，writer 配置捕获的是追加后的列表。
+	polishDraft := tools.NewPolishDraftTool(store, nil, "")
+	polishDraft.SetEnabled(pipelineEnabled)
+	writerTools = append(writerTools, polishDraft)
 
 	architectStopGuardFactory := func(_, _ string) agentcore.StopGuard {
 		return guard.NewArchitectStopGuard(store, onGuardBlock)
@@ -305,7 +346,7 @@ func BuildWorkers(
 		Model:            writerModel,
 		SystemPrompt:     writerPrompt,
 		Tools:            writerTools,
-		MaxTurns:         30,
+		MaxTurns:         45,
 		MaxRetries:       subagentMaxRetries,
 		ThinkingLevel:    resolvedRoleThinking(writerModel, cfg, "writer"),
 		StopAfterTools:   []string{"commit_chapter"},
@@ -372,7 +413,75 @@ func BuildWorkers(
 		},
 	}
 
-	subagentRunner := subagent.NewRunner(architectShort, architectLong, writer, editor)
+	// ── 文风精修师子代理（无工具、纯文本转换的嵌套模型：独立 Runner / system prompt /
+	// ContextManager / cache key / provenance）。由 polish_draft 工具在 Writer 单次 Run 内
+	// 嵌套调用——模式与 review_style 内部启动 critic runner 一致；不 Swap 同一 Writer 会话。
+	// 全部上下文（草稿全文 + 精修依据 + 既有 findings + rewrite brief）由 buildPolishTask
+	// 塞进任务文本，模型只输出整章正文作为最终响应。 ──
+	polisherModel := models.ForRoleWithFailover("polisher", reportFailover)
+	_, polisherModelName, _ := models.CurrentSelection("polisher")
+	polisherContextWindow, polisherSource := cfg.ResolveContextWindow(polisherModelName)
+	bootstrap.LogContextWindowChoice("polisher", polisherModelName, polisherContextWindow, polisherSource)
+
+	// 精修者提示词身份：实际 prompt 内容的 sha256 前缀（可溯源，随 checkpoint 落盘）
+	polisherHash := sha256.Sum256([]byte(bundle.Prompts.Polisher))
+	polisherPromptHash := "prompt:" + hex.EncodeToString(polisherHash[:8])
+
+	polisher := subagent.Config{
+		Name:             "polisher",
+		Description:      "文风精修师：在不改变剧情事实的前提下打磨草稿文风/节奏/色气",
+		Model:            polisherModel,
+		SystemPrompt:     bundle.Prompts.Polisher,
+		Tools:            polisherTools,
+		MaxTurns:         1,
+		MaxRetries:       subagentMaxRetries,
+		ThinkingLevel:    resolvedRoleThinking(polisherModel, cfg, "polisher"),
+		OnMessage:        onMsg,
+		CacheLastMessage: "ephemeral",
+		PromptCacheKey:   cacheBase + "-polisher",
+		StopGuardFactory: func(_, _ string) agentcore.StopGuard {
+			// polisher 正常路径以最终文本响应结束（产物由 polish_draft 工具
+			// 校验并落盘），不能用 writer 同款 guard：polisher 协议禁止自行
+			// commit，要求 commit checkpoint 会让每次正常结束都被拦截、连续
+			// 空转后 escalate，polish_draft 永远失败（实测 63 章 rewrite
+			// 死循环）。恒放行 end_turn，仅对 provider 拒答立即升级。
+			return guard.NewPolisherStopGuard()
+		},
+		ContextManagerFactory: func(model agentcore.ChatModel) agentcore.ContextManager {
+			// 与 writer 同款配置（窗口随模型动态解析），agent 名="polisher"。
+			window, _ := cfg.ResolveContextWindow(bootstrap.ModelName(model))
+			return newContextManager(contextManagerConfig{
+				Model:            model,
+				ContextWindow:    window,
+				ReserveTokens:    bootstrap.CompactReserveTokens(window),
+				KeepRecentTokens: 20000,
+				Agent:            "polisher",
+				CommitOnProject:  true,
+				ToolMicrocompact: &corecontext.ToolResultMicrocompactConfig{
+					IdleThreshold: 5 * time.Minute,
+				},
+				ExtraStrategies: []corecontext.Strategy{
+					ctxpack.NewStoreSummaryCompact(ctxpack.StoreSummaryCompactConfig{
+						Store:            store,
+						KeepRecentTokens: 20000,
+					}),
+				},
+				Summary: &corecontext.FullSummaryConfig{
+					PostSummaryHooks:    []corecontext.PostSummaryHook{restore.Hook()},
+					SystemPrompt:        ctxpack.WriterSummarySystemPrompt,
+					SummaryPrompt:       ctxpack.WriterSummaryPrompt,
+					UpdateSummaryPrompt: ctxpack.WriterUpdateSummaryPrompt,
+					TurnPrefixPrompt:    ctxpack.WriterTurnPrefixPrompt,
+				},
+			})
+		},
+	}
+	polisherRunner := subagent.NewRunner(polisher)
+
+	// 把嵌套调用的 polisher runner 挂到早期注入 writer 工具集的 polish_draft 实例上。
+	polishDraft.SetPolisherRunner(polisherRunner, polisherPromptHash)
+
+	subagentRunner := subagent.NewRunner(architectShort, architectLong, writer, editor, polisher)
 
 	// 运行时联动各角色推理强度(经 subagentRunner override;/model 调整用)。
 	applyThinking := func(role string, level agentcore.ThinkingLevel) {
@@ -381,7 +490,7 @@ func BuildWorkers(
 			level, _ = ResolveThinkingForModel(models.ForRole("architect"), level)
 			subagentRunner.SetThinkingLevel("architect_short", level)
 			subagentRunner.SetThinkingLevel("architect_long", level)
-		case "writer", "editor":
+		case "writer", "editor", "polisher":
 			level, _ = ResolveThinkingForModel(models.ForRole(role), level)
 			subagentRunner.SetThinkingLevel(role, level)
 		}

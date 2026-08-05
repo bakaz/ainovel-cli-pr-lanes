@@ -73,13 +73,13 @@ func setupOverrideStore(t *testing.T, chapter int, draft string) *storepkg.Store
 			{
 				Cycle: 3, Status: domain.ReviewStatusFinalPending,
 				CreatedAt: "2026-07-25T12:00:00Z", AttemptID: "a1",
-				Request:     &domain.StyleReviewRequest{Prompt: "test", Model: "test"},
+				Request:     &domain.StyleReviewRequest{Prompt: "test", Model: "test", PolishCheckpointSeq: 42},
 				DraftDigest: draftDigest, BasisDigest: basisDigest,
 			},
 			{
 				Cycle: 4, Status: domain.ReviewStatusExhausted,
 				CreatedAt: "2026-07-25T13:00:00Z", AttemptID: "a1",
-				Request: &domain.StyleReviewRequest{Prompt: "test", Model: "test"},
+				Request: &domain.StyleReviewRequest{Prompt: "test", Model: "test", PolishCheckpointSeq: 42},
 				Result: &domain.StyleReviewResult{
 					Verdict:  domain.ReviewVerdictRevise,
 					Evidence: "final revise",
@@ -250,12 +250,21 @@ func TestStyleReviewOverride_Success(t *testing.T) {
 	if lastCycle.Override.DraftDigest != expectedDraftDigest {
 		t.Errorf("override draft_digest mismatch: %q vs %q", lastCycle.Override.DraftDigest, expectedDraftDigest)
 	}
+
+	// C1-H3：overridden 条目必须保留 exhausted 条目的 Epoch 与 PolishCheckpointSeq
+	// （commit gate 以当前 terminal 条目为权威读取绑定 seq）。
+	if lastCycle.EpochValue() != 1 {
+		t.Errorf("overridden entry epoch = %d, want 1（保留 exhausted 条目的 epoch）", lastCycle.EpochValue())
+	}
+	if lastCycle.Request == nil || lastCycle.Request.PolishCheckpointSeq != 42 {
+		t.Errorf("overridden entry polish_checkpoint_seq = %+v, want 42（保留 exhausted 条目的绑定）", lastCycle.Request)
+	}
 }
 
 // ── 6. Override permits commit ──────────────────────────────────────
 
 func TestStyleReviewOverride_CommitAfterOverrideSucceeds(t *testing.T) {
-	draft := "可提交的正文内容。"
+	draft := "可提交的正文内容。她心里骂自己丢人，真不要脸。"
 	st := setupOverrideStore(t, 1, draft)
 	eventsCh := make(chan Event, 10)
 	h := &Host{store: st, events: eventsCh, done: make(chan struct{}, 4)}
@@ -308,3 +317,71 @@ func TestStyleReviewOverride_CommitAfterOverrideSucceeds(t *testing.T) {
 //
 // 具体验证分散在各个拒绝测试中（如 TestStyleReviewOverride_RejectsNonExhausted
 // 验证了失败后 overridden 条目未被追加）。
+
+// ── 8. C1-H3: override 保留 Epoch 与 PolishCheckpointSeq ──────────────
+
+// TestStyleReviewOverride_PreservesEpochAndPolishSeq 验证 overridden 条目保留
+// exhausted 条目的 Epoch 与 Request.PolishCheckpointSeq——commit gate 以当前
+// terminal 条目为权威取绑定 seq，若 override 丢失绑定会退化为 legacy 时间比较。
+func TestStyleReviewOverride_PreservesEpochAndPolishSeq(t *testing.T) {
+	draft := "第一章正文。她心里骂自己丢人，真不要脸。"
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := st.Progress.Init("test", 100); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	checkDigest := domain.DigestDraft(draft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "test-artifact", checkDigest); err != nil {
+		t.Fatalf("Append checkpoint: %v", err)
+	}
+	// 构造 epoch 2 + 绑定 polish seq 7 的 exhausted 账本（模拟返工队列章节的耗尽态）。
+	draftDigest := domain.DigestDraft(draft)
+	basisDigest := tools.ComputeBasisDigest(st, 1, "test-v1")
+	req := func(prompt string) *domain.StyleReviewRequest {
+		return &domain.StyleReviewRequest{Prompt: prompt, Model: "test", PolishCheckpointSeq: 7}
+	}
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: req("test"), DraftDigest: draftDigest, BasisDigest: basisDigest, Epoch: 2},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z", AttemptID: "a1", Request: req("test"),
+				Result: &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "revise",
+					Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Evidence: "some evidence"}}},
+				DraftDigest: draftDigest, BasisDigest: basisDigest, Epoch: 2},
+			{Cycle: 3, Status: domain.ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z", AttemptID: "a1", Request: req("test"), DraftDigest: draftDigest, BasisDigest: basisDigest, Epoch: 2},
+			{Cycle: 4, Status: domain.ReviewStatusExhausted, CreatedAt: "2026-07-25T13:00:00Z", AttemptID: "a1", Request: req("test"),
+				Result: &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "final revise",
+					Findings: []domain.StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "error", Evidence: "test evidence"}}},
+				DraftDigest: draftDigest, BasisDigest: basisDigest, Epoch: 2},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+	h := &Host{store: st, events: make(chan Event, 10), done: make(chan struct{}, 4)}
+	if err := h.StyleReviewOverride(1, "人工确认"); err != nil {
+		t.Fatalf("StyleReviewOverride: %v", err)
+	}
+	loaded, err := st.StyleReview.Load(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := loaded.CurrentCycle()
+	if last.Status != domain.ReviewStatusOverridden {
+		t.Fatalf("expected overridden, got %s", last.Status)
+	}
+	if last.EpochValue() != 2 {
+		t.Errorf("override epoch = %d, want 2（保留 exhausted 的 epoch）", last.EpochValue())
+	}
+	if last.Request == nil || last.Request.PolishCheckpointSeq != 7 {
+		t.Errorf("override polish_checkpoint_seq = %+v, want 7（保留 exhausted 的绑定）", last.Request)
+	}
+}

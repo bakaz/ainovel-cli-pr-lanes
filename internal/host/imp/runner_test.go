@@ -39,7 +39,7 @@ func (s *scriptedLLM) Generate(_ context.Context, _ []agentcore.Message, _ []age
 func TestRunner_FullImport(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "novel.txt")
-	body := strings.Repeat("正文段落，足够字数以通过 LoadChapterContent 校验。\n", 30)
+	body := strings.Repeat("正文段落，足够字数以通过 LoadChapterContent 校验。她心里骂自己丢人，真不要脸。\n", 30)
 	content := "第一章 初遇\n" + body + "\n第二章 循迹\n" + body
 	if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -108,7 +108,7 @@ func TestRunner_FullImport(t *testing.T) {
 func TestRunner_SkipsAlreadyCompletedChapters(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "novel.txt")
-	body := strings.Repeat("正文段落。\n", 30)
+	body := strings.Repeat("正文段落。她心里骂自己丢人，真不要脸。\n", 30)
 	content := "第一章 a\n" + body + "\n第二章 b\n" + body
 	if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ func TestRunner_SkipsAlreadyCompletedChapters(t *testing.T) {
 func TestRunner_ResumeFromSkipsFoundation(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "novel.txt")
-	body := strings.Repeat("正文。\n", 30)
+	body := strings.Repeat("正文。她心里骂自己丢人，真不要脸。\n", 30)
 	content := "第一章 a\n" + body + "\n第二章 b\n" + body
 	_ = os.WriteFile(src, []byte(content), 0o644)
 
