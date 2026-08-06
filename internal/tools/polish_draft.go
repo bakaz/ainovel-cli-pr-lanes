@@ -405,10 +405,12 @@ func (t *PolishDraftTool) handleMechanicalRegression(chapter int, content string
 // buildPolishTask 构造发送给 polisher runner 的任务文本：
 // 当前草稿全文 + 规范评审依据（风格目标/契约/指南针文风/锚点/用户规则/事实大纲）
 // + 已给的 revise findings（完整六字段）+ 重写/打磨 brief（PendingRewrites 时）。
-// 与 review_style 的 basis 使用同一数据源（buildReviewBasis），保证精修与评审看到
-// 同一份风格事实。
+// 与 review_style 的 basis 共用同一数据源（buildStyleBasis），保证精修与评审看到
+// 同一份风格事实（style goal/contract/compass/anchors/structured/factual outline）；
+// 用户规则按职责角色投影：polisher → writer 视图（default+writer），
+// critic → editor 视图（default+writer+editor）。
 func (t *PolishDraftTool) buildPolishTask(chapter int, content string, wordCount int) string {
-	basis := buildReviewBasis(t.store, chapter, t.polisherPromptHash)
+	basis := buildPolishBasis(t.store, chapter, t.polisherPromptHash)
 	basisJSON, _ := json.Marshal(basis)
 
 	var sb strings.Builder

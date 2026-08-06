@@ -2348,6 +2348,226 @@ func TestReviewStyle_UserRulesChangeDetected(t *testing.T) {
 	if out1basis == out2basis {
 		t.Error("basis digest should change when user rules change")
 	}
+
+	// ── 敏感性表驱动：按职责角色投影，只有该角色可见的输入变化才影响 digest ──
+	t.Run("角色投影敏感性", func(t *testing.T) {
+		base := fourBucketSnapshot()
+		if err := st.UserRules.Save(base); err != nil {
+			t.Fatalf("Save UserRules: %v", err)
+		}
+		baseDigest := ComputeBasisDigest(st, 1, testCriticVersion)
+
+		tests := []struct {
+			name       string
+			mutate     func(s *rules.Snapshot)
+			wantChange bool
+		}{
+			{"default 分区变化", func(s *rules.Snapshot) {
+				s.Preferences.Default = []rules.PreferenceRule{{ID: "def-2", Text: "DEFAULT_RULE_009 新规则"}}
+			}, true},
+			{"writer 分区变化", func(s *rules.Snapshot) {
+				s.Preferences.Writer = []rules.PreferenceRule{{ID: "wri-2", Text: "WRITER_RULE_009 新规则"}}
+			}, true},
+			{"editor 分区变化", func(s *rules.Snapshot) {
+				s.Preferences.Editor = []rules.PreferenceRule{{ID: "edi-2", Text: "EDITOR_RULE_009 新规则"}}
+			}, true},
+			{"structured 变化", func(s *rules.Snapshot) {
+				s.Structured.Genre = "奇幻"
+			}, true},
+			{"architect 分区变化（critic 不可见）", func(s *rules.Snapshot) {
+				s.Preferences.Architect = []rules.PreferenceRule{{ID: "arc-2", Text: "ARCH_RULE_009 新规则"}}
+			}, false},
+			{"sources 诊断元数据变化", func(s *rules.Snapshot) {
+				s.Sources = []string{"src-z"}
+			}, false},
+			{"uncertain 诊断元数据变化", func(s *rules.Snapshot) {
+				s.Uncertain = []string{"uncertain-z"}
+			}, false},
+			{"status 诊断元数据变化", func(s *rules.Snapshot) {
+				s.Status = rules.StatusDegraded
+			}, false},
+			{"version 诊断元数据变化", func(s *rules.Snapshot) {
+				s.Version = 99
+			}, false},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				snap := fourBucketSnapshot()
+				tc.mutate(snap)
+				if err := st.UserRules.Save(snap); err != nil {
+					t.Fatalf("Save UserRules: %v", err)
+				}
+				got := ComputeBasisDigest(st, 1, testCriticVersion)
+				if tc.wantChange && got == baseDigest {
+					t.Errorf("basis digest should change for: %s", tc.name)
+				}
+				if !tc.wantChange && got != baseDigest {
+					t.Errorf("basis digest should NOT change for: %s", tc.name)
+				}
+			})
+		}
+	})
+}
+
+// ── 31b. User rules role projection ───────────────────────────────────
+
+// fourBucketSnapshot 构造四角色分区的快照，用于验证 basis 的角色投影。
+func fourBucketSnapshot() *rules.Snapshot {
+	return &rules.Snapshot{
+		Version: rules.SnapshotVersion,
+		Status:  rules.StatusReady,
+		Structured: rules.Structured{
+			Genre:            "科幻",
+			ChapterWords:     &rules.WordRange{Min: 3000, Max: 6000},
+			ForbiddenPhrases: []string{"某种程度上"},
+		},
+		Preferences: rules.PreferenceBuckets{
+			Default:   []rules.PreferenceRule{{ID: "def-1", Text: "DEFAULT_RULE_001 使用平实语言"}},
+			Architect: []rules.PreferenceRule{{ID: "arc-1", Text: "ARCH_RULE_007 世界观设定"}},
+			Writer:    []rules.PreferenceRule{{ID: "wri-1", Text: "WRITER_RULE_002 侧重节奏"}},
+			Editor:    []rules.PreferenceRule{{ID: "edi-1", Text: "EDITOR_RULE_003 去除冗词"}},
+		},
+		Sources:   []string{"src-a"},
+		Uncertain: []string{"uncertain-x"},
+	}
+}
+
+func TestBasis_UserRulesRoleProjection(t *testing.T) {
+	st := setupCriticStore(t, 1, "正文。")
+	if err := st.UserRules.Save(fourBucketSnapshot()); err != nil {
+		t.Fatalf("Save UserRules: %v", err)
+	}
+
+	polish := buildPolishBasis(st, 1, "test-polish-v1")
+	critic := buildCriticBasis(st, 1, testCriticVersion)
+
+	// ── polisher → writer 视图：default+writer，不含 architect/editor 与诊断元数据 ──
+	polishRules := string(polish.UserRules)
+	for _, want := range []string{"DEFAULT_RULE_001", "WRITER_RULE_002", `"genre":"科幻"`} {
+		if !strings.Contains(polishRules, want) {
+			t.Errorf("polisher basis user_rules 应包含 %s，实际: %s", want, polishRules)
+		}
+	}
+	for _, forbid := range []string{"ARCH_RULE_007", "EDITOR_RULE_003", "src-a", "uncertain-x", `"sources"`, `"uncertain"`, `"version"`, `"status"`} {
+		if strings.Contains(polishRules, forbid) {
+			t.Errorf("polisher basis user_rules 不应包含 %s，实际: %s", forbid, polishRules)
+		}
+	}
+
+	// ── critic → editor 视图：default+writer+editor，不含 architect 与诊断元数据 ──
+	criticRules := string(critic.UserRules)
+	for _, want := range []string{"DEFAULT_RULE_001", "WRITER_RULE_002", "EDITOR_RULE_003", `"genre":"科幻"`} {
+		if !strings.Contains(criticRules, want) {
+			t.Errorf("critic basis user_rules 应包含 %s，实际: %s", want, criticRules)
+		}
+	}
+	for _, forbid := range []string{"ARCH_RULE_007", "src-a", "uncertain-x", `"sources"`, `"uncertain"`, `"version"`, `"status"`} {
+		if strings.Contains(criticRules, forbid) {
+			t.Errorf("critic basis user_rules 不应包含 %s，实际: %s", forbid, criticRules)
+		}
+	}
+
+	// structured 字段存在（两个角色共享同一 structured 投影）
+	for name, rulesJSON := range map[string]json.RawMessage{
+		"polisher": polish.UserRules,
+		"critic":   critic.UserRules,
+	} {
+		var payload map[string]any
+		if err := json.Unmarshal(rulesJSON, &payload); err != nil {
+			t.Fatalf("%s: unmarshal user_rules: %v", name, err)
+		}
+		if _, ok := payload["structured"]; !ok {
+			t.Errorf("%s: user_rules 应包含 structured 字段", name)
+		}
+	}
+}
+
+// ── 31c. Missing snapshot fallback ────────────────────────────────────
+
+func TestBasis_UserRulesMissingSnapshotFallback(t *testing.T) {
+	st := setupCriticStore(t, 1, "正文。") // 不保存 UserRules：模拟快照缺失
+
+	polish1 := buildPolishBasis(st, 1, "test-polish-v1")
+	polish2 := buildPolishBasis(st, 1, "test-polish-v1")
+	critic1 := buildCriticBasis(st, 1, testCriticVersion)
+
+	// 稳定：重复构建得到相同 payload（SystemDefaults 回退确定性）
+	if string(polish1.UserRules) != string(polish2.UserRules) {
+		t.Error("缺失快照时 polisher user_rules 应稳定（重复构建一致）")
+	}
+
+	for name, basis := range map[string]domain.ReviewBasis{
+		"polisher": polish1,
+		"critic":   critic1,
+	} {
+		rulesJSON := string(basis.UserRules)
+		if len(basis.UserRules) == 0 || rulesJSON == "null" {
+			t.Errorf("%s: 缺失快照时 user_rules 不应为 null/空，实际: %s", name, rulesJSON)
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(basis.UserRules, &payload); err != nil {
+			t.Fatalf("%s: unmarshal user_rules: %v", name, err)
+		}
+		if _, ok := payload["preferences"]; !ok {
+			t.Errorf("%s: user_rules 应包含 preferences 字段", name)
+		}
+		structured, ok := payload["structured"].(map[string]any)
+		if !ok {
+			t.Errorf("%s: user_rules 应包含 structured 字段", name)
+			continue
+		}
+		// 机械底线来自 SystemDefaults：章节字数约束存在（3000-6000）
+		cw, ok := structured["chapter_words"].(map[string]any)
+		if !ok {
+			t.Errorf("%s: fallback structured 应包含 chapter_words（SystemDefaults 机械底线）", name)
+			continue
+		}
+		if cw["min"] != float64(3000) || cw["max"] != float64(6000) {
+			t.Errorf("%s: fallback chapter_words 应为 3000-6000，实际: %v", name, cw)
+		}
+	}
+}
+
+// ── 31d. ComputeBasisDigest 口径固定（critic/editor 视图） ─────────────
+
+func TestReviewStyle_ComputeBasisDigestCriticAudience(t *testing.T) {
+	draft := "正文。"
+	st := setupCriticStore(t, 1, draft)
+	if err := st.UserRules.Save(fourBucketSnapshot()); err != nil {
+		t.Fatalf("Save UserRules: %v", err)
+	}
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// 1) 实际发送的 basis、ComputeBasisDigest、账本 basis_digest 三者同口径（editor 视图）
+	expected := domain.DigestReviewBasis(buildCriticBasis(st, 1, testCriticVersion))
+	if got := ComputeBasisDigest(st, 1, testCriticVersion); got != expected {
+		t.Errorf("ComputeBasisDigest %q != buildCriticBasis digest %q", got, expected)
+	}
+	ledger, err := st.StyleReview.Load(1)
+	if err != nil || ledger == nil || len(ledger.Cycles) == 0 {
+		t.Fatalf("load ledger: %v", err)
+	}
+	if last := ledger.CurrentCycle(); last.BasisDigest != expected {
+		t.Errorf("ledger basis_digest %q != buildCriticBasis digest %q", last.BasisDigest, expected)
+	}
+
+	// 2) editor 分区变化对 digest 敏感（critic 口径确实包含 editor 分区）
+	base := ComputeBasisDigest(st, 1, testCriticVersion)
+	snap := fourBucketSnapshot()
+	snap.Preferences.Editor = []rules.PreferenceRule{{ID: "edi-2", Text: "EDITOR_RULE_009 新规则"}}
+	if err := st.UserRules.Save(snap); err != nil {
+		t.Fatalf("Save UserRules: %v", err)
+	}
+	if got := ComputeBasisDigest(st, 1, testCriticVersion); got == base {
+		t.Error("ComputeBasisDigest 应对 editor 分区变化敏感（critic 口径含 editor）")
+	}
 }
 
 // ── 32. Chapter contract change detected ──────────────────────────────

@@ -220,7 +220,7 @@ func (t *ReviewStyleTool) Execute(ctx context.Context, args json.RawMessage) (js
 	}
 
 	// ── 5. 构建规范基础 payload（包含实际数据）并计算摘要 ──
-	basis := t.buildReviewBasis(a.Chapter)
+	basis := t.buildCriticBasis(a.Chapter)
 	basisDigest := t.computeBasisDigest(a.Chapter)
 
 	// ── 6. 决定操作路径 ──
@@ -887,11 +887,14 @@ func (t *ReviewStyleTool) buildSuccessOutput(chapter int, result *domain.StyleRe
 
 // ── Canonical basis payload ──────────────────────────────────────────
 
-// buildReviewBasis 加载全部实际章节数据构建规范基础 payload。
-// 各字段包含实际内容而非标识符——序列化后既发送给 critic 作为依据，
-// 也作为摘要输入——commit gate 通过重新计算相同摘要来检测任意输入变更。
-// 使用的 compass 作用域逻辑与 Writer context 一致（scopedCompassForChapter）。
-func buildReviewBasis(st *store.Store, chapter int, criticPromptHash string) domain.ReviewBasis {
+// buildStyleBasis 按职责角色投影加载全部实际章节数据构建规范基础 payload。
+// 各字段包含实际内容而非标识符——序列化后既发送给对应角色（critic/editor 或
+// polisher/writer）作为依据，也作为摘要输入——commit gate 通过重新计算相同摘要
+// 检测任意输入变更。使用的 compass 作用域逻辑与 Writer context 一致
+// （scopedCompassForChapter）。
+// 用户规则按角色投影（loadUserRulesJSON）：polisher → writer（default+writer），
+// critic → editor（default+writer+editor），与 novel_context 的 PayloadForRole 口径一致。
+func buildStyleBasis(st *store.Store, chapter int, promptHash, role string) domain.ReviewBasis {
 	prose, dialogue, taboos := loadScopedCompassProseDialogueTaboos(st, chapter)
 	return domain.ReviewBasis{
 		StyleGoal:       loadChapterStyleGoal(st, chapter),
@@ -900,10 +903,23 @@ func buildReviewBasis(st *store.Store, chapter int, criticPromptHash string) dom
 		CompassDialogue: dialogue,
 		CompassTaboos:   taboos,
 		AnchorExcerpts:  loadAnchorExcerpts(st, chapter),
-		UserRules:       loadUserRulesJSON(st),
+		UserRules:       loadUserRulesJSON(st, role),
 		FactualOutline:  loadFactualOutline(st, chapter),
-		CriticVersion:   criticPromptHash,
+		CriticVersion:   promptHash,
 	}
+}
+
+// buildCriticBasis 是 review_style（critic）实际发送给批评者的 basis：
+// 用户规则使用 editor 视图（default+writer+editor）。ComputeBasisDigest
+// 固定复用本函数，保证 commit gate 与评审实际发送口径一致（防漂移）。
+func buildCriticBasis(st *store.Store, chapter int, criticPromptHash string) domain.ReviewBasis {
+	return buildStyleBasis(st, chapter, criticPromptHash, "editor")
+}
+
+// buildPolishBasis 是 polisher 使用的 basis：用户规则使用 writer 视图
+// （default+writer），与 Writer 角色看到的分区一致；不注入 editor/architect 专属规则。
+func buildPolishBasis(st *store.Store, chapter int, polisherPromptHash string) domain.ReviewBasis {
+	return buildStyleBasis(st, chapter, polisherPromptHash, "writer")
 }
 
 // loadScopedCompassProseDialogueTaboos loads the compass with chapter-scoped
@@ -945,8 +961,8 @@ func loadScopedCompassProseDialogueTaboos(st *store.Store, chapter int) (prose [
 	return
 }
 
-func (t *ReviewStyleTool) buildReviewBasis(chapter int) domain.ReviewBasis {
-	return buildReviewBasis(t.store, chapter, t.criticPromptHash)
+func (t *ReviewStyleTool) buildCriticBasis(chapter int) domain.ReviewBasis {
+	return buildCriticBasis(t.store, chapter, t.criticPromptHash)
 }
 
 func (t *ReviewStyleTool) computeBasisDigest(chapter int) string {
@@ -954,9 +970,11 @@ func (t *ReviewStyleTool) computeBasisDigest(chapter int) string {
 }
 
 // ComputeBasisDigest 是 review_style 与 CheckCommitStyleGate 共享的
-// 基础摘要计算函数。使用与 buildReviewBasis 相同的数据源计算确定性摘要。
+// 基础摘要计算函数。口径固定为 critic/editor 视图（buildCriticBasis），
+// 与 review_style 实际发送给 critic 的 basis 完全一致——若未来 critic 视图
+// 调整，commit gate 自动跟随，杜绝口径漂移。
 func ComputeBasisDigest(st *store.Store, chapter int, criticPromptHash string) string {
-	basis := buildReviewBasis(st, chapter, criticPromptHash)
+	basis := buildCriticBasis(st, chapter, criticPromptHash)
 	return domain.DigestReviewBasis(basis)
 }
 
@@ -1030,13 +1048,18 @@ func loadAnchorExcerpts(st *store.Store, chapter int) []string {
 	return excerpts
 }
 
-// loadUserRulesJSON 加载用户规则作为 JSON RawMessage。
-func loadUserRulesJSON(st *store.Store) json.RawMessage {
-	rules, err := st.UserRules.Load()
-	if err != nil || rules == nil {
-		return nil
+// loadUserRulesJSON 按职责角色投影加载用户规则（structured + 该角色分区偏好）。
+// 只暴露创作相关偏好，不注入 version/status/sources/uncertain 诊断元数据
+// （与 novel_context 的 PayloadForRole 口径一致）。
+// 缺失快照时回退 rules.SystemDefaults()（与 writer 侧一致），保证机械底线
+// （字数/禁语/疲劳词）始终存在，且返回稳定结构而非 null。
+func loadUserRulesJSON(st *store.Store, role string) json.RawMessage {
+	snap, err := st.UserRules.Load()
+	if err != nil || snap == nil {
+		def := rules.BuildSnapshot([]rules.Candidate{rules.SystemDefaults()})
+		snap = &def
 	}
-	data, _ := json.Marshal(rules)
+	data, _ := json.Marshal(snap.PayloadForRole(role))
 	return json.RawMessage(data)
 }
 
