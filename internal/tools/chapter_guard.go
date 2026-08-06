@@ -251,8 +251,11 @@ func CheckCommitStyleGate(st *store.Store, chapter int) error {
 		if currCycle.Request != nil {
 			criticVersion = currCycle.Request.Prompt
 		}
-		currentBasisDigest := ComputeBasisDigest(st, chapter, criticVersion)
-		if currentBasisDigest != currCycle.BasisDigest {
+		// 双摘要兼容：同时接受 canonical 与 legacy（旧字段排列）摘要——升级前
+		// 落盘的 basis_digest 按旧 wire 顺序计算，若只按 canonical 比对会误判
+		// basis 已变更而错误拒绝 commit。
+		currentBasis := buildCriticBasis(st, chapter, criticVersion)
+		if !domain.BasisDigestMatches(currentBasis, currCycle.BasisDigest, domain.DigestReviewBasis(currentBasis)) {
 			return fmt.Errorf("critic 模式：章节 %d 的评审基础已变更（风格目标/规则/锚点/大纲），需要重新评审: %w",
 				chapter, errs.ErrToolPrecondition)
 		}

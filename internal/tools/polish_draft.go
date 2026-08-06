@@ -403,20 +403,24 @@ func (t *PolishDraftTool) handleMechanicalRegression(chapter int, content string
 }
 
 // buildPolishTask 构造发送给 polisher runner 的任务文本：
-// 当前草稿全文 + 规范评审依据（风格目标/契约/指南针文风/锚点/用户规则/事实大纲）
-// + 已给的 revise findings（完整六字段）+ 重写/打磨 brief（PendingRewrites 时）。
+// 规范评审依据（风格目标/契约/指南针文风/锚点/用户规则/事实大纲）
+// + 已给的 revise findings（完整六字段）+ 重写/打磨 brief（PendingRewrites 时）
+// + 章节与草稿全文（动态内容放最后）。
 // 与 review_style 的 basis 共用同一数据源（buildStyleBasis），保证精修与评审看到
 // 同一份风格事实（style goal/contract/compass/anchors/structured/factual outline）；
 // 用户规则按职责角色投影：polisher → writer 视图（default+writer），
 // critic → editor 视图（default+writer+editor）。
+//
+// 布局按 ora-1 缓存优化阶段 2（Prompt Capsule 重排）：稳定书级内容
+// （basis/findings/brief）在前，章节动态内容（章节号/字数/草稿全文）最后——
+// 跨 spawn 的内容前缀缓存（DeepSeek 磁盘缓存按内容前缀匹配）命中稳定前缀，
+// 只有尾部的草稿段需要重新计算。
 func (t *PolishDraftTool) buildPolishTask(chapter int, content string, wordCount int) string {
 	basis := buildPolishBasis(t.store, chapter, t.polisherPromptHash)
 	basisJSON, _ := json.Marshal(basis)
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "## 精修任务\n\n### 章节\n第 %d 章\n\n### 待精修草稿（字数：%d）\n%s\n\n",
-		chapter, wordCount, content)
-	fmt.Fprintf(&sb, "### 精修依据（风格目标/章节契约/指南针文风/锚点/用户规则/事实大纲）\n%s\n\n", basisJSON)
+	fmt.Fprintf(&sb, "## 精修任务\n\n### 精修依据（风格目标/章节契约/指南针文风/锚点/用户规则/事实大纲）\n%s\n\n", basisJSON)
 
 	// 已给的 revise findings：完整投影（status/verdict/draft_digest/findings 六字段）。
 	if ledger, lErr := t.store.StyleReview.Load(chapter); lErr == nil && ledger != nil {
@@ -438,6 +442,10 @@ func (t *PolishDraftTool) buildPolishTask(chapter int, content string, wordCount
 			fmt.Fprintf(&sb, "### 重写/打磨任务背景\n%s\n\n", briefJSON)
 		}
 	}
+
+	// 章节动态内容放最后（稳定前缀缓存之后）：章节号/字数变化量小、token 占比低，
+	// 草稿全文是每章唯一的大块动态内容，放在尾部让前缀缓存最大化复用。
+	fmt.Fprintf(&sb, "### 章节与草稿（字数：%d）\n第 %d 章\n\n%s\n\n", wordCount, chapter, content)
 
 	fmt.Fprintf(&sb, "请严格按精修者提示词（polisher）输出结构化精修 edit 列表 JSON（{\"version\":1,\"edits\":[{\"old_string\":\"原文唯一连续片段\",\"new_string\":\"精修后片段\"}]}）；无修改时输出 {\"version\":1,\"edits\":[]}。")
 	return sb.String()

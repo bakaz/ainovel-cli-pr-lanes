@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -876,6 +877,96 @@ func TestDigestReviewBasis_Deterministic(t *testing.T) {
 	b := DigestReviewBasis(basis)
 	if a != b {
 		t.Error("not deterministic")
+	}
+}
+
+// legacyDigestTestBasis 构造全字段填充的 ReviewBasis，用于锁定 legacy 摘要
+// 算法与验证 canonical/legacy 的差异。
+func legacyDigestTestBasis() ReviewBasis {
+	return ReviewBasis{
+		CriticVersion: "critic-v1",
+		UserRules:     json.RawMessage(`{"default":["规则A"],"editor":["规则B"]}`),
+		CompassProse:  []string{"稳重", "克制"},
+		CompassDialogue: []CharacterVoice{
+			{Name: "主角", Rules: []string{"沉稳", "简洁"}},
+		},
+		CompassTaboos:  []string{"网络用语"},
+		AnchorExcerpts: []string{"锚点一"},
+		StyleGoal: &ChapterStyleGoal{
+			FocalFilter:   "聚焦主角视角",
+			ProseMovement: "明快",
+		},
+		ChapterContract: &ChapterContract{
+			RequiredBeats: []string{"伏笔兑现"},
+			HookGoal:      "留下悬念",
+		},
+		FactualOutline: "第一章大纲事实",
+	}
+}
+
+// TestDigestReviewBasis_LegacyGolden 锁定 legacy（旧字段排列）摘要算法：
+// golden 值对应 ae540649（stable-first prompt capsule 字段重排）之前旧版
+// DigestReviewBasis（整体 json.Marshal + sha256）的输出。若此值变化，说明
+// legacy 兼容路径失效，升级后旧 pending 账本会被误判为 basis 漂移而降级。
+func TestDigestReviewBasis_LegacyGolden(t *testing.T) {
+	want := "sha256:b04dc9762b2ea7f310138a2984853b0ad330fb71502008851551ef639888a592"
+	if got := DigestReviewBasisLegacy(legacyDigestTestBasis()); got != want {
+		t.Errorf("DigestReviewBasisLegacy = %q, want %q（legacy 摘要算法不得漂移）", got, want)
+	}
+}
+
+// TestDigestReviewBasis_ContentSensitive 验证 canonical 摘要是内容的纯函数：
+// 相同内容 → 相同摘要；任一字段内容变化 → 摘要变化。
+func TestDigestReviewBasis_ContentSensitive(t *testing.T) {
+	basis := legacyDigestTestBasis()
+	if DigestReviewBasis(basis) != DigestReviewBasis(basis) {
+		t.Error("same content must produce same digest")
+	}
+	changed := legacyDigestTestBasis()
+	changed.FactualOutline = "大纲事实已变更"
+	if DigestReviewBasis(changed) == DigestReviewBasis(basis) {
+		t.Error("content change must change canonical digest")
+	}
+}
+
+// TestDigestReviewBasis_LegacyDiffersFromCanonical 演示迁移问题的存在：
+// 同一语义内容在旧字段排列（legacy）与新 canonical 排列下摘要不同——这正是
+// BasisDigestMatches 双摘要兼容要解决的升级期误判来源。
+func TestDigestReviewBasis_LegacyDiffersFromCanonical(t *testing.T) {
+	basis := legacyDigestTestBasis()
+	if DigestReviewBasis(basis) == DigestReviewBasisLegacy(basis) {
+		t.Error("legacy 与 canonical 摘要必须不同（否则双摘要兼容无意义）")
+	}
+}
+
+// TestBasisDigestMatches_DualAcceptance 覆盖双摘要兼容判定：
+// 新写入（canonical）、旧落盘（legacy）、未绑定（空）均通过；内容真实漂移拒绝。
+func TestBasisDigestMatches_DualAcceptance(t *testing.T) {
+	basis := legacyDigestTestBasis()
+	current := DigestReviewBasis(basis)
+	legacy := DigestReviewBasisLegacy(basis)
+
+	tests := []struct {
+		name     string
+		recorded string
+		want     bool
+	}{
+		{"new canonical recorded matches", current, true},
+		{"legacy wire-order recorded matches (upgrade compat)", legacy, true},
+		{"unbound (empty) recorded always matches", "", true},
+	}
+	for _, tc := range tests {
+		if got := BasisDigestMatches(basis, tc.recorded, current); got != tc.want {
+			t.Errorf("%s: BasisDigestMatches = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// 内容真实漂移：recorded 是旧内容的 legacy 摘要，当前内容已变更，
+	// canonical 与 legacy 两种算法均不匹配 → 必须判定为漂移（拒绝）。
+	changed := legacyDigestTestBasis()
+	changed.StyleGoal = &ChapterStyleGoal{FocalFilter: "新聚焦", ProseMovement: "新节奏"}
+	if BasisDigestMatches(changed, legacy, DigestReviewBasis(changed)) {
+		t.Error("drifted basis must not match under dual acceptance")
 	}
 }
 

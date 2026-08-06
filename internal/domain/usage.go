@@ -34,3 +34,44 @@ type AgentUsageTotals struct {
 	// 只在实时路径累计，session replay 不重放检测。
 	CacheBreaks int `json:"cache_breaks,omitempty"`
 }
+
+// PrefixManifest 是单次 LLM 请求的缓存分层观测记录，append-only 落盘到
+// meta/prefix_manifest.jsonl。只记录 hash 与 token 数，绝不记录正文内容——
+// 它是诊断"命中的是 system/basis/草稿哪一段"的数据面，不承载任何文本。
+//
+// v1 说明：
+//   - ToolsHash/SystemHash（+估算 token）来自 agents.BuildWorkers 注册的静态
+//     基线（system prompt + tools schema 是每次请求重发的稳定前缀）；
+//   - basis/draft 分段由 internal/tools/ 的 prompt 构造处产出，暂未注入（另一
+//     lane 改造中），对应 Hash/EstTokens 字段保持空；
+//   - 空缺期间可用跨请求增量推断边界：CacheReadTokens 停滞在
+//     SystemEstTokens+ToolsEstTokens 总量附近 → 命中停在稳定前缀；
+//     CacheReadTokens 随 InputTokens 同步增长 → 命中延伸进动态段。
+//
+// Gap 是距同 role+task 上一次请求的间隔（纳秒）；Status 当前恒为 "ok"
+// （Record 只在成功响应后触发），Error 为失败路径预留。
+type PrefixManifest struct {
+	Role                  string        `json:"role"`
+	RunID                 string        `json:"run_id,omitempty"`
+	RequestIndex          int           `json:"request_index"`
+	ProviderConfigKey     string        `json:"provider_config_key,omitempty"` // go0/go1/go2（配置键）
+	ProtocolProvider      string        `json:"protocol_provider,omitempty"`   // openai/anthropic/...（协议名）
+	Model                 string        `json:"model,omitempty"`
+	FailoverEpoch         int           `json:"failover_epoch"` // 1=primary，2+=第 N 个备用；0=未知
+	ToolsHash             string        `json:"tools_hash,omitempty"`
+	ToolsEstTokens        int           `json:"tools_est_tokens,omitempty"`
+	SystemHash            string        `json:"system_hash,omitempty"`
+	SystemEstTokens       int           `json:"system_est_tokens,omitempty"`
+	StableBasisHash       string        `json:"stable_basis_hash,omitempty"`
+	StableBasisEstTokens  int           `json:"stable_basis_est_tokens,omitempty"`
+	DynamicBasisHash      string        `json:"dynamic_basis_hash,omitempty"`
+	DynamicBasisEstTokens int           `json:"dynamic_basis_est_tokens,omitempty"`
+	DraftHash             string        `json:"draft_hash,omitempty"`
+	DraftEstTokens        int           `json:"draft_est_tokens,omitempty"`
+	InputTokens           int           `json:"input_tokens"`
+	CacheReadTokens       int           `json:"cache_read_tokens"`
+	CacheMissTokens       int           `json:"cache_miss_tokens"`
+	Gap                   time.Duration `json:"gap_ns"`
+	Status                string        `json:"status,omitempty"`
+	Error                 string        `json:"error,omitempty"`
+}

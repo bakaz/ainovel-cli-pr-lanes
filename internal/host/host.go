@@ -178,7 +178,7 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 	// onGuardBlock 前置声明:h 构造后才能挂事件浮出闭包。
 	var onGuardBlock func(agent, reason string, consecutive int32)
 	contract := projectprofile.ContractFor(profile.Contract)
-	workers, askUser, restore, applyThinking := agents.BuildWorkers(cfg, store, models, bundle, usage.Record,
+	workers, askUser, restore, applyThinking := agents.BuildWorkers(cfg, store, models, bundle, usage.RecordRun,
 		func(agent, reason string, consecutive int32) {
 			if onGuardBlock != nil {
 				onGuardBlock(agent, reason, consecutive)

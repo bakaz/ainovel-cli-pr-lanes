@@ -16,9 +16,10 @@ import (
 // sessionRecord 是 meta/sessions/*.jsonl 单条记录的轻量解析形态——只取
 // 累计 usage 需要的字段。Content 等大字段跳过解析，节省启动期 IO。
 //
-// 模型归属三级降级：
-//  1. Usage.Provider/Model — agentcore/litellm 透传的真实响应模型（首选）
-//  2. Meta(_meta)          — 上游未透传时，写入侧由 ModelLookup 补的"当时生效"模型
+// 模型归属三级降级（provider 优先 _meta 的配置键，与写入侧 mergeSessionMeta
+// 的优先级一致）：
+//  1. Meta(_meta)          — 写入侧 ModelLookup 补的配置键（go0/go1/go2）+ 模型
+//  2. Usage.Provider/Model — agentcore/litellm 透传的真实响应模型（协议名）
 //  3. 都没有                — replay 退回 effectiveModel 用当前 ModelSet 反推（精度受损）
 type sessionRecord struct {
 	Role  agentcore.Role     `json:"role"`
@@ -118,14 +119,15 @@ func (t *UsageTracker) replayFile(path, agentName string) (int, error) {
 		if rec.Role != agentcore.RoleAssistant || rec.Usage == nil {
 			continue
 		}
-		provider, modelName := usageActualModel(rec.Usage)
+		provider, modelName := "", ""
 		if rec.Meta != nil {
-			if provider == "" {
-				provider = rec.Meta.Provider
-			}
-			if modelName == "" {
-				modelName = rec.Meta.Model
-			}
+			provider, modelName = rec.Meta.Provider, rec.Meta.Model
+		}
+		if provider == "" {
+			provider, _ = usageActualModel(rec.Usage)
+		}
+		if modelName == "" {
+			_, modelName = usageActualModel(rec.Usage)
 		}
 		t.accumulate(role, provider, modelName, *rec.Usage)
 		count++

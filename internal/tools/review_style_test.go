@@ -2117,8 +2117,8 @@ func TestReviewStyle_MultiByteRuneBoundary(t *testing.T) {
 				msgText += block.Text
 			}
 		}
-		// 找草稿段: 在 "### 草稿" 之后的内容
-		idx := strings.Index(msgText, "### 草稿")
+		// 找草稿段: 在 "### 章节与草稿" 之后的内容
+		idx := strings.Index(msgText, "### 章节与草稿")
 		if idx < 0 {
 			t.Error("critic message missing draft section header")
 			return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
@@ -3047,6 +3047,172 @@ func TestReviewStyle_FinalPendingBasisDriftDegraded(t *testing.T) {
 	}
 	if last.BasisDigest != oldBasisDigest {
 		t.Errorf("degraded should preserve old basis digest")
+	}
+}
+
+// ── 43b. 升级兼容：旧字段排列（legacy digest）落盘的 initial_pending 恢复 ──
+// ora-1 必补测试：ae540649（ReviewBasis 字段声明顺序重排）之前版本落盘的
+// pending 账本，其 basis_digest 按旧 wire 顺序整体 marshal 计算（legacy 摘要），
+// 与新版 canonical 摘要不同。升级后恢复 pending 时不得把相同语义内容误判为
+// basis 漂移而降级——必须复用原 attempt 并正常完成评审。
+
+func TestReviewStyle_PreseededInitialPendingRecovery_LegacyDigest(t *testing.T) {
+	draft := mechCleanDraft("正文。")
+	st := setupCriticStore(t, 1, draft)
+	draftDigest := domain.DigestDraft(draft)
+	legacyBasisDigest := domain.DigestReviewBasisLegacy(buildCriticBasis(st, 1, testCriticVersion))
+
+	pendingLedger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{{
+			Cycle: 1, Status: domain.ReviewStatusInitialPending,
+			CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "legacy-pending-attempt",
+			Request:     &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "preloaded-model"},
+			DraftDigest: draftDigest, BasisDigest: legacyBasisDigest,
+		}},
+	}
+	if err := st.StyleReview.Save(pendingLedger); err != nil {
+		t.Fatalf("Save preseeded: %v", err)
+	}
+
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if output.Degraded {
+		t.Fatal("legacy digest pending must NOT degrade on recovery (basis unchanged)")
+	}
+	if output.Verdict != "pass" {
+		t.Fatalf("verdict = %q, want pass", output.Verdict)
+	}
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger.Cycles[0].AttemptID != "legacy-pending-attempt" {
+		t.Errorf("initial_pending attempt_id changed to %q", ledger.Cycles[0].AttemptID)
+	}
+	if len(ledger.Cycles) != 2 {
+		t.Fatalf("expected 2 cycles (reused + result), got %d", len(ledger.Cycles))
+	}
+}
+
+// ── 43c. 升级兼容：旧字段排列（legacy digest）落盘的 final_pending 恢复 ──
+
+func TestReviewStyle_PreseededFinalPendingRecovery_LegacyDigest(t *testing.T) {
+	draft := mechCleanDraft("正文。")
+	st := setupCriticStore(t, 1, draft)
+	draftDigest := domain.DigestDraft(draft)
+	legacyBasisDigest := domain.DigestReviewBasisLegacy(buildCriticBasis(st, 1, testCriticVersion))
+
+	ledger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1",
+				Request:     &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"},
+				DraftDigest: draftDigest, BasisDigest: legacyBasisDigest},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen,
+				CreatedAt: "2026-07-25T11:00:00Z", AttemptID: "a1",
+				Request: &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"},
+				Result: &domain.StyleReviewResult{
+					Verdict: domain.ReviewVerdictRevise, Evidence: "revise",
+					Findings: []domain.StyleReviewFinding{{
+						Dimension: "pacing", Category: "style", Severity: "warning", Evidence: "e",
+					}},
+				},
+				DraftDigest: draftDigest, BasisDigest: legacyBasisDigest},
+			{Cycle: 3, Status: domain.ReviewStatusFinalPending,
+				CreatedAt: "2026-07-25T12:00:00Z", AttemptID: "legacy-final-attempt",
+				Request:     &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "preloaded-final"},
+				DraftDigest: draftDigest, BasisDigest: legacyBasisDigest},
+		},
+	}
+	if err := st.StyleReview.Save(ledger); err != nil {
+		t.Fatalf("Save preseeded: %v", err)
+	}
+
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if output.Degraded {
+		t.Fatal("legacy digest final_pending must NOT degrade on recovery (basis unchanged)")
+	}
+	if output.Verdict != "pass" {
+		t.Fatalf("verdict = %q, want pass", output.Verdict)
+	}
+	loaded, _ := st.StyleReview.Load(1)
+	if loaded.Cycles[2].AttemptID != "legacy-final-attempt" {
+		t.Errorf("final_pending attempt_id changed to %q", loaded.Cycles[2].AttemptID)
+	}
+	if len(loaded.Cycles) != 4 {
+		t.Fatalf("expected 4 cycles, got %d", len(loaded.Cycles))
+	}
+}
+
+// ── 43d. 升级兼容：legacy digest 落盘 + 基础真实漂移 → 仍须降级 ─────────
+// 双摘要兼容只放宽"同一语义内容因字段排列不同产生的摘要差异"，真实内容
+// 漂移（风格目标变更）在 canonical 与 legacy 两种算法下都必须被检出。
+
+func TestReviewStyle_InitialPendingBasisDrift_LegacyDigestStillDegrades(t *testing.T) {
+	draft := "正文。"
+	st := setupCriticStore(t, 1, draft)
+	draftDigest := domain.DigestDraft(draft)
+	legacyBasisDigest := domain.DigestReviewBasisLegacy(buildCriticBasis(st, 1, testCriticVersion))
+
+	pendingLedger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{{
+			Cycle: 1, Status: domain.ReviewStatusInitialPending,
+			CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "old-initial-attempt",
+			Request:     &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "m"},
+			DraftDigest: draftDigest, BasisDigest: legacyBasisDigest,
+		}},
+	}
+	if err := st.StyleReview.Save(pendingLedger); err != nil {
+		t.Fatalf("Save ledger: %v", err)
+	}
+
+	// 真实漂移：风格目标变更
+	plan, _ := st.Drafts.LoadChapterPlan(1)
+	if plan == nil {
+		plan = &domain.ChapterPlan{Chapter: 1}
+	}
+	plan.StyleGoal = &domain.ChapterStyleGoal{
+		FocalFilter:   "new-focal",
+		ProseMovement: "new-prose",
+	}
+	if err := st.Drafts.SaveChapterPlan(*plan); err != nil {
+		t.Fatalf("SaveChapterPlan: %v", err)
+	}
+
+	// Critic 不应被调用——legacy digest 下的真实漂移必须立即降级
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		t.Fatal("critic should not be called on basis drift")
+		return nil, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output StyleReviewOutput
+	json.Unmarshal(out, &output)
+	if !output.Degraded {
+		t.Fatal("expected degraded when initial pending basis has drifted (legacy recorded digest)")
+	}
+	if !strings.Contains(output.Error, "基础已变更") {
+		t.Errorf("error %q should mention basis change", output.Error)
 	}
 }
 
@@ -4094,5 +4260,55 @@ func TestReviewStyle_MechanicalCleanAccepted(t *testing.T) {
 	ledger, _ := st.StyleReview.Load(1)
 	if ledger.CurrentStatus() != domain.ReviewStatusAcceptedInitial {
 		t.Fatalf("expected accepted_initial, got %s", ledger.CurrentStatus())
+	}
+}
+
+// ── 缓存优化阶段 2：Prompt Capsule 重排（critic）──────────────────────
+
+// TestReviewStyle_TaskBasisBeforeDraft 断言 critic task 文本的布局：
+// 稳定书级内容（评审依据 basis）在前、章节动态内容（章节号/字数/草稿全文）
+// 最后、输出要求 footer 收尾——跨 spawn 的内容前缀缓存（DeepSeek 磁盘缓存
+// 按内容前缀匹配）依赖该顺序：basis 必须先于草稿全文出现。
+func TestReviewStyle_TaskBasisBeforeDraft(t *testing.T) {
+	const draft = "她心里骂自己丢人，真不要脸。"
+	st := setupCriticStore(t, 1, draft)
+	var taskText string
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		for _, block := range msgs[len(msgs)-1].Content {
+			if block.Text != "" {
+				taskText += block.Text
+			}
+		}
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if taskText == "" {
+		t.Fatal("critic 未收到任务文本")
+	}
+
+	idx := func(marker string) int {
+		i := strings.Index(taskText, marker)
+		if i < 0 {
+			t.Errorf("task 缺少段标记 %q\n任务文本:\n%s", marker, taskText)
+		}
+		return i
+	}
+
+	basisIdx := idx("### 评审依据")
+	draftIdx := idx("### 章节与草稿")
+	footerIdx := idx("请严格按样式批评者提示词")
+
+	// 稳定内容（basis）位于动态草稿段之前；草稿段位于 footer 之前。
+	if !(basisIdx < draftIdx && draftIdx < footerIdx) {
+		t.Errorf("task 段顺序错误：评审依据(%d) < 章节与草稿(%d) < footer(%d) 未成立\n任务文本:\n%s",
+			basisIdx, draftIdx, footerIdx, taskText)
+	}
+
+	// basis JSON（critic_version 是 basis 首个字段）必须出现在草稿全文之前。
+	if strings.Index(taskText, `"critic_version"`) > strings.Index(taskText, draft) {
+		t.Errorf("basis JSON（critic_version）必须出现在草稿全文之前\n任务文本:\n%s", taskText)
 	}
 }

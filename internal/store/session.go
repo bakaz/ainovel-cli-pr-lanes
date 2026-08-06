@@ -81,8 +81,17 @@ type sessionLogEntry struct {
 }
 
 type sessionLogMeta struct {
+	// Provider 是**配置键**（go0/go1/go2），不是协议名——旧实现写 Usage.Provider
+	// 的协议名（"openai"），多个账号在 session 里全部显示 openai，无法诊断
+	// 账号切换；配置键由 ModelLookup（ModelSet.SelectionReport，读 failover
+	// 租约目标）提供——fallback 实际服务的备用账号也能精确归因，不会把 go1
+	// 的请求记成 go0。
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model,omitempty"`
+	// Protocol 是 API 协议类型（openai/anthropic/...），当 Provider 被配置键
+	// 覆盖时保留协议信息（replay 计价与诊断仍可参考）。旧 jsonl 无此字段，
+	// 解析方按零值处理。
+	Protocol string `json:"protocol,omitempty"`
 }
 
 // logEntry 序列化消息并按需附加 _meta。lookupMeta 已计算好的 meta 传进来；
@@ -96,10 +105,7 @@ func (s *SessionStore) logEntry(rel string, msg agentcore.AgentMessage, meta *se
 	compacted := compactMessage(m)
 	entry := sessionLogEntry{Message: compacted}
 	if compacted.Role == agentcore.RoleAssistant && compacted.Usage != nil {
-		entry.Meta = usageMeta(compacted.Usage)
-		if entry.Meta == nil {
-			entry.Meta = meta
-		}
+		entry.Meta = mergeSessionMeta(meta, usageMeta(compacted.Usage))
 	}
 	data, err := json.Marshal(entry)
 	if err != nil {
@@ -117,6 +123,32 @@ func usageMeta(usage *agentcore.Usage) *sessionLogMeta {
 		Provider: usage.Provider,
 		Model:    usage.Model,
 	}
+}
+
+// mergeSessionMeta 合并 ModelLookup 的配置键信息与 Usage 透传的协议信息。
+// 优先级：provider 用配置键（go0/go1/go2）而非 Usage.Provider 的协议名
+// （"openai"）——否则多个账号在 session 里全显示 openai，无法诊断账号切换；
+// 协议名挪到 protocol 字段保留。lookup 与 usage 均缺时返回 nil（不带 _meta）。
+func mergeSessionMeta(lookup, usage *sessionLogMeta) *sessionLogMeta {
+	if usage == nil {
+		return lookup
+	}
+	merged := *usage
+	if lookup != nil {
+		if merged.Provider == "" {
+			merged.Provider = lookup.Provider
+		} else if lookup.Provider != "" && merged.Provider != lookup.Provider {
+			merged.Protocol = merged.Provider
+			merged.Provider = lookup.Provider
+		}
+		if merged.Model == "" {
+			merged.Model = lookup.Model
+		}
+	}
+	if merged.Provider == "" && merged.Model == "" {
+		return nil
+	}
+	return &merged
 }
 
 // subAgentPath 根据 agentName+task 生成文件路径。

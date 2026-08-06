@@ -26,6 +26,7 @@ type Store struct {
 	Checkpoints     *CheckpointStore
 	Sessions        *SessionStore
 	Usage           *UsageStore
+	PrefixManifest  *PrefixManifestStore
 	Simulation      *SimulationStore
 	StyleAnchors    *StyleAnchorsStore
 	Decisions       *DecisionStore
@@ -56,6 +57,7 @@ func NewStore(dir string) *Store {
 		Checkpoints:     NewCheckpointStore(io),
 		Sessions:        NewSessionStore(newIO(dir)),
 		Usage:           NewUsageStore(newIO(dir)),
+		PrefixManifest:  NewPrefixManifestStore(newIO(dir)),
 		Simulation:      NewSimulationStore(newIO(dir)),
 		StyleAnchors:    NewStyleAnchorsStore(newIO(dir)),
 		Decisions:       NewDecisionStore(newIO(dir)),
