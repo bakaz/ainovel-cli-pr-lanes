@@ -1789,3 +1789,72 @@ func TestPolishDraft_EditListNoOpFSMNeedsPostPolishCheck(t *testing.T) {
 		t.Fatalf("required_next_action #2 = %v, want review_style", act2)
 	}
 }
+
+// ── 缓存优化阶段 2：Prompt Capsule 重排 ───────────────────────────────
+//
+// TestPolishDraft_TaskBasisBeforeDraft：断言 polisher task 文本的布局为
+// "稳定书级内容（basis/findings/brief）在前、章节动态内容（章节号/字数/草稿
+// 全文）最后、输出要求 footer 收尾"。跨 spawn 的内容前缀缓存（DeepSeek 磁盘
+// 缓存按内容前缀匹配）依赖该顺序：basis 必须先于草稿全文出现。
+func TestPolishDraft_TaskBasisBeforeDraft(t *testing.T) {
+	const draft = "她站在窗前，望着远处的灯火。"
+	st := setupPolishStore(t, 1, draft)
+
+	// 追加 revision 账本（既有评审意见段）：验证 findings 也位于草稿之前。
+	now := time.Now().Format(time.RFC3339)
+	digest := domain.DigestDraft(draft)
+	basisDigest := "sha256:" + strings.Repeat("b", 64)
+	reviseResult := &domain.StyleReviewResult{Verdict: domain.ReviewVerdictRevise, Evidence: "ok",
+		Findings: []domain.StyleReviewFinding{{Dimension: domain.FindingDimensionPacing,
+			Category: domain.FindingCategoryStyle, Severity: domain.FindingSeverityWarning,
+			Evidence: "第二段节奏偏慢"}}}
+	if err := st.StyleReview.Save(domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m"}},
+			{Cycle: 2, Status: domain.ReviewStatusRevisionOpen, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: digest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: "v1", Model: "m"},
+				Result:  reviseResult},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText("x")}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+	task := tool.buildPolishTask(1, draft, utf8.RuneCountInString(draft))
+
+	idx := func(marker string) int {
+		i := strings.Index(task, marker)
+		if i < 0 {
+			t.Errorf("task 缺少段标记 %q\n任务文本:\n%s", marker, task)
+		}
+		return i
+	}
+
+	basisIdx := idx("### 精修依据")
+	findingsIdx := idx("### 既有评审意见")
+	draftIdx := idx("### 章节与草稿")
+	footerIdx := idx("请严格按精修者提示词")
+
+	// 稳定内容全部位于动态草稿段之前；草稿段位于 footer 之前。
+	if !(basisIdx < findingsIdx && findingsIdx < draftIdx && draftIdx < footerIdx) {
+		t.Errorf("task 段顺序错误：精修依据(%d) < 既有评审意见(%d) < 章节与草稿(%d) < footer(%d) 未成立\n任务文本:\n%s",
+			basisIdx, findingsIdx, draftIdx, footerIdx, task)
+	}
+
+	// basis JSON（critic_version 是 basis 首个字段）必须出现在草稿全文之前。
+	if strings.Index(task, `"critic_version"`) > strings.Index(task, draft) {
+		t.Errorf("basis JSON（critic_version）必须出现在草稿全文之前\n任务文本:\n%s", task)
+	}
+
+	// 草稿全文只出现一次（动态段），且位于 basis JSON 之后。
+	if strings.Count(task, draft) != 1 {
+		t.Errorf("草稿全文应恰好出现一次（动态段），实际 %d 次", strings.Count(task, draft))
+	}
+}

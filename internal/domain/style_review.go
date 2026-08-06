@@ -558,7 +558,63 @@ func DigestDraft(content string) string {
 // ReviewBasis 是发送给批评者的规范评审依据 payload。
 // 包含当前章节的完整结构化风格目标、契约、规则、锚点、
 // 用户规则和大纲事实数据。序列化后既发送也给摘要检测变更。
+//
+// 字段声明顺序 = JSON wire 顺序（encoding/json 按声明序输出 struct 字段）。
+// 按 ora-1 缓存优化阶段 2（Prompt Capsule 重排）从稳定到动态排列：稳定书级
+// 内容（prompt 版本/用户规则/长期 compass/锚点）在前，章节级动态内容
+// （风格目标/章节契约/事实大纲）在后——跨 spawn 的内容前缀缓存（DeepSeek
+// 磁盘缓存按内容前缀匹配）因此能在动态字段变化前命中尽量长的稳定前缀。
+// 注意：字段声明顺序只影响 JSON wire 输出（前缀缓存），不影响摘要——
+// DigestReviewBasis 使用与声明顺序无关的 canonical payload（按字段名排序），
+// 因此重排字段不会使已落盘账本的 basis_digest 失效；字段集合不得增减
+// （增减会改变 canonical 摘要，需显式迁移已落盘账本）。
 type ReviewBasis struct {
+	CriticVersion   string            `json:"critic_version"`
+	UserRules       json.RawMessage   `json:"user_rules,omitempty"`
+	CompassProse    []string          `json:"compass_prose,omitempty"`
+	CompassDialogue []CharacterVoice  `json:"compass_dialogue,omitempty"`
+	CompassTaboos   []string          `json:"compass_taboos,omitempty"`
+	AnchorExcerpts  []string          `json:"anchor_excerpts,omitempty"`
+	StyleGoal       *ChapterStyleGoal `json:"style_goal,omitempty"`
+	ChapterContract *ChapterContract  `json:"chapter_contract,omitempty"`
+	FactualOutline  string            `json:"factual_outline"`
+}
+
+// DigestReviewBasis 对完整规范 ReviewBasis 做确定性摘要。
+//
+// 摘要使用 canonical payload：以 map[string]any 重建全部字段后由
+// encoding/json 按键名升序输出——结果只依赖字段内容与 JSON 标签名，
+// 与字段声明顺序（JSON wire 排列）无关。缓存优化阶段重排 ReviewBasis
+// 字段（ae540649 stable-first prompt capsule）因此不再改变摘要，已落盘
+// 账本（pending basis_digest）在升级后依然匹配，不会误判 basis 漂移。
+func DigestReviewBasis(basis ReviewBasis) string {
+	data, _ := json.Marshal(canonicalReviewBasisPayload(basis))
+	h := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(h[:])
+}
+
+// canonicalReviewBasisPayload 重建 ReviewBasis 全字段为 map（不省略空值）。
+// encoding/json 对 map 的字符串键按字典序升序输出，保证摘要与字段声明
+// 顺序解耦；嵌套结构（ChapterStyleGoal/ChapterContract/CharacterVoice）
+// 按各自结构体声明序输出，其字段顺序不受本处影响。
+func canonicalReviewBasisPayload(basis ReviewBasis) map[string]any {
+	return map[string]any{
+		"anchor_excerpts":  basis.AnchorExcerpts,
+		"chapter_contract": basis.ChapterContract,
+		"compass_dialogue": basis.CompassDialogue,
+		"compass_prose":    basis.CompassProse,
+		"compass_taboos":   basis.CompassTaboos,
+		"critic_version":   basis.CriticVersion,
+		"factual_outline":  basis.FactualOutline,
+		"style_goal":       basis.StyleGoal,
+		"user_rules":       basis.UserRules,
+	}
+}
+
+// legacyReviewBasisWire 是 ae540649（stable-first prompt capsule）之前旧版
+// ReviewBasis 的 JSON wire 字段排列（动态在前、稳定在后）。仅用于复现旧版
+// DigestReviewBasis 的整体 marshal 输出；不得再作为任何新摘要的输入。
+type legacyReviewBasisWire struct {
 	StyleGoal       *ChapterStyleGoal `json:"style_goal,omitempty"`
 	ChapterContract *ChapterContract  `json:"chapter_contract,omitempty"`
 	CompassProse    []string          `json:"compass_prose,omitempty"`
@@ -570,11 +626,36 @@ type ReviewBasis struct {
 	CriticVersion   string            `json:"critic_version"`
 }
 
-// DigestReviewBasis 对完整规范 ReviewBasis 做确定性摘要。
-func DigestReviewBasis(basis ReviewBasis) string {
-	data, _ := json.Marshal(basis)
+// DigestReviewBasisLegacy 按旧版（ae540649 之前）字段排列计算 legacy 摘要，
+// 仅用于升级期读取兼容：旧版落盘的 pending 账本 basis_digest 是按旧 wire
+// 顺序整体 json.Marshal 计算的，恢复比对时需同时接受 canonical 与 legacy
+// 两种摘要。新写入的 basis_digest 一律使用 DigestReviewBasis。
+func DigestReviewBasisLegacy(basis ReviewBasis) string {
+	data, _ := json.Marshal(legacyReviewBasisWire{
+		StyleGoal:       basis.StyleGoal,
+		ChapterContract: basis.ChapterContract,
+		CompassProse:    basis.CompassProse,
+		CompassDialogue: basis.CompassDialogue,
+		CompassTaboos:   basis.CompassTaboos,
+		AnchorExcerpts:  basis.AnchorExcerpts,
+		UserRules:       basis.UserRules,
+		FactualOutline:  basis.FactualOutline,
+		CriticVersion:   basis.CriticVersion,
+	})
 	h := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(h[:])
+}
+
+// BasisDigestMatches 判断账本已落盘 digest（recorded）与当前 basis 是否一致，
+// 同时接受 canonical（DigestReviewBasis）与 legacy（DigestReviewBasisLegacy，
+// 旧字段排列）两种算法——升级瞬间旧 pending 账本的 basis_digest 仍按旧算法
+// 计算，双摘要接受可避免升级后恢复 pending 时误判 basis 漂移而降级。
+// recorded 为空（历史条目未绑定）时视为一致，返回 true。
+func BasisDigestMatches(basis ReviewBasis, recorded, current string) bool {
+	if recorded == "" {
+		return true
+	}
+	return current == recorded || DigestReviewBasisLegacy(basis) == recorded
 }
 
 // ── RFC3339 validation ─────────────────────────────────────────────

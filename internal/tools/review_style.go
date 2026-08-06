@@ -358,10 +358,19 @@ func (t *ReviewStyleTool) executeInitialReview(ctx context.Context, chapter int,
 			// Stale-basis deadlock prevention: if the basis has drifted since
 			// the pending attempt was created, degrade immediately with the
 			// persisted authority rather than leaving a stranded pending entry.
-			if cp.BasisDigest != "" && basisDigest != cp.BasisDigest {
+			// 双摘要兼容：同时接受 canonical 与 legacy（旧字段排列）摘要，升级前
+			// 落盘的 pending basis_digest 不会因字段重排被误判为漂移。
+			if !domain.BasisDigestMatches(basis, cp.BasisDigest, basisDigest) {
 				return t.appendDegraded(chapter, cp.AttemptID, cp.DraftDigest, cp.BasisDigest, request,
 					fmt.Errorf("章节 %d 的评审基础已变更，初始评审待定（attempt %s）已失效，需要新的 check_consistency: %w",
 						chapter, cp.AttemptID, errs.ErrToolPrecondition))
+			}
+			// 复用旧 attempt：后续写入（degraded/result）必须沿用账本中已落盘的
+			// basis_digest——旧版本落盘的可能是 legacy（旧字段排列）摘要，若换绑
+			// canonical 摘要，append-only 校验会拒绝结果落盘。内容一致性已由
+			// BasisDigestMatches 保证；cp.BasisDigest 为空（未绑定）时保持新摘要。
+			if cp.BasisDigest != "" {
+				basisDigest = cp.BasisDigest
 			}
 
 			pendingEntry.DraftDigest = draftDigest
@@ -468,10 +477,18 @@ func (t *ReviewStyleTool) executeFinalReview(ctx context.Context, chapter int, c
 
 			// Stale-basis deadlock prevention: if the basis has drifted since
 			// the final pending attempt was created, degrade immediately.
-			if cp.BasisDigest != "" && basisDigest != cp.BasisDigest {
+			// 双摘要兼容：同时接受 canonical 与 legacy（旧字段排列）摘要，升级前
+			// 落盘的 pending basis_digest 不会因字段重排被误判为漂移。
+			if !domain.BasisDigestMatches(basis, cp.BasisDigest, basisDigest) {
 				return t.appendDegraded(chapter, cp.AttemptID, cp.DraftDigest, cp.BasisDigest, request,
 					fmt.Errorf("章节 %d 的评审基础已变更，最终评审待定（attempt %s）已失效，需要新的 check_consistency: %w",
 						chapter, cp.AttemptID, errs.ErrToolPrecondition))
+			}
+			// 复用旧 attempt：后续写入（degraded/result）沿用账本中已落盘的
+			// basis_digest（可能是 legacy 旧字段排列摘要），否则 append-only
+			// 校验会拒绝落盘；内容一致性已由 BasisDigestMatches 保证。
+			if cp.BasisDigest != "" {
+				basisDigest = cp.BasisDigest
 			}
 		}
 	}
@@ -599,19 +616,22 @@ func (t *ReviewStyleTool) callCritic(ctx context.Context, chapter int, content s
 		truncNote = fmt.Sprintf("（草稿共 %d runes，仅发送前 %d runes）", runeCount, maxCriticRunes)
 	}
 
+	// ── 任务文本（ora-1 缓存优化阶段 2：Prompt Capsule 重排）──
+	// 稳定书级内容（评审依据 basis）在前，章节动态内容（章节号/字数/草稿全文）
+	// 最后、短 footer 收尾——跨 spawn 的内容前缀缓存（DeepSeek 磁盘缓存按内容
+	// 前缀匹配）命中稳定前缀，只有尾部的草稿段需要重新计算。
 	taskText := fmt.Sprintf(`## 评审任务
-
-### 章节
-第 %d 章
-
-### 草稿（字数：%d）%s
-%s
 
 ### 评审依据
 %s
 
+### 章节与草稿（字数：%d）%s
+第 %d 章
+
+%s
+
 请严格按样式批评者提示词中定义的 JSON 格式输出（含 mandatory strength.evidence）。`,
-		chapter, wordCount, truncNote, draftForCritic, basisPayload)
+		basisPayload, wordCount, truncNote, chapter, draftForCritic)
 
 	// ── Invoke the critic with empty-output retry ──
 	// 空输出（空串/仅空白）是瞬态故障，自动重试（2s/4s/8s 指数退避）；
