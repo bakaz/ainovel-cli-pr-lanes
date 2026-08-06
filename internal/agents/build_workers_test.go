@@ -562,11 +562,12 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 	if ac.MaxTurns != 3 {
 		t.Errorf("polisher MaxTurns = %d, want 3 (1 initial + up to 2 length recoveries)", ac.MaxTurns)
 	}
-	// length 截断 recovery 必须要求整章重输出（默认续写提示会让尾段覆盖草稿）
+	// length 截断 recovery 必须要求整表重输出 edit 列表 JSON（默认续写提示会让
+	// JSON 尾段残缺，解析失败）
 	if ac.LengthRecoveryPrompt == "" {
-		t.Error("polisher LengthRecoveryPrompt must be set (restart from chapter title, full chapter)")
-	} else if !strings.Contains(ac.LengthRecoveryPrompt, "重新输出完整的精修后章节") {
-		t.Errorf("polisher LengthRecoveryPrompt should require a full re-output, got %q", ac.LengthRecoveryPrompt)
+		t.Error("polisher LengthRecoveryPrompt must be set (restart from first edit, full edit list JSON)")
+	} else if !strings.Contains(ac.LengthRecoveryPrompt, "重新输出完整的精修 edit 列表 JSON") {
+		t.Errorf("polisher LengthRecoveryPrompt should require a full edit-list re-output, got %q", ac.LengthRecoveryPrompt)
 	}
 	// mimo-v2.5 真实 max output = 131072：显式覆盖默认 65536，避免 thinking 截断
 	if ac.MaxTokens != 131072 {

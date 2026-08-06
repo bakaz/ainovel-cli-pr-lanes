@@ -436,16 +436,16 @@ func BuildWorkers(
 	// ContextManager / cache key / provenance）。由 polish_draft 工具在 Writer 单次 Run 内
 	// 嵌套调用——模式与 review_style 内部启动 critic runner 一致；不 Swap 同一 Writer 会话。
 	// 全部上下文（草稿全文 + 精修依据 + 既有 findings + rewrite brief）由 buildPolishTask
-	// 塞进任务文本，模型只输出整章正文作为最终响应。 ──
+	// 塞进任务文本，模型输出结构化 edit 列表 JSON 作为最终响应（ora-1 形态 2）。
 	// MaxTurns=3（1 初始 + 最多 2 次 length recovery）：polisher 模型 thinking 极长，
 	// 实测频繁被 max_tokens 截断（StopReason=length）。agentcore 对 length 截断自动注入
 	// recovery prompt 继续下一轮，但循环在每轮顶部按 turnCount(>=MaxTurns) fail-closed；
 	// MaxTurns=1 会让首次 recovery 立即撞 MaxTurnsError（生产 55 章 rewrite 卡死根因）。
 	// MaxTurns=3 允许连续 2 次 recovery；连续 3 次 length 时第 4 次调用前报 MaxTurnsError
 	// fail-closed（比 agentcore 内部 recovery 预算放行截断结果更保守，见 defaultMaxLengthRecoveries）。
-	// LengthRecoveryPrompt 要求从头重新输出完整章节：默认 recovery prompt 是"从截断处续写"，
-	// 若第一轮已输出部分正文、第二轮只续写尾段，RunResult 只返回尾段，polish_draft 会把
-	// 尾段当完整章节保存（章节截头覆盖草稿）——故必须显式覆盖为整章重写。
+	// LengthRecoveryPrompt 要求从头重新输出完整 edit 列表 JSON：默认 recovery prompt 是
+	// "从截断处续写"，若第一轮已输出部分 JSON、第二轮只续写尾段，RunResult 只返回尾段，
+	// 解析必然失败且内容残缺——故必须显式覆盖为整表重输出。
 	// MaxTokens=131072：mimo-v2.5（小米 MiMo-V2.5）真实输出上限 131072 tokens
 	//（OpenRouter top_provider.max_completion_tokens 四方一致）；agentcore 默认
 	// GenerationConfig.MaxTokens=65536 会把 75-97K 字符的 thinking 截断（thinking 与
@@ -473,13 +473,13 @@ func BuildWorkers(
 		CacheLastMessage: "ephemeral",
 		PromptCacheKey:   cacheBase + "-polisher",
 		// 覆盖 agentcore 默认的"从截断处续写"recovery prompt：length 截断后要求模型
-		// 从章节标题开始完整重输出，避免仅返回尾段导致章节截头覆盖草稿（见上方注释）。
-		LengthRecoveryPrompt: "上一次输出被截断。不要从中间续写；请从章节标题开始，重新输出完整的精修后章节。只输出完整正文。",
+		// 从头完整重输出 edit 列表 JSON，避免仅返回尾段导致 JSON 残缺（见上方注释）。
+		LengthRecoveryPrompt: "上一次输出被截断。不要从中间续写；请从第一条 edit 开始，重新输出完整的精修 edit 列表 JSON（{\"version\":1,\"edits\":[{\"old_string\":\"原文片段\",\"new_string\":\"精修后片段\"}]}）。只输出该 JSON，不要附加任何其他内容。",
 		// mimo-v2.5 真实 max output = 131072（见上方注释），显式覆盖默认 65536。
 		MaxTokens: 131072,
 		StopGuardFactory: func(_, _ string) agentcore.StopGuard {
-			// polisher 正常路径以最终文本响应结束（产物由 polish_draft 工具
-			// 校验并落盘），不能用 writer 同款 guard：polisher 协议禁止自行
+			// polisher 正常路径以最终 edit 列表 JSON 响应结束（产物由 polish_draft
+			// 工具校验并落盘），不能用 writer 同款 guard：polisher 协议禁止自行
 			// commit，要求 commit checkpoint 会让每次正常结束都被拦截、连续
 			// 空转后 escalate，polish_draft 永远失败（实测 63 章 rewrite
 			// 死循环）。恒放行 end_turn，仅对 provider 拒答立即升级。

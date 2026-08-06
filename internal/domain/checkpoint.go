@@ -97,6 +97,12 @@ type Checkpoint struct {
 	// ErrorCategory 是降级原因的稳定分类（stream_idle/max_turns/timeout/network/
 	// rate_limit/overloaded，与 agentcore.ErrorKind 同义），仅审计用，不影响判定。
 	ErrorCategory string `json:"error_category,omitempty"`
+	// Method 记录精修执行方式："edit_list"（结构化 edit 列表原子应用，ora-1 形态 2）
+	// 或 "full_text"（整章重输出，旧协议回退路径）；degraded 记录可能为空。仅审计用。
+	Method string `json:"method,omitempty"`
+	// EditCount 是 edit_list 路径实际应用的 edit 条数（空 edits=0）；
+	// full_text/degraded 路径为零。仅审计用，不影响判定。
+	EditCount int `json:"edit_count,omitempty"`
 }
 
 // PolishCheckpointMeta 是 polish 步骤 checkpoint 的附加元数据。
@@ -108,4 +114,6 @@ type PolishCheckpointMeta struct {
 	Changed       bool
 	Degraded      bool
 	ErrorCategory string
+	Method        string
+	EditCount     int
 }

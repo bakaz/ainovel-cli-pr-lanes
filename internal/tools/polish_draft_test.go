@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/subagent"
@@ -1140,4 +1141,651 @@ func snippet(s string) string {
 		return s
 	}
 	return string(r[:40]) + "…"
+}
+
+// ── edit list 路径（ora-1 形态 2）──────────────────────────────────────
+
+// editListJSON 构造 polisher 协议的 edit 列表 JSON（测试辅助）。
+func editListJSON(items ...[2]string) string {
+	var sb strings.Builder
+	sb.WriteString(`{"version":1,"edits":[`)
+	for i, it := range items {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		o, _ := json.Marshal(it[0])
+		n, _ := json.Marshal(it[1])
+		sb.WriteString(`{"old_string":` + string(o) + `,"new_string":` + string(n) + `}`)
+	}
+	sb.WriteString(`]}`)
+	return sb.String()
+}
+
+func polishCheckpointCount(t *testing.T, st *store.Store, chapter int) int {
+	t.Helper()
+	n := 0
+	for _, cp := range st.Checkpoints.All() {
+		if cp.Scope.Matches(domain.ChapterScope(chapter)) && cp.Step == "polish" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestPolishDraft_EditListSuccess：单 edit 成功路径——草稿落盘为应用后文本、
+// 恰好一个 polish checkpoint（Method=edit_list、EditCount=1、InputDigest/Digest/
+// Stage/Changed 正确）。
+func TestPolishDraft_EditListSuccess(t *testing.T) {
+	draft := mechCleanDraft("她站在窗前，望着远处的灯火。")
+	st := setupPolishStore(t, 1, draft)
+	savePermissiveUserRules(t, st) // 机械门禁激活：输入 clean，候选也必须 clean
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"她站在窗前", "她倚窗而立"}))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Polished || !output.Changed {
+		t.Fatalf("expected polished+changed output, got %+v", output)
+	}
+	if output.InputDigest != domain.DigestDraft(draft) {
+		t.Errorf("input_digest mismatch")
+	}
+
+	want := "她倚窗而立，望着远处的灯火。她心里骂自己丢人，真不要脸。"
+	saved, _, err := st.Drafts.LoadChapterContent(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved != want {
+		t.Fatalf("saved draft = %q, want %q", saved, want)
+	}
+
+	cp := polishCheckpointOf(t, st, 1)
+	if cp.Method != "edit_list" {
+		t.Errorf("checkpoint method = %q, want edit_list", cp.Method)
+	}
+	if cp.EditCount != 1 {
+		t.Errorf("checkpoint edit_count = %d, want 1", cp.EditCount)
+	}
+	if cp.InputDigest != domain.DigestDraft(draft) {
+		t.Errorf("checkpoint input_digest = %s, want %s", cp.InputDigest, domain.DigestDraft(draft))
+	}
+	if cp.Digest != domain.DigestDraft(want) {
+		t.Errorf("checkpoint digest = %s, want digest of applied text", cp.Digest)
+	}
+	if !cp.Changed || cp.Stage != "draft" || cp.PolisherModel != "mock-polisher-model" {
+		t.Errorf("checkpoint meta wrong: %+v", cp)
+	}
+	if output.OutputDigest != domain.DigestDraft(want) {
+		t.Errorf("output_digest mismatch")
+	}
+	if n := polishCheckpointCount(t, st, 1); n != 1 {
+		t.Errorf("polish checkpoints = %d, want exactly 1 per call", n)
+	}
+}
+
+// TestPolishDraft_EditListMultipleEditsReverseOrder：多 edit 全部基于同一输入
+// 快照定位、按 offset 应用，最终草稿为逐条替换后的完整文本。
+func TestPolishDraft_EditListMultipleEditsReverseOrder(t *testing.T) {
+	draft := mechCleanDraft("她站在窗前。他坐在桌边。猫趴在角落。不远处传来犬吠。")
+	st := setupPolishStore(t, 1, draft)
+	savePermissiveUserRules(t, st)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
+			[2]string{"猫趴在角落。", "猫蜷在窗台。"},
+			[2]string{"她站在窗前。", "她倚窗而立。"},
+			[2]string{"他坐在桌边。", "他立在门前。"},
+		))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	want := "她倚窗而立。他立在门前。猫蜷在窗台。不远处传来犬吠。她心里骂自己丢人，真不要脸。"
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != want {
+		t.Fatalf("saved draft = %q, want %q", saved, want)
+	}
+	if cp := polishCheckpointOf(t, st, 1); cp.EditCount != 3 {
+		t.Errorf("edit_count = %d, want 3", cp.EditCount)
+	}
+}
+
+// TestPolishDraft_EditListEmptyNoOp：edits=[] 合法 no-op——changed=false、
+// 仍 AppendPolish 推进 seq（连续两次调用产生两个递增 seq 的 checkpoint）。
+func TestPolishDraft_EditListEmptyNoOp(t *testing.T) {
+	draft := mechCleanDraft("这段文字已经很好，无需修改。")
+	st := setupPolishStore(t, 1, draft)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(`{"version":1,"edits":[]}`)}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute #1: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Polished || output.Changed {
+		t.Fatalf("no-op must report polished=true changed=false, got %+v", output)
+	}
+	if output.InputDigest != output.OutputDigest {
+		t.Fatalf("no-op digests must match: %s vs %s", output.InputDigest, output.OutputDigest)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Errorf("draft must remain unchanged on no-op, got %q", saved)
+	}
+	cp := polishCheckpointOf(t, st, 1)
+	if cp.Changed || cp.EditCount != 0 || cp.Method != "edit_list" {
+		t.Errorf("no-op checkpoint meta wrong: changed=%v edit_count=%d method=%q", cp.Changed, cp.EditCount, cp.Method)
+	}
+	if cp.Digest != domain.DigestDraft(draft) {
+		t.Errorf("no-op checkpoint digest must equal current draft")
+	}
+
+	// 第二次 no-op：AppendPolish 不做 digest 去重，seq 必须递增。
+	cp1 := cp.Seq
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Execute #2: %v", err)
+	}
+	cp2 := polishCheckpointOf(t, st, 1)
+	if cp2.Seq <= cp1 {
+		t.Errorf("no-op polish must advance seq: cp2=%d cp1=%d", cp2.Seq, cp1)
+	}
+	if n := polishCheckpointCount(t, st, 1); n != 2 {
+		t.Errorf("polish checkpoints = %d, want 2", n)
+	}
+}
+
+// TestPolishDraft_EditListFallbackFullText：非 JSON 输出 → 回退整章模式
+// （旧协议全保留），checkpoint Method=full_text。
+func TestPolishDraft_EditListFallbackFullText(t *testing.T) {
+	const draft = "她站在窗前。这个句子很长很长，长到读起来非常累，一点都不顺口。"
+	st := setupPolishStore(t, 1, draft)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText("她倚窗而立。短句更有力，节奏明快。")}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Polished || !output.Changed {
+		t.Fatalf("expected full-text polish success, got %+v", output)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != "她倚窗而立。短句更有力，节奏明快。" {
+		t.Fatalf("saved draft = %q", saved)
+	}
+	cp := polishCheckpointOf(t, st, 1)
+	if cp.Method != "full_text" {
+		t.Errorf("checkpoint method = %q, want full_text", cp.Method)
+	}
+	if cp.EditCount != 0 {
+		t.Errorf("full_text checkpoint edit_count = %d, want 0", cp.EditCount)
+	}
+}
+
+// TestPolishDraft_EditListFencedFallsBackRejected：围栏包裹的 edit plan JSON
+// → 回退整章模式 → 整章模式的围栏检查拒绝（错误含"围栏"），草稿不变。
+func TestPolishDraft_EditListFencedFallsBackRejected(t *testing.T) {
+	st := setupPolishStore(t, 1, strings.Repeat("长", 10))
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText("```json\n{\"version\":1,\"edits\":[{\"old_string\":\"长\",\"new_string\":\"短\"}]}\n```")}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("expected fence rejection")
+	}
+	if !strings.Contains(err.Error(), "围栏") {
+		t.Errorf("expected fence-rejection error, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != strings.Repeat("长", 10) {
+		t.Error("draft must remain unchanged")
+	}
+	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
+		t.Error("no polish checkpoint after rejection")
+	}
+}
+
+// TestPolishDraft_EditListContractVersionRejected：version 不受支持 → fail-closed
+// 契约错误（不回退、不落盘）。
+func TestPolishDraft_EditListContractVersionRejected(t *testing.T) {
+	st := setupPolishStore(t, 1, "草稿。她心里骂自己丢人，真不要脸。")
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(`{"version":2,"edits":[]}`)}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("expected contract error for version=2")
+	}
+	if !strings.Contains(err.Error(), "契约") || !strings.Contains(err.Error(), "version") {
+		t.Errorf("expected contract error message, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != "草稿。她心里骂自己丢人，真不要脸。" {
+		t.Error("draft must remain unchanged")
+	}
+	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
+		t.Error("no polish checkpoint after contract error")
+	}
+}
+
+// ── edit 路径失败：fail-closed（草稿原样、无 checkpoint） ───────────────
+
+func TestPolishDraft_EditListAnchorMissing(t *testing.T) {
+	draft := mechCleanDraft("她站在窗前，望着远处。")
+	st := setupPolishStore(t, 1, draft)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"不存在的片段", "x"}))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("expected error for missing anchor")
+	}
+	if !strings.Contains(err.Error(), "内容校验") || !strings.Contains(err.Error(), "不存在") {
+		t.Errorf("expected content-validation error, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Error("draft must remain unchanged")
+	}
+	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
+		t.Error("no polish checkpoint after anchor failure")
+	}
+}
+
+func TestPolishDraft_EditListAnchorMultiple(t *testing.T) {
+	draft := mechCleanDraft("重复的片段，重复的片段。")
+	st := setupPolishStore(t, 1, draft)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"重复的片段", "x"}))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil || !strings.Contains(err.Error(), "出现 2 次") {
+		t.Fatalf("expected multiplicity error, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Error("draft must remain unchanged")
+	}
+}
+
+func TestPolishDraft_EditListOverlap(t *testing.T) {
+	draft := mechCleanDraft("她站在窗前，望着远处。")
+	st := setupPolishStore(t, 1, draft)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
+			[2]string{"她站在窗前", "a"},
+			[2]string{"在窗前，望着", "b"},
+		))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil || !strings.Contains(err.Error(), "重叠") {
+		t.Fatalf("expected overlap error, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Error("draft must remain unchanged")
+	}
+}
+
+// TestPolishDraft_EditListInvalidNthAtomic：第 N 条无效 → 整批拒绝，
+// 前 N-1 条合法 edit 也绝不落盘（原子性）。
+func TestPolishDraft_EditListInvalidNthAtomic(t *testing.T) {
+	draft := mechCleanDraft("她站在窗前。他坐在桌边。猫趴在角落。")
+	st := setupPolishStore(t, 1, draft)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
+			[2]string{"她站在窗前。", "她倚窗而立。"},
+			[2]string{"他坐在桌边。", "他立在门前。"},
+			[2]string{"不存在的片段", "x"},
+			[2]string{"猫趴在角落。", "猫蜷在窗台。"},
+		))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil || !strings.Contains(err.Error(), "不存在") {
+		t.Fatalf("expected error on invalid 3rd edit, got: %v", err)
+	}
+	// 前两条合法 edit 未落盘：草稿保持原样。
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Fatalf("draft must remain unchanged (atomic): got %q", saved)
+	}
+	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
+		t.Error("no polish checkpoint after atomic failure")
+	}
+}
+
+func TestPolishDraft_EditListTooManyEdits(t *testing.T) {
+	draft := mechCleanDraft("草稿。")
+	st := setupPolishStore(t, 1, draft)
+	items := make([]string, 0, maxPolishEdits+1)
+	for i := 0; i < maxPolishEdits+1; i++ {
+		items = append(items, fmt.Sprintf(`{"old_string":"x%d","new_string":"y%d"}`, i, i))
+	}
+	body := `{"version":1,"edits":[` + strings.Join(items, ",") + `]}`
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(body)}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil || !strings.Contains(err.Error(), "超过上限") {
+		t.Fatalf("expected count-limit error, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Error("draft must remain unchanged")
+	}
+}
+
+func TestPolishDraft_EditListOutputTooLong(t *testing.T) {
+	st := setupPolishStore(t, 1, "甲乙")
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"甲", strings.Repeat("长", maxPolishOutputRunes+1)}))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil || !strings.Contains(err.Error(), "超过上限") {
+		t.Fatalf("expected output-length error, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != "甲乙" {
+		t.Error("draft must remain unchanged")
+	}
+	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
+		t.Error("no polish checkpoint after length failure")
+	}
+}
+
+// ── 机械回归门禁与连续拒绝收敛（循环 B） ────────────────────────────────
+
+// TestPolishDraft_EditListMechanicalRegressionRejected：输入 clean、edit 引入
+// 禁词（"不知为何"是系统默认 forbidden phrase）→ 机械回归拒绝，fail-closed：
+// 草稿不变、无 checkpoint、错误明确区分"机械回归"、不混入 Degraded=true。
+func TestPolishDraft_EditListMechanicalRegressionRejected(t *testing.T) {
+	draft := mechCleanDraft("她停住了，望着远处。")
+	st := setupPolishStore(t, 1, draft)
+	savePermissiveUserRules(t, st)
+	// 前置断言：输入确实无 error 级机械违规（门禁激活的前提）。
+	if hasErrorViolations(computeMechanicalViolations(st, draft, utf8.RuneCountInString(draft))) {
+		t.Fatal("test precondition: input draft must be mechanically clean")
+	}
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"她停住了", "她不知为何停住了"}))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("expected mechanical-regression rejection")
+	}
+	if !strings.Contains(err.Error(), "机械回归") {
+		t.Errorf("expected mechanical-regression error, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Error("draft must remain unchanged")
+	}
+	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
+		t.Error("no polish checkpoint after mechanical regression rejection")
+	}
+}
+
+// TestPolishDraft_EditListMechanicalRegressionConverges：连续第 2 次机械回归拒绝
+// → 写 rejected 性质 polish checkpoint（Degraded=true + ErrorCategory=
+// mechanical_regression，Digest=当前草稿、Changed=false）→ 返回成功摘要（FSM
+// 收敛到 post-check），草稿始终不变。
+func TestPolishDraft_EditListMechanicalRegressionConverges(t *testing.T) {
+	draft := mechCleanDraft("她停住了，望着远处。")
+	st := setupPolishStore(t, 1, draft)
+	savePermissiveUserRules(t, st)
+	badEdit := editListJSON([2]string{"她停住了", "她不知为何停住了"})
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(badEdit)}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	// 第 1 次：fail-closed。
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil || !strings.Contains(err.Error(), "机械回归") {
+		t.Fatalf("first rejection must fail-closed, got: %v", err)
+	}
+	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
+		t.Fatal("no checkpoint after first rejection")
+	}
+
+	// 第 2 次：收敛为 rejected checkpoint。
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("second rejection must converge (no error), got: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || output.ErrorCategory != "mechanical_regression" {
+		t.Fatalf("converged output must be degraded(mechanical_regression), got %+v", output)
+	}
+	if output.Changed || output.OutputDigest != domain.DigestDraft(draft) {
+		t.Fatalf("converged output must report changed=false with current digest, got %+v", output)
+	}
+	if !output.Polished {
+		t.Error("converged output must report polished=true (工具完成留痕，调用方继续 post-check)")
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Error("draft must remain unchanged even after convergence")
+	}
+	cp := polishCheckpointOf(t, st, 1)
+	if !cp.Degraded || cp.ErrorCategory != "mechanical_regression" {
+		t.Errorf("rejected checkpoint must be degraded(mechanical_regression), got %+v", cp)
+	}
+	if cp.Digest != domain.DigestDraft(draft) || cp.Changed {
+		t.Errorf("rejected checkpoint must bind current digest with changed=false, got %+v", cp)
+	}
+	if cp.Method != "edit_list" || cp.EditCount != 1 {
+		t.Errorf("rejected checkpoint method/edit_count wrong: %s/%d", cp.Method, cp.EditCount)
+	}
+
+	// 第 3 次：收敛后计数清零，重新 fail-closed（防无限收敛）。
+	_, err = tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil || !strings.Contains(err.Error(), "机械回归") {
+		t.Fatalf("after convergence streak resets; 3rd rejection must fail-closed, got: %v", err)
+	}
+	if n := polishCheckpointCount(t, st, 1); n != 1 {
+		t.Errorf("polish checkpoints = %d, want exactly 1 (rejected)", n)
+	}
+}
+
+// ── FSM 集成：edit 路径与章节状态机 ────────────────────────────────────
+
+// TestPolishDraft_EditListFSMIntegration：check → polish(edit list) → 必须再次
+// check（needs_post_polish_check，review 被拒）→ check → needs_review；之后普通
+// edit 修改草稿 → check 后 polish 变 stale → needs_polish（postPolishEdit 语义
+// 原样生效）。
+func TestPolishDraft_EditListFSMIntegration(t *testing.T) {
+	st := fsmEnabledStore(t, 1, "她站在窗前，望着远处的灯火。")
+	cfg := fsmEnabledCfg()
+
+	checkTool := NewCheckConsistencyTool(st)
+	checkTool.SetChapterFSMConfig(cfg)
+
+	// 1. 首次 check（draft_dirty）→ needs_polish。
+	out1, err := checkTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("check #1: %v", err)
+	}
+	var res1 map[string]any
+	if err := json.Unmarshal(out1, &res1); err != nil {
+		t.Fatal(err)
+	}
+	act1, _ := res1["required_next_action"].(map[string]any)
+	if act1 == nil || act1["action"] != ActionPolishDraft {
+		t.Fatalf("required_next_action #1 = %v, want polish_draft", act1)
+	}
+
+	// 2. edit-list polish（真实 edit 路径）。
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"她站在窗前", "她倚窗而立"}))}, nil
+	})
+	polishTool := newEnabledPolishTool(st, polisher)
+	polishTool.SetChapterFSMConfig(cfg)
+	pOut, err := polishTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("polish: %v", err)
+	}
+	var pRes PolishDraftOutput
+	if err := json.Unmarshal(pOut, &pRes); err != nil {
+		t.Fatal(err)
+	}
+	if !pRes.Polished || !pRes.Changed {
+		t.Fatalf("polish result = %+v, want polished+changed", pRes)
+	}
+	polishCP := polishCheckpointOf(t, st, 1)
+	if polishCP.Method != "edit_list" {
+		t.Errorf("checkpoint method = %q, want edit_list", polishCP.Method)
+	}
+
+	// 3. FSM：精修产生新候选（digest 变 → consistency stale）→ draft_dirty，
+	//    review/commit 被拒（必须重新 check；consistency seq > polish seq 之后
+	//    才允许 review）。
+	decision, err := ResolveChapterStage(st, 1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Stage != ChapterStageDraftDirty {
+		t.Fatalf("stage after changing polish = %s, want draft_dirty", decision.Stage)
+	}
+	if err := RequireChapterAction(st, 1, ChapterActionReview, cfg); err == nil ||
+		!strings.Contains(err.Error(), "check_consistency") {
+		t.Fatalf("review must be rejected before post-polish check, got: %v", err)
+	}
+
+	// 4. 重新 check（consistency seq > polish seq）→ needs_review（顺序
+	//    polish → consistency → critic 成立）。
+	out2, err := checkTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("check #2: %v", err)
+	}
+	var res2 map[string]any
+	if err := json.Unmarshal(out2, &res2); err != nil {
+		t.Fatal(err)
+	}
+	act2, _ := res2["required_next_action"].(map[string]any)
+	if act2 == nil || act2["action"] != ActionReviewStyle {
+		t.Fatalf("required_next_action #2 = %v, want review_style", act2)
+	}
+
+	// 5. 后续普通 edit（模拟 edit_chapter 修改草稿）→ check → polish stale →
+	//    needs_polish（postPolishEdit 语义原样生效）。
+	edited := "她倚窗而立，望着远处的灯火，心头一紧。她心里骂自己丢人，真不要脸。"
+	if err := st.Drafts.SaveDraft(1, edited); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("check #3 after edit: %v", err)
+	}
+	decision2, err := ResolveChapterStage(st, 1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision2.Stage != ChapterStageNeedsPolish || decision2.Required != ChapterActionPolish {
+		t.Fatalf("stage after edit+check = %s (required %s), want needs_polish/polish_draft",
+			decision2.Stage, decision2.Required)
+	}
+}
+
+// TestPolishDraft_EditListNoOpFSMNeedsPostPolishCheck：no-op polish（digest 不变）
+// 后 consistency 仍 fresh，但 consistency seq < polish seq → FSM 必须收敛到
+// needs_post_polish_check（review 被拒，required=check_consistency）；重新 check
+// 后 consistency seq > polish seq → needs_review。覆盖"edit 后需再次 check
+// （consistency seq > polish seq）"的顺序绑定。
+func TestPolishDraft_EditListNoOpFSMNeedsPostPolishCheck(t *testing.T) {
+	st := fsmEnabledStore(t, 1, "她站在窗前，望着远处的灯火。")
+	cfg := fsmEnabledCfg()
+
+	checkTool := NewCheckConsistencyTool(st)
+	checkTool.SetChapterFSMConfig(cfg)
+	if _, err := checkTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("check #1: %v", err)
+	}
+
+	// no-op edit-list polish（edits=[]，digest 不变）。
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(`{"version":1,"edits":[]}`)}, nil
+	})
+	polishTool := newEnabledPolishTool(st, polisher)
+	polishTool.SetChapterFSMConfig(cfg)
+	pOut, err := polishTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("polish: %v", err)
+	}
+	var pRes PolishDraftOutput
+	if err := json.Unmarshal(pOut, &pRes); err != nil {
+		t.Fatal(err)
+	}
+	if pRes.Changed {
+		t.Fatal("no-op polish must report changed=false")
+	}
+
+	// 顺序绑定：consistency seq <= polish seq → needs_post_polish_check，review 被拒。
+	decision, err := ResolveChapterStage(st, 1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Stage != ChapterStageNeedsPostPolishCheck {
+		t.Fatalf("stage after no-op polish = %s, want needs_post_polish_check", decision.Stage)
+	}
+	if err := RequireChapterAction(st, 1, ChapterActionReview, cfg); err == nil ||
+		!strings.Contains(err.Error(), "check_consistency") {
+		t.Fatalf("review must be rejected while consistency seq <= polish seq, got: %v", err)
+	}
+
+	// 重新 check（新 seq）→ needs_review。
+	out2, err := checkTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("check #2: %v", err)
+	}
+	var res2 map[string]any
+	if err := json.Unmarshal(out2, &res2); err != nil {
+		t.Fatal(err)
+	}
+	act2, _ := res2["required_next_action"].(map[string]any)
+	if act2 == nil || act2["action"] != ActionReviewStyle {
+		t.Fatalf("required_next_action #2 = %v, want review_style", act2)
+	}
 }

@@ -93,6 +93,8 @@ func (cs *CheckpointStore) append(scope domain.Scope, step, artifact, digest str
 		cp.Changed = polishMeta.Changed
 		cp.Degraded = polishMeta.Degraded
 		cp.ErrorCategory = polishMeta.ErrorCategory
+		cp.Method = polishMeta.Method
+		cp.EditCount = polishMeta.EditCount
 	}
 
 	data, err := json.Marshal(cp)
