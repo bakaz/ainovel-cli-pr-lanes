@@ -106,6 +106,78 @@ func TestSessionStore_NilLookup(t *testing.T) {
 	}
 }
 
+// TestSessionStore_MetaPrefersConfigKey 验证 _meta.provider 优先配置键
+// （go0/go1/go2）而非 Usage.Provider 的协议名（"openai"），协议名挪到 protocol
+// 字段——账号切换诊断的关键修复。
+func TestSessionStore_MetaPrefersConfigKey(t *testing.T) {
+	dir := t.TempDir()
+	s := NewSessionStore(newIO(dir))
+	lookup := ModelLookup(func(agentName string) (string, string) {
+		return "go0", "gpt-4o"
+	})
+	logger := s.SubAgentLogger(lookup)
+
+	logger("writer", "写第 1 章", agentcore.Message{
+		Role: agentcore.RoleAssistant,
+		Usage: &agentcore.Usage{
+			Provider: "openai", Model: "gpt-4o",
+			Input: 1000, Output: 200, CacheRead: 800, TotalTokens: 1200,
+		},
+	})
+
+	entries := readJSONL(t, filepath.Join(dir, "meta/sessions/agents/writer-ch01.jsonl"))
+	if len(entries) != 1 {
+		t.Fatalf("entries=%d want 1", len(entries))
+	}
+	meta, ok := entries[0]["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("assistant+Usage 应有 _meta, got %v", entries[0]["_meta"])
+	}
+	if meta["provider"] != "go0" {
+		t.Errorf("_meta.provider = %v, want go0（配置键）", meta["provider"])
+	}
+	if meta["protocol"] != "openai" {
+		t.Errorf("_meta.protocol = %v, want openai", meta["protocol"])
+	}
+	if meta["model"] != "gpt-4o" {
+		t.Errorf("_meta.model = %v, want gpt-4o", meta["model"])
+	}
+}
+
+// TestMergeSessionMetaPriority 验证 mergeSessionMeta 的合并优先级。
+func TestMergeSessionMetaPriority(t *testing.T) {
+	// lookup 配置键 + usage 协议名 → 配置键进 provider，协议名进 protocol
+	m := mergeSessionMeta(&sessionLogMeta{Provider: "go0", Model: "m"},
+		&sessionLogMeta{Provider: "openai", Model: "m"})
+	if m == nil || m.Provider != "go0" || m.Protocol != "openai" || m.Model != "m" {
+		t.Errorf("lookup+usage 合并异常: %+v", m)
+	}
+
+	// 无 lookup → usage 原样（旧行为）
+	m = mergeSessionMeta(nil, &sessionLogMeta{Provider: "openai", Model: "m"})
+	if m == nil || m.Provider != "openai" || m.Protocol != "" {
+		t.Errorf("仅 usage 合并异常: %+v", m)
+	}
+
+	// 无 usage → lookup
+	m = mergeSessionMeta(&sessionLogMeta{Provider: "go0", Model: "m"}, nil)
+	if m == nil || m.Provider != "go0" || m.Protocol != "" {
+		t.Errorf("仅 lookup 合并异常: %+v", m)
+	}
+
+	// 全空 → nil
+	if got := mergeSessionMeta(nil, nil); got != nil {
+		t.Errorf("全空应返回 nil, got %+v", got)
+	}
+
+	// 相同 provider（配置键恰好等于协议名）→ 不产生 protocol
+	m = mergeSessionMeta(&sessionLogMeta{Provider: "openai", Model: "m"},
+		&sessionLogMeta{Provider: "openai", Model: "m"})
+	if m == nil || m.Provider != "openai" || m.Protocol != "" {
+		t.Errorf("同名 provider 不应产生 protocol: %+v", m)
+	}
+}
+
 func makeAssistantWithUsage() agentcore.Message {
 	return agentcore.Message{
 		Role:  agentcore.RoleAssistant,

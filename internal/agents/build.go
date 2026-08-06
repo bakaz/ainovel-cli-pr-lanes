@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/voocel/agentcore"
@@ -43,6 +44,44 @@ func promptCacheBase(bookDir string) string {
 	return "nvl-" + hex.EncodeToString(sum[:6])
 }
 
+// prefixBaselineFor 计算某 agent 提示词前缀（system prompt + tools schema）的
+// 静态观测基线，供 Prefix Manifest 的分段估算使用：每次请求都会重发这段稳定
+// 前缀，缓存命中是否覆盖它可与 CacheRead 对比（仅观测，不参与路由）。
+// tools 序列化用 name/description/schema——与请求侧发送的内容同源；json.Marshal
+// 对 map 按键排序，哈希跨进程稳定。
+func prefixBaselineFor(system string, tools []agentcore.Tool) bootstrap.PrefixBaseline {
+	sysHash := sha256.Sum256([]byte(system))
+	var toolBytes []byte
+	if len(tools) > 0 {
+		entries := make([]any, 0, len(tools))
+		for _, tl := range tools {
+			entries = append(entries, map[string]any{
+				"name": tl.Name(), "desc": tl.Description(), "schema": tl.Schema(),
+			})
+		}
+		toolBytes, _ = json.Marshal(entries)
+	}
+	toolsHash := sha256.Sum256(toolBytes)
+	return bootstrap.PrefixBaseline{
+		SystemHash:      "sha256:" + hex.EncodeToString(sysHash[:8]),
+		SystemEstTokens: estTokens(len(system)),
+		ToolsHash:       "sha256:" + hex.EncodeToString(toolsHash[:8]),
+		ToolsEstTokens:  estTokens(len(toolBytes)),
+	}
+}
+
+// estTokens 粗估 token 数：UTF-8 字节数 / 4（中英混合正文的经验近似，1 token
+// ≈ 4 字节）。只用于观测估算，不参与任何计费或路由。
+func estTokens(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	if t := n / 4; t > 0 {
+		return t
+	}
+	return 1
+}
+
 // subagentMaxRetries 是所有 Worker 的 LLM retry 上限。
 // 退避策略：指数退避（受 maxDelay 上限约束），优先服从 server Retry-After。
 // retryable 错误（stream-idle / 503 / 短暂网络抖动）在 Worker 层就近重试，
@@ -50,11 +89,62 @@ func promptCacheBase(bookDir string) string {
 // 项目铁律一保证写类工具走 checkpoint+digest 幂等，重试是安全的。
 const subagentMaxRetries = 7
 
-// UsageRecorder 是 BuildWorkers 可选的用量回调；签名与 OnMessage 一致，
-// 每条 agent 消息都会调一次，由 Host 层负责聚合。task 是本次 spawn 的任务文本
-// 作为会话身份，供缓存链断裂检测按会话重置基线。
+// UsageRecorder 是 BuildWorkers 可选的用量回调；每条带 Usage 的模型响应都会
+// 调一次，由 Host 层负责聚合。
+//   - runID 是本次 spawn 的实例标识（agentcore RunMeta.InstanceID，形如
+//     "writer#7"，与 prompt cache key 追加的 #seq 是同一个 runSeq 拼出来的），
+//     Prefix Manifest 据此区分同一 task 的多次 spawn（缓存血缘精确归因）；
+//   - task 是本次 spawn 的任务文本，作为会话身份供缓存链断裂检测按会话重置基线。
+//
 // nil 表示不追踪。
-type UsageRecorder func(agentName, task string, msg agentcore.AgentMessage)
+type UsageRecorder func(agentName, task, runID string, msg agentcore.AgentMessage)
+
+// runUsageObserver 把 agentcore 每次 spawn 的实例标识绑定到该 run 内每条
+// 模型响应上，透传给 UsageRecorder 作为 Prefix Manifest 的 RunID。
+//
+// 背景：manifest 的 RunID 若只按 task 文本哈希，同一任务被再次 spawn 时会
+// 被误判为同一 run（真实 cache key 已追加 #seq），RequestIndex 跨 run 累计，
+// 缓存血缘诊断失真。agentcore 的 Run 事件带 RunMeta.InstanceID
+// （= agentName#runSeq，与 prompt cache key 的 #seq 是同一个 runSeq 拼出来
+// 的），经 Runner.SetEventObserver 可拿到，故在此透传。
+//
+// task 文本从 run 首条 user 消息（AgentLoop 注入的任务消息）捕获；后续
+// steering / length-recovery 注入的 user 消息不覆盖（task 非空即锁定）。
+// 事件语义：EventModelResponse 在每次模型调用完成后恰好发一条，携带该次
+// 响应的 assistant 消息（含 Usage）——与 OnMessage 的 assistant 消息一一对应。
+//
+// 并发：每个 Runner 独立安装一个 observer 实例；同一 Runner 的 run 串行
+// 消费事件，mu 仅兜底异常路径。
+type runUsageObserver struct {
+	mu       sync.Mutex
+	instance string
+	task     string
+	record   UsageRecorder
+}
+
+func newRunUsageObserver(record UsageRecorder) *runUsageObserver {
+	return &runUsageObserver{record: record}
+}
+
+// OnEvent 是 Runner.SetEventObserver 的回调形态。
+func (o *runUsageObserver) OnEvent(meta subagent.RunMeta, ev agentcore.Event) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if meta.InstanceID != o.instance {
+		o.instance = meta.InstanceID
+		o.task = ""
+	}
+	switch ev.Type {
+	case agentcore.EventMessageStart:
+		if m, ok := ev.Message.(agentcore.Message); ok && m.Role == agentcore.RoleUser && o.task == "" {
+			o.task = m.TextContent()
+		}
+	case agentcore.EventModelResponse:
+		if m, ok := ev.Message.(agentcore.Message); ok {
+			o.record(meta.Agent, o.task, meta.InstanceID, m)
+		}
+	}
+}
 
 // ApplyThinking 把某具体角色的推理强度应用到 Worker（运行时 /model 调整用）。
 // architect → 两个 architect_* 子代理；writer/editor → 对应子代理。
@@ -249,17 +339,21 @@ func BuildWorkers(
 
 	// modelLookup 写入 session 时给每条 assistant 消息附 _meta:{provider,model}，
 	// 让 replay 不再依赖"当前 ModelSet"来反推历史 cost，运行中切换模型也能精确算。
+	// 数据源必须用 SelectionReport（读 failover 租约目标）：fallback 实际服务的是
+	// 备用配置键（go1），若用 CurrentSelection 只读 primary，会把 go1 的请求记成
+	// go0，甚至产生不存在的 go0/备用模型组合。局限：SelectionReport 在响应完成
+	// 后（OnMessage 时机）查询，并发 run 交错时可能读到全局最新租约目标而非本次
+	// 响应的目标——agentcore Usage 只透传协议名（openai/anthropic），项目侧无法
+	// 把配置键绑定到响应级；租约窗口（10min）内目标稳定，实际模型名仍以
+	// Usage.Model 为准。
 	modelLookup := func(agentName string) (string, string) {
 		role := agentToRole(agentName)
-		provider, name, _ := models.CurrentSelection(role)
-		return provider, name
+		rep := models.SelectionReport(role)
+		return rep.ConfigKey, rep.Model
 	}
 	baseOnMsg := store.Sessions.SubAgentLogger(modelLookup)
 	onMsg := func(agentName, task string, msg agentcore.AgentMessage) {
 		baseOnMsg(agentName, task, msg)
-		if recordUsage != nil {
-			recordUsage(agentName, task, msg)
-		}
 	}
 
 	// 提示词缓存：一书一基、一角色一名、一会话一键（subagent spawn 追加 #seq）。
@@ -519,7 +613,29 @@ func BuildWorkers(
 	// 把嵌套调用的 polisher runner 挂到早期注入 writer 工具集的 polish_draft 实例上。
 	polishDraft.SetPolisherRunner(polisherRunner, polisherPromptHash)
 
+	// 注册提示词前缀观测基线（Prefix Manifest 的分段估算数据源）：system prompt
+	// 与 tools schema 是每次请求都会重发的稳定前缀；basis/draft 是工具动态产出，
+	// 由 usage manifest 用 Input/CacheRead 的跨请求增量推断边界（见 domain.PrefixManifest）。
+	// 注意 writerTools 已是最终列表（已追加 review_style / polish_draft）。
+	models.SetAgentPrefixBaseline("architect_short", prefixBaselineFor(architectShort.SystemPrompt, architectShortTools))
+	models.SetAgentPrefixBaseline("architect_long", prefixBaselineFor(architectLong.SystemPrompt, architectLongTools))
+	models.SetAgentPrefixBaseline("writer", prefixBaselineFor(writer.SystemPrompt, writerTools))
+	models.SetAgentPrefixBaseline("editor", prefixBaselineFor(editor.SystemPrompt, editorTools))
+	models.SetAgentPrefixBaseline("polisher", prefixBaselineFor(polisher.SystemPrompt, polisherTools))
+	models.SetAgentPrefixBaseline("style_critic", prefixBaselineFor(criticCfg.SystemPrompt, nil))
+
 	subagentRunner := subagent.NewRunner(architectShort, architectLong, writer, editor, polisher)
+
+	// 用量记录改由 run observer 驱动：OnMessage 回调没有 run 实例标识，而
+	// RunMeta.InstanceID（= agent#runSeq，与 prompt cache key 的 #seq 同源）
+	// 只有事件流能拿到——故每个 runner 挂一个独立 observer，把 InstanceID 透传
+	// 给 UsageRecorder（Prefix Manifest 的 RunID 据此对齐真实缓存血统；task 由
+	// observer 从 run 首条 user 消息捕获）。session 日志仍走 OnMessage 路径。
+	if recordUsage != nil {
+		for _, r := range []*subagent.Runner{criticRunner, polisherRunner, subagentRunner} {
+			r.SetEventObserver(newRunUsageObserver(recordUsage).OnEvent)
+		}
+	}
 
 	// 运行时联动各角色推理强度(经 subagentRunner override;/model 调整用)。
 	applyThinking := func(role string, level agentcore.ThinkingLevel) {

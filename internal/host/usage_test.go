@@ -4,10 +4,15 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/voocel/agentcore"
+	"github.com/voocel/ainovel-cli/internal/bootstrap"
+	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/models"
+	storepkg "github.com/voocel/ainovel-cli/internal/store"
 )
 
 func TestUsageTrackerReplaySessionsReadsWorkerLogs(t *testing.T) {
@@ -512,5 +517,338 @@ func TestCacheBreakDetection(t *testing.T) {
 	snap := tk.Snapshot()
 	if snap.Overall.CacheBreaks != 2 || snap.PerAgent["writer"].CacheBreaks != 2 {
 		t.Fatalf("断裂计数应进快照：overall=%d writer=%d", snap.Overall.CacheBreaks, snap.PerAgent["writer"].CacheBreaks)
+	}
+}
+
+// TestUsageTracker_PrefixManifestAppended 验证每次请求落一条 Prefix Manifest
+// 到 meta/prefix_manifest.jsonl，字段来源正确（modelSet=nil 时配置键为空）。
+func TestUsageTracker_PrefixManifestAppended(t *testing.T) {
+	dir := t.TempDir()
+	st := storepkg.NewStore(dir)
+	tk := NewUsageTracker(nil, st)
+
+	tk.Record("writer", "写第 1 章", agentcore.Message{
+		Role: agentcore.RoleAssistant,
+		Usage: &agentcore.Usage{
+			Provider: "openai", Model: "gpt-4o",
+			Input: 5000, CacheRead: 4000, Output: 100,
+		},
+	})
+	tk.Record("writer", "写第 1 章", agentcore.Message{
+		Role: agentcore.RoleAssistant,
+		Usage: &agentcore.Usage{
+			Provider: "openai", Model: "gpt-4o",
+			Input: 5200, CacheRead: 4800, Output: 100,
+		},
+	})
+
+	data, err := os.ReadFile(filepath.Join(dir, "meta/prefix_manifest.jsonl"))
+	if err != nil {
+		t.Fatalf("读 manifest: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("manifest 行数 = %d, want 2\n%s", len(lines), data)
+	}
+	var pm1, pm2 domain.PrefixManifest
+	if err := json.Unmarshal([]byte(lines[0]), &pm1); err != nil {
+		t.Fatalf("unmarshal pm1: %v", err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &pm2); err != nil {
+		t.Fatalf("unmarshal pm2: %v", err)
+	}
+
+	if pm1.Role != "writer" || pm1.RequestIndex != 1 || pm2.RequestIndex != 2 {
+		t.Errorf("role/request_index = (%s,%d)/(%s,%d)", pm1.Role, pm1.RequestIndex, pm2.Role, pm2.RequestIndex)
+	}
+	if pm1.RunID == "" || pm1.RunID != pm2.RunID {
+		t.Errorf("同 task 的 RunID 应稳定非空：%q vs %q", pm1.RunID, pm2.RunID)
+	}
+	if pm1.ProtocolProvider != "openai" || pm1.Model != "gpt-4o" {
+		t.Errorf("协议/model = %s/%s", pm1.ProtocolProvider, pm1.Model)
+	}
+	if pm1.ProviderConfigKey != "" {
+		t.Errorf("modelSet=nil 时配置键应为空，got %q", pm1.ProviderConfigKey)
+	}
+	if pm1.CacheMissTokens != 1000 || pm2.CacheMissTokens != 400 {
+		t.Errorf("cache_miss = %d/%d, want 1000/400", pm1.CacheMissTokens, pm2.CacheMissTokens)
+	}
+	if pm2.Gap <= 0 {
+		t.Errorf("第二条 Gap 应 > 0，got %v", pm2.Gap)
+	}
+	if pm1.Status != "ok" || pm1.InputTokens != 5000 || pm1.CacheReadTokens != 4000 {
+		t.Errorf("基础字段异常：%+v", pm1)
+	}
+}
+
+// TestUsageTracker_PrefixManifestWithModelSet 验证 manifest 携带配置键
+// （go0/go1）、failover epoch 与静态前缀基线（system/tools）。
+func TestUsageTracker_PrefixManifestWithModelSet(t *testing.T) {
+	cfg := bootstrap.Config{
+		Provider:  "go0",
+		ModelName: "model-a",
+		Providers: map[string]bootstrap.ProviderConfig{
+			"go0": {Type: "openai", APIKey: "sk-x"},
+			"go1": {Type: "openai", APIKey: "sk-y"},
+		},
+		Roles: map[string]bootstrap.RoleConfig{
+			"writer": {Provider: "go0", Model: "model-a",
+				Fallbacks: []bootstrap.ModelRef{{Provider: "go1", Model: "model-b"}}},
+		},
+	}
+	ms, err := bootstrap.NewModelSet(cfg)
+	if err != nil {
+		t.Fatalf("NewModelSet: %v", err)
+	}
+	ms.SetAgentPrefixBaseline("writer", bootstrap.PrefixBaseline{
+		SystemHash: "s1", SystemEstTokens: 100, ToolsHash: "t1", ToolsEstTokens: 200,
+	})
+
+	dir := t.TempDir()
+	st := storepkg.NewStore(dir)
+	tk := NewUsageTracker(ms, st)
+	tk.Record("writer", "写第 1 章", agentcore.Message{
+		Role: agentcore.RoleAssistant,
+		Usage: &agentcore.Usage{
+			Provider: "openai", Model: "model-a",
+			Input: 5000, CacheRead: 3000, Output: 100,
+		},
+	})
+
+	data, err := os.ReadFile(filepath.Join(dir, "meta/prefix_manifest.jsonl"))
+	if err != nil {
+		t.Fatalf("读 manifest: %v", err)
+	}
+	var pm domain.PrefixManifest
+	if err := json.Unmarshal(data, &pm); err != nil {
+		t.Fatalf("unmarshal manifest: %v", err)
+	}
+	if pm.ProviderConfigKey != "go0" {
+		t.Errorf("ProviderConfigKey = %q, want go0", pm.ProviderConfigKey)
+	}
+	if pm.ProtocolProvider != "openai" || pm.FailoverEpoch != 1 {
+		t.Errorf("protocol/epoch = %s/%d, want openai/1", pm.ProtocolProvider, pm.FailoverEpoch)
+	}
+	if pm.SystemHash != "s1" || pm.SystemEstTokens != 100 || pm.ToolsHash != "t1" || pm.ToolsEstTokens != 200 {
+		t.Errorf("基线字段异常：%+v", pm)
+	}
+}
+
+// TestUsageTracker_StyleCriticFailoverAttribution 是 ora-1 中-2 必补测试：
+// style_critic 必须归一为 critic role——critic 由备用账号（go1）服务时，
+// SelectionReport 与 manifest 的 provider_config_key/failover_epoch 必须记
+// go1/2，而不是回落 default（go0/1）。此前 agentRoleName 只归一 architect_*，
+// style_critic 回落 default 导致 manifest、cacheBreak 告警、live 成本全记到
+// primary 账号（agents.agentToRole 已归一，host 侧漏了同一映射）。
+func TestUsageTracker_StyleCriticFailoverAttribution(t *testing.T) {
+	cfg := bootstrap.Config{
+		Provider:  "go0",
+		ModelName: "model-a",
+		Providers: map[string]bootstrap.ProviderConfig{
+			"go0": {Type: "openai", APIKey: "sk-x"},
+			"go1": {Type: "openai", APIKey: "sk-y"},
+		},
+		Roles: map[string]bootstrap.RoleConfig{
+			"critic": {Provider: "go0", Model: "model-a",
+				Fallbacks: []bootstrap.ModelRef{{Provider: "go1", Model: "model-b"}}},
+		},
+	}
+	ms, err := bootstrap.NewModelSet(cfg)
+	if err != nil {
+		t.Fatalf("NewModelSet: %v", err)
+	}
+	// 登记 failover wrapper（SelectionReport 需要）并模拟 critic failover：
+	// 亲和推到备用 go1（epoch 2）。
+	ms.ForRoleWithFailover("critic", nil)
+	ms.SetFailoverAffinityForTest("critic", 1)
+
+	// 归一名 + SelectionReport 端到端：style_critic 必须命中 critic 的亲和目标
+	if got := agentRoleName("style_critic"); got != "critic" {
+		t.Fatalf("agentRoleName(style_critic) = %q, want critic", got)
+	}
+	rep := ms.SelectionReport(agentRoleName("style_critic"))
+	if rep.ConfigKey != "go1" || rep.Epoch != 2 {
+		t.Fatalf("critic failover 后 SelectionReport = %+v, want go1/epoch 2", rep)
+	}
+
+	// manifest 端到端：Record("style_critic") 走 agentRoleName → critic →
+	// SelectionReport → 备用账号归因
+	dir := t.TempDir()
+	st := storepkg.NewStore(dir)
+	tk := NewUsageTracker(ms, st)
+	tk.Record("style_critic", "评第 1 章", makeUsageMsg(3000, 2000, 0, 100))
+
+	data, err := os.ReadFile(filepath.Join(dir, "meta/prefix_manifest.jsonl"))
+	if err != nil {
+		t.Fatalf("读 manifest: %v", err)
+	}
+	var pm domain.PrefixManifest
+	if err := json.Unmarshal(data, &pm); err != nil {
+		t.Fatalf("unmarshal manifest: %v", err)
+	}
+	if pm.Role != "critic" {
+		t.Errorf("manifest role = %q, want critic（style_critic 归一）", pm.Role)
+	}
+	if pm.ProviderConfigKey != "go1" || pm.FailoverEpoch != 2 {
+		t.Errorf("manifest 归因 = %q/epoch %d, want go1/2（critic 由备用账号服务）",
+			pm.ProviderConfigKey, pm.FailoverEpoch)
+	}
+}
+
+// TestCacheBreakHint 验证归因修正：5m TTL 只对 Anthropic 协议路径保留，
+// 未知 provider 长间隔 → TTL 未知，短间隔 → 路由漂移/逐出。
+func TestCacheBreakHint(t *testing.T) {
+	cases := []struct {
+		gap      time.Duration
+		protocol string
+		model    string
+		want     string
+	}{
+		{2 * time.Minute, "openai", "gpt-4o", "疑似路由漂移或逐出（短间隔 miss，非 TTL 过期）"},
+		{10 * time.Minute, "openai", "gpt-4o", "长间隔后 miss，TTL 未知（非 Anthropic 5m 契约路径）"},
+		{10 * time.Minute, "anthropic", "claude-sonnet-4-6", "疑似 5m TTL 过期"},
+		{2 * time.Hour, "anthropic", "claude-sonnet-4-6", "疑似 1h TTL 过期"},
+		{2 * time.Minute, "anthropic", "claude-sonnet-4-6", "疑似服务端逐出/路由漂移（中转站轮询上游是常见原因）"},
+		{10 * time.Minute, "", "claude-3-5-sonnet", "疑似 5m TTL 过期"}, // 仅模型名识别 Anthropic
+	}
+	for _, c := range cases {
+		if got := cacheBreakHint(c.gap, c.protocol, c.model); got != c.want {
+			t.Errorf("cacheBreakHint(%v, %q, %q) = %q, want %q", c.gap, c.protocol, c.model, got, c.want)
+		}
+	}
+}
+
+// TestIsAnthropicProtocol 验证协议识别覆盖协议名与模型名前缀两种路径。
+func TestIsAnthropicProtocol(t *testing.T) {
+	if !isAnthropicProtocol("anthropic", "claude-sonnet") {
+		t.Error("anthropic 协议应识别")
+	}
+	if !isAnthropicProtocol("openai", "claude-3-5-sonnet") {
+		t.Error("claude 模型名前缀应识别")
+	}
+	if isAnthropicProtocol("openai", "gpt-4o") {
+		t.Error("openai/gpt 不应识别为 anthropic")
+	}
+	if isAnthropicProtocol("", "gpt-4o") {
+		t.Error("空协议/非 claude 模型不应识别")
+	}
+}
+
+// TestRunIDForTask 验证 run 标识对同 task 稳定、不同 task 不同、空 task 为空。
+func TestRunIDForTask(t *testing.T) {
+	a := runIDForTask("写第 1 章")
+	b := runIDForTask("写第 1 章")
+	c := runIDForTask("写第 2 章")
+	if a == "" || a != b {
+		t.Errorf("同 task 应稳定非空：%q vs %q", a, b)
+	}
+	if a == c {
+		t.Errorf("不同 task 应不同：%q vs %q", a, c)
+	}
+	if runIDForTask("") != "" {
+		t.Error("空 task 应返回空 run id")
+	}
+}
+
+// TestEffectiveRunID 验证透传的 runID 优先；未透传退回 task 哈希。
+func TestEffectiveRunID(t *testing.T) {
+	if got := effectiveRunID("writer#3", "写第 1 章"); got != "writer#3" {
+		t.Errorf("透传 runID 应原样使用, got %q", got)
+	}
+	fallback := effectiveRunID("", "写第 1 章")
+	if fallback == "" || fallback != runIDForTask("写第 1 章") {
+		t.Errorf("空 runID 应退回 task 哈希, got %q", fallback)
+	}
+}
+
+// TestUsageTracker_ManifestRunIDDistinctPerSpawn 验证（ora-1 必补测试 6）：
+// 同一 task 的两次独立 spawn 必须使用不同 RunID，且 RequestIndex 各自从 1
+// 重新计数——此前 RunID 只是 task 文本哈希，同任务再 spawn 时 manifest 视为
+// 同一 run，RequestIndex 继续累计，缓存血缘诊断失真。
+// runID 来自 agentcore RunMeta.InstanceID（agent#runSeq，与 prompt cache key
+// 的 #seq 同源）。
+func TestUsageTracker_ManifestRunIDDistinctPerSpawn(t *testing.T) {
+	dir := t.TempDir()
+	st := storepkg.NewStore(dir)
+	tk := NewUsageTracker(nil, st)
+
+	msg := func() agentcore.AgentMessage {
+		return agentcore.Message{
+			Role: agentcore.RoleAssistant,
+			Usage: &agentcore.Usage{
+				Provider: "openai", Model: "gpt-4o",
+				Input: 5000, CacheRead: 4000, Output: 100,
+			},
+		}
+	}
+	// 第一次 spawn：两条请求（同一 run 内 RequestIndex 递增）。
+	tk.RecordRun("writer", "写第 1 章", "writer#3", msg())
+	tk.RecordRun("writer", "写第 1 章", "writer#3", msg())
+	// 同一 task 第二次 spawn：新 InstanceID。
+	tk.RecordRun("writer", "写第 1 章", "writer#4", msg())
+
+	data, err := os.ReadFile(filepath.Join(dir, "meta/prefix_manifest.jsonl"))
+	if err != nil {
+		t.Fatalf("读 manifest: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("manifest 行数 = %d, want 3", len(lines))
+	}
+	var runs [3]domain.PrefixManifest
+	for i, ln := range lines {
+		if err := json.Unmarshal([]byte(ln), &runs[i]); err != nil {
+			t.Fatalf("unmarshal %d: %v", i, err)
+		}
+	}
+	// 同一 spawn 内 RunID 稳定、RequestIndex 递增。
+	if runs[0].RunID != "writer#3" || runs[1].RunID != "writer#3" {
+		t.Errorf("同 spawn RunID 应稳定：%q / %q", runs[0].RunID, runs[1].RunID)
+	}
+	if runs[0].RequestIndex != 1 || runs[1].RequestIndex != 2 {
+		t.Errorf("同 spawn RequestIndex 应 1,2：%d, %d", runs[0].RequestIndex, runs[1].RequestIndex)
+	}
+	// 新 spawn：RunID 不同，RequestIndex 重新从 1 开始。
+	if runs[2].RunID == runs[0].RunID {
+		t.Errorf("不同 spawn RunID 必须不同：%q", runs[2].RunID)
+	}
+	if runs[2].RequestIndex != 1 {
+		t.Errorf("新 spawn RequestIndex 应重新从 1 开始, got %d", runs[2].RequestIndex)
+	}
+}
+
+// TestCacheBreak_RunIDChangeResetsBaseline 验证同 task 换 spawn（runID 变化）
+// 时缓存链基线重置——换 spawn = 新缓存血统，与换 task 语义一致。此前只按
+// task 重置，同一任务第二次 spawn 的首请求会误跟上一 spawn 的末请求比较。
+func TestCacheBreak_RunIDChangeResetsBaseline(t *testing.T) {
+	tk := NewUsageTracker(nil, nil)
+
+	tk.RecordRun("writer", "写第 1 章", "writer#3", makeUsageMsg(30000, 28000, 0, 100))
+	tk.RecordRun("writer", "写第 1 章", "writer#3", makeUsageMsg(34000, 4096, 0, 100))
+	if got := tk.OverallCacheBreaks(); got != 1 {
+		t.Fatalf("同 spawn 内断裂应检测, got %d", got)
+	}
+
+	// 新 spawn 首请求：即使命中骤降（28k→0）也不比较不告警。
+	tk.RecordRun("writer", "写第 1 章", "writer#4", makeUsageMsg(40000, 0, 0, 100))
+	if got := tk.OverallCacheBreaks(); got != 1 {
+		t.Fatalf("换 spawn 应重置基线不告警, got %d", got)
+	}
+
+	// 新 spawn 内再次断裂 → 正常告警。
+	tk.RecordRun("writer", "写第 1 章", "writer#4", makeUsageMsg(45000, 38000, 0, 100))
+	tk.RecordRun("writer", "写第 1 章", "writer#4", makeUsageMsg(48000, 5000, 0, 100))
+	if got := tk.OverallCacheBreaks(); got != 2 {
+		t.Fatalf("新 spawn 内断裂应正常检测, got %d", got)
+	}
+}
+
+// TestMissTokensClamped 验证 miss = input - cache_read，下限 0。
+func TestMissTokensClamped(t *testing.T) {
+	if got := missTokens(100, 60); got != 40 {
+		t.Errorf("missTokens(100, 60) = %d, want 40", got)
+	}
+	if got := missTokens(50, 100); got != 0 {
+		t.Errorf("missTokens(50, 100) = %d, want 0", got)
 	}
 }

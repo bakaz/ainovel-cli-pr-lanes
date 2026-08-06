@@ -2,6 +2,8 @@ package host
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -31,7 +33,8 @@ const (
 // UsageTracker 累计整个会话所有 agent 的 LLM 输入/输出 token 与美元成本。
 //
 // 工作机制：
-//   - 每次 agent 的 OnMessage 回调触发时调用 Record(agentName, msg)
+//   - 每次 agent 的模型响应完成（agentcore EventModelResponse 事件）时，
+//     agents.BuildWorkers 的 run observer 调用 RecordRun(agentName, task, runID, msg)
 //   - agentName 映射到 role（architect_* 归一为 architect），查 ModelSet 当前该 role 绑定的模型
 //   - 用 models.DefaultRegistry 查模型价格，按非缓存输入/输出/缓存读/缓存写四项累乘
 //   - 注册表无此模型时，退回 msg.Usage.Cost.Total（provider 自带，可能为 0）
@@ -78,6 +81,11 @@ type UsageTracker struct {
 	// onMissingUsage 在首次发现"assistant 消息无 Usage"时调用一次（与 slog warn
 	// 同时机）。预算启用时这意味着计费盲区——成本恒 0、预算永不触发，必须喊人。
 	onMissingUsage func()
+
+	// manifestIdx / manifestLast 是 Prefix Manifest 的 per-(role,task) 请求序号
+	// 与上次请求时间，用于 RequestIndex 与 Gap 字段（仅内存，随进程丢弃）。
+	manifestIdx  map[string]int
+	manifestLast map[string]time.Time
 }
 
 // usageSample 是单次 OnMessage 的命中样本，仅记录命中率分子分母。
@@ -89,11 +97,14 @@ type usageSample struct {
 // cacheTrackState 是一个 role 当前会话的缓存链基线。task（spawn 任务文本）是
 // 会话身份：换 task = 新 spawn = 新缓存血统（prompt_cache_key 带 #seq），首请求
 // 命中低是常态，直接换基线不比较——否则"上一会话很短、新会话首请求前缀反而更长"
-// 时会误报断裂。Input 语义（含 CacheRead，见 computeCost 注释）恰好等于"服务端
-// 处理的前缀长度"，据此可区分三种走向：前缀缩短 = 会话内压缩（合法，重置基线）；
+// 时会误报断裂。runID（agentcore RunMeta.InstanceID，与 #seq 同源）进一步区分
+// 同一 task 的再次 spawn：换 runID 同样换基线，避免跨 spawn 比较。
+// Input 语义（含 CacheRead，见 computeCost 注释）恰好等于"服务端处理的前缀
+// 长度"，据此可区分三种走向：前缀缩短 = 会话内压缩（合法，重置基线）；
 // 前缀增长且命中跟涨 = 链路健康；前缀增长而命中骤降 = 断裂。
 type cacheTrackState struct {
 	task          string
+	runID         string
 	lastPrefix    int
 	lastCacheRead int
 	lastAt        time.Time
@@ -127,13 +138,25 @@ func NewUsageTracker(set *bootstrap.ModelSet, store *storepkg.Store) *UsageTrack
 	}
 }
 
-// Record 把一条 agent 消息分发到累加 / 诊断两条路径。
+// Record 是 UsageRecorder 的兼容入口（runID 未知的旧路径/测试）：委托
+// RecordRun，runID 为空时 manifest 退回 task 文本哈希（见 effectiveRunID）。
+func (t *UsageTracker) Record(agentName, task string, msg agentcore.AgentMessage) {
+	t.RecordRun(agentName, task, "", msg)
+}
+
+// RecordRun 把一条 agent 消息分发到累加 / 诊断两条路径。
+//
+// runID 是本次 spawn 的实例标识（agentcore RunMeta.InstanceID，形如
+// "writer#7"，与 prompt cache key 追加的 #seq 是同一个 runSeq 拼出来的）。
+// Prefix Manifest 用它区分同一 task 的多次 spawn——否则 RunID 只是 task 文本
+// 哈希，同任务再 spawn 时 manifest 视为同一 run，RequestIndex 跨 run 累计，
+// 缓存血缘诊断失真。空串时退回 task 哈希（兼容直接 Record 的调用方）。
 //
 // 累加只看 Usage 是否存在——"哪条消息带 Usage" 是 agentcore/litellm adapter
 // 装配细节（上游协议把 usage 放在响应顶层），未来装配规则变了也不用动这里。
 // 诊断要求 Role=Assistant 且 Content 非空，避免 AbortMsg / 异常恢复 / tool /
 // user 消息污染 missingAssistantUsage 计数。
-func (t *UsageTracker) Record(agentName, task string, msg agentcore.AgentMessage) {
+func (t *UsageTracker) RecordRun(agentName, task, runID string, msg agentcore.AgentMessage) {
 	if t == nil {
 		return
 	}
@@ -148,26 +171,30 @@ func (t *UsageTracker) Record(agentName, task string, msg agentcore.AgentMessage
 		return
 	}
 	role := agentRoleName(agentName)
-	t.noteCacheBreak(role, task, *m.Usage)
+	// 先解析 provider/model 再归因——归因需要知道是否 Anthropic 协议路径
+	//（唯一有明确 5m 缓存契约的协议）才能给"5m TTL 过期"结论。
 	provider, modelName := usageActualModel(m.Usage)
+	t.noteCacheBreak(role, task, runID, provider, modelName, *m.Usage)
 	t.accumulate(role, provider, modelName, *m.Usage)
+	t.recordManifest(agentName, task, runID, m.Usage)
 }
 
 // noteCacheBreak 是缓存链断裂检测（纯观测，不修复，只在 live Record 路径调用）。
 //
-// 判定：同一会话（role+task）内前缀（Input，含 CacheRead）未缩短，而命中量较上次
-// 下降 >5% 且降幅 ≥2000 tokens。task 变化 = 新 spawn = 新缓存血统，直接换基线不
-// 比较；前缀缩短说明是上下文压缩，属合法下降，只重置基线不告警。归因按优先级给
-// 提示：间隔超过 TTL → 疑似过期；间隔很短且客户端字节本应稳定 → 疑似服务端逐出/
-// 路由漂移（中转站轮询上游是常见原因）。
-func (t *UsageTracker) noteCacheBreak(role, task string, u agentcore.Usage) {
+// 判定：同一会话（role+task+run）内前缀（Input，含 CacheRead）未缩短，而命中量
+// 较上次下降 >5% 且降幅 ≥2000 tokens。task 或 runID 变化 = 新 spawn = 新缓存
+// 血统，直接换基线不比较；前缀缩短说明是上下文压缩，属合法下降，只重置基线不
+// 告警。归因按优先级给提示：Anthropic 协议路径（明确 5m 契约）长间隔 → TTL
+// 过期；未知 provider 长间隔 → "TTL 未知"；短间隔 → 疑似路由漂移/服务端逐出。
+// 日志附当前配置键与 failover epoch，便于把断裂与账号切换对齐。
+func (t *UsageTracker) noteCacheBreak(role, task, runID, provider, modelName string, u agentcore.Usage) {
 	now := time.Now()
 	prefix := u.Input // litellm 各 provider 保证 Input 含 CacheRead
 
 	t.mu.Lock()
 	st := t.cacheTrack[role]
-	if st == nil || st.task != task {
-		t.cacheTrack[role] = &cacheTrackState{task: task, lastPrefix: prefix, lastCacheRead: u.CacheRead, lastAt: now}
+	if st == nil || st.task != task || st.runID != runID {
+		t.cacheTrack[role] = &cacheTrackState{task: task, runID: runID, lastPrefix: prefix, lastCacheRead: u.CacheRead, lastAt: now}
 		t.mu.Unlock()
 		return
 	}
@@ -192,18 +219,155 @@ func (t *UsageTracker) noteCacheBreak(role, task string, u agentcore.Usage) {
 		return
 	}
 	gap := now.Sub(prevAt).Round(time.Second)
-	hint := "疑似服务端逐出/路由漂移（中转站轮询上游是常见原因）"
-	if gap > time.Hour {
-		hint = "疑似 1h TTL 过期"
-	} else if gap > 5*time.Minute {
-		hint = "疑似 5m TTL 过期"
+	protocol := strings.TrimSpace(provider)
+	cfgKey, epoch := "", 0
+	if t.modelSet != nil {
+		rep := t.modelSet.SelectionReport(role)
+		if protocol == "" {
+			protocol = rep.Protocol
+		}
+		cfgKey, epoch = rep.ConfigKey, rep.Epoch
 	}
+	hint := cacheBreakHint(gap, protocol, modelName)
 	slog.Warn("缓存链断裂：前缀未缩短而命中骤降",
 		"module", "usage", "role", role,
+		"provider_key", cfgKey, "failover_epoch", epoch, "protocol", protocol,
 		"cache_read", fmt.Sprintf("%d→%d", prevRead, u.CacheRead),
 		"prefix", fmt.Sprintf("%d→%d", prevPrefix, prefix),
 		"gap", gap.String(), "hint", hint)
 	t.notifyDirty()
+}
+
+// cacheBreakHint 按 provider 的 TTL 契约归因缓存链断裂。
+// Anthropic 协议路径有明确 5m 缓存契约，长间隔可归因为 TTL 过期；其它 provider
+// 的 TTL 未知——长间隔 miss 只报"TTL 未知"，短间隔 miss 更可能是路由漂移或
+// 服务端逐出（客户端自造轮询是常见诱因）。
+func cacheBreakHint(gap time.Duration, protocol, modelName string) string {
+	if isAnthropicProtocol(protocol, modelName) {
+		switch {
+		case gap > time.Hour:
+			return "疑似 1h TTL 过期"
+		case gap > 5*time.Minute:
+			return "疑似 5m TTL 过期"
+		}
+		return "疑似服务端逐出/路由漂移（中转站轮询上游是常见原因）"
+	}
+	if gap > 5*time.Minute {
+		return "长间隔后 miss，TTL 未知（非 Anthropic 5m 契约路径）"
+	}
+	return "疑似路由漂移或逐出（短间隔 miss，非 TTL 过期）"
+}
+
+// isAnthropicProtocol 判断是否走 Anthropic 协议路径（唯一有明确 5m 缓存契约
+// 的协议）：协议名含 anthropic 或模型名以 claude 开头。
+func isAnthropicProtocol(protocol, modelName string) bool {
+	p := strings.ToLower(protocol)
+	m := strings.ToLower(modelName)
+	return strings.Contains(p, "anthropic") || strings.HasPrefix(m, "claude")
+}
+
+// recordManifest 为一次请求落一条 Prefix Manifest 到 meta/prefix_manifest.jsonl
+// （append-only，只记 hash 与 token 数，不记正文）。数据源：
+//   - Usage 的 input/cache_read + provider/model（协议名）
+//   - ModelSet.SelectionReport：配置键（go0/go1）+ 协议类型 + failover epoch
+//   - 静态前缀基线（system/tools hash + 估算 token）：agents.BuildWorkers 注册
+//   - RequestIndex / Gap：本 tracker 按 (role, task, run) 内存维护
+//
+// runID 是本次 spawn 的实例标识（agentcore RunMeta.InstanceID，与 prompt cache
+// key 的 #seq 同源）；空串时退回 task 文本哈希（兼容直接 Record 的调用方）。
+func (t *UsageTracker) recordManifest(agentName, task, runID string, u *agentcore.Usage) {
+	if t == nil || t.store == nil || u == nil {
+		return
+	}
+	role := agentRoleName(agentName)
+
+	var rep bootstrap.SelectionReport
+	if t.modelSet != nil {
+		rep = t.modelSet.SelectionReport(role)
+	}
+	protocol := strings.TrimSpace(u.Provider)
+	if protocol == "" {
+		protocol = rep.Protocol
+	}
+	model := strings.TrimSpace(u.Model)
+	if model == "" {
+		model = rep.Model
+	}
+
+	// RequestIndex 按 (role, task, run) 计数：同一次 spawn 内递增，换 spawn
+	// 重新从 1 开始——RunID 现在区分 spawn，序号必须跟着 run 对齐。
+	key := role + "\x00" + task + "\x00" + runID
+	var gap time.Duration
+	reqIdx := 0
+	t.mu.Lock()
+	if t.manifestIdx == nil {
+		t.manifestIdx = make(map[string]int)
+		t.manifestLast = make(map[string]time.Time)
+	}
+	t.manifestIdx[key]++
+	reqIdx = t.manifestIdx[key]
+	if prev, ok := t.manifestLast[key]; ok {
+		gap = time.Since(prev).Round(time.Millisecond)
+	}
+	t.manifestLast[key] = time.Now()
+	t.mu.Unlock()
+
+	pm := domain.PrefixManifest{
+		Role:              role,
+		RunID:             effectiveRunID(runID, task),
+		RequestIndex:      reqIdx,
+		ProviderConfigKey: rep.ConfigKey,
+		ProtocolProvider:  protocol,
+		Model:             model,
+		FailoverEpoch:     rep.Epoch,
+		InputTokens:       u.Input,
+		CacheReadTokens:   u.CacheRead,
+		CacheMissTokens:   missTokens(u.Input, u.CacheRead),
+		Gap:               gap,
+		Status:            "ok",
+	}
+	if t.modelSet != nil {
+		if b := t.modelSet.AgentPrefixBaseline(agentName); b.SystemHash != "" || b.ToolsHash != "" {
+			pm.SystemHash = b.SystemHash
+			pm.SystemEstTokens = b.SystemEstTokens
+			pm.ToolsHash = b.ToolsHash
+			pm.ToolsEstTokens = b.ToolsEstTokens
+		}
+	}
+	if err := t.store.PrefixManifest.Append(pm); err != nil {
+		slog.Warn("prefix manifest 落盘失败", "module", "usage", "role", role, "err", err)
+	}
+}
+
+// effectiveRunID 优先使用调用方透传的 run 实例标识（agentcore
+// RunMeta.InstanceID，形如 "writer#7"——与 prompt cache key 追加的 #seq 是
+// 同一个 runSeq 拼出来的，诊断时可直接对齐真实缓存血统）；未透传（直接
+// Record 的旧路径/测试）时退回 task 文本哈希。
+func effectiveRunID(runID, task string) string {
+	if runID != "" {
+		return runID
+	}
+	return runIDForTask(task)
+}
+
+// runIDForTask 从任务文本派生 run 标识（sha256 前缀），仅在调用方未透传 run
+// 实例标识（effectiveRunID 的 fallback）时使用。
+// 注意：同一 task 多次 spawn 会得到相同哈希——真实路径经 RecordRun 透传
+// InstanceID（agent#seq）区分 spawn，此函数只是兼容旧入口与测试。
+func runIDForTask(task string) string {
+	if task == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(task))
+	return "task:" + hex.EncodeToString(sum[:6])
+}
+
+// missTokens 返回本次请求的未命中 token（Input 减 CacheRead，下限 0）。
+func missTokens(input, cacheRead int) int {
+	if m := input - cacheRead; m > 0 {
+		return m
+	}
+	return 0
 }
 
 func usageActualModel(u *agentcore.Usage) (provider, modelName string) {
@@ -299,17 +463,19 @@ func (t *UsageTracker) SetOnCost(cb func(total float64)) {
 func (t *UsageTracker) effectiveModel(role, provider, modelName string) (string, string) {
 	provider = strings.TrimSpace(provider)
 	modelName = strings.TrimSpace(modelName)
-	if modelName == "" {
-		if t != nil && t.modelSet != nil {
-			p, m, _ := t.modelSet.CurrentSelection(role)
-			return p, m
-		}
-		return "", ""
-	}
-	if provider == "" && t != nil && t.modelSet != nil {
-		p, m, _ := t.modelSet.CurrentSelection(role)
-		if m == modelName {
-			provider = p
+	if t != nil && t.modelSet != nil {
+		// 配置键优先：role 当前生效选择（含 failover 租约目标）与本次调用模型
+		// 一致时，用配置键（go0/go1/go2）作为 provider 维度——Usage.Provider
+		// 只是协议名（"openai"），无法区分账号。不一致（如 failover 瞬时、模型
+		// 与选择不匹配）时退回 Usage.Provider，账号级真相以 Prefix Manifest 为准。
+		rep := t.modelSet.SelectionReport(role)
+		if rep.Model != "" {
+			if modelName == "" {
+				return rep.ConfigKey, rep.Model
+			}
+			if rep.Model == modelName {
+				provider = rep.ConfigKey
+			}
 		}
 	}
 	return provider, modelName
@@ -720,10 +886,17 @@ func (t *UsageTracker) resolveCost(modelName string, u agentcore.Usage) (cost, s
 }
 
 // agentRoleName 把 subagent 名字归一到 role 名。
-// architect_short/mid/long 都归到 architect；其他原样返回。
+// architect_short/mid/long 都归到 architect；style_critic 归到 critic；
+// 其他原样返回。与 agents.agentToRole 对齐（build 与 host 互不依赖故各持一份）——
+// 缺失 style_critic 映射会让 SelectionReport 回落 default：critic 由备用账号
+// 服务时 manifest 的 provider_config_key/failover_epoch、cacheBreak 告警、live
+// 成本全记到 primary 账号。
 func agentRoleName(agentName string) string {
 	if strings.HasPrefix(agentName, "architect_") {
 		return "architect"
+	}
+	if agentName == "style_critic" {
+		return "critic"
 	}
 	return agentName
 }
