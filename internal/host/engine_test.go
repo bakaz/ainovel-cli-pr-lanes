@@ -26,6 +26,7 @@ import (
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/flow"
 	"github.com/voocel/ainovel-cli/internal/projectprofile"
+	"github.com/voocel/ainovel-cli/internal/rules"
 	storepkg "github.com/voocel/ainovel-cli/internal/store"
 	"github.com/voocel/ainovel-cli/internal/tools"
 )
@@ -202,8 +203,11 @@ func newTestEngine(t *testing.T, st *storepkg.Store, workers *subagent.Runner, a
 		failurePrompt:   "sys",
 		planStartPrompt: "sys",
 		style:           "default",
-		observer:        obs,
-		refresh:         func() {},
+		// 与生产一致注入完整 FSM 配置（pipeline 开启；需要模型一致性校验的
+		// 场景由具体测试覆盖 e.fsmConfig）。
+		fsmConfig: tools.ChapterFSMConfig{Enabled: true, PipelineEnabled: true},
+		observer:  obs,
+		refresh:   func() {},
 		emitEvent: func(ev Event) {
 			mu.Lock()
 			*events = append(*events, ev)
@@ -753,6 +757,242 @@ func TestEngine_MaxTurnsReflectionInjectedAndBudgetBoundary(t *testing.T) {
 	}
 	if _, ok := e.maxTurnsRetries[key]; ok {
 		t.Fatal("额度耗尽后计数必须清除")
+	}
+}
+
+// ── P0-1:反思提示按 Required action 生成唯一动作 ──────────────────────
+
+// savePermissiveUserRules 放宽 chapter_words 阈值,避免测试短草稿触发机械
+// error 而落到 needs_edit(与 internal/tools 测试同款前置;FSM 判定仅关心
+// error 级违规,机械检查本身不被绕过)。
+func savePermissiveUserRules(t *testing.T, st *storepkg.Store) {
+	t.Helper()
+	snap := rules.BuildSnapshot([]rules.Candidate{
+		rules.SystemDefaults(),
+		{Source: "test", Structured: rules.Structured{ChapterWords: &rules.WordRange{Min: 0, Max: 100000}}},
+	})
+	if err := st.UserRules.Save(&snap); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// reflectionReviewStageStore 构造 needs_review 现场：草稿已存在、consistency
+// checkpoint 与草稿 digest 匹配（fresh）、pipeline 精修记录合法且 seq 更早、
+// critic 模式空账本 → required=review_style。
+func reflectionReviewStageStore(t *testing.T) *storepkg.Store {
+	t.Helper()
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("反思提示试书", 1); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("phase: %v", err)
+	}
+	savePermissiveUserRules(t, st)
+	const draft = "第1章的正文段落。她心里骂自己丢人，真不要脸。"
+	d := domain.DigestDraft(draft)
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatalf("draft: %v", err)
+	}
+	// 先 polish 后 consistency：保证 LatestConsistency.Seq > LatestPolish.Seq，
+	// 通过 post-polish check 段，进入 critic 评审段。
+	if _, err := st.Checkpoints.AppendPolish(domain.ChapterScope(1), "polish", "", d,
+		domain.PolishCheckpointMeta{Stage: "draft", Changed: false}); err != nil {
+		t.Fatalf("polish checkpoint: %v", err)
+	}
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "", d); err != nil {
+		t.Fatalf("consistency checkpoint: %v", err)
+	}
+	return st
+}
+
+// TestEngine_MaxTurnsReflectionRequiredBranchHints 反思提示必须按 Required action
+// 生成唯一动作：needs_review 场景提示 review_style 并禁止直接提交，不得再出现
+// 与 FSM 拦截（review_style 阶段 commit 被拒）自相矛盾的"直接提交当前最佳草稿"。
+func TestEngine_MaxTurnsReflectionRequiredBranchHints(t *testing.T) {
+	st := reflectionReviewStageStore(t)
+	e, _, _ := newTestEngine(t, st, subagent.NewRunner(), nil)
+	// 必须在 newTestEngine 之后设置：RunMeta.Init 会清空 style mode。
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("style mode: %v", err)
+	}
+	if d, err := tools.ResolveChapterStage(st, 1, e.fsmConfig); err != nil || d.Stage != tools.ChapterStageNeedsReview {
+		t.Fatalf("前置条件: 应为 needs_review, got stage=%s err=%v", d.Stage, err)
+	}
+
+	inst := &flow.Instruction{Agent: "writer", Task: "写第 1 章", Chapter: 1}
+	refl := e.buildMaxTurnsReflection(inst, 1, &agentcore.MaxTurnsError{Limit: 45})
+
+	for _, want := range []string{"needs_review", "当前唯一动作", "review_style(chapter=1)", "禁止直接提交"} {
+		if !strings.Contains(refl, want) {
+			t.Fatalf("needs_review 反思应包含 %q, got: %s", want, refl)
+		}
+	}
+	for _, banned := range []string{"直接提交当前最佳草稿", "可直接提交", "直接收敛到提交", "跳过该工具"} {
+		if strings.Contains(refl, banned) {
+			t.Fatalf("needs_review 反思不得包含 %q（与 FSM 拒绝提交矛盾）, got: %s", banned, refl)
+		}
+	}
+}
+
+// TestEngine_MaxTurnsReflectionCommitBranchHint needs_commit 场景的唯一动作提示
+// 允许提交（与 FSM 一致，仅此阶段可 commit）。
+func TestEngine_MaxTurnsReflectionCommitBranchHint(t *testing.T) {
+	st := reflectionReviewStageStore(t)
+	e, _, _ := newTestEngine(t, st, subagent.NewRunner(), nil)
+	// 直接以 needs_commit 结束的 ledger：terminal 且绑定当前候选。
+	draftText, err := st.Drafts.LoadDraft(1)
+	if err != nil || draftText == "" {
+		t.Fatalf("load draft: %v", err)
+	}
+	d := domain.DigestDraft(draftText)
+	now := time.Now().Format(time.RFC3339)
+	later := time.Now().Add(2 * time.Second).Format(time.RFC3339)
+	if err := st.StyleReview.Save(domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, AttemptID: "a1", CreatedAt: now,
+				Request:     &domain.StyleReviewRequest{Prompt: "p", Model: "m"},
+				DraftDigest: d, BasisDigest: d},
+			{Cycle: 2, Status: domain.ReviewStatusAcceptedInitial, AttemptID: "a1", CreatedAt: later,
+				Request:     &domain.StyleReviewRequest{Prompt: "p", Model: "m"},
+				Result:      &domain.StyleReviewResult{Verdict: domain.ReviewVerdictPass, Evidence: "e"},
+				DraftDigest: d, BasisDigest: d},
+		},
+	}); err != nil {
+		t.Fatalf("ledger: %v", err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("style mode: %v", err)
+	}
+	if d, err := tools.ResolveChapterStage(st, 1, e.fsmConfig); err != nil || d.Stage != tools.ChapterStageNeedsCommit {
+		t.Fatalf("前置条件: 应为 needs_commit, got stage=%s err=%v", d.Stage, err)
+	}
+
+	inst := &flow.Instruction{Agent: "writer", Task: "写第 1 章", Chapter: 1}
+	refl := e.buildMaxTurnsReflection(inst, 1, &agentcore.MaxTurnsError{Limit: 45})
+
+	for _, want := range []string{"needs_commit", "可直接提交", "commit_chapter(chapter=1)"} {
+		if !strings.Contains(refl, want) {
+			t.Fatalf("needs_commit 反思应包含 %q, got: %s", want, refl)
+		}
+	}
+	for _, banned := range []string{"禁止直接提交", "禁止 edit_chapter/commit_chapter", "升级人工"} {
+		if strings.Contains(refl, banned) {
+			t.Fatalf("needs_commit 反思不得包含 %q, got: %s", banned, refl)
+		}
+	}
+}
+
+// TestEngine_MaxTurnsReflectionBlockedHint blocked 阶段无 required：反思必须
+// 停止自动重试并升级人工，不得给出任何继续写作/提交的提示。
+func TestEngine_MaxTurnsReflectionBlockedHint(t *testing.T) {
+	const ch = 1
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("blocked 试书", 3); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("phase: %v", err)
+	}
+	e, _, _ := newTestEngine(t, st, subagent.NewRunner(), nil)
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("style mode: %v", err)
+	}
+	if err := st.StyleReview.Save(*exhaustedLedger(ch)); err != nil {
+		t.Fatalf("ledger: %v", err)
+	}
+	if d, err := tools.ResolveChapterStage(st, ch, e.fsmConfig); err != nil || d.Stage != tools.ChapterStageBlocked {
+		t.Fatalf("前置条件: 应为 blocked, got stage=%s err=%v", d.Stage, err)
+	}
+
+	inst := &flow.Instruction{Agent: "writer", Task: "写第 1 章", Chapter: ch}
+	refl := e.buildMaxTurnsReflection(inst, 1, &agentcore.MaxTurnsError{Limit: 45})
+
+	for _, want := range []string{"blocked", "停止自动重试并升级人工"} {
+		if !strings.Contains(refl, want) {
+			t.Fatalf("blocked 反思应包含 %q, got: %s", want, refl)
+		}
+	}
+	for _, banned := range []string{"可直接提交", "直接收敛到提交", "当前唯一动作"} {
+		if strings.Contains(refl, banned) {
+			t.Fatalf("blocked 反思不得包含 %q, got: %s", banned, refl)
+		}
+	}
+}
+
+// TestEngine_MaxTurnsReflectionUsesFullFSMConfig P0-2：反思解析必须用与生产
+// 工具一致的完整 FSM 配置。构造 ExpectedPolisherModel 场景：polish 记录模型
+// 不匹配 → 完整配置判定 needs_polish；残缺配置（缺 PipelineEnabled）则误判
+// needs_review——正是生产日志"required=review_style 却 commit 被拒"的根因。
+func TestEngine_MaxTurnsReflectionUsesFullFSMConfig(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := st.Progress.Init("完整配置试书", 1); err != nil {
+		t.Fatalf("progress: %v", err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatalf("phase: %v", err)
+	}
+	savePermissiveUserRules(t, st)
+	const draft = "第1章的正文段落。她心里骂自己丢人，真不要脸。"
+	d := domain.DigestDraft(draft)
+	if err := st.Drafts.SaveDraft(1, draft); err != nil {
+		t.Fatalf("draft: %v", err)
+	}
+	// polish 记录模型与 ExpectedPolisherModel 不一致 → 完整配置判 needs_polish。
+	if _, err := st.Checkpoints.AppendPolish(domain.ChapterScope(1), "polish", "", d,
+		domain.PolishCheckpointMeta{Stage: "draft", PolisherModel: "other-model", Changed: false}); err != nil {
+		t.Fatalf("polish checkpoint: %v", err)
+	}
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "", d); err != nil {
+		t.Fatalf("consistency checkpoint: %v", err)
+	}
+	e, _, _ := newTestEngine(t, st, subagent.NewRunner(), nil)
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("style mode: %v", err)
+	}
+
+	// 残缺配置（修复前 engine 所用）：PipelineEnabled=false → 跳过 pipeline 段，
+	// 误判 needs_review——证明修复前后判定确实分歧。
+	broken, err := tools.ResolveChapterStage(st, 1, tools.ChapterFSMConfig{Enabled: true})
+	if err != nil {
+		t.Fatalf("resolve broken cfg: %v", err)
+	}
+	if broken.Stage != tools.ChapterStageNeedsReview {
+		t.Fatalf("残缺配置应误判 needs_review（分歧前提）, got stage=%s", broken.Stage)
+	}
+
+	// 完整配置（与 BuildWorkers 注入一致）：polish 模型不匹配 → needs_polish。
+	full := tools.ChapterFSMConfig{
+		Enabled: true, PipelineEnabled: true, ExpectedPolisherModel: "expected-polisher",
+	}
+	if want, err := tools.ResolveChapterStage(st, 1, full); err != nil {
+		t.Fatalf("resolve full cfg: %v", err)
+	} else if want.Stage != tools.ChapterStageNeedsPolish {
+		t.Fatalf("完整配置应判 needs_polish, got stage=%s", want.Stage)
+	}
+	e.fsmConfig = full
+	inst := &flow.Instruction{Agent: "writer", Task: "写第 1 章", Chapter: 1}
+	refl := e.buildMaxTurnsReflection(inst, 1, &agentcore.MaxTurnsError{Limit: 45})
+
+	for _, wantText := range []string{"needs_polish", "当前唯一动作", "polish_draft(chapter=1)", "禁止 edit_chapter/commit_chapter"} {
+		if !strings.Contains(refl, wantText) {
+			t.Fatalf("反思应包含 %q, got: %s", wantText, refl)
+		}
+	}
+	for _, banned := range []string{"review_style", "可直接提交", "直接收敛到提交"} {
+		if strings.Contains(refl, banned) {
+			t.Fatalf("反思不得包含 %q（必须与完整配置一致）, got: %s", banned, refl)
+		}
 	}
 }
 

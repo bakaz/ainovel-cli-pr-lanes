@@ -268,7 +268,10 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 		failurePrompt:   bundle.Prompts.ArbiterFailure,
 		planStartPrompt: bundle.Prompts.ArbiterPlanStart,
 		style:           cfg.Style,
-		migrationCheck:  h.checkMigrationGate, // 引擎循环边界迁移门
+		// 与 BuildWorkers 注入六工具同源的完整 FSM 配置：反思/失败裁定解析的
+		// stage/required 必须与真实工具拦截一致（P0-2）。
+		fsmConfig:      agents.ChapterFSMConfigFor(cfg, models),
+		migrationCheck: h.checkMigrationGate, // 引擎循环边界迁移门
 		// 同步重询:阻塞引擎循环一次裁定(数秒),换取"干预先于后续创作生效"。
 		reconsult: h.handleIntervention,
 		observer:  h.observer,

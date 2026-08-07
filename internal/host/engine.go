@@ -85,6 +85,12 @@ type engine struct {
 	// runWorker 派发时拼进实际任务文本(一次性消费);不进 inst.Task,
 	// 保持 trackDeadlock 的 key 稳定。
 	pendingReflection map[string]string
+	// fsmConfig 是与生产 Writer 工具集一致的章节流水线 FSM 配置(agents 包
+	// BuildWorkers 注入六工具的同源配置,host 构造时经 ChapterFSMConfigFor 注入)。
+	// 反思与失败裁定用它解析 stage/required——残缺配置(缺 PipelineEnabled/
+	// ExpectedPolisherModel)会让反思报告的 stage 偏离真实工具拦截,产生
+	// "提示直接提交"与"FSM 拒绝提交"的自相矛盾(P0-2)。
+	fsmConfig tools.ChapterFSMConfig
 }
 
 // deadlockConsultAt / deadlockAbortAt:repeats 达到前者问 Arbiter,达到后者硬熔断。
@@ -710,8 +716,9 @@ func (e *engine) handleMaxTurnsRetry(ctx context.Context, inst *flow.Instruction
 }
 
 // buildMaxTurnsReflection 组装带反思的失败摘要,注入 max_turns 反思重试轮:
-// 上次失败原因 / FSM stage 与 required action / 草稿状态 / 按失败类型的
-// 策略提示 / 预算提示。全部字段 best-effort:store 读失败即省略,不阻断重派。
+// 上次失败原因 / FSM stage 与 required action / 草稿状态 / 按 Required action
+// 生成的唯一动作提示 / 预算提示。全部字段 best-effort:store 读失败即省略,
+// 不阻断重派。stage/required 用与生产一致的 e.fsmConfig 解析。
 func (e *engine) buildMaxTurnsReflection(inst *flow.Instruction, retry int, werr error) string {
 	var b strings.Builder
 	b.WriteString("上次执行未完成,原因: 达到轮次上限(max turns reached)")
@@ -719,7 +726,7 @@ func (e *engine) buildMaxTurnsReflection(inst *flow.Instruction, retry int, werr
 		fmt.Fprintf(&b, "; 目标章节: 第 %d 章", inst.Chapter)
 		var stage tools.ChapterStage
 		var required tools.ChapterAction
-		if d, err := tools.ResolveChapterStage(e.store, inst.Chapter, tools.ChapterFSMConfig{Enabled: true}); err == nil {
+		if d, err := tools.ResolveChapterStage(e.store, inst.Chapter, e.fsmConfig); err == nil {
 			stage, required = d.Stage, d.Required
 			if d.Reason != "" {
 				fmt.Fprintf(&b, "; 流水线判定: %s", d.Reason)
@@ -738,17 +745,29 @@ func (e *engine) buildMaxTurnsReflection(inst *flow.Instruction, retry int, werr
 				fmt.Fprintf(&b, ", 当前要求的动作: %s", required)
 			}
 		}
-		// 按失败类型的策略提示。
+		// 按 Required action 生成唯一动作提示,与 FSM 拦截的 required 严格一致,
+		// 消除"提示直接提交"与"FSM 拒绝提交"的自相矛盾(P0-1)。
 		b.WriteString("; 策略提示: ")
-		switch stage {
-		case tools.ChapterStageNeedsPolish, tools.ChapterStageNeedsPostPolishCheck,
-			tools.ChapterStageNeedsReview, tools.ChapterStageRevisionOpen:
-			b.WriteString("疑似卡在精修/评审循环——直接提交当前最佳草稿,不要再次进入修订循环")
-		case tools.ChapterStageNeedsEdit, tools.ChapterStageDraftDirty,
-			tools.ChapterStageNeedsDraft, tools.ChapterStageRewriteNotStarted:
-			b.WriteString("若某工具反复失败,跳过该工具改用替代路径")
+		switch required {
+		case tools.ChapterActionPolish:
+			fmt.Fprintf(&b, "当前唯一动作：调用 polish_draft(chapter=%d)，成功后调用一次 check_consistency，严格执行其 required_next_action。禁止 edit_chapter/commit_chapter。", inst.Chapter)
+		case tools.ChapterActionCheck:
+			fmt.Fprintf(&b, "当前唯一动作：调用 check_consistency(chapter=%d)，然后严格执行其 required_next_action。", inst.Chapter)
+		case tools.ChapterActionReview:
+			fmt.Fprintf(&b, "当前唯一动作：调用 review_style(chapter=%d)，按评审结果继续。禁止直接提交。", inst.Chapter)
+		case tools.ChapterActionEdit:
+			b.WriteString("当前唯一动作：按当前 findings 用 edit_chapter 修改，修改后调用 check_consistency。")
+		case tools.ChapterActionDraft:
+			fmt.Fprintf(&b, "当前唯一动作：调用 draft_chapter(chapter=%d, mode=write) 提供完整正文。", inst.Chapter)
+		case tools.ChapterActionCommit:
+			fmt.Fprintf(&b, "可直接提交：调用 commit_chapter(chapter=%d)（含必要参数）。", inst.Chapter)
 		default:
-			b.WriteString("直接收敛到提交,不要重复已完成的步骤")
+			// required 为空:blocked/disabled/complete 等无下一步动作的阶段。
+			if stage == tools.ChapterStageBlocked {
+				b.WriteString("当前状态 blocked：停止自动重试并升级人工。")
+			} else {
+				b.WriteString("直接收敛到提交，不要重复已完成的步骤")
+			}
 		}
 	}
 	// 预算提示:仍以配置的轮次上限执行,提示尽早收敛到提交。
@@ -823,10 +842,10 @@ func (e *engine) failureFacts(kind string, inst *flow.Instruction, errMsg string
 		f.NextChapter = p.NextChapter()
 		f.PendingQueue = p.PendingRewrites
 	}
-	// writer 目标章的 FSM 阶段与要求动作(ResolveChapterStage 现场解析;
-	// 读失败或非 writer 任务时留空,best-effort 不阻断裁定)。
+	// writer 目标章的 FSM 阶段与要求动作(ResolveChapterStage 现场解析,用与
+	// 生产一致的 e.fsmConfig;读失败或非 writer 任务时留空,best-effort 不阻断裁定)。
 	if inst.Chapter > 0 {
-		if d, err := tools.ResolveChapterStage(e.store, inst.Chapter, tools.ChapterFSMConfig{Enabled: true}); err == nil {
+		if d, err := tools.ResolveChapterStage(e.store, inst.Chapter, e.fsmConfig); err == nil {
 			f.Stage = string(d.Stage)
 			f.RequiredAction = string(d.Required)
 		}

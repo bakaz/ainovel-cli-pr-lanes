@@ -267,6 +267,25 @@ func appendSceneGuidance(prompt, guidance string) string {
 	return prompt + "\n\n" + guidance
 }
 
+// ChapterFSMConfigFor 计算章节流水线 FSM 的运行配置——BuildWorkers 注入六工具
+// 与 host 构造 Engine 时共用同一来源，保证引擎反思/失败裁定解析出的
+// stage/required 与真实工具拦截严格一致（残缺配置缺 PipelineEnabled/
+// ExpectedPolisherModel 会让反思报告的 stage 偏离生产判定）。
+func ChapterFSMConfigFor(cfg bootstrap.Config, models *bootstrap.ModelSet) tools.ChapterFSMConfig {
+	pipelineEnabled := cfg.ChapterPipelineEnabled()
+	expectedPolisherModel := ""
+	if pipelineEnabled {
+		if _, ok := cfg.Roles["polisher"]; ok {
+			_, expectedPolisherModel, _ = models.CurrentSelection("polisher")
+		}
+	}
+	return tools.ChapterFSMConfig{
+		Enabled:               true,
+		PipelineEnabled:       pipelineEnabled,
+		ExpectedPolisherModel: expectedPolisherModel,
+	}
+}
+
 // BuildWorkers 组装三个 Worker(architect_short/long、writer、editor)为可程序化
 // 调用的 subagent.Runner——Engine 直接调用其 Run(类型化入口),无 LLM 中间层
 // (docs/engine-rfc.md §1)。
@@ -297,15 +316,15 @@ func BuildWorkers(
 	// commit gate，不强制 critic mode——两者独立。pipeline 启用 + mode=off 是可接受
 	// 组合：此时 commit 的 pipeline gate 仍要求 fresh polish checkpoint（现状保留），
 	// 但评审门控（CheckCommitStyleGate）不生效。
-	pipelineEnabled := cfg.ChapterPipelineEnabled()
-	// expectedPolisherModel 提升到 BuildWorkers 作用域：pipeline 开启且 Roles 显式
-	// 配置 polisher 时记录其当前模型名，供 commit gate 与章节 FSM（polish 绑定）
-	// 共用；空 = 未显式配置（跳过模型一致性校验）。
-	expectedPolisherModel := ""
+	// 章节流水线 FSM 运行配置的单一来源（六工具注入与 host 构造 Engine 共用，
+	// 见 ChapterFSMConfigFor）。
+	fsmCfg := ChapterFSMConfigFor(cfg, models)
+	pipelineEnabled := fsmCfg.PipelineEnabled
+	// expectedPolisherModel：pipeline 开启且 Roles 显式配置 polisher 时记录其
+	// 当前模型名，供 commit gate 与章节 FSM（polish 绑定）共用；空 = 未显式
+	// 配置（跳过模型一致性校验）。
+	expectedPolisherModel := fsmCfg.ExpectedPolisherModel
 	if pipelineEnabled {
-		if _, ok := cfg.Roles["polisher"]; ok {
-			_, expectedPolisherModel, _ = models.CurrentSelection("polisher")
-		}
 		ts.commitTool.SetPolishPipeline(&tools.PolishPipelineConfig{ExpectedModel: expectedPolisherModel})
 	}
 	for _, list := range [][]agentcore.Tool{writerTools, polisherTools} {
@@ -396,11 +415,6 @@ func BuildWorkers(
 	// plan_chapter 不进 FSM（写 plan 不改正文候选 digest）。六工具均实现
 	// ChapterFSMConfigurable；其余工具（novel_context/read_chapter 等）不实现，
 	// 类型断言自动跳过。
-	fsmCfg := tools.ChapterFSMConfig{
-		Enabled:               true,
-		PipelineEnabled:       pipelineEnabled,
-		ExpectedPolisherModel: expectedPolisherModel,
-	}
 	for _, tl := range writerTools {
 		if configurable, ok := tl.(tools.ChapterFSMConfigurable); ok {
 			configurable.SetChapterFSMConfig(fsmCfg)
