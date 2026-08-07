@@ -389,8 +389,11 @@ output/novel/meta/simulation_profile.json
     "anthropic": { "api_key": "sk-ant-xxx" }
   },
   "roles": {
-    "writer": { "provider": "anthropic", "model": "claude-sonnet-4", "reasoning_effort": "high" },
-    "architect": { "provider": "openrouter", "model": "google/gemini-2.5-pro", "reasoning_effort": "low" }
+    "architect": { "provider": "openrouter", "model": "google/gemini-2.5-pro", "reasoning_effort": "high" },
+    "writer": { "provider": "anthropic", "model": "claude-sonnet-4", "reasoning_effort": "medium" },
+    "editor": { "provider": "openrouter", "model": "google/gemini-2.5-pro", "reasoning_effort": "medium" },
+    "polisher": { "provider": "anthropic", "model": "claude-sonnet-4", "reasoning_effort": "low" },
+    "critic": { "provider": "openrouter", "model": "google/gemini-2.5-flash", "reasoning_effort": "low" }
   }
 }
 ```

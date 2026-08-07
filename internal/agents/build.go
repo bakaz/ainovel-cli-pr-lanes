@@ -393,6 +393,7 @@ func BuildWorkers(
 		SystemPrompt:   bundle.Prompts.StyleCritic,
 		MaxTurns:       1,
 		MaxRetries:     subagentMaxRetries,
+		ThinkingLevel:  resolvedRoleThinking(criticModel, cfg, "critic"),
 		OnMessage:      onMsg,
 		PromptCacheKey: cacheBase + "-style_critic",
 	}
