@@ -1287,6 +1287,9 @@ func TestPolishDraft_EditListEmptyNoOp(t *testing.T) {
 	if !output.Polished || output.Changed {
 		t.Fatalf("no-op must report polished=true changed=false, got %+v", output)
 	}
+	if output.Degraded {
+		t.Fatal("empty edits must be legal no-op, NOT degraded (④: 原始空列表非 degraded)")
+	}
 	if output.InputDigest != output.OutputDigest {
 		t.Fatalf("no-op digests must match: %s vs %s", output.InputDigest, output.OutputDigest)
 	}
@@ -1295,11 +1298,12 @@ func TestPolishDraft_EditListEmptyNoOp(t *testing.T) {
 		t.Errorf("draft must remain unchanged on no-op, got %q", saved)
 	}
 	cp := polishCheckpointOf(t, st, 1)
-	if cp.Changed || cp.EditCount != 0 || cp.Method != "edit_list" {
-		t.Errorf("no-op checkpoint meta wrong: changed=%v edit_count=%d method=%q", cp.Changed, cp.EditCount, cp.Method)
+	if cp.Changed || cp.EditCount != 0 || cp.Method != "edit_list" || cp.Degraded {
+		t.Errorf("no-op checkpoint meta wrong: changed=%v edit_count=%d method=%q degraded=%v",
+			cp.Changed, cp.EditCount, cp.Method, cp.Degraded)
 	}
-	if cp.Digest != domain.DigestDraft(draft) {
-		t.Errorf("no-op checkpoint digest must equal current draft")
+	if cp.ProposedEditCount != 0 || cp.DroppedEditCount != 0 || cp.Partial {
+		t.Errorf("no-op checkpoint audit must be all zero, got %+v", cp)
 	}
 
 	// 第二次 no-op：AppendPolish 不做 digest 去重，seq 必须递增。
@@ -1400,14 +1404,13 @@ func TestPolishDraft_EditListContractVersionRejected(t *testing.T) {
 	}
 }
 
-// ── edit 路径失败：P0-4 内部有界纠错（首次失败带反馈重试 → 二次失败收敛降级） ──
+// ── edit 路径失败收敛：④ 取代 P0-4（不再触发第二次模型纠错） ────────────
 //
-// 内容校验失败（anchor 缺失/多次/重叠/超限等）不再 fail-closed 返回错误——否则
-// FSM 仍 needs_polish → writer 反复重调同一工具直到 max turns。现在工具内部
-// 重新调用 polisher 一次（附加精确纠错反馈）；仍失败 → 写 rejected/degraded
-// polish checkpoint（ErrorCategory=edit_plan_invalid / coverage_exceeded）→
-// FSM 收敛到 post-check → 返回成功摘要（Degraded=true），不再消耗 writer turns。
-// 草稿始终不变；mock polisher 每次返回相同坏计划时总调用次数恰为 2（无第 3 次）。
+// 逐条局部验证 + 按优先级部分接受：单条无效只丢弃该条；原始非空但全部被丢弃
+// （无安全 edit）→ 写 rejected/degraded polish checkpoint（ErrorCategory=
+// edit_plan_invalid / coverage_exceeded，按全部 drop reasons 判定）→ FSM 收敛到
+// post-check → 返回成功摘要（Degraded=true）。polisher 恰被调用 1 次（不再第 2
+// 次模型纠错——④ 取代 P0-4 recoverEditPlanValidation），草稿始终不变。
 
 func TestPolishDraft_EditListAnchorMissing(t *testing.T) {
 	draft := mechCleanDraft("她站在窗前，望着远处。")
@@ -1421,7 +1424,7 @@ func TestPolishDraft_EditListAnchorMissing(t *testing.T) {
 
 	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
 	if err != nil {
-		t.Fatalf("content-validation failure must converge internally (no error), got: %v", err)
+		t.Fatalf("all-rejected must converge internally (no error), got: %v", err)
 	}
 	var output PolishDraftOutput
 	if err := json.Unmarshal(out, &output); err != nil {
@@ -1433,6 +1436,12 @@ func TestPolishDraft_EditListAnchorMissing(t *testing.T) {
 	if output.Changed {
 		t.Error("converged output must report changed=false")
 	}
+	if output.DroppedEditCount != 1 || output.ProposedEditCount != 1 {
+		t.Errorf("audit proposed/dropped = %d/%d, want 1/1", output.ProposedEditCount, output.DroppedEditCount)
+	}
+	if len(output.DropReasons) != 1 || output.DropReasons[0] != "anchor_missing" {
+		t.Errorf("drop_reasons = %v, want [anchor_missing]", output.DropReasons)
+	}
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != draft {
 		t.Error("draft must remain unchanged")
@@ -1441,11 +1450,15 @@ func TestPolishDraft_EditListAnchorMissing(t *testing.T) {
 	if !cp.Degraded || cp.ErrorCategory != "edit_plan_invalid" || cp.Changed {
 		t.Errorf("rejected checkpoint must be degraded(edit_plan_invalid) changed=false, got %+v", cp)
 	}
+	if cp.EditCount != 0 || cp.ProposedEditCount != 1 || cp.DroppedEditCount != 1 {
+		t.Errorf("rejected checkpoint edit audit wrong: applied=%d proposed=%d dropped=%d",
+			cp.EditCount, cp.ProposedEditCount, cp.DroppedEditCount)
+	}
 	if cp.Digest != domain.DigestDraft(draft) {
 		t.Errorf("checkpoint digest = %s, want current draft digest", cp.Digest)
 	}
-	if calls != 2 {
-		t.Errorf("polisher calls = %d, want 2 (1 initial + 1 feedback retry, no 3rd call)", calls)
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1 (④: no second model correction call)", calls)
 	}
 }
 
@@ -1474,82 +1487,107 @@ func TestPolishDraft_EditListAnchorMultiple(t *testing.T) {
 	if saved != draft {
 		t.Error("draft must remain unchanged")
 	}
-	if calls != 2 {
-		t.Errorf("polisher calls = %d, want 2", calls)
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1", calls)
 	}
 }
 
-func TestPolishDraft_EditListOverlap(t *testing.T) {
+// 重叠的 edit：按优先级部分接受——高优先级应用、低优先级丢弃（不再整批拒绝）。
+func TestPolishDraft_EditListOverlapPartial(t *testing.T) {
 	draft := mechCleanDraft("她站在窗前，望着远处。")
 	st := setupPolishStore(t, 1, draft)
 	calls := 0
 	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
 		calls++
 		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
-			[2]string{"她站在窗前", "a"},
-			[2]string{"在窗前，望着", "b"},
+			[2]string{"她站在窗前", "她倚窗而立"},
+			[2]string{"在窗前，望着", "x"},
 		))}, nil
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
 	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
 	if err != nil {
-		t.Fatalf("must converge internally, got: %v", err)
+		t.Fatalf("overlap must be partial-accepted (no error), got: %v", err)
 	}
 	var output PolishDraftOutput
 	if err := json.Unmarshal(out, &output); err != nil {
 		t.Fatal(err)
 	}
-	if !output.Degraded || output.ErrorCategory != "edit_plan_invalid" {
-		t.Fatalf("expected degraded(edit_plan_invalid), got %+v", output)
+	if !output.Polished || !output.Changed || output.Degraded {
+		t.Fatalf("expected partial success, got %+v", output)
 	}
+	if !output.Partial || output.ProposedEditCount != 2 || output.DroppedEditCount != 1 {
+		t.Errorf("audit partial/proposed/dropped = %v/%d/%d, want true/2/1",
+			output.Partial, output.ProposedEditCount, output.DroppedEditCount)
+	}
+	if len(output.DropReasons) != 1 || output.DropReasons[0] != "overlap_lower_priority" {
+		t.Errorf("drop_reasons = %v, want [overlap_lower_priority]", output.DropReasons)
+	}
+	want := "她倚窗而立，望着远处。她心里骂自己丢人，真不要脸。"
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
-	if saved != draft {
-		t.Error("draft must remain unchanged")
+	if saved != want {
+		t.Fatalf("saved draft = %q, want %q", saved, want)
 	}
-	if calls != 2 {
-		t.Errorf("polisher calls = %d, want 2", calls)
+	cp := polishCheckpointOf(t, st, 1)
+	if cp.EditCount != 1 || cp.ProposedEditCount != 2 || cp.DroppedEditCount != 1 || !cp.Partial {
+		t.Errorf("checkpoint audit wrong: applied=%d proposed=%d dropped=%d partial=%v",
+			cp.EditCount, cp.ProposedEditCount, cp.DroppedEditCount, cp.Partial)
+	}
+	if cp.Degraded {
+		t.Error("partial success must not be degraded")
+	}
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1", calls)
 	}
 }
 
-// TestPolishDraft_EditListInvalidNthAtomic：第 N 条无效 → 整批拒绝（原子性），
-// 前 N-1 条合法 edit 也绝不落盘；随后按 P0-4 收敛降级。
-func TestPolishDraft_EditListInvalidNthAtomic(t *testing.T) {
-	draft := mechCleanDraft("她站在窗前。他坐在桌边。猫趴在角落。")
+// 第 3 条 anchor missing：前后合法 edit 仍应用（部分接受），恰一个非 degraded
+// checkpoint（EditCount=实际应用数 3）。
+func TestPolishDraft_EditListInvalidNthPartial(t *testing.T) {
+	draft := mechCleanDraft("甲乙丙丁戊己庚辛壬癸")
 	st := setupPolishStore(t, 1, draft)
 	calls := 0
 	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
 		calls++
 		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
-			[2]string{"她站在窗前。", "她倚窗而立。"},
-			[2]string{"他坐在桌边。", "他立在门前。"},
+			[2]string{"甲", "子"},
+			[2]string{"乙", "丑"},
 			[2]string{"不存在的片段", "x"},
-			[2]string{"猫趴在角落。", "猫蜷在窗台。"},
+			[2]string{"丙", "寅"},
 		))}, nil
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
 	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
 	if err != nil {
-		t.Fatalf("must converge internally, got: %v", err)
+		t.Fatalf("mid-list invalid edit must be partial-accepted, got: %v", err)
 	}
 	var output PolishDraftOutput
 	if err := json.Unmarshal(out, &output); err != nil {
 		t.Fatal(err)
 	}
-	if !output.Degraded || output.ErrorCategory != "edit_plan_invalid" {
-		t.Fatalf("expected degraded(edit_plan_invalid), got %+v", output)
+	if !output.Polished || !output.Changed || output.Degraded {
+		t.Fatalf("expected partial success, got %+v", output)
 	}
-	// 前两条合法 edit 未落盘：草稿保持原样（原子性）。
+	if !output.Partial || output.ProposedEditCount != 4 || output.DroppedEditCount != 1 {
+		t.Errorf("audit partial/proposed/dropped = %v/%d/%d, want true/4/1",
+			output.Partial, output.ProposedEditCount, output.DroppedEditCount)
+	}
+	// 第 3 条被丢弃、其余三条全部应用：EditCount = 实际应用数 = 3。
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
-	if saved != draft {
-		t.Fatalf("draft must remain unchanged (atomic): got %q", saved)
+	if saved != "子丑寅丁戊己庚辛壬癸她心里骂自己丢人，真不要脸。" {
+		t.Fatalf("saved draft = %q", saved)
 	}
 	if n := polishCheckpointCount(t, st, 1); n != 1 {
-		t.Errorf("polish checkpoints = %d, want exactly 1 (degraded)", n)
+		t.Errorf("polish checkpoints = %d, want exactly 1", n)
 	}
-	if calls != 2 {
-		t.Errorf("polisher calls = %d, want 2", calls)
+	cp := polishCheckpointOf(t, st, 1)
+	if cp.EditCount != 3 || cp.DroppedEditCount != 1 || !cp.Partial || cp.Degraded {
+		t.Errorf("checkpoint audit wrong: %+v", cp)
+	}
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1", calls)
 	}
 }
 
@@ -1583,8 +1621,8 @@ func TestPolishDraft_EditListTooManyEdits(t *testing.T) {
 	if saved != draft {
 		t.Error("draft must remain unchanged")
 	}
-	if calls != 2 {
-		t.Errorf("polisher calls = %d, want 2", calls)
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1", calls)
 	}
 }
 
@@ -1615,100 +1653,91 @@ func TestPolishDraft_EditListOutputTooLong(t *testing.T) {
 	if n := polishCheckpointCount(t, st, 1); n != 1 {
 		t.Errorf("polish checkpoints = %d, want exactly 1 (degraded)", n)
 	}
-	if calls != 2 {
-		t.Errorf("polisher calls = %d, want 2", calls)
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1", calls)
 	}
 }
 
-// ── P0-4：覆盖超限的内部有界纠错（首次带反馈重试 / 二次收敛降级） ────────
+// ── 覆盖超限：④ 部分接受/单调用收敛（取代 P0-4 带反馈重试） ──────────────
 //
-// 普通 draft 场景覆盖上限 50%（P1-6）：63% 计划首次校验失败 → 工具内部重调
-// polisher 一次并附加精确反馈（覆盖 X/Y runes、上限、只保留高优先级修改、
-// 缩小 old_string、不得重复原计划）→ 合法计划成功；连续两次相同覆盖错误 →
-// 写 rejected/degraded checkpoint（ErrorCategory=coverage_exceeded）、不再第 3
-// 次调用 polisher、草稿不变（不跑到 writer 的 max turns）。
+// 普通 draft 场景覆盖上限 50%：超限计划中"导致越线的 edit"被丢弃（部分接受），
+// 其余合法 edit 仍应用；全部被丢弃 → 写 rejected/degraded checkpoint
+// （ErrorCategory=coverage_exceeded）、polisher 恰被调用 1 次（不再第 2 次模型
+// 纠错）、草稿不变。
 
-// TestPolishDraft_EditListCoverageRetrySucceeds：首次 63% 覆盖失败 → 带反馈重试，
-// mock polisher 第 2 次返回合法计划 → 成功（polished+changed，草稿落盘为应用后
-// 文本，恰 1 个非 degraded checkpoint）。第 2 次调用任务文本含精确纠错反馈。
-func TestPolishDraft_EditListCoverageRetrySucceeds(t *testing.T) {
-	draft := mechCleanDraft("她站在窗前，望着远处的灯火。晚风拂过她的发梢。")
+// TestPolishDraft_EditListCoveragePartial：5 条 edit 中第 5 条（覆盖超限）被丢弃，
+// 第 6 条较短仍可接受 → 部分成功（EditCount=5、DroppedEditCount=1、
+// DropReasons=[coverage_limit]、Partial=true、恰 1 次 polisher 调用、非 degraded）。
+func TestPolishDraft_EditListCoveragePartial(t *testing.T) {
+	draft := mechCleanDraft("甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉")
 	st := setupPolishStore(t, 1, draft)
-	savePermissiveUserRules(t, st) // 机械门禁激活：输入 clean，候选也必须 clean
+	savePermissiveUserRules(t, st)
 	calls := 0
-	var retryTask string
-	badPlan := editListJSON([2]string{"她站在窗前，望着远处的灯火。晚风拂过她的发梢。", "她倚窗而立，望向远方的灯火。晚风拂过她的发梢。"})
-	goodPlan := editListJSON([2]string{"她站在窗前", "她倚窗而立"})
-	polisher := newMockPolisher(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
 		calls++
-		if i == 0 {
-			// 首次：覆盖 23/37 runes ≈ 62% > 50% → 内容校验失败
-			return &agentcore.LLMResponse{Message: polisherText(badPlan)}, nil
-		}
-		if len(msgs) > 0 {
-			retryTask = msgs[len(msgs)-1].TextContent()
-		}
-		return &agentcore.LLMResponse{Message: polisherText(goodPlan)}, nil
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
+			[2]string{"甲", "壹"},
+			[2]string{"乙", "贰"},
+			[2]string{"丙", "叁"},
+			[2]string{"丁", "肆"},
+			[2]string{"戊己庚辛壬癸子丑寅卯辰巳午未", "X"}, // 14 runes → 4+14=18 > 17（含填充后预算）
+			[2]string{"申", "伍"}, // 1 rune → 4+1=5 ≤ 17
+		))}, nil
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
 	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
 	if err != nil {
-		t.Fatalf("Execute must succeed after feedback retry, got: %v", err)
+		t.Fatalf("coverage-exceeding edit must be dropped individually, got: %v", err)
 	}
 	var output PolishDraftOutput
 	if err := json.Unmarshal(out, &output); err != nil {
 		t.Fatal(err)
 	}
-	if !output.Polished || !output.Changed {
-		t.Fatalf("expected polished+changed after retry, got %+v", output)
+	if !output.Polished || !output.Changed || output.Degraded {
+		t.Fatalf("expected partial success, got %+v", output)
 	}
-	if output.Degraded {
-		t.Fatal("retry success must NOT be degraded")
+	if !output.Partial || output.ProposedEditCount != 6 || output.DroppedEditCount != 1 {
+		t.Errorf("audit partial/proposed/dropped = %v/%d/%d, want true/6/1",
+			output.Partial, output.ProposedEditCount, output.DroppedEditCount)
 	}
-	want := "她倚窗而立，望着远处的灯火。晚风拂过她的发梢。她心里骂自己丢人，真不要脸。"
+	if len(output.DropReasons) != 1 || output.DropReasons[0] != "coverage_limit" {
+		t.Errorf("drop_reasons = %v, want [coverage_limit]", output.DropReasons)
+	}
+	want := "壹贰叁肆戊己庚辛壬癸子丑寅卯辰巳午未伍酉她心里骂自己丢人，真不要脸。"
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != want {
 		t.Fatalf("saved draft = %q, want %q", saved, want)
 	}
 	cp := polishCheckpointOf(t, st, 1)
-	if cp.Degraded || cp.Method != "edit_list" || cp.EditCount != 1 {
-		t.Errorf("checkpoint must be non-degraded edit_list(1), got %+v", cp)
+	if cp.EditCount != 5 || cp.DroppedEditCount != 1 || !cp.Partial || cp.Degraded {
+		t.Errorf("checkpoint audit wrong: applied=%d dropped=%d partial=%v degraded=%v",
+			cp.EditCount, cp.DroppedEditCount, cp.Partial, cp.Degraded)
 	}
-	if calls != 2 {
-		t.Errorf("polisher calls = %d, want 2 (1 initial + 1 feedback retry)", calls)
-	}
-	// 第 2 次任务文本必须含精确纠错反馈：覆盖数字、场景上限、硬约束。
-	for _, wantFrag := range []string{"上次计划无效", "覆盖 23/37 runes", "上限 50%", "只保留优先级最高的修改", "缩小 old_string", "不得重复原计划"} {
-		if !strings.Contains(retryTask, wantFrag) {
-			t.Errorf("retry task 缺少纠错反馈片段 %q\n任务文本:\n%s", wantFrag, retryTask)
-		}
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1 (no model retry for partial acceptance)", calls)
 	}
 }
 
-// TestPolishDraft_EditListCoverageConverges：连续两次相同覆盖错误 → 写
-// rejected/degraded polish checkpoint（ErrorCategory=coverage_exceeded，
-// Digest=当前草稿、Changed=false、Method=edit_list）→ 返回成功摘要
-// （Degraded=true）→ FSM 收敛；polisher 恰被调用 2 次（不再第 3 次），
-// 草稿不变——普通 draft 同 63% 场景有界降级，不跑到 45 turns。
+// TestPolishDraft_EditListCoverageConverges：单条 63% 覆盖计划（超 50% 上限）全部
+// 被丢弃 → 写 rejected/degraded polish checkpoint（ErrorCategory=coverage_exceeded，
+// Digest=当前草稿、Changed=false、Method=edit_list、EditCount=0 实际应用数、
+// ProposedEditCount=1、DropReasons=[coverage_limit]）→ 返回成功摘要（Degraded=true）
+// → FSM 收敛；polisher 恰被调用 1 次（④ 不再第 2 次模型纠错），草稿不变。
 func TestPolishDraft_EditListCoverageConverges(t *testing.T) {
 	draft := mechCleanDraft("她站在窗前，望着远处的灯火。晚风拂过她的发梢。")
 	st := setupPolishStore(t, 1, draft)
 	calls := 0
-	var retryTask string
 	badPlan := editListJSON([2]string{"她站在窗前，望着远处的灯火。晚风拂过她的发梢。", "她倚窗而立，望向远方的灯火。晚风拂过她的发梢。"})
-	polisher := newMockPolisher(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
 		calls++
-		if len(msgs) > 0 && i > 0 {
-			retryTask = msgs[len(msgs)-1].TextContent()
-		}
 		return &agentcore.LLMResponse{Message: polisherText(badPlan)}, nil
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
 	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
 	if err != nil {
-		t.Fatalf("second failure must converge (no error), got: %v", err)
+		t.Fatalf("all-dropped coverage must converge (no error), got: %v", err)
 	}
 	var output PolishDraftOutput
 	if err := json.Unmarshal(out, &output); err != nil {
@@ -1723,6 +1752,12 @@ func TestPolishDraft_EditListCoverageConverges(t *testing.T) {
 	if !output.Polished {
 		t.Error("converged output must report polished=true (工具完成留痕，调用方继续 post-check)")
 	}
+	if output.ProposedEditCount != 1 || output.DroppedEditCount != 1 {
+		t.Errorf("audit proposed/dropped = %d/%d, want 1/1", output.ProposedEditCount, output.DroppedEditCount)
+	}
+	if len(output.DropReasons) != 1 || output.DropReasons[0] != "coverage_limit" {
+		t.Errorf("drop_reasons = %v, want [coverage_limit]", output.DropReasons)
+	}
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != draft {
 		t.Error("draft must remain unchanged")
@@ -1734,18 +1769,14 @@ func TestPolishDraft_EditListCoverageConverges(t *testing.T) {
 	if cp.Digest != domain.DigestDraft(draft) {
 		t.Errorf("checkpoint digest = %s, want current draft digest", cp.Digest)
 	}
-	if cp.Method != "edit_list" || cp.EditCount != 1 {
-		t.Errorf("rejected checkpoint method/edit_count = %s/%d, want edit_list/1", cp.Method, cp.EditCount)
+	if cp.Method != "edit_list" || cp.EditCount != 0 || cp.ProposedEditCount != 1 || cp.DroppedEditCount != 1 {
+		t.Errorf("rejected checkpoint method/edit audit wrong: %+v", cp)
 	}
 	if n := polishCheckpointCount(t, st, 1); n != 1 {
 		t.Errorf("polish checkpoints = %d, want exactly 1 (degraded)", n)
 	}
-	if calls != 2 {
-		t.Errorf("polisher calls = %d, want 2 (retry once, no 3rd call — 不跑到 45 turns)", calls)
-	}
-	// 重试任务文本含覆盖纠错反馈（62% > 50%）。
-	if !strings.Contains(retryTask, "上次计划无效") || !strings.Contains(retryTask, "覆盖 23/37 runes") {
-		t.Errorf("retry task 必须含覆盖纠错反馈, got:\n%s", retryTask)
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1 (④: no second model correction call)", calls)
 	}
 }
 
@@ -2020,58 +2051,109 @@ func TestPolishDraft_FullTextMechanicalRegressionConverges(t *testing.T) {
 	}
 }
 
-// ── 机械回归门禁与连续拒绝收敛（循环 B） ────────────────────────────────
+// ── 机械回归：④ 第 6 条（责任 edit 剔除 / mechRejectStreak 收敛） ───────
+//
+// 候选引入新的 error 级机械违规时：逐条单独应用找出责任 edit → 剔除 → 重建候选。
+// 存在安全子集 → 部分接受成功（不增加 mechRejectStreak，审计记录 mechanical drop）；
+// 仍无法安全（组合违规，无法定位责任 edit）→ mechRejectStreak（首次 fail-closed，
+// 连续 2 次收敛为 rejected checkpoint，EditCount=0 实际应用数）。
 
-// TestPolishDraft_EditListMechanicalRegressionRejected：输入 clean、edit 引入
-// 禁词（"不知为何"是系统默认 forbidden phrase）→ 机械回归拒绝，fail-closed：
-// 草稿不变、无 checkpoint、错误明确区分"机械回归"、不混入 Degraded=true。
-func TestPolishDraft_EditListMechanicalRegressionRejected(t *testing.T) {
-	draft := mechCleanDraft("她停住了，望着远处。")
+// TestPolishDraft_EditListMechanicalDropKeepsOthers：三个 edit 中仅中间一个引入
+// 禁词（"不知为何"）→ 该条被剔除（mechanical），前后合法 edit 仍应用 → 部分成功
+// （Changed=true、Partial=true、DropReasons=[mechanical]、恰 1 次 polisher 调用、
+// 非 degraded、mechRejectStreak 不增加）。
+func TestPolishDraft_EditListMechanicalDropKeepsOthers(t *testing.T) {
+	draft := mechCleanDraft("她停住了，望着远处。他走近了。")
 	st := setupPolishStore(t, 1, draft)
 	savePermissiveUserRules(t, st)
-	// 前置断言：输入确实无 error 级机械违规（门禁激活的前提）。
 	if hasErrorViolations(computeMechanicalViolations(st, draft, utf8.RuneCountInString(draft))) {
 		t.Fatal("test precondition: input draft must be mechanically clean")
 	}
+	calls := 0
 	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
-		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"她停住了", "她不知为何停住了"}))}, nil
+		calls++
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
+			[2]string{"她停住了", "她缓缓停住"},
+			[2]string{"望着远处", "她不知为何望着远处"}, // 引入禁词"不知为何"
+			[2]string{"他走近了", "他快步走近"},
+		))}, nil
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
-	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
-	if err == nil {
-		t.Fatal("expected mechanical-regression rejection")
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("responsible edit must be dropped individually, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "机械回归") {
-		t.Errorf("expected mechanical-regression error, got: %v", err)
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
 	}
+	if !output.Polished || !output.Changed || output.Degraded {
+		t.Fatalf("expected partial success, got %+v", output)
+	}
+	if !output.Partial || output.ProposedEditCount != 3 || output.DroppedEditCount != 1 {
+		t.Errorf("audit partial/proposed/dropped = %v/%d/%d, want true/3/1",
+			output.Partial, output.ProposedEditCount, output.DroppedEditCount)
+	}
+	if len(output.DropReasons) != 1 || output.DropReasons[0] != "mechanical" {
+		t.Errorf("drop_reasons = %v, want [mechanical]", output.DropReasons)
+	}
+	want := "她缓缓停住，望着远处。他快步走近。她心里骂自己丢人，真不要脸。"
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
-	if saved != draft {
-		t.Error("draft must remain unchanged")
+	if saved != want {
+		t.Fatalf("saved draft = %q, want %q", saved, want)
 	}
-	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
-		t.Error("no polish checkpoint after mechanical regression rejection")
+	cp := polishCheckpointOf(t, st, 1)
+	if cp.EditCount != 2 || cp.DroppedEditCount != 1 || !cp.Partial || cp.Degraded {
+		t.Errorf("checkpoint audit wrong: applied=%d dropped=%d partial=%v degraded=%v",
+			cp.EditCount, cp.DroppedEditCount, cp.Partial, cp.Degraded)
+	}
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1", calls)
+	}
+
+	// 机械安全子集部分接受是成功路径：不增加 mechRejectStreak（下一轮同样场景
+	// 仍直接部分接受，而不是直接走到收敛）。
+	out2, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("second call must also partial-accept (streak not incremented), got: %v", err)
+	}
+	var output2 PolishDraftOutput
+	if err := json.Unmarshal(out2, &output2); err != nil {
+		t.Fatal(err)
+	}
+	if output2.Degraded {
+		t.Fatal("safe-subset success must never be degraded (streak not incremented)")
 	}
 }
 
-// TestPolishDraft_EditListMechanicalRegressionConverges：连续第 2 次机械回归拒绝
-// → 写 rejected 性质 polish checkpoint（Degraded=true + ErrorCategory=
-// mechanical_regression，Digest=当前草稿、Changed=false）→ 返回成功摘要（FSM
-// 收敛到 post-check），草稿始终不变。
-func TestPolishDraft_EditListMechanicalRegressionConverges(t *testing.T) {
-	draft := mechCleanDraft("她停住了，望着远处。")
+// TestPolishDraft_EditListMechanicalCombinationConverges：两条 edit 单独应用都
+// clean、组合后才形成"不知为何"（跨 edit 拼接的禁词）→ 无法定位责任 edit →
+// 走 mechRejectStreak：第 1 次 fail-closed；第 2 次收敛为 rejected checkpoint
+// （Degraded=true + ErrorCategory=mechanical_regression、Method=edit_list、
+// EditCount=0 实际应用数、ProposedEditCount=2、DropReasons=[mechanical]）；
+// 第 3 次（收敛后计数清零）重新 fail-closed（防无限收敛）。
+func TestPolishDraft_EditListMechanicalCombinationConverges(t *testing.T) {
+	draft := mechCleanDraft("甲乙说。")
 	st := setupPolishStore(t, 1, draft)
 	savePermissiveUserRules(t, st)
-	badEdit := editListJSON([2]string{"她停住了", "她不知为何停住了"})
+	if hasErrorViolations(computeMechanicalViolations(st, draft, utf8.RuneCountInString(draft))) {
+		t.Fatal("test precondition: input draft must be mechanically clean")
+	}
+	calls := 0
 	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
-		return &agentcore.LLMResponse{Message: polisherText(badEdit)}, nil
+		calls++
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
+			[2]string{"甲", "不知"}, // 单独应用 clean
+			[2]string{"乙", "为何"}, // 单独应用 clean；组合后"不知为何" → error 级违规
+		))}, nil
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
-	// 第 1 次：fail-closed。
+	// 第 1 次：fail-closed（组合违规无法剔除责任 edit）。
 	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
 	if err == nil || !strings.Contains(err.Error(), "机械回归") {
-		t.Fatalf("first rejection must fail-closed, got: %v", err)
+		t.Fatalf("first combination regression must fail-closed, got: %v", err)
 	}
 	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
 		t.Fatal("no checkpoint after first rejection")
@@ -2106,8 +2188,12 @@ func TestPolishDraft_EditListMechanicalRegressionConverges(t *testing.T) {
 	if cp.Digest != domain.DigestDraft(draft) || cp.Changed {
 		t.Errorf("rejected checkpoint must bind current digest with changed=false, got %+v", cp)
 	}
-	if cp.Method != "edit_list" || cp.EditCount != 1 {
-		t.Errorf("rejected checkpoint method/edit_count wrong: %s/%d", cp.Method, cp.EditCount)
+	if cp.Method != "edit_list" || cp.EditCount != 0 || cp.ProposedEditCount != 2 || cp.DroppedEditCount != 2 {
+		t.Errorf("rejected checkpoint edit audit wrong: method=%s applied=%d proposed=%d dropped=%d",
+			cp.Method, cp.EditCount, cp.ProposedEditCount, cp.DroppedEditCount)
+	}
+	if len(cp.DropReasons) != 1 || cp.DropReasons[0] != "mechanical" {
+		t.Errorf("rejected checkpoint drop_reasons = %v, want [mechanical]", cp.DropReasons)
 	}
 
 	// 第 3 次：收敛后计数清零，重新 fail-closed（防无限收敛）。
@@ -2117,6 +2203,9 @@ func TestPolishDraft_EditListMechanicalRegressionConverges(t *testing.T) {
 	}
 	if n := polishCheckpointCount(t, st, 1); n != 1 {
 		t.Errorf("polish checkpoints = %d, want exactly 1 (rejected)", n)
+	}
+	if calls != 3 {
+		t.Errorf("polisher calls = %d, want 3 (one per Execute)", calls)
 	}
 }
 
@@ -2345,5 +2434,123 @@ func TestPolishDraft_TaskBasisBeforeDraft(t *testing.T) {
 	// 草稿全文只出现一次（动态段），且位于 basis JSON 之后。
 	if strings.Count(task, draft) != 1 {
 		t.Errorf("草稿全文应恰好出现一次（动态段），实际 %d 次", strings.Count(task, draft))
+	}
+}
+
+// ── 归一化匹配（exact + normalized 两级）工具层回归 ─────────────────────
+
+// TestPolishDraft_EditListNormalizedUnique：old_string 精确缺失但白名单归一化后
+// 唯一（智能引号 vs ASCII 引号）→ normalized 定位应用成功；checkpoint 审计
+// NormalizedMatchCount=1、MatchModes=[normalized]，草稿落盘为应用后文本。
+func TestPolishDraft_EditListNormalizedUnique(t *testing.T) {
+	draft := mechCleanDraft("她说道：“你好，世界。”他说道：“再见。”这是一段保留原样的上下文，用于满足覆盖比例上限要求。")
+	st := setupPolishStore(t, 1, draft)
+	savePermissiveUserRules(t, st)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
+			[2]string{`她说道:"你好,世界."`, `她说："你好呀。"`},
+		))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Polished || !output.Changed || output.Degraded {
+		t.Fatalf("expected normalized-apply success, got %+v", output)
+	}
+	if output.NormalizedMatchCount != 1 {
+		t.Errorf("normalized_match_count = %d, want 1", output.NormalizedMatchCount)
+	}
+	if len(output.MatchModes) != 1 || output.MatchModes[0] != "normalized" {
+		t.Errorf("match_modes = %v, want [normalized]", output.MatchModes)
+	}
+	want := `她说："你好呀。"他说道：“再见。”这是一段保留原样的上下文，用于满足覆盖比例上限要求。她心里骂自己丢人，真不要脸。`
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != want {
+		t.Fatalf("saved draft = %q, want %q", saved, want)
+	}
+	cp := polishCheckpointOf(t, st, 1)
+	if cp.EditCount != 1 || cp.NormalizedMatchCount != 1 {
+		t.Errorf("checkpoint audit wrong: edit_count=%d normalized=%d", cp.EditCount, cp.NormalizedMatchCount)
+	}
+	if len(cp.MatchModes) != 1 || cp.MatchModes[0] != "normalized" {
+		t.Errorf("checkpoint match_modes = %v, want [normalized]", cp.MatchModes)
+	}
+}
+
+// ── 部分接受审计（④）：checkpoint 审计字段与正文隔离 ────────────────────
+
+// TestPolishDraft_EditListPartialCheckpointAudit：部分接受后 checkpoint 的
+// EditCount=实际应用数、ProposedEditCount/DroppedEditCount/DropReasons/Partial/
+// MatchModes 审计正确，且审计字段绝不含正文/old_string/new_string 内容。
+func TestPolishDraft_EditListPartialCheckpointAudit(t *testing.T) {
+	draft := mechCleanDraft("甲乙丙丁戊己庚辛壬癸")
+	st := setupPolishStore(t, 1, draft)
+	savePermissiveUserRules(t, st)
+	calls := 0
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
+			[2]string{"甲", "子"},
+			[2]string{"不存在的片段", "x"},
+			[2]string{"乙", "丑"},
+		))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Polished || !output.Changed || output.Degraded {
+		t.Fatalf("expected partial success, got %+v", output)
+	}
+	// EditCount == 实际应用数（2）；proposed=3、dropped=1（anchor_missing）。
+	if output.ProposedEditCount != 3 || output.DroppedEditCount != 1 || !output.Partial {
+		t.Errorf("audit proposed/dropped/partial = %d/%d/%v, want 3/1/true",
+			output.ProposedEditCount, output.DroppedEditCount, output.Partial)
+	}
+	if len(output.DropReasons) != 1 || output.DropReasons[0] != "anchor_missing" {
+		t.Errorf("drop_reasons = %v, want [anchor_missing]", output.DropReasons)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != "子丑丙丁戊己庚辛壬癸她心里骂自己丢人，真不要脸。" {
+		t.Fatalf("saved draft = %q", saved)
+	}
+	cp := polishCheckpointOf(t, st, 1)
+	if cp.EditCount != 2 || cp.ProposedEditCount != 3 || cp.DroppedEditCount != 1 || !cp.Partial {
+		t.Errorf("checkpoint edit audit wrong: %+v", cp)
+	}
+	if len(cp.DropReasons) != 1 || cp.DropReasons[0] != "anchor_missing" {
+		t.Errorf("checkpoint drop_reasons = %v, want [anchor_missing]", cp.DropReasons)
+	}
+	if len(cp.MatchModes) != 2 || cp.MatchModes[0] != "exact" || cp.MatchModes[1] != "exact" {
+		t.Errorf("checkpoint match_modes = %v, want [exact exact]", cp.MatchModes)
+	}
+	if cp.NormalizedMatchCount != 0 {
+		t.Errorf("checkpoint normalized_match_count = %d, want 0", cp.NormalizedMatchCount)
+	}
+	// 审计字段不得含正文内容（old_string/new_string/正文片段均不得出现在审计 JSON）。
+	raw, err := json.Marshal(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, frag := range []string{"不存在的片段", "子", "丑", "甲乙丙丁戊己庚辛壬癸"} {
+		if strings.Contains(string(raw), frag) {
+			t.Errorf("checkpoint 审计 JSON 不得含正文内容 %q（审计字段与正文隔离）", frag)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("polisher calls = %d, want 1", calls)
 	}
 }

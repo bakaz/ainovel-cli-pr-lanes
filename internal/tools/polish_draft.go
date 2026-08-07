@@ -134,6 +134,14 @@ type PolishDraftOutput struct {
 	// ErrorCategory 是降级原因的稳定分类（stream_idle/max_turns/timeout/network/
 	// rate_limit/overloaded），审计用。
 	ErrorCategory string `json:"error_category,omitempty"`
+	// 以下审计字段是 edit_list 路径部分接受/归一化匹配的摘要（ora-1 ④）：只含计数
+	// 与原因分类，绝不含正文/old_string/new_string 内容。仅审计用。
+	ProposedEditCount    int      `json:"proposed_edit_count,omitempty"`
+	DroppedEditCount     int      `json:"dropped_edit_count,omitempty"`
+	DropReasons          []string `json:"drop_reasons,omitempty"`
+	NormalizedMatchCount int      `json:"normalized_match_count,omitempty"`
+	Partial              bool     `json:"partial,omitempty"`
+	MatchModes           []string `json:"match_modes,omitempty"`
 }
 
 func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
@@ -187,9 +195,10 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 		return t.handlePolisherFailure(a.Chapter, inputDigest, wordCount, err)
 	}
 
-	// ── 6. 输出解析与执行路径（ora-1 形态 2）： ──
-	//    - 成功解析为 edit list → edit 路径：内存中基于同一输入快照原子应用全部
-	//      edit → 一次 SaveDraft → 一个最终 polish checkpoint（Method=edit_list）。
+	// ── 6. 输出解析与执行路径（ora-1 形态 2 + ④）： ──
+	//    - 成功解析为 edit list → edit 路径：内存中基于同一输入快照逐条验证 +
+	//      按优先级部分接受（单条无效只丢弃该条）→ 一次 SaveDraft → 一个最终
+	//      polish checkpoint（Method=edit_list、EditCount=实际应用数、审计字段）。
 	//    - 解析失败（非 JSON/围栏/未知字段/纯正文）→ 回退现有整章模式（旧协议，
 	//      渐进切换；整章模式现有校验/落盘/checkpoint 全保留）。
 	//    - 契约错误（edit plan 形状但 version 不受支持等）→ fail-closed，草稿原样、
@@ -201,7 +210,7 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 		}
 		return t.applyFullTextPolish(a.Chapter, content, wordCount, inputDigest, outputText)
 	}
-	return t.applyEditPlan(ctx, a.Chapter, content, wordCount, inputDigest, plan)
+	return t.applyEditPlan(a.Chapter, content, wordCount, inputDigest, plan)
 }
 
 // applyFullTextPolish 是整章重输出回退路径（旧协议）：polisher 输出无法解析为
@@ -257,7 +266,11 @@ func (t *PolishDraftTool) applyFullTextPolish(chapter int, content string, wordC
 	// 拒绝走与 edit 路径相同的连续收敛（mechRejectStreak 共享，Method=full_text）。
 	if !hasErrorViolations(computeMechanicalViolations(t.store, content, wordCount)) {
 		if hasErrorViolations(computeMechanicalViolations(t.store, outputText, outputRunes)) {
-			return t.handleMechanicalRegression(chapter, content, wordCount, inputDigest, "full_text", nil)
+			_, summary, mErr := t.mechanicalRegression(chapter, inputDigest, wordCount, "full_text", 0)
+			if mErr != nil {
+				return nil, mErr
+			}
+			return summary, nil
 		}
 	}
 
@@ -308,84 +321,42 @@ func (t *PolishDraftTool) applyFullTextPolish(chapter int, content string, wordC
 	})
 }
 
-// applyEditPlan 是 edit list 路径（ora-1 形态 2 主体）：校验 → 原子应用 →
-// 机械回归门禁 → 一次 SaveDraft → draft checkpoint → 一个最终 polish checkpoint
-// （Method=edit_list、EditCount=len(edits)）。任一校验失败 fail-closed：草稿原样、
-// 不写 polish checkpoint、返回明确错误（区分契约/内容/机械回归，不混入 Degraded=true）。
+// applyEditPlan 是 edit list 路径主体（ora-1 ④）：逐条局部验证 + 按优先级部分接受
+// （ApplyPolishEditPlanDetailed）→ 机械回归子流程（责任 edit 剔除，安全子集部分
+// 接受）→ 一次 SaveDraft → draft checkpoint → 一个最终 polish checkpoint
+// （Method=edit_list、EditCount=实际应用数、Partial/DropReasons/NormalizedMatchCount
+// 等审计字段）。
 //
-// P0-4 内部有界纠错：首次内容校验失败（覆盖超限/anchor 缺失等）不再直接失败返回
-// （否则 FSM 仍 needs_polish → writer 反复重调同一工具直到 max turns），而是工具
-// 内部重新调用 polisher 一次并附加精确纠错反馈（recoverEditPlanValidation）；
-// 第二次仍失败 → 写 rejected/degraded polish checkpoint（ErrorCategory=
-// coverage_exceeded / edit_plan_invalid）→ FSM 收敛到 post-check → 返回成功摘要
-// （Degraded=true），不再消耗 writer turns。
-func (t *PolishDraftTool) applyEditPlan(ctx context.Context, chapter int, content string, wordCount int, inputDigest string, plan *PolishEditPlan) (json.RawMessage, error) {
-	// ── 1. 校验 + 应用（纯函数，基于同一输入快照；无部分结果） ──
-	candidate, err := ApplyPolishEditPlan(content, plan, polishCoverageLimitForChapter(t.store, chapter))
+// 失败收敛（④ 取代 P0-4 模型纠错：不再触发第二次模型调用 recoverEditPlanValidation）：
+//   - 原始 edits=[] → 合法 no-op（非 degraded）。
+//   - 原始非空但全部被丢弃（无安全 edit）→ 写 rejected/degraded polish checkpoint
+//     （category 按全部 drop reasons 判定：coverage_exceeded / edit_plan_invalid）→
+//     FSM 收敛到 post-check → 返回成功摘要（Degraded=true）。
+//   - 机械回归且无安全子集 → mechRejectStreak（首次 fail-closed，连续 2 次收敛为
+//     rejected checkpoint）；有安全子集时不增加 streak。
+func (t *PolishDraftTool) applyEditPlan(chapter int, content string, wordCount int, inputDigest string, plan *PolishEditPlan) (json.RawMessage, error) {
+	res, err := ApplyPolishEditPlanDetailed(content, plan, polishCoverageLimitForChapter(t.store, chapter))
 	if err != nil {
-		var pe *PolishEditError
-		if !errors.As(err, &pe) || pe.Kind != PolishEditErrContent {
-			// 非内容类校验错误（未来扩展防御）：fail-closed 原样返回。
-			return nil, fmt.Errorf("polisher edit plan 校验错误：%v: %w", err, errs.ErrToolPrecondition)
-		}
-		// P0-4 首次内容校验失败：内部重调 polisher 一次（附加精确反馈）有界纠错。
-		return t.recoverEditPlanValidation(ctx, chapter, content, wordCount, inputDigest, plan, err)
+		// 全无效（原始非空且 0 应用）：degraded 收敛，不再第二次调用 polisher。
+		return t.handleEditPlanRejected(chapter, inputDigest, wordCount, res)
 	}
-	// 校验通过：机械回归门禁 + 原子落盘 + checkpoint。
-	return t.applyEditPlanCandidate(chapter, content, wordCount, inputDigest, candidate, plan)
+	res2, summary, mErr := t.salvageMechanical(chapter, content, wordCount, inputDigest, res)
+	if mErr != nil {
+		return nil, mErr
+	}
+	if summary != nil {
+		return summary, nil
+	}
+	return t.applyEditPlanCandidate(chapter, wordCount, inputDigest, res2)
 }
 
-// recoverEditPlanValidation 是 P0-4 的首次纠错重试：内容校验失败后，工具内部
-// 重新调用 polisher 一次，任务文本附加精确纠错反馈（覆盖 X/Y runes、场景上限、
-// 只保留高优先级修改、缩小 old_string、不得重复原计划——polishCorrectionFeedback）。
-//
-// 重试产出的收敛路径：
-//   - 合法 edit plan 且内容校验通过 → 与正常路径相同继续（机械门禁 + 落盘）。
-//   - 回退整章模式（非 JSON/纯正文）→ 走 full-text 路径（P0-5 门禁：机械回归 +
-//     长度比例），仍是合法收敛。
-//   - 重试仍失败（内容校验再次失败 / 契约错误）→ 第二次失败：写 rejected/degraded
-//     polish checkpoint（handleEditPlanInvalid）→ FSM 收敛，不再消耗 writer turns。
-func (t *PolishDraftTool) recoverEditPlanValidation(ctx context.Context, chapter int, content string, wordCount int, inputDigest string, plan *PolishEditPlan, firstErr error) (json.RawMessage, error) {
-	taskText := t.buildPolishTask(chapter, content, wordCount, polishCorrectionFeedback(firstErr))
-	outputText, err := t.runPolisherWithEmptyRetry(ctx, chapter, taskText)
-	if err != nil {
-		// 重试时 runner 失败：与主路径同构——可降级错误写 provider 类 degraded
-		// checkpoint，不可降级原样返回。
-		return t.handlePolisherFailure(chapter, inputDigest, wordCount, err)
-	}
-
-	plan2, fallback, parseErr := ParsePolishEditPlan(outputText)
-	if parseErr != nil {
-		if !fallback {
-			// 重试仍产出契约错误（version 不受支持/缺字段）：第二次失败 → 收敛降级。
-			return t.handleEditPlanInvalid(chapter, inputDigest, wordCount, plan, parseErr)
-		}
-		// 重试改为整章重输出（旧协议合法形态）：走 full-text 门禁（机械回归 + 长度比例）。
-		return t.applyFullTextPolish(chapter, content, wordCount, inputDigest, outputText)
-	}
-	candidate, err2 := ApplyPolishEditPlan(content, plan2, polishCoverageLimitForChapter(t.store, chapter))
-	if err2 != nil {
-		// 第二次内容校验仍失败（覆盖超限/anchor 缺失等）：收敛降级，不再第三次调用。
-		return t.handleEditPlanInvalid(chapter, inputDigest, wordCount, plan2, err2)
-	}
-	// 重试候选合法：与正常路径相同继续（机械回归门禁 + 原子落盘 + checkpoint）。
-	return t.applyEditPlanCandidate(chapter, content, wordCount, inputDigest, candidate, plan2)
-}
-
-// applyEditPlanCandidate 是 edit 候选通过内容校验后的公共收尾（正常路径与 P0-4
-// 纠错重试路径共用）：机械回归门禁 → 一次 SaveDraft + draft checkpoint + 一个
-// polish checkpoint（Method=edit_list）→ 成功摘要。
-func (t *PolishDraftTool) applyEditPlanCandidate(chapter int, content string, wordCount int, inputDigest string, candidate string, plan *PolishEditPlan) (json.RawMessage, error) {
-	// ── 2. 机械回归门禁（统一检查器 computeMechanicalViolations，与 check_consistency
-	//    同源）：若 polisher 输入无 error 级机械违规，则候选必须也无——精修不得
-	//    引入新的机械违规（防"修文风 → 引入禁词/文学腔"的静默劣化）。 ──
-	if !hasErrorViolations(computeMechanicalViolations(t.store, content, wordCount)) {
-		if hasErrorViolations(computeMechanicalViolations(t.store, candidate, utf8.RuneCountInString(candidate))) {
-			return t.handleMechanicalRegression(chapter, content, wordCount, inputDigest, "edit_list", plan)
-		}
-	}
-
-	// ── 3. 原子落盘：一次 SaveDraft + draft checkpoint + 一个 polish checkpoint ──
+// applyEditPlanCandidate 是 edit 候选通过内容校验与机械门禁后的公共收尾：
+// 一次 SaveDraft + draft checkpoint + 一个 polish checkpoint（Method=edit_list、
+// EditCount=实际应用数、ProposedEditCount/DroppedEditCount/DropReasons/
+// NormalizedMatchCount/Partial/MatchModes 审计）→ 成功摘要（不回传全文）。
+func (t *PolishDraftTool) applyEditPlanCandidate(chapter int, wordCount int, inputDigest string, res *PolishEditPlanResult) (json.RawMessage, error) {
+	// ── 原子落盘：一次 SaveDraft + draft checkpoint + 一个 polish checkpoint ──
+	candidate := res.Candidate
 	outputDigest := domain.DigestDraft(candidate)
 	if err := t.store.Drafts.SaveDraft(chapter, candidate); err != nil {
 		return nil, fmt.Errorf("save polished draft: %w: %w", errs.ErrStoreWrite, err)
@@ -400,17 +371,24 @@ func (t *PolishDraftTool) applyEditPlanCandidate(chapter int, content string, wo
 	stage := polishStageForChapter(t.store, chapter)
 	changed := outputDigest != inputDigest
 	polisherModel := t.loadPolisherModelName()
+	audit := auditFromResult(res)
 	if _, err := t.store.Checkpoints.AppendPolish(
 		domain.ChapterScope(chapter), "polish",
 		fmt.Sprintf("drafts/%02d.draft.md", chapter),
 		outputDigest,
 		domain.PolishCheckpointMeta{
-			InputDigest:   inputDigest,
-			PolisherModel: polisherModel,
-			Stage:         stage,
-			Changed:       changed,
-			Method:        "edit_list",
-			EditCount:     len(plan.Edits),
+			InputDigest:          inputDigest,
+			PolisherModel:        polisherModel,
+			Stage:                stage,
+			Changed:              changed,
+			Method:               "edit_list",
+			EditCount:            len(res.Applied),
+			ProposedEditCount:    audit.ProposedEditCount,
+			DroppedEditCount:     audit.DroppedEditCount,
+			DropReasons:          audit.DropReasons,
+			NormalizedMatchCount: audit.NormalizedMatchCount,
+			Partial:              audit.Partial,
+			MatchModes:           audit.MatchModes,
 		},
 	); err != nil {
 		return nil, fmt.Errorf("checkpoint polish: %w", err)
@@ -418,18 +396,92 @@ func (t *PolishDraftTool) applyEditPlanCandidate(chapter int, content string, wo
 	// 成功推进：清零机械回归连续计数。
 	t.mechRejectStreak[chapter] = 0
 
-	// ── 4. 摘要返回（不回传全文） ──
+	// ── 摘要返回（不回传全文） ──
 	return json.Marshal(PolishDraftOutput{
-		Chapter:       chapter,
-		Polished:      true,
-		Changed:       changed,
-		InputDigest:   inputDigest,
-		OutputDigest:  outputDigest,
-		PolisherModel: polisherModel,
-		Stage:         stage,
-		WordCount:     utf8.RuneCountInString(candidate),
-		NextStep:      "精修完成。下一步**必须**调用 check_consistency 重新核验；通过后按返回的 required_next_action 继续（review_style → terminal → commit_chapter）",
+		Chapter:              chapter,
+		Polished:             true,
+		Changed:              changed,
+		InputDigest:          inputDigest,
+		OutputDigest:         outputDigest,
+		PolisherModel:        polisherModel,
+		Stage:                stage,
+		WordCount:            utf8.RuneCountInString(candidate),
+		ProposedEditCount:    audit.ProposedEditCount,
+		DroppedEditCount:     audit.DroppedEditCount,
+		DropReasons:          audit.DropReasons,
+		NormalizedMatchCount: audit.NormalizedMatchCount,
+		Partial:              audit.Partial,
+		MatchModes:           audit.MatchModes,
+		NextStep:             "精修完成。下一步**必须**调用 check_consistency 重新核验；通过后按返回的 required_next_action 继续（review_style → terminal → commit_chapter）",
 	})
+}
+
+// PolishCheckpointAudit 是 edit_list 路径的审计字段集（部分接受/归一化匹配，只含
+// 计数与原因分类，绝不含正文内容）。
+type PolishCheckpointAudit struct {
+	ProposedEditCount    int
+	DroppedEditCount     int
+	DropReasons          []string
+	NormalizedMatchCount int
+	Partial              bool
+	MatchModes           []string
+}
+
+// auditFromResult 从部分接受结果导出 checkpoint/摘要审计字段。
+func auditFromResult(res *PolishEditPlanResult) PolishCheckpointAudit {
+	return PolishCheckpointAudit{
+		ProposedEditCount:    res.ProposedEditCount,
+		DroppedEditCount:     len(res.Dropped),
+		DropReasons:          res.DropReasons(),
+		NormalizedMatchCount: res.NormalizedMatchCount,
+		Partial:              res.Partial,
+		MatchModes:           res.AppliedMatchModes(),
+	}
+}
+
+// salvageMechanical 是 edit 路径的机械回归子流程（ora-1 ④ 第 6 条）：
+//
+//   - 输入无 error 级机械违规时门禁激活（与 P0-5 同一检查器）；候选无新违规 →
+//     直接返回原结果。
+//   - 候选引入新违规 → 逐条单独应用，找出责任 edit（单独应用即引入违规的 edit）
+//     → 剔除责任 edit、基于同一输入快照重建候选。
+//   - 剔除后存在安全子集（含空子集）→ 部分接受成功（不增加 mechRejectStreak，
+//     审计记录 mechanical drop reasons）。
+//   - 仍无法安全（违规来自组合效应，无法定位责任 edit / 剔除后仍违规）→ 走
+//     mechRejectStreak：首次 fail-closed（返回错误），连续 2 次收敛为 rejected
+//     checkpoint（返回成功摘要，不消耗 writer turns）。
+//
+// 返回三元组：res2（安全子集结果）、summary（非 nil = 已写 rejected checkpoint
+// 并返回成功摘要）、err（fail-closed 错误）。
+func (t *PolishDraftTool) salvageMechanical(chapter int, content string, wordCount int, inputDigest string, res *PolishEditPlanResult) (*PolishEditPlanResult, json.RawMessage, error) {
+	// 门禁前提：polisher 输入无 error 级机械违规（精修不得引入新的机械违规）。
+	if hasErrorViolations(computeMechanicalViolations(t.store, content, wordCount)) {
+		return res, nil, nil
+	}
+	if !hasErrorViolations(computeMechanicalViolations(t.store, res.Candidate, utf8.RuneCountInString(res.Candidate))) {
+		return res, nil, nil
+	}
+
+	// 逐条单独应用，找出责任 edit。
+	responsible := map[int]bool{}
+	for _, a := range res.Applied {
+		solo := ApplySinglePolishEdit(content, a)
+		if hasErrorViolations(computeMechanicalViolations(t.store, solo, utf8.RuneCountInString(solo))) {
+			responsible[a.Idx] = true
+		}
+	}
+	if len(responsible) > 0 {
+		res.DropApplied(content, responsible)
+		if !hasErrorViolations(computeMechanicalViolations(t.store, res.Candidate, utf8.RuneCountInString(res.Candidate))) {
+			// 安全子集：部分接受成功（不增加 mechRejectStreak）。
+			slog.Warn("polisher edit 候选机械回归：已剔除责任 edit，部分接受安全子集",
+				"module", "tools", "chapter", chapter, "responsible", len(responsible),
+				"applied", len(res.Applied), "dropped", len(res.Dropped))
+			return res, nil, nil
+		}
+	}
+	// 仍无法安全（组合违规/剔除后仍违规）→ mechRejectStreak 收敛。
+	return t.mechanicalRegression(chapter, inputDigest, wordCount, "edit_list", res.ProposedEditCount)
 }
 
 // handleMechanicalRegression 处理机械回归拒绝（循环 B 收敛）。edit 路径与
@@ -444,51 +496,63 @@ func (t *PolishDraftTool) applyEditPlanCandidate(chapter int, content string, wo
 //     与 provider 降级同路径）→ 收敛到 post-check → check → review，防"精修反复
 //     引入机械违规 → 永久 fail-closed 死循环"。返回成功摘要（Degraded=true +
 //     ErrorCategory=mechanical_regression，调用方继续 post-polish check）。
-func (t *PolishDraftTool) handleMechanicalRegression(chapter int, content string, wordCount int, inputDigest string, method string, plan *PolishEditPlan) (json.RawMessage, error) {
+func (t *PolishDraftTool) mechanicalRegression(chapter int, inputDigest string, wordCount int, method string, proposedEditCount int) (*PolishEditPlanResult, json.RawMessage, error) {
 	t.mechRejectStreak[chapter]++
 	if t.mechRejectStreak[chapter] < 2 {
-		return nil, fmt.Errorf("polisher 候选机械回归：候选引入新的 error 级机械违规，拒绝落盘（草稿未变）；连续 2 次将自动收敛为 rejected checkpoint: %w",
+		return nil, nil, fmt.Errorf("polisher 候选机械回归：候选引入新的 error 级机械违规，拒绝落盘（草稿未变）；连续 2 次将自动收敛为 rejected checkpoint: %w",
 			errs.ErrToolPrecondition)
 	}
 	t.mechRejectStreak[chapter] = 0
 
-	editCount := 0
-	if plan != nil {
-		editCount = len(plan.Edits)
+	audit := PolishCheckpointAudit{
+		ProposedEditCount: proposedEditCount,
+		DroppedEditCount:  proposedEditCount,
+		DropReasons:       []string{string(PolishEditDropMechanical)},
 	}
 	reason := fmt.Sprintf("polisher 候选连续 2 次引入 error 级机械违规，已写入 rejected polish checkpoint（正文未变，digest=%s）",
 		inputDigest)
-	return t.writeDegradedPolishCheckpoint(chapter, inputDigest, wordCount, "mechanical_regression", method, editCount, reason)
+	summary, err := t.writeDegradedPolishCheckpoint(chapter, inputDigest, wordCount, "mechanical_regression", method, audit, reason)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nil, summary, nil
 }
 
-// handleEditPlanInvalid 是 P0-4 的二次失败收敛：内容校验连续两次失败（首次失败
-// 已带反馈重试一次，仍失败）→ 写审计明确的 rejected/degraded polish checkpoint：
-// ErrorCategory="coverage_exceeded"（覆盖比例超限，含结构化数字）或
-// "edit_plan_invalid"（anchor 缺失/重叠/超长/产物过短/契约错误等其余内容失败），
-// Digest=当前草稿、Changed=false、Method=edit_list → FSM 收敛到 post-check →
+// handleEditPlanRejected 处理"原始非空但全部 edit 被丢弃"的收敛（ora-1 ④）：
+// 不再调用 recoverEditPlanValidation（不再触发第二次模型纠错——④ 取代 P0-4）。
+// category 按全部 drop reasons 判定：含 coverage_limit → coverage_exceeded，
+// 否则 → edit_plan_invalid。写审计明确的 rejected/degraded polish checkpoint
+// （Digest=当前草稿、Changed=false、Method=edit_list、EditCount=0 实际应用数、
+// ProposedEditCount/DroppedEditCount/DropReasons 审计）→ FSM 收敛到 post-check →
 // check → review → commit。返回成功摘要（Degraded=true），不再消耗 writer turns。
-// 与 provider 失败（handlePolisherFailure）的 degraded 语义区分：本路径是"输出
-// 契约/内容失败"，收敛机制一致但 ErrorCategory 不同。
-func (t *PolishDraftTool) handleEditPlanInvalid(chapter int, inputDigest string, wordCount int, plan *PolishEditPlan, err error) (json.RawMessage, error) {
+func (t *PolishDraftTool) handleEditPlanRejected(chapter int, inputDigest string, wordCount int, res *PolishEditPlanResult) (json.RawMessage, error) {
 	category := "edit_plan_invalid"
-	var pe *PolishEditError
-	if errors.As(err, &pe) && pe.CoverageLimit > 0 {
-		category = "coverage_exceeded"
+	for _, d := range res.Dropped {
+		if d.DropReason == PolishEditDropCoverageLimit {
+			category = "coverage_exceeded"
+			break
+		}
 	}
-	reason := fmt.Sprintf("polisher edit plan 连续 2 次内容校验失败（%s），已写入 rejected/degraded polish checkpoint（正文未变，digest=%s）",
-		category, inputDigest)
-	slog.Warn("polisher edit plan 连续 2 次内容校验失败，已写入 rejected/degraded polish checkpoint",
-		"module", "tools", "chapter", chapter, "category", category, "digest", inputDigest, "err", err)
-	return t.writeDegradedPolishCheckpoint(chapter, inputDigest, wordCount, category, "edit_list", len(plan.Edits), reason)
+	reasons := res.DropReasons()
+	audit := PolishCheckpointAudit{
+		ProposedEditCount: res.ProposedEditCount,
+		DroppedEditCount:  len(res.Dropped),
+		DropReasons:       reasons,
+	}
+	reason := fmt.Sprintf("polisher edit plan 全部 %d 条 edit 均被丢弃（%s），已写入 rejected/degraded polish checkpoint（正文未变，digest=%s）",
+		len(res.Dropped), category, inputDigest)
+	slog.Warn("polisher edit plan 全部 edit 均被丢弃，已写入 rejected/degraded polish checkpoint",
+		"module", "tools", "chapter", chapter, "category", category, "digest", inputDigest, "drop_reasons", reasons)
+	return t.writeDegradedPolishCheckpoint(chapter, inputDigest, wordCount, category, "edit_list", audit, reason)
 }
 
 // writeDegradedPolishCheckpoint 写 rejected/degraded 性质 polish checkpoint
 // （正文未变、Digest=当前草稿、Changed=false、Degraded=true）并返回成功摘要。
-// provider 失败（handlePolisherFailure）、内容校验二次失败（handleEditPlanInvalid）、
-// 机械回归连续拒绝（handleMechanicalRegression）的收敛共用此路径：FSM 将 degraded
+// provider 失败（handlePolisherFailure）、内容校验全无效（handleEditPlanRejected）、
+// 机械回归连续拒绝（mechanicalRegression）的收敛共用此路径：FSM 将 degraded
 // 记录视作合法 polish 记录 → 强制 post-polish check → review，防永久 fail-closed
 // 死循环。checkpoint/store 写失败不可收敛：原样返回（账本未留痕，状态不变）。
-func (t *PolishDraftTool) writeDegradedPolishCheckpoint(chapter int, inputDigest string, wordCount int, category, method string, editCount int, reason string) (json.RawMessage, error) {
+func (t *PolishDraftTool) writeDegradedPolishCheckpoint(chapter int, inputDigest string, wordCount int, category, method string, audit PolishCheckpointAudit, reason string) (json.RawMessage, error) {
 	polisherModel := t.loadPolisherModelName()
 	stage := polishStageForChapter(t.store, chapter)
 	if _, aErr := t.store.Checkpoints.AppendPolish(
@@ -496,48 +560,47 @@ func (t *PolishDraftTool) writeDegradedPolishCheckpoint(chapter int, inputDigest
 		fmt.Sprintf("drafts/%02d.draft.md", chapter),
 		inputDigest,
 		domain.PolishCheckpointMeta{
-			InputDigest:   inputDigest,
-			PolisherModel: polisherModel,
-			Stage:         stage,
-			Changed:       false,
-			Degraded:      true,
-			ErrorCategory: category,
-			Method:        method,
-			EditCount:     editCount,
+			InputDigest:          inputDigest,
+			PolisherModel:        polisherModel,
+			Stage:                stage,
+			Changed:              false,
+			Degraded:             true,
+			ErrorCategory:        category,
+			Method:               method,
+			EditCount:            0, // EditCount=实际应用数：degraded 路径未应用任何 edit
+			ProposedEditCount:    audit.ProposedEditCount,
+			DroppedEditCount:     audit.DroppedEditCount,
+			DropReasons:          audit.DropReasons,
+			NormalizedMatchCount: audit.NormalizedMatchCount,
+			Partial:              audit.Partial,
+			MatchModes:           audit.MatchModes,
 		},
 	); aErr != nil {
 		return nil, fmt.Errorf("checkpoint polish (degraded): %w", aErr)
 	}
 	slog.Warn("已写入 rejected/degraded polish checkpoint", "module", "tools", "chapter", chapter,
-		"category", category, "digest", inputDigest)
+		"category", category, "digest", inputDigest, "drop_reasons", audit.DropReasons)
 
 	return json.Marshal(PolishDraftOutput{
-		Chapter:       chapter,
-		Polished:      true,
-		Changed:       false,
-		Degraded:      true,
-		ErrorCategory: category,
-		InputDigest:   inputDigest,
-		OutputDigest:  inputDigest,
-		PolisherModel: polisherModel,
-		Stage:         stage,
-		WordCount:     wordCount,
-		Reason:        reason,
-		NextStep:      "精修被拒绝并已收敛记录（正文未变）。下一步**必须**调用 check_consistency 重新核验；通过后按返回的 required_next_action 继续（review_style → terminal → commit_chapter）",
+		Chapter:              chapter,
+		Polished:             true,
+		Changed:              false,
+		Degraded:             true,
+		ErrorCategory:        category,
+		InputDigest:          inputDigest,
+		OutputDigest:         inputDigest,
+		PolisherModel:        polisherModel,
+		Stage:                stage,
+		WordCount:            wordCount,
+		ProposedEditCount:    audit.ProposedEditCount,
+		DroppedEditCount:     audit.DroppedEditCount,
+		DropReasons:          audit.DropReasons,
+		NormalizedMatchCount: audit.NormalizedMatchCount,
+		Partial:              audit.Partial,
+		MatchModes:           audit.MatchModes,
+		Reason:               reason,
+		NextStep:             "精修被拒绝并已收敛记录（正文未变）。下一步**必须**调用 check_consistency 重新核验；通过后按返回的 required_next_action 继续（review_style → terminal → commit_chapter）",
 	})
-}
-
-// polishCorrectionFeedback 构造 P0-4 纠错反馈文本：首次内容校验失败后注入
-// polisher 任务文本（recoverEditPlanValidation），给出精确数字与硬约束——
-// 覆盖超限错误带 X/Y runes 与场景上限（%），其余内容错误带原始错误信息；
-// 共同约束：只保留优先级最高的修改、缩小 old_string 范围、不得重复原计划。
-func polishCorrectionFeedback(err error) string {
-	var pe *PolishEditError
-	if errors.As(err, &pe) && pe.CoverageLimit > 0 {
-		return fmt.Sprintf("上次计划无效：所有 old_string 覆盖 %d/%d runes（%.0f%%），当前场景上限 %d%%。\n只保留优先级最高的修改，缩小 old_string 范围，不得重复原计划。",
-			pe.CoverageRunes, pe.InputRunes, 100*float64(pe.CoverageRunes)/float64(pe.InputRunes), int(pe.CoverageLimit*100))
-	}
-	return fmt.Sprintf("上次计划无效：%v。\n只保留优先级最高的修改，缩小 old_string 范围，不得重复原计划。", err)
 }
 
 // polishCoverageLimitForChapter 按场景返回 edit list 覆盖上限（P1-6）：
@@ -555,8 +618,7 @@ func polishCoverageLimitForChapter(st *store.Store, chapter int) float64 {
 // buildPolishTask 构造发送给 polisher runner 的任务文本：
 // 规范评审依据（风格目标/契约/指南针文风/锚点/用户规则/事实大纲）
 // + 已给的 revise findings（完整六字段）+ 重写/打磨 brief（PendingRewrites 时）
-// + 章节与草稿全文（动态内容放最后）+ 可选的 P0-4 纠错反馈（correction，非空时
-// 追加在草稿之后、输出要求 footer 之前）。
+// + 章节与草稿全文（动态内容放最后）。
 // 与 review_style 的 basis 共用同一数据源（buildStyleBasis），保证精修与评审看到
 // 同一份风格事实（style goal/contract/compass/anchors/structured/factual outline）；
 // 用户规则按职责角色投影：polisher → writer 视图（default+writer），
@@ -565,8 +627,8 @@ func polishCoverageLimitForChapter(st *store.Store, chapter int) float64 {
 // 布局按 ora-1 缓存优化阶段 2（Prompt Capsule 重排）：稳定书级内容
 // （basis/findings/brief）在前，章节动态内容（章节号/字数/草稿全文）最后——
 // 跨 spawn 的内容前缀缓存（DeepSeek 磁盘缓存按内容前缀匹配）命中稳定前缀，
-// 只有尾部的草稿段需要重新计算。纠错反馈是单次调用特有的动态段，置于草稿之后
-// 不影响稳定前缀；首次调用 correction="" 不产生该段（任务文本与旧版完全一致）。
+// 只有尾部的草稿段需要重新计算。correction 参数保留（当前恒为空串：④ 已取消
+// P0-4 纠错重试，不再注入纠错反馈段，任务文本与主路径完全一致）。
 func (t *PolishDraftTool) buildPolishTask(chapter int, content string, wordCount int, correction string) string {
 	basis := buildPolishBasis(t.store, chapter, t.polisherPromptHash)
 	basisJSON, _ := json.Marshal(basis)
@@ -599,8 +661,7 @@ func (t *PolishDraftTool) buildPolishTask(chapter int, content string, wordCount
 	// 草稿全文是每章唯一的大块动态内容，放在尾部让前缀缓存最大化复用。
 	fmt.Fprintf(&sb, "### 章节与草稿（字数：%d）\n第 %d 章\n\n%s\n\n", wordCount, chapter, content)
 
-	// P0-4 纠错反馈（仅首次内容校验失败后的重试调用非空）：给出精确数字与硬约束，
-	// 置于草稿段之后、输出要求 footer 之前，不破坏稳定前缀缓存布局。
+	// correction 段保留（当前恒为空串：④ 已取消 P0-4 纠错重试，不再注入）。
 	if correction != "" {
 		fmt.Fprintf(&sb, "### 上次计划纠错反馈（必须遵守，不得重复原计划）\n%s\n\n", correction)
 	}

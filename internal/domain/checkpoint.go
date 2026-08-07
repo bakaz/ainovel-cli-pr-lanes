@@ -103,6 +103,22 @@ type Checkpoint struct {
 	// EditCount 是 edit_list 路径实际应用的 edit 条数（空 edits=0）；
 	// full_text/degraded 路径为零。仅审计用，不影响判定。
 	EditCount int `json:"edit_count,omitempty"`
+	// 以下字段是 edit_list 路径的部分接受/归一化匹配审计（ora-1 ④）：只含计数与
+	// 原因分类，绝不含正文/old_string/new_string 内容。仅审计用，不影响判定。
+	// ProposedEditCount 是 polisher 提出的 edit 条数（可能超过上限/含无效条）。
+	ProposedEditCount int `json:"proposed_edit_count,omitempty"`
+	// DroppedEditCount 是被丢弃（未应用）的 edit 条数。
+	DroppedEditCount int `json:"dropped_edit_count,omitempty"`
+	// DropReasons 是被丢弃 edit 的原因分类（anchor_missing/anchor_ambiguous/
+	// overlap_lower_priority/coverage_limit/output_too_short/output_too_long/
+	// count_limit/noop/empty_old_string/old_too_long/mechanical），按原 plan 下标序。
+	DropReasons []string `json:"drop_reasons,omitempty"`
+	// NormalizedMatchCount 是实际应用中经归一化（白名单等价）定位的 edit 条数。
+	NormalizedMatchCount int `json:"normalized_match_count,omitempty"`
+	// Partial=true 表示部分接受：≥1 条应用且 ≥1 条被丢弃（无需模型二次纠错）。
+	Partial bool `json:"partial,omitempty"`
+	// MatchModes 是实际应用 edit 的匹配模式（"exact"/"normalized"，按应用序）。
+	MatchModes []string `json:"match_modes,omitempty"`
 }
 
 // PolishCheckpointMeta 是 polish 步骤 checkpoint 的附加元数据。
@@ -116,4 +132,11 @@ type PolishCheckpointMeta struct {
 	ErrorCategory string
 	Method        string
 	EditCount     int
+	// 审计字段（edit_list 路径部分接受/归一化匹配，见 Checkpoint 同名注释）。
+	ProposedEditCount    int
+	DroppedEditCount     int
+	DropReasons          []string
+	NormalizedMatchCount int
+	Partial              bool
+	MatchModes           []string
 }
