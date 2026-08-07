@@ -605,6 +605,11 @@ func (t *PolishDraftTool) buildPolishTask(chapter int, content string, wordCount
 		fmt.Fprintf(&sb, "### 上次计划纠错反馈（必须遵守，不得重复原计划）\n%s\n\n", correction)
 	}
 
+	// P1-6 场景覆盖上限：随任务文本告知实际上限（普通精修 50%、重写 70%），
+	// 让 polisher 在 rewrite 场景充分利用 70% 能力，而不是被静态 50% 文案限制。
+	limit := polishCoverageLimitForChapter(t.store, chapter)
+	fmt.Fprintf(&sb, "### 覆盖上限\n本任务所有 old_string 覆盖范围合计不得超过输入草稿的 %.0f%%。\n\n", limit*100)
+
 	fmt.Fprintf(&sb, "请严格按精修者提示词（polisher）输出结构化精修 edit 列表 JSON（{\"version\":1,\"edits\":[{\"old_string\":\"原文唯一连续片段\",\"new_string\":\"精修后片段\"}]}）；无修改时输出 {\"version\":1,\"edits\":[]}。")
 	return sb.String()
 }
