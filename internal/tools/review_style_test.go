@@ -3581,6 +3581,120 @@ func TestReviewStyle_StagnationSameFindingsLeadsToExhausted(t *testing.T) {
 	}
 }
 
+// ── 49b. P1-7: final revision 总数上限（不同 finding 振荡）→ exhausted ──
+//
+// 同一评审 epoch 内 final revise 轮次（final_pending → revision_open）上限为 3：
+// 即使每次 critic 都返回不同 finding（不触发同签名停滞），第 4 次 final revise
+// 也进入 exhausted（与同签名停滞共用收敛路径：/style-override 或接受当前候选）。
+
+func TestReviewStyle_FinalRevisionCapExhausts(t *testing.T) {
+	st := setupCriticStore(t, 1, "正文。一些句子。")
+	draft, _, _ := st.Drafts.LoadChapterContent(1)
+
+	// 每次调用返回不同 finding（problem/dimension/category/severity 各不相同），
+	// 保证永不触发同签名停滞——收敛完全由轮次上限驱动。
+	reviseOutputs := []string{
+		`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"pacing","category":"style","severity":"warning","evidence":"末段","problem":"问题一","revision":"改法一"}]}`,
+		`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"hook","category":"plot","severity":"error","evidence":"首段","problem":"问题二","revision":"改法二"}]}`,
+		`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"continuity","category":"logic","severity":"warning","evidence":"中段","problem":"问题三","revision":"改法三"}]}`,
+		`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"aesthetic","category":"style","severity":"warning","evidence":"结尾","problem":"问题四","revision":"改法四"}]}`,
+		`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"character","category":"tone","severity":"error","evidence":"对话","problem":"问题五","revision":"改法五"}]}`,
+	}
+	callCount := 0
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		callCount++
+		idx := callCount - 1
+		if idx >= len(reviseOutputs) {
+			idx = len(reviseOutputs) - 1
+		}
+		return &agentcore.LLMResponse{Message: criticText(reviseOutputs[idx])}, nil
+	})
+
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+
+	// Round 1: initial review → revise（不计入 final revision）
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Round 1: %v", err)
+	}
+
+	// Rounds 2-4: 连续 3 次 final review 返回不同 finding 的 revise → 均 revision_open
+	for round := 2; round <= 4; round++ {
+		newDraft := draft + fmt.Sprintf("\n修改%d。", round)
+		if err := st.Drafts.SaveDraft(1, newDraft); err != nil {
+			t.Fatal(err)
+		}
+		d := domain.DigestDraft(newDraft)
+		if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", fmt.Sprintf("a%d", round), d); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+			t.Fatalf("Round %d: %v", round, err)
+		}
+		ledger, _ := st.StyleReview.Load(1)
+		if ledger.CurrentStatus() != domain.ReviewStatusRevisionOpen {
+			t.Fatalf("Round %d: expected revision_open (final revision %d/3), got %s", round, round-1, ledger.CurrentStatus())
+		}
+	}
+
+	// Round 5: 第 4 次 final revise（仍为不同 finding）→ 超过 3 次上限 → exhausted
+	newDraft4 := draft + "\n修改5。"
+	if err := st.Drafts.SaveDraft(1, newDraft4); err != nil {
+		t.Fatal(err)
+	}
+	d4 := domain.DigestDraft(newDraft4)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "a5", d4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+		t.Fatalf("Round 5: %v", err)
+	}
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusExhausted {
+		t.Fatalf("Round 5: expected exhausted after 3 final revisions + 4th revise, got %s", ledger.CurrentStatus())
+	}
+
+	// exhausted 语义（与同签名停滞一致）：新评审被拒，必须先 /style-override
+	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err == nil {
+		t.Fatal("review_style after exhausted must be rejected")
+	}
+
+	// FSM/commit gate 交互：exhausted 拒绝 commit
+	commitTool := NewCommitChapterTool(st)
+	commitArgs, _ := json.Marshal(map[string]any{
+		"chapter": 1, "summary": "测试", "characters": []string{},
+		"key_events": []string{},
+	})
+	if _, err := commitTool.Execute(t.Context(), commitArgs); err == nil {
+		t.Fatal("commit must be blocked while exhausted")
+	}
+
+	// 收敛路径：/style-override（接受当前候选）→ overridden terminal → commit 放行
+	exhaustedEntry := ledger.CurrentCycle()
+	if err := st.StyleReview.Update(1, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
+		now := time.Now().Format(time.RFC3339)
+		entry := domain.StyleReviewEntry{
+			Cycle:       len(cur.Cycles) + 1,
+			Status:      domain.ReviewStatusOverridden,
+			CreatedAt:   now,
+			AttemptID:   "",
+			DraftDigest: d4,
+			BasisDigest: exhaustedEntry.BasisDigest,
+			Override: &domain.StyleReviewOverride{
+				Actor: "user", Reason: "接受当前候选",
+				DraftDigest: d4, BasisDigest: exhaustedEntry.BasisDigest,
+				OverriddenAt: now,
+			},
+		}
+		cur.Cycles = append(cur.Cycles, entry)
+		return cur, nil
+	}); err != nil {
+		t.Fatalf("override: %v", err)
+	}
+	if _, err := commitTool.Execute(t.Context(), commitArgs); err != nil {
+		t.Fatalf("commit after override should succeed: %v", err)
+	}
+}
+
 // ── 50. Stagnation: override recovers from exhausted ─────────────────────
 
 func TestReviewStyle_OverrideAfterStagnationExhausted(t *testing.T) {

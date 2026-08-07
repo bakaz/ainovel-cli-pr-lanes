@@ -52,7 +52,8 @@ const (
 //	revision_open ──final_pending────────→ (via edit→check_consistency→review_style)
 //	final_pending ──accepted_revised─────→ [terminal]
 //	final_pending ──revision_open────────→ (loop: revise → edit → check → final_pending → revise → ...)
-//	final_pending ──exhausted────────────→ (stagnation: repeated identical final findings)
+//	final_pending ──exhausted────────────→ (stagnation: repeated identical final findings;
+//	                                         or final-revision count cap exceeded)
 //	final_pending ──degraded─────────────→ final_pending (retry: degraded is a transient
 //	                                         call failure, not a review verdict)
 //	exhausted ──overridden───────────────→ [terminal]
@@ -399,6 +400,34 @@ func DetectFinalReviewStagnation(ledger *StyleReviewLedger, currentResult *Style
 		}
 	}
 	return false
+}
+
+// FinalRevisionCount 统计当前评审 epoch 内的 final revision 轮次：即由
+// final_pending → revision_open 严格相邻转换产生的 revision_open 周期数
+// （"进入过 revision_open 后再次 final review 返回 revise"的次数）。
+// initial 评审的 revision_open（initial_pending → revision_open）不计入。
+//
+// 计数绑定当前 epoch（MaxEpoch，与即将追加的新周期同代）：返工队列章节开启
+// 新 epoch 后从 0 重新计数（P1-7：每个评审 epoch 的 final revision 总数上限）。
+//
+// 与 DetectFinalReviewStagnation 叠加使用：同签名停滞立即 exhausted；不同
+// finding 的振荡（critic 反复换问题要求修订）在轮次达到上限后同样 exhausted，
+// 防止无限消耗 writer 轮次。
+func FinalRevisionCount(ledger *StyleReviewLedger) int {
+	if ledger == nil || ledger.IsEmpty() {
+		return 0
+	}
+	epoch := ledger.MaxEpoch()
+	count := 0
+	for i := range ledger.Cycles {
+		if ledger.Cycles[i].EpochValue() != epoch {
+			continue
+		}
+		if isStrictAdjacentFinalRevise(ledger, i) {
+			count++
+		}
+	}
+	return count
 }
 
 // ── StyleReviewOverride ─────────────────────────────────────────────

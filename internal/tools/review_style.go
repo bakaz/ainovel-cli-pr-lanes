@@ -26,6 +26,14 @@ import (
 // text so the critic knows which portion it sees.
 const maxCriticRunes = 12000
 
+// maxFinalRevisionsPerEpoch 是同一评审 epoch 内 final revision 轮次上限
+// （ora-1 P1-7，建议 2-3，取 3）：final 评审返回 revise（final_pending →
+// revision_open）的次数达到该值后，critic 再返回 revise 即进入 exhausted。
+// 与同签名停滞（DetectFinalReviewStagnation）叠加：同签名立即 exhausted；
+// 不同 finding 的振荡（ch130：critic revise → edit → polish → check → review
+// 循环）在 3 轮后 exhausted，防止无限消耗 writer 轮次。
+const maxFinalRevisionsPerEpoch = 3
+
 // ── Critic empty-output retry ────────────────────────────────────────
 //
 // Production observations: the critic model (deepseek-v4-flash via the
@@ -817,8 +825,13 @@ func (t *ReviewStyleTool) appendFinalResult(chapter int, attemptID string, reque
 
 		// V2: detect stagnation — same finding signature as previous
 		// final_revise → revision_open → exhausted to prevent infinite loops.
+		// P1-7: 叠加 final revision 总数上限——同一 epoch 内 final revise 轮次
+		// 达到 maxFinalRevisionsPerEpoch 后，即使 findings 各不相同（oscillation）
+		// 也进入 exhausted，与同签名停滞共用同一收敛路径（/style-override 或
+		// 接受当前候选）。
 		if nextStatus == domain.ReviewStatusRevisionOpen {
-			if domain.DetectFinalReviewStagnation(cur, result) {
+			if domain.DetectFinalReviewStagnation(cur, result) ||
+				domain.FinalRevisionCount(cur) >= maxFinalRevisionsPerEpoch {
 				nextStatus = domain.ReviewStatusExhausted
 			}
 		}

@@ -1403,3 +1403,78 @@ func TestDetectStagnation_CrossEpochNotDetected(t *testing.T) {
 		t.Fatal("cross-epoch identical findings must NOT trigger stagnation")
 	}
 }
+
+// ── FinalRevisionCount: final revision 轮次上限计数（P1-7） ─────────────
+
+// TestFinalRevisionCount_Basic 验证只统计 final_pending → revision_open 严格
+// 相邻转换产生的 revision_open（"进入过 revision_open 后再次 final review 返回
+// revise"），initial 评审的 revision_open 不计入。
+func TestFinalRevisionCount_Basic(t *testing.T) {
+	d := testDraft
+	b := testBasis
+	reqInit := &StyleReviewRequest{Prompt: "init", Model: "m"}
+	reqFinal := &StyleReviewRequest{Prompt: "final review", Model: "m"}
+	revResult := func(problem string) *StyleReviewResult {
+		return &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "e",
+			Findings: []StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Problem: problem, Suggestion: "改"}}}
+	}
+	ledger := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			// initial → revise（不计入）→ final → revise(#1) → final → revise(#2)
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: reqInit, DraftDigest: d, BasisDigest: b},
+			{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z", AttemptID: "a1", Request: reqInit, Result: revResult("初始问题"), DraftDigest: d, BasisDigest: b},
+			{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z", AttemptID: "a2", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 4, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T13:00:00Z", AttemptID: "a2", Request: reqFinal, Result: revResult("问题一"), DraftDigest: d, BasisDigest: b},
+			{Cycle: 5, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T14:00:00Z", AttemptID: "a3", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 6, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T15:00:00Z", AttemptID: "a3", Request: reqFinal, Result: revResult("问题二"), DraftDigest: d, BasisDigest: b},
+		},
+	}
+	if got := FinalRevisionCount(ledger); got != 2 {
+		t.Fatalf("FinalRevisionCount = %d, want 2", got)
+	}
+}
+
+// TestFinalRevisionCount_NilOrEmpty 验证 nil / 空账本计数为 0。
+func TestFinalRevisionCount_NilOrEmpty(t *testing.T) {
+	if got := FinalRevisionCount(nil); got != 0 {
+		t.Fatalf("nil ledger count = %d, want 0", got)
+	}
+	empty := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic}
+	if got := FinalRevisionCount(empty); got != 0 {
+		t.Fatalf("empty ledger count = %d, want 0", got)
+	}
+}
+
+// TestFinalRevisionCount_CrossEpochIsolated 验证计数绑定当前 epoch
+// （MaxEpoch）：旧 epoch 的 final revision 不计入，返工队列章节开启新 epoch
+// 后从 0 重新计数。
+func TestFinalRevisionCount_CrossEpochIsolated(t *testing.T) {
+	d := testDraft
+	b := testBasis
+	reqInit := &StyleReviewRequest{Prompt: "init", Model: "m"}
+	reqFinal := &StyleReviewRequest{Prompt: "final review", Model: "m"}
+	revResult := func(problem string) *StyleReviewResult {
+		return &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "e",
+			Findings: []StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Problem: problem, Suggestion: "改"}}}
+	}
+	ledger := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			// epoch 1：initial → revise → final → revise(#1) → final → revise(#2) → exhausted
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: reqInit, DraftDigest: d, BasisDigest: b, Epoch: 1},
+			{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z", AttemptID: "a1", Request: reqInit, Result: revResult("问题A"), DraftDigest: d, BasisDigest: b, Epoch: 1},
+			{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z", AttemptID: "a2", Request: reqFinal, DraftDigest: d, BasisDigest: b, Epoch: 1},
+			{Cycle: 4, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T13:00:00Z", AttemptID: "a2", Request: reqFinal, Result: revResult("问题B"), DraftDigest: d, BasisDigest: b, Epoch: 1},
+			{Cycle: 5, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T14:00:00Z", AttemptID: "a3", Request: reqFinal, DraftDigest: d, BasisDigest: b, Epoch: 1},
+			{Cycle: 6, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T15:00:00Z", AttemptID: "a3", Request: reqFinal, Result: revResult("问题C"), DraftDigest: d, BasisDigest: b, Epoch: 1},
+			{Cycle: 7, Status: ReviewStatusExhausted, CreatedAt: "2026-07-25T16:00:00Z", AttemptID: "a4", Request: reqFinal, Result: revResult("问题D"), DraftDigest: d, BasisDigest: b, Epoch: 1},
+			// epoch 2：initial → revise → final_pending（当前评审将产出结果，追加到 epoch 2）
+			{Cycle: 8, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T17:00:00Z", AttemptID: "a5", Request: reqInit, DraftDigest: d, BasisDigest: b, Epoch: 2},
+			{Cycle: 9, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T18:00:00Z", AttemptID: "a5", Request: reqInit, Result: revResult("问题E"), DraftDigest: d, BasisDigest: b, Epoch: 2},
+			{Cycle: 10, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T19:00:00Z", AttemptID: "a6", Request: reqFinal, DraftDigest: d, BasisDigest: b, Epoch: 2},
+		},
+	}
+	// 当前 epoch = 2：epoch 1 的 2 次 final revision 不计入 → 0
+	if got := FinalRevisionCount(ledger); got != 0 {
+		t.Fatalf("FinalRevisionCount = %d, want 0 (cross-epoch isolation)", got)
+	}
+}
