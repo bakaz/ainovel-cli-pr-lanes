@@ -174,7 +174,7 @@ func TestPolishEditPlan_ApplyReverseOrder(t *testing.T) {
 		{OldString: "她站在窗前。", NewString: "她倚窗而立。"},
 		{OldString: "他坐在桌边。", NewString: "他立在门前。"},
 	}}
-	got, err := ApplyPolishEditPlan(input, plan)
+	got, err := ApplyPolishEditPlan(input, plan, maxPolishEditCoverageRatio)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestPolishEditPlan_ApplyAdjacentRanges(t *testing.T) {
 		{OldString: "丙丁", NewString: "子丑"},
 		{OldString: "甲乙", NewString: "寅卯"},
 	}}
-	got, err := ApplyPolishEditPlan(input, plan)
+	got, err := ApplyPolishEditPlan(input, plan, maxPolishEditCoverageRatio)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestPolishEditPlan_ApplyAllAnchorsOnInputSnapshot(t *testing.T) {
 		{OldString: "B", NewString: "X"},
 		{OldString: "A", NewString: "AB"},
 	}}
-	got, err := ApplyPolishEditPlan(input, plan)
+	got, err := ApplyPolishEditPlan(input, plan, maxPolishEditCoverageRatio)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestPolishEditPlan_ApplyAllAnchorsOnInputSnapshot(t *testing.T) {
 // 空 edits → no-op：原样返回输入。
 func TestPolishEditPlan_ApplyEmptyEditsNoOp(t *testing.T) {
 	input := "原样文本。"
-	got, err := ApplyPolishEditPlan(input, &PolishEditPlan{Version: 1})
+	got, err := ApplyPolishEditPlan(input, &PolishEditPlan{Version: 1}, maxPolishEditCoverageRatio)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestPolishEditPlan_ApplyEmptyEditsNoOp(t *testing.T) {
 func TestPolishEditPlan_ApplyAnchorMissing(t *testing.T) {
 	_, err := ApplyPolishEditPlan("她站在窗前。", &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
 		{OldString: "不存在的片段", NewString: "x"},
-	}})
+	}}, maxPolishEditCoverageRatio)
 	if err == nil {
 		t.Fatal("expected error for missing anchor")
 	}
@@ -250,7 +250,7 @@ func TestPolishEditPlan_ApplyAnchorMissing(t *testing.T) {
 func TestPolishEditPlan_ApplyAnchorMultiple(t *testing.T) {
 	_, err := ApplyPolishEditPlan("重复的片段，重复的片段。", &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
 		{OldString: "重复的片段", NewString: "x"},
-	}})
+	}}, maxPolishEditCoverageRatio)
 	if err == nil {
 		t.Fatal("expected error for non-unique anchor")
 	}
@@ -263,7 +263,7 @@ func TestPolishEditPlan_ApplyOverlap(t *testing.T) {
 	_, err := ApplyPolishEditPlan("她站在窗前。", &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
 		{OldString: "她站在窗前", NewString: "a"},
 		{OldString: "在窗前。", NewString: "b"},
-	}})
+	}}, maxPolishEditCoverageRatio)
 	if err == nil {
 		t.Fatal("expected error for overlapping ranges")
 	}
@@ -275,7 +275,7 @@ func TestPolishEditPlan_ApplyOverlap(t *testing.T) {
 func TestPolishEditPlan_ApplyEmptyOld(t *testing.T) {
 	_, err := ApplyPolishEditPlan("甲乙", &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
 		{OldString: "", NewString: "x"},
-	}})
+	}}, maxPolishEditCoverageRatio)
 	if err == nil {
 		t.Fatal("expected error for empty old_string")
 	}
@@ -284,7 +284,7 @@ func TestPolishEditPlan_ApplyEmptyOld(t *testing.T) {
 func TestPolishEditPlan_ApplySameOldNew(t *testing.T) {
 	_, err := ApplyPolishEditPlan("甲乙", &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
 		{OldString: "甲", NewString: "甲"},
-	}})
+	}}, maxPolishEditCoverageRatio)
 	if err == nil {
 		t.Fatal("expected error for identical old/new")
 	}
@@ -295,7 +295,7 @@ func TestPolishEditPlan_ApplyTooManyEdits(t *testing.T) {
 	for i := range edits {
 		edits[i] = PolishEditItem{OldString: "a", NewString: "b"}
 	}
-	_, err := ApplyPolishEditPlan("x", &PolishEditPlan{Version: 1, Edits: edits})
+	_, err := ApplyPolishEditPlan("x", &PolishEditPlan{Version: 1, Edits: edits}, maxPolishEditCoverageRatio)
 	if err == nil {
 		t.Fatal("expected error for too many edits")
 	}
@@ -308,7 +308,7 @@ func TestPolishEditPlan_ApplyOldTooLong(t *testing.T) {
 	old := strings.Repeat("长", maxPolishEditOldRunes+1)
 	_, err := ApplyPolishEditPlan(old, &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
 		{OldString: old, NewString: "短"},
-	}})
+	}}, maxPolishEditCoverageRatio)
 	if err == nil {
 		t.Fatal("expected error for overlong old_string")
 	}
@@ -321,7 +321,7 @@ func TestPolishEditPlan_ApplyOldTooLong(t *testing.T) {
 func TestPolishEditPlan_ApplyCoverageTooLarge(t *testing.T) {
 	_, err := ApplyPolishEditPlan("一二三四五六七八九十", &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
 		{OldString: "一二三四五六", NewString: ""},
-	}})
+	}}, maxPolishEditCoverageRatio)
 	if err == nil {
 		t.Fatal("expected error for coverage > 50%")
 	}
@@ -334,7 +334,7 @@ func TestPolishEditPlan_ApplyCoverageTooLarge(t *testing.T) {
 func TestPolishEditPlan_ApplyOutputTooLong(t *testing.T) {
 	_, err := ApplyPolishEditPlan("甲乙", &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
 		{OldString: "甲", NewString: strings.Repeat("长", maxPolishOutputRunes+1)},
-	}})
+	}}, maxPolishEditCoverageRatio)
 	if err == nil {
 		t.Fatal("expected error for overlong candidate")
 	}
@@ -352,12 +352,96 @@ func TestPolishEditPlan_ApplyInvalidNthNoPartialResult(t *testing.T) {
 		{OldString: "不存在的片段", NewString: "x"},
 		{OldString: "猫趴在角落。", NewString: "猫蜷在窗台。"},
 	}}
-	_, err := ApplyPolishEditPlan(input, plan)
+	_, err := ApplyPolishEditPlan(input, plan, maxPolishEditCoverageRatio)
 	if err == nil {
 		t.Fatal("expected error for invalid edit #2 (0-based)")
 	}
 	var pe *PolishEditError
 	if !errors.As(err, &pe) || pe.Index != 2 {
 		t.Fatalf("err = %v, want error at index 2", err)
+	}
+}
+
+// ── 覆盖阈值按场景区分（P1-6） ─────────────────────────────────────────
+//
+// 普通 draft 阶段保持 50% 上限；stage=rewrite（重写/打磨队列）放宽到 70%；
+// 超过 70% 仍拒绝（要求显式整章 rewrite 路径）。覆盖错误携带结构化数字
+// （CoverageRunes/InputRunes/CoverageLimit），供 P0-4 纠错反馈与审计分类使用。
+
+// 普通 draft（50% 上限）：等于 50 接受、超过拒绝。
+func TestPolishEditPlan_CoverageDraftBoundary(t *testing.T) {
+	input := "一二三四五六七八九十" // 10 runes，每个字符唯一
+	// 恰好 50%（5/10）→ 接受。
+	got, err := ApplyPolishEditPlan(input, &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
+		{OldString: "一二三四五", NewString: "x"},
+	}}, maxPolishEditCoverageRatio)
+	if err != nil {
+		t.Fatalf("coverage == 50%% must be accepted, got: %v", err)
+	}
+	if got == input {
+		t.Error("plan must be applied")
+	}
+	// 超过 50%（6/10）→ 拒绝，且错误携带结构化覆盖数字。
+	_, err = ApplyPolishEditPlan(input, &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
+		{OldString: "一二三四五六", NewString: "x"},
+	}}, maxPolishEditCoverageRatio)
+	if err == nil {
+		t.Fatal("coverage > 50%% must be rejected")
+	}
+	var pe *PolishEditError
+	if !errors.As(err, &pe) || pe.CoverageLimit != maxPolishEditCoverageRatio {
+		t.Fatalf("err = %v, want coverage error with limit 0.50", err)
+	}
+	if pe.CoverageRunes != 6 || pe.InputRunes != 10 {
+		t.Errorf("coverage fields = %d/%d, want 6/10", pe.CoverageRunes, pe.InputRunes)
+	}
+	if !strings.Contains(err.Error(), "50%") {
+		t.Errorf("coverage error message must mention 50%%, got: %v", err)
+	}
+}
+
+// rewrite（70% 上限）：63% 接受、超过 70 拒绝；同一 63% 计划在普通 draft
+// （50%）场景必须被拒绝——阈值按场景区分。new_string 保持与 old 等长，
+// 避免候选低于 40% 输出下限干扰覆盖断言。
+func TestPolishEditPlan_CoverageRewriteBoundary(t *testing.T) {
+	input := strings.Repeat("一二三四五六七八九十", 10) // 100 runes
+	plan63 := &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
+		{OldString: strings.Repeat("一二三四五六七八九十", 6) + "一二三", NewString: strings.Repeat("改", 63)}, // 63 runes = 63%
+	}}
+	// 63% ≤ 70% → rewrite 场景接受。
+	if _, err := ApplyPolishEditPlan(input, plan63, maxPolishEditCoverageRatioRewrite); err != nil {
+		t.Fatalf("63%% coverage must be accepted in rewrite (70%% limit), got: %v", err)
+	}
+	// 同一 63% 计划在普通 draft（50%）场景必须被拒绝。
+	if _, err := ApplyPolishEditPlan(input, plan63, maxPolishEditCoverageRatio); err == nil {
+		t.Fatal("63%% coverage must be rejected in draft mode (50%% limit)")
+	}
+	// 超过 70%（71/100）→ rewrite 场景仍拒绝。
+	plan71 := &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
+		{OldString: strings.Repeat("一二三四五六七八九十", 7) + "一", NewString: strings.Repeat("改", 71)}, // 71 runes = 71%
+	}}
+	_, err := ApplyPolishEditPlan(input, plan71, maxPolishEditCoverageRatioRewrite)
+	if err == nil {
+		t.Fatal("coverage 71%% must be rejected even in rewrite mode (> 70%%)")
+	}
+	var pe *PolishEditError
+	if !errors.As(err, &pe) || pe.CoverageLimit != maxPolishEditCoverageRatioRewrite {
+		t.Fatalf("err = %v, want coverage error with limit 0.70", err)
+	}
+	if !strings.Contains(err.Error(), "70%") {
+		t.Errorf("coverage error message must mention 70%%, got: %v", err)
+	}
+}
+
+// 非法 limit 参数（≤0 或 >1）按默认 0.50 兜底（纵深防御）。
+func TestPolishEditPlan_CoverageInvalidLimitDefaults(t *testing.T) {
+	input := "一二三四五六七八九十"
+	for _, limit := range []float64{0, -1, 1.5} {
+		// 6/10 = 60%：默认 50% 下拒绝；若 limit 被错误当作"无上限"则会接受。
+		if _, err := ApplyPolishEditPlan(input, &PolishEditPlan{Version: 1, Edits: []PolishEditItem{
+			{OldString: "一二三四五六", NewString: "x"},
+		}}, limit); err == nil {
+			t.Fatalf("invalid limit %v must fall back to 0.50 and reject 60%% coverage", limit)
+		}
 	}
 }

@@ -21,8 +21,12 @@ const (
 	maxPolishEdits = 32
 	// maxPolishEditOldRunes 是单条 old_string 的长度上限（runes）。
 	maxPolishEditOldRunes = 2000
-	// maxPolishEditCoverageRatio 是所有 old range 总和占输入的比例上限。
+	// maxPolishEditCoverageRatio 是所有 old range 总和占输入的比例上限（普通 draft 场景）。
 	maxPolishEditCoverageRatio = 0.50
+	// maxPolishEditCoverageRatioRewrite 是重写/打磨队列（stage=rewrite）场景的
+	// 覆盖上限（P1-6）：重写场景允许更大改动面（70%），但超过 70% 仍拒绝——
+	// 要求走显式整章 rewrite 路径，edit list 不隐式放开（见 polishCoverageLimitForChapter）。
+	maxPolishEditCoverageRatioRewrite = 0.70
 	// minPolishEditOutputRatio 是应用后候选占输入的比例下限（与整章模式 40% 一致）。
 	minPolishEditOutputRatio = 0.40
 )
@@ -56,6 +60,12 @@ type PolishEditError struct {
 	Kind  PolishEditErrKind
 	Index int // 出错 edit 下标；-1 表示整体
 	Msg   string
+	// 覆盖比例超限错误（Kind=Content）时填充：全部 old range 的 runes 总和、
+	// 输入 runes 总数、当前场景覆盖上限比例。P0-4 内部纠错反馈与审计分类
+	// （coverage_exceeded vs edit_plan_invalid）依赖这些字段。
+	CoverageRunes int
+	InputRunes    int
+	CoverageLimit float64 // 0 表示非覆盖超限错误
 }
 
 func (e *PolishEditError) Error() string {
@@ -132,13 +142,20 @@ func ParsePolishEditPlan(output string) (*PolishEditPlan, bool, error) {
 
 // ApplyPolishEditPlan 校验并原子应用 edit plan 到输入快照，返回完整候选文本。
 //
+// maxCoverageRatio 是当前场景的覆盖比例上限（所有 old range runes 总和 ÷ 输入
+// runes），由调用方按场景传入（P1-6：普通 draft 0.50、rewrite 0.70）。调用方
+// 必须传入非零合法值（0 < maxCoverageRatio <= 1），否则按默认 0.50 兜底。
+//
 // 所有校验基于原始输入快照：任一失败返回 *PolishEditError（Kind=Content），
 // 不产生任何部分结果（纯函数，调用方据此保证草稿原子性——第 N 条无效时
 // 前 N-1 条也绝不落盘）。
 //
 // 应用算法：每条 old_string 必须在输入中精确且唯一出现；按 byte offset 倒序
 // 替换（先替换靠后的 range，再替换靠前的 range），保证互不重叠的 edit 互不干扰。
-func ApplyPolishEditPlan(input string, plan *PolishEditPlan) (string, error) {
+func ApplyPolishEditPlan(input string, plan *PolishEditPlan, maxCoverageRatio float64) (string, error) {
+	if maxCoverageRatio <= 0 || maxCoverageRatio > 1 {
+		maxCoverageRatio = maxPolishEditCoverageRatio
+	}
 	// 1. 条数上限。
 	if len(plan.Edits) > maxPolishEdits {
 		return "", &PolishEditError{Kind: PolishEditErrContent, Index: -1,
@@ -190,11 +207,12 @@ func ApplyPolishEditPlan(input string, plan *PolishEditPlan) (string, error) {
 		}
 	}
 
-	// 4. 覆盖比例上限：所有 old ranges 总和 ≤ 输入 50%。
-	if inputRunes > 0 && coverageRunes > int(float64(inputRunes)*maxPolishEditCoverageRatio) {
+	// 4. 覆盖比例上限：所有 old ranges 总和 ≤ 输入 × 当前场景上限（P1-6）。
+	if inputRunes > 0 && coverageRunes > int(float64(inputRunes)*maxCoverageRatio) {
 		return "", &PolishEditError{Kind: PolishEditErrContent, Index: -1,
-			Msg: fmt.Sprintf("所有 old_string 覆盖 %d/%d runes（%.0f%%），超过上限 50%%",
-				coverageRunes, inputRunes, 100*float64(coverageRunes)/float64(inputRunes))}
+			CoverageRunes: coverageRunes, InputRunes: inputRunes, CoverageLimit: maxCoverageRatio,
+			Msg: fmt.Sprintf("所有 old_string 覆盖 %d/%d runes（%.0f%%），超过上限 %.0f%%",
+				coverageRunes, inputRunes, 100*float64(coverageRunes)/float64(inputRunes), maxCoverageRatio*100)}
 	}
 
 	// 5. 按 start 升序拼接（ranges 已在重叠检查时排序，且互不重叠）：

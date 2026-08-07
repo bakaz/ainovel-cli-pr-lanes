@@ -332,7 +332,9 @@ func TestPolishDraft_InvalidUTF8(t *testing.T) {
 // ── 6. 校验失败：超长输出 ──
 
 func TestPolishDraft_TooLong(t *testing.T) {
-	st := setupPolishStore(t, 1, "原草稿。")
+	// 输入为章节级长度（12 万 runes），输出超 maxPolishOutputRunes 但未超
+	// 2 倍长度比例（P0-5）→ 命中 max 上限检查（"上限"错误信息）。
+	st := setupPolishStore(t, 1, strings.Repeat("长", 120000))
 	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
 		return &agentcore.LLMResponse{Message: polisherText(strings.Repeat("长", maxPolishOutputRunes+1))}, nil
 	})
@@ -538,7 +540,9 @@ func TestPolishDraft_RewriteStage(t *testing.T) {
 // （StopReason=length），第二轮收到专用 recovery prompt（而非默认续写提示）并输出
 // 完整章节 → 最终保存的是完整章，不是半章/尾段。
 func TestPolishDraft_LengthRecoveryFullChapter(t *testing.T) {
-	const draft = "她站在窗前，望着远方的灯火。这个句子写得拖沓冗长，读起来非常累。"
+	// 输入为章节级长度（与完整输出同量级），避免 P0-5 full-text 长度比例门禁
+	// （输出 ≤ 输入 2 倍）误伤：完整章 ≈ 输入 1.1 倍，正常通过。
+	draft := strings.Repeat("她站在窗前，望着远方的灯火。这个句子写得拖沓冗长，读起来非常累。", 40)
 	half := strings.Repeat("这是被截断的半章正文，精修尚未完成，后面还有大量内容没有输出。", 30)
 	full := strings.Repeat("这是精修后的完整章节正文，覆盖了从开头到结尾的全部内容，句式干净利落。", 40)
 
@@ -602,7 +606,8 @@ func TestPolishDraft_LengthRecoveryFullChapter(t *testing.T) {
 // TestPolishDraft_LengthRecoveryThinkingOnly：第一轮仅 thinking 无正文即被截断
 // （mimo 实测 thinking 75-97K 字符场景），第二轮完整输出 → 草稿保存完整、checkpoint 写入。
 func TestPolishDraft_LengthRecoveryThinkingOnly(t *testing.T) {
-	const draft = "她站在窗前，望着远方的灯火。这个句子写得拖沓冗长，读起来非常累。"
+	// 输入为章节级长度（与完整输出同量级），避免 P0-5 full-text 长度比例门禁误伤。
+	draft := strings.Repeat("她站在窗前，望着远方的灯火。这个句子写得拖沓冗长，读起来非常累。", 20)
 	full := strings.Repeat("这是精修后的完整章节正文，覆盖了从开头到结尾的全部内容。", 20)
 
 	st := setupPolishStore(t, 1, draft)
@@ -710,7 +715,8 @@ func TestPolishDraft_LengthRecoveryExhaustedDegraded(t *testing.T) {
 // 不是两段拼接。MaxTurns=3 恰好覆盖 1 次初始 + 2 次 recovery，是
 // length-recovery 精确变体（1×length→complete 与 3×length→fail-closed 之间的边界）。
 func TestPolishDraft_LengthTwiceThenComplete(t *testing.T) {
-	const draft = "这是第三章的原始草稿，句子冗长拖沓，需要精修。"
+	// 输入为章节级长度（与完整输出同量级），避免 P0-5 full-text 长度比例门禁误伤。
+	draft := strings.Repeat("这是第三章的原始草稿，句子冗长拖沓，需要精修。", 50)
 	half := strings.Repeat("这是第一次被截断的半章正文，精修尚未完成，后面还有大量内容没有输出。", 30)
 	full := strings.Repeat("这是第三次输出的完整精修章节正文，覆盖了从开头到结尾的全部内容，句式干净利落。", 40)
 
@@ -1394,54 +1400,91 @@ func TestPolishDraft_EditListContractVersionRejected(t *testing.T) {
 	}
 }
 
-// ── edit 路径失败：fail-closed（草稿原样、无 checkpoint） ───────────────
+// ── edit 路径失败：P0-4 内部有界纠错（首次失败带反馈重试 → 二次失败收敛降级） ──
+//
+// 内容校验失败（anchor 缺失/多次/重叠/超限等）不再 fail-closed 返回错误——否则
+// FSM 仍 needs_polish → writer 反复重调同一工具直到 max turns。现在工具内部
+// 重新调用 polisher 一次（附加精确纠错反馈）；仍失败 → 写 rejected/degraded
+// polish checkpoint（ErrorCategory=edit_plan_invalid / coverage_exceeded）→
+// FSM 收敛到 post-check → 返回成功摘要（Degraded=true），不再消耗 writer turns。
+// 草稿始终不变；mock polisher 每次返回相同坏计划时总调用次数恰为 2（无第 3 次）。
 
 func TestPolishDraft_EditListAnchorMissing(t *testing.T) {
 	draft := mechCleanDraft("她站在窗前，望着远处。")
 	st := setupPolishStore(t, 1, draft)
+	calls := 0
 	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
 		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"不存在的片段", "x"}))}, nil
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
-	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
-	if err == nil {
-		t.Fatal("expected error for missing anchor")
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("content-validation failure must converge internally (no error), got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "内容校验") || !strings.Contains(err.Error(), "不存在") {
-		t.Errorf("expected content-validation error, got: %v", err)
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || output.ErrorCategory != "edit_plan_invalid" {
+		t.Fatalf("expected degraded(edit_plan_invalid) convergence, got %+v", output)
+	}
+	if output.Changed {
+		t.Error("converged output must report changed=false")
 	}
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != draft {
 		t.Error("draft must remain unchanged")
 	}
-	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
-		t.Error("no polish checkpoint after anchor failure")
+	cp := polishCheckpointOf(t, st, 1)
+	if !cp.Degraded || cp.ErrorCategory != "edit_plan_invalid" || cp.Changed {
+		t.Errorf("rejected checkpoint must be degraded(edit_plan_invalid) changed=false, got %+v", cp)
+	}
+	if cp.Digest != domain.DigestDraft(draft) {
+		t.Errorf("checkpoint digest = %s, want current draft digest", cp.Digest)
+	}
+	if calls != 2 {
+		t.Errorf("polisher calls = %d, want 2 (1 initial + 1 feedback retry, no 3rd call)", calls)
 	}
 }
 
 func TestPolishDraft_EditListAnchorMultiple(t *testing.T) {
 	draft := mechCleanDraft("重复的片段，重复的片段。")
 	st := setupPolishStore(t, 1, draft)
+	calls := 0
 	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
 		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"重复的片段", "x"}))}, nil
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
-	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
-	if err == nil || !strings.Contains(err.Error(), "出现 2 次") {
-		t.Fatalf("expected multiplicity error, got: %v", err)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("must converge internally, got: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || output.ErrorCategory != "edit_plan_invalid" {
+		t.Fatalf("expected degraded(edit_plan_invalid), got %+v", output)
 	}
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != draft {
 		t.Error("draft must remain unchanged")
+	}
+	if calls != 2 {
+		t.Errorf("polisher calls = %d, want 2", calls)
 	}
 }
 
 func TestPolishDraft_EditListOverlap(t *testing.T) {
 	draft := mechCleanDraft("她站在窗前，望着远处。")
 	st := setupPolishStore(t, 1, draft)
+	calls := 0
 	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
 		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
 			[2]string{"她站在窗前", "a"},
 			[2]string{"在窗前，望着", "b"},
@@ -1449,22 +1492,34 @@ func TestPolishDraft_EditListOverlap(t *testing.T) {
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
-	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
-	if err == nil || !strings.Contains(err.Error(), "重叠") {
-		t.Fatalf("expected overlap error, got: %v", err)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("must converge internally, got: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || output.ErrorCategory != "edit_plan_invalid" {
+		t.Fatalf("expected degraded(edit_plan_invalid), got %+v", output)
 	}
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != draft {
 		t.Error("draft must remain unchanged")
 	}
+	if calls != 2 {
+		t.Errorf("polisher calls = %d, want 2", calls)
+	}
 }
 
-// TestPolishDraft_EditListInvalidNthAtomic：第 N 条无效 → 整批拒绝，
-// 前 N-1 条合法 edit 也绝不落盘（原子性）。
+// TestPolishDraft_EditListInvalidNthAtomic：第 N 条无效 → 整批拒绝（原子性），
+// 前 N-1 条合法 edit 也绝不落盘；随后按 P0-4 收敛降级。
 func TestPolishDraft_EditListInvalidNthAtomic(t *testing.T) {
 	draft := mechCleanDraft("她站在窗前。他坐在桌边。猫趴在角落。")
 	st := setupPolishStore(t, 1, draft)
+	calls := 0
 	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
 		return &agentcore.LLMResponse{Message: polisherText(editListJSON(
 			[2]string{"她站在窗前。", "她倚窗而立。"},
 			[2]string{"他坐在桌边。", "他立在门前。"},
@@ -1474,17 +1529,27 @@ func TestPolishDraft_EditListInvalidNthAtomic(t *testing.T) {
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
-	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
-	if err == nil || !strings.Contains(err.Error(), "不存在") {
-		t.Fatalf("expected error on invalid 3rd edit, got: %v", err)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("must converge internally, got: %v", err)
 	}
-	// 前两条合法 edit 未落盘：草稿保持原样。
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || output.ErrorCategory != "edit_plan_invalid" {
+		t.Fatalf("expected degraded(edit_plan_invalid), got %+v", output)
+	}
+	// 前两条合法 edit 未落盘：草稿保持原样（原子性）。
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != draft {
 		t.Fatalf("draft must remain unchanged (atomic): got %q", saved)
 	}
-	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
-		t.Error("no polish checkpoint after atomic failure")
+	if n := polishCheckpointCount(t, st, 1); n != 1 {
+		t.Errorf("polish checkpoints = %d, want exactly 1 (degraded)", n)
+	}
+	if calls != 2 {
+		t.Errorf("polisher calls = %d, want 2", calls)
 	}
 }
 
@@ -1496,38 +1561,462 @@ func TestPolishDraft_EditListTooManyEdits(t *testing.T) {
 		items = append(items, fmt.Sprintf(`{"old_string":"x%d","new_string":"y%d"}`, i, i))
 	}
 	body := `{"version":1,"edits":[` + strings.Join(items, ",") + `]}`
+	calls := 0
 	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
 		return &agentcore.LLMResponse{Message: polisherText(body)}, nil
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
-	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
-	if err == nil || !strings.Contains(err.Error(), "超过上限") {
-		t.Fatalf("expected count-limit error, got: %v", err)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("must converge internally, got: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || output.ErrorCategory != "edit_plan_invalid" {
+		t.Fatalf("expected degraded(edit_plan_invalid), got %+v", output)
 	}
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != draft {
 		t.Error("draft must remain unchanged")
 	}
+	if calls != 2 {
+		t.Errorf("polisher calls = %d, want 2", calls)
+	}
 }
 
 func TestPolishDraft_EditListOutputTooLong(t *testing.T) {
 	st := setupPolishStore(t, 1, "甲乙")
+	calls := 0
 	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
 		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"甲", strings.Repeat("长", maxPolishOutputRunes+1)}))}, nil
 	})
 	tool := newEnabledPolishTool(st, polisher)
 
-	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
-	if err == nil || !strings.Contains(err.Error(), "超过上限") {
-		t.Fatalf("expected output-length error, got: %v", err)
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("must converge internally, got: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || output.ErrorCategory != "edit_plan_invalid" {
+		t.Fatalf("expected degraded(edit_plan_invalid), got %+v", output)
 	}
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != "甲乙" {
 		t.Error("draft must remain unchanged")
 	}
+	if n := polishCheckpointCount(t, st, 1); n != 1 {
+		t.Errorf("polish checkpoints = %d, want exactly 1 (degraded)", n)
+	}
+	if calls != 2 {
+		t.Errorf("polisher calls = %d, want 2", calls)
+	}
+}
+
+// ── P0-4：覆盖超限的内部有界纠错（首次带反馈重试 / 二次收敛降级） ────────
+//
+// 普通 draft 场景覆盖上限 50%（P1-6）：63% 计划首次校验失败 → 工具内部重调
+// polisher 一次并附加精确反馈（覆盖 X/Y runes、上限、只保留高优先级修改、
+// 缩小 old_string、不得重复原计划）→ 合法计划成功；连续两次相同覆盖错误 →
+// 写 rejected/degraded checkpoint（ErrorCategory=coverage_exceeded）、不再第 3
+// 次调用 polisher、草稿不变（不跑到 writer 的 max turns）。
+
+// TestPolishDraft_EditListCoverageRetrySucceeds：首次 63% 覆盖失败 → 带反馈重试，
+// mock polisher 第 2 次返回合法计划 → 成功（polished+changed，草稿落盘为应用后
+// 文本，恰 1 个非 degraded checkpoint）。第 2 次调用任务文本含精确纠错反馈。
+func TestPolishDraft_EditListCoverageRetrySucceeds(t *testing.T) {
+	draft := mechCleanDraft("她站在窗前，望着远处的灯火。晚风拂过她的发梢。")
+	st := setupPolishStore(t, 1, draft)
+	savePermissiveUserRules(t, st) // 机械门禁激活：输入 clean，候选也必须 clean
+	calls := 0
+	var retryTask string
+	badPlan := editListJSON([2]string{"她站在窗前，望着远处的灯火。晚风拂过她的发梢。", "她倚窗而立，望向远方的灯火。晚风拂过她的发梢。"})
+	goodPlan := editListJSON([2]string{"她站在窗前", "她倚窗而立"})
+	polisher := newMockPolisher(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
+		if i == 0 {
+			// 首次：覆盖 23/37 runes ≈ 62% > 50% → 内容校验失败
+			return &agentcore.LLMResponse{Message: polisherText(badPlan)}, nil
+		}
+		if len(msgs) > 0 {
+			retryTask = msgs[len(msgs)-1].TextContent()
+		}
+		return &agentcore.LLMResponse{Message: polisherText(goodPlan)}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute must succeed after feedback retry, got: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Polished || !output.Changed {
+		t.Fatalf("expected polished+changed after retry, got %+v", output)
+	}
+	if output.Degraded {
+		t.Fatal("retry success must NOT be degraded")
+	}
+	want := "她倚窗而立，望着远处的灯火。晚风拂过她的发梢。她心里骂自己丢人，真不要脸。"
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != want {
+		t.Fatalf("saved draft = %q, want %q", saved, want)
+	}
+	cp := polishCheckpointOf(t, st, 1)
+	if cp.Degraded || cp.Method != "edit_list" || cp.EditCount != 1 {
+		t.Errorf("checkpoint must be non-degraded edit_list(1), got %+v", cp)
+	}
+	if calls != 2 {
+		t.Errorf("polisher calls = %d, want 2 (1 initial + 1 feedback retry)", calls)
+	}
+	// 第 2 次任务文本必须含精确纠错反馈：覆盖数字、场景上限、硬约束。
+	for _, wantFrag := range []string{"上次计划无效", "覆盖 23/37 runes", "上限 50%", "只保留优先级最高的修改", "缩小 old_string", "不得重复原计划"} {
+		if !strings.Contains(retryTask, wantFrag) {
+			t.Errorf("retry task 缺少纠错反馈片段 %q\n任务文本:\n%s", wantFrag, retryTask)
+		}
+	}
+}
+
+// TestPolishDraft_EditListCoverageConverges：连续两次相同覆盖错误 → 写
+// rejected/degraded polish checkpoint（ErrorCategory=coverage_exceeded，
+// Digest=当前草稿、Changed=false、Method=edit_list）→ 返回成功摘要
+// （Degraded=true）→ FSM 收敛；polisher 恰被调用 2 次（不再第 3 次），
+// 草稿不变——普通 draft 同 63% 场景有界降级，不跑到 45 turns。
+func TestPolishDraft_EditListCoverageConverges(t *testing.T) {
+	draft := mechCleanDraft("她站在窗前，望着远处的灯火。晚风拂过她的发梢。")
+	st := setupPolishStore(t, 1, draft)
+	calls := 0
+	var retryTask string
+	badPlan := editListJSON([2]string{"她站在窗前，望着远处的灯火。晚风拂过她的发梢。", "她倚窗而立，望向远方的灯火。晚风拂过她的发梢。"})
+	polisher := newMockPolisher(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		calls++
+		if len(msgs) > 0 && i > 0 {
+			retryTask = msgs[len(msgs)-1].TextContent()
+		}
+		return &agentcore.LLMResponse{Message: polisherText(badPlan)}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("second failure must converge (no error), got: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || output.ErrorCategory != "coverage_exceeded" {
+		t.Fatalf("expected degraded(coverage_exceeded) convergence, got %+v", output)
+	}
+	if output.Changed || output.OutputDigest != domain.DigestDraft(draft) {
+		t.Fatalf("converged output must report changed=false with current digest, got %+v", output)
+	}
+	if !output.Polished {
+		t.Error("converged output must report polished=true (工具完成留痕，调用方继续 post-check)")
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Error("draft must remain unchanged")
+	}
+	cp := polishCheckpointOf(t, st, 1)
+	if !cp.Degraded || cp.ErrorCategory != "coverage_exceeded" || cp.Changed {
+		t.Errorf("rejected checkpoint must be degraded(coverage_exceeded) changed=false, got %+v", cp)
+	}
+	if cp.Digest != domain.DigestDraft(draft) {
+		t.Errorf("checkpoint digest = %s, want current draft digest", cp.Digest)
+	}
+	if cp.Method != "edit_list" || cp.EditCount != 1 {
+		t.Errorf("rejected checkpoint method/edit_count = %s/%d, want edit_list/1", cp.Method, cp.EditCount)
+	}
+	if n := polishCheckpointCount(t, st, 1); n != 1 {
+		t.Errorf("polish checkpoints = %d, want exactly 1 (degraded)", n)
+	}
+	if calls != 2 {
+		t.Errorf("polisher calls = %d, want 2 (retry once, no 3rd call — 不跑到 45 turns)", calls)
+	}
+	// 重试任务文本含覆盖纠错反馈（62% > 50%）。
+	if !strings.Contains(retryTask, "上次计划无效") || !strings.Contains(retryTask, "覆盖 23/37 runes") {
+		t.Errorf("retry task 必须含覆盖纠错反馈, got:\n%s", retryTask)
+	}
+}
+
+// TestPolishDraft_Rewrite63PercentPipelineIntegration：~3951 rune 重写队列章节 +
+// 63% 覆盖 edit plan 的完整链路（P1-6 集成）：rewrite 场景覆盖上限放宽到 70% →
+// 63% 计划一次通过（无纠错重试）→ polish（checkpoint stage=rewrite、method=
+// edit_list、edit_count=2）→ check → review（critic pass，epoch-2 绑定 polish
+// seq）→ commit（pipeline 门控）→ 队列 drain、终稿覆盖。同一 63% 计划在普通
+// draft 场景会被拒（50% 上限，见 TestPolishEditPlan_CoverageRewriteBoundary 与
+// TestPolishDraft_EditListCoverageConverges）。
+func TestPolishDraft_Rewrite63PercentPipelineIntegration(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := st.Progress.Init("test", 10); err != nil {
+		t.Fatalf("Progress.Init: %v", err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatalf("SetStyleReviewMode: %v", err)
+	}
+	savePermissiveUserRules(t, st)
+
+	// 已完成章节进入重写队列：终稿 = 旧版本，草稿 = 返工版本（~3951 runes）。
+	// 带序号行（第%d段）保证 63% 覆盖计划的 old_string 唯一；序号不用"次"
+	// 避免触发节拍账本硬闸（第N+计数单位 ≥3 → error 级文学腔违例）。
+	const unit = "她站在窗前，望着远方的灯火。风从巷口涌来，卷起几片枯叶。"
+	n := 118
+	lines := make([]string, n)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("第%d段，%s", i+1, unit)
+	}
+	rework := mechCleanDraft(strings.Join(lines, "\n"))
+	if r := utf8.RuneCountInString(rework); r < 3800 || r > 4100 {
+		t.Fatalf("rework draft runes = %d, want ~3951", r)
+	}
+	final := "# 一\n原始终稿内容。她心里骂自己丢人，真不要脸。"
+	if err := st.Drafts.SaveDraft(1, rework); err != nil {
+		t.Fatalf("SaveDraft rework: %v", err)
+	}
+	if err := st.Drafts.SaveFinalChapter(1, final); err != nil {
+		t.Fatalf("SaveFinalChapter: %v", err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 100, "", ""); err != nil {
+		t.Fatalf("MarkChapterComplete: %v", err)
+	}
+	if err := st.Progress.SetPendingRewrites([]int{1}, "返工"); err != nil {
+		t.Fatalf("SetPendingRewrites: %v", err)
+	}
+	if err := st.Progress.SetFlow(domain.FlowRewriting); err != nil {
+		t.Fatalf("SetFlow: %v", err)
+	}
+	// 旧 epoch（epoch 1）terminal 账本：绑定原始终稿 digest。
+	now := time.Now().Format(time.RFC3339)
+	basisDigest := ComputeBasisDigest(st, 1, testCriticVersion)
+	originalDigest := domain.DigestDraft(final)
+	oldLedger := domain.StyleReviewLedger{
+		SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+		Cycles: []domain.StyleReviewEntry{
+			{Cycle: 1, Status: domain.ReviewStatusInitialPending, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: originalDigest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "critic-model"}},
+			{Cycle: 2, Status: domain.ReviewStatusAcceptedInitial, CreatedAt: now,
+				AttemptID: "a1", DraftDigest: originalDigest, BasisDigest: basisDigest,
+				Request: &domain.StyleReviewRequest{Prompt: testCriticVersion, Model: "critic-model"},
+				Result:  &domain.StyleReviewResult{Verdict: domain.ReviewVerdictPass, Evidence: "ok"}},
+		},
+	}
+	if err := st.StyleReview.Save(oldLedger); err != nil {
+		t.Fatalf("Save old ledger: %v", err)
+	}
+
+	// 1) 无 polish → check_consistency 建议 polish_draft。
+	checkTool := NewCheckConsistencyTool(st)
+	checkTool.SetPipelineEnabled(true)
+	out1, err := checkTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("check_consistency #1: %v", err)
+	}
+	var res1 map[string]any
+	if err := json.Unmarshal(out1, &res1); err != nil {
+		t.Fatal(err)
+	}
+	act1, _ := res1["required_next_action"].(map[string]any)
+	if act1 == nil || act1["action"] != ActionPolishDraft {
+		t.Fatalf("required_next_action #1 = %v, want %s", act1, ActionPolishDraft)
+	}
+
+	// 2) polish_draft：63% 覆盖 edit plan（两条 old_string：lines[0:37] 与
+	// lines[37:74]，各 ≤2000 runes，合计 74/118 行 ≈ 63%）→ rewrite 场景上限
+	// 70% 一次通过（无纠错重试，恰 1 次 polisher 调用）。
+	polishedLines := make([]string, n)
+	for i, l := range lines {
+		polishedLines[i] = strings.Replace(l, "她站在窗前，望着远方的灯火。", "她临窗而立，望向远处的灯火。", 1)
+	}
+	oldA := strings.Join(lines[0:37], "\n")
+	oldB := strings.Join(lines[37:74], "\n")
+	newA := strings.Join(polishedLines[0:37], "\n")
+	newB := strings.Join(polishedLines[37:74], "\n")
+	planJSON := editListJSON([2]string{oldA, newA}, [2]string{oldB, newB})
+	coverage := float64(utf8.RuneCountInString(oldA)+utf8.RuneCountInString(oldB)) / float64(utf8.RuneCountInString(rework))
+	if coverage <= 0.60 || coverage > 0.70 {
+		t.Fatalf("coverage = %.1f%%, want (60%%, 70%%] for rewrite acceptance", coverage*100)
+	}
+	pCalls := 0
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		pCalls++
+		return &agentcore.LLMResponse{Message: polisherText(planJSON)}, nil
+	})
+	polishTool := newEnabledPolishTool(st, polisher)
+	pOut, err := polishTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("polish_draft: %v", err)
+	}
+	var pRes PolishDraftOutput
+	if err := json.Unmarshal(pOut, &pRes); err != nil {
+		t.Fatal(err)
+	}
+	if !pRes.Polished || !pRes.Changed || pRes.Degraded {
+		t.Fatalf("polish result = %+v, want polished+changed, non-degraded", pRes)
+	}
+	if pCalls != 1 {
+		t.Errorf("polisher calls = %d, want 1 (63%% accepted at rewrite 70%% limit, no retry)", pCalls)
+	}
+	polishCP := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish")
+	if polishCP == nil || polishCP.Stage != "rewrite" || polishCP.Method != "edit_list" || polishCP.EditCount != 2 {
+		t.Fatalf("polish checkpoint = %+v, want stage=rewrite method=edit_list edit_count=2", polishCP)
+	}
+	// 候选已原子落盘：前 74 行精修（两条 edit：0:37 与 37:74）、其余行原样保留。
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	expected := strings.Join(append(append([]string{}, polishedLines[0:74]...), lines[74:]...), "\n") + "她心里骂自己丢人，真不要脸。"
+	if saved != expected {
+		t.Fatalf("saved draft 与 63%% edit plan 应用结果不一致：\ngot  %q...\nwant %q...", snippet(saved), snippet(expected))
+	}
+
+	// 3) 精修后 check_consistency（新 seq）→ 建议 review_style。
+	out2, err := checkTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("check_consistency #2: %v", err)
+	}
+	var res2 map[string]any
+	if err := json.Unmarshal(out2, &res2); err != nil {
+		t.Fatal(err)
+	}
+	act2, _ := res2["required_next_action"].(map[string]any)
+	if act2 == nil || act2["action"] != ActionReviewStyle {
+		t.Fatalf("required_next_action #2 = %v, want %s", act2, ActionReviewStyle)
+	}
+
+	// 4) review_style（critic pass）→ 新 epoch（epoch 2）终验，绑定本次 polish seq。
+	critic := newMockCritic(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	reviewTool := NewReviewStyleTool(st, critic, testCriticVersion)
+	reviewTool.SetPipelineEnabled(true)
+	rOut, err := reviewTool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("review_style: %v", err)
+	}
+	var rRes StyleReviewOutput
+	if err := json.Unmarshal(rOut, &rRes); err != nil {
+		t.Fatal(err)
+	}
+	if rRes.Verdict != "pass" {
+		t.Fatalf("review = %s, want pass", rRes.Verdict)
+	}
+	ledger, err := st.StyleReview.Load(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := ledger.CurrentCycle()
+	if last.Request == nil || last.Request.PolishCheckpointSeq != polishCP.Seq {
+		t.Fatalf("epoch-2 result 绑定 polish seq = %+v, want %d", last.Request, polishCP.Seq)
+	}
+
+	// 5) commit（pipeline 门控开启）→ 放行并 drain 队列。
+	commitTool := NewCommitChapterTool(st)
+	commitTool.SetPolishPipeline(&PolishPipelineConfig{ExpectedModel: "mock-polisher-model"})
+	args, _ := json.Marshal(map[string]any{
+		"chapter": 1, "summary": "63% 精修提交", "characters": []string{"主角"},
+		"key_events":       []string{"事件"},
+		"world_state_mode": "preserve",
+	})
+	if _, err := commitTool.Execute(t.Context(), args); err != nil {
+		t.Fatalf("commit after 63%% rewrite chain should pass: %v", err)
+	}
+	progress, err := st.Progress.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(progress.PendingRewrites) != 0 {
+		t.Fatalf("PendingRewrites = %v, want drained", progress.PendingRewrites)
+	}
+	finalText, _ := st.Drafts.LoadChapterText(1)
+	if finalText == "" {
+		t.Fatal("final chapter should have been overwritten")
+	}
+}
+
+// ── P0-5：full-text 回退路径的机械回归门禁 ─────────────────────────────
+
+// TestPolishDraft_FullTextMechanicalRegressionRejected：full-text 候选（非 JSON
+// 纯正文）引入 error 级机械违规（"不知为何"禁词）→ 机械回归门禁拒绝保存：
+// 草稿不变、无 polish checkpoint、错误明确区分"机械回归"、不混入 Degraded=true。
+func TestPolishDraft_FullTextMechanicalRegressionRejected(t *testing.T) {
+	draft := mechCleanDraft("她停住了，望着远处。")
+	st := setupPolishStore(t, 1, draft)
+	savePermissiveUserRules(t, st)
+	if hasErrorViolations(computeMechanicalViolations(st, draft, utf8.RuneCountInString(draft))) {
+		t.Fatal("test precondition: input draft must be mechanically clean")
+	}
+	// 非 JSON 纯正文（走 full-text 回退），长度在 40%~2x 范围内，含禁词"不知为何"。
+	badText := "她不知为何停住了，望着远处。她心里骂自己丢人，真不要脸。"
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(badText)}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("expected mechanical-regression rejection on full-text candidate")
+	}
+	if !strings.Contains(err.Error(), "机械回归") {
+		t.Errorf("expected mechanical-regression error, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Error("draft must remain unchanged")
+	}
 	if cp := st.Checkpoints.LatestByStep(domain.ChapterScope(1), "polish"); cp != nil {
-		t.Error("no polish checkpoint after length failure")
+		t.Error("no polish checkpoint after full-text mechanical rejection")
+	}
+}
+
+// TestPolishDraft_FullTextMechanicalRegressionConverges：full-text 候选连续第 2 次
+// 机械回归拒绝（与 edit 路径共享 mechRejectStreak）→ 写 rejected polish checkpoint
+// （ErrorCategory=mechanical_regression、Method=full_text）→ 返回成功摘要收敛。
+func TestPolishDraft_FullTextMechanicalRegressionConverges(t *testing.T) {
+	draft := mechCleanDraft("她停住了，望着远处。")
+	st := setupPolishStore(t, 1, draft)
+	savePermissiveUserRules(t, st)
+	badText := "她不知为何停住了，望着远处。她心里骂自己丢人，真不要脸。"
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		return &agentcore.LLMResponse{Message: polisherText(badText)}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	// 第 1 次：fail-closed。
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil || !strings.Contains(err.Error(), "机械回归") {
+		t.Fatalf("first rejection must fail-closed, got: %v", err)
+	}
+	// 第 2 次：收敛为 rejected checkpoint（full_text method）。
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("second rejection must converge (no error), got: %v", err)
+	}
+	var output PolishDraftOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || output.ErrorCategory != "mechanical_regression" {
+		t.Fatalf("converged output must be degraded(mechanical_regression), got %+v", output)
+	}
+	cp := polishCheckpointOf(t, st, 1)
+	if !cp.Degraded || cp.ErrorCategory != "mechanical_regression" || cp.Method != "full_text" {
+		t.Errorf("rejected checkpoint must be degraded(mechanical_regression) method=full_text, got %+v", cp)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Error("draft must remain unchanged")
 	}
 }
 
@@ -1827,7 +2316,7 @@ func TestPolishDraft_TaskBasisBeforeDraft(t *testing.T) {
 		return &agentcore.LLMResponse{Message: polisherText("x")}, nil
 	})
 	tool := newEnabledPolishTool(st, polisher)
-	task := tool.buildPolishTask(1, draft, utf8.RuneCountInString(draft))
+	task := tool.buildPolishTask(1, draft, utf8.RuneCountInString(draft), "")
 
 	idx := func(marker string) int {
 		i := strings.Index(task, marker)
