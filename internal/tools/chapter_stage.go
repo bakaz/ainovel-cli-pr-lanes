@@ -348,7 +348,10 @@ func ComputeChapterStage(in ChapterStageInput) ChapterStageDecision {
 			}
 			reason := "首次 consistency 已通过，需要精修当前草稿"
 			if postPolishEdit(in) {
-				reason = "草稿在精修后又被修改（digest 与最后一次 polish 记录不一致）：必须重新 check_consistency → polish_draft → check_consistency → 再 review/commit，不要直接 commit"
+				// 当前阶段已是 needs_polish：check_consistency 会被 FSM 拒绝
+				// （allowed 只有 polish_draft），故不得再引导"先 check"。
+				// 唯一动作是 polish；成功后 check 一次，再跟随 required_next_action。
+				reason = fmt.Sprintf("草稿在精修后已被修改（digest 与最后一次 polish 记录不一致）。当前唯一动作：调用 polish_draft(chapter=%d)，成功后调用一次 check_consistency，再严格执行 required_next_action。禁止 edit_chapter / commit_chapter。", in.Chapter)
 			}
 			return decision(ChapterStageNeedsPolish,
 				[]ChapterAction{ChapterActionPolish}, ChapterActionPolish, reason)

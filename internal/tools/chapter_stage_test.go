@@ -939,9 +939,9 @@ func TestResolveChapterStage_StoreReadError(t *testing.T) {
 
 // TestComputeChapterStage_PostPolishEditReason 验证核心纠错场景：polish 后
 // writer 又 edit 草稿导致 digest 与最后一次 polish checkpoint 不一致时，
-// needs_polish 的 reason 必须给出专门提示（精修后又被修改 + 恢复序列），
-// 而不是笼统的"需要精修当前草稿"；对照场景（无 polish/模型不符/阶段不符）
-// 不得误报。
+// needs_polish 的 reason 必须给出专门提示（精修后已被修改 + 当前唯一动作是
+// polish），而不是笼统的"需要精修当前草稿"，也不得再引导"先 check"（此刻
+// check 会被 FSM 拒绝）；对照场景（无 polish/模型不符/阶段不符）不得误报。
 func TestComputeChapterStage_PostPolishEditReason(t *testing.T) {
 	const critic = domain.StyleQualityCritic
 	d := dig("draft-content")     // polish checkpoint 记录的 output digest
@@ -950,24 +950,35 @@ func TestComputeChapterStage_PostPolishEditReason(t *testing.T) {
 	// 核心场景：LatestPolish.OutputDigest(=Digest)=d != 当前草稿 d3。
 	in := ChapterStageInput{
 		PipelineEnabled: true, StyleReviewMode: critic,
-		DraftExists: true, DraftDigest: d3,
+		Chapter: 1, DraftExists: true, DraftDigest: d3,
 		LatestConsistency: consistencyCP(8, d3), LatestPolish: polishCP(7, d, "draft", ""),
 	}
 	got := ComputeChapterStage(in)
 	if got.Stage != ChapterStageNeedsPolish {
 		t.Fatalf("stage = %s, want needs_polish", got.Stage)
 	}
-	if !strings.Contains(got.Reason, "精修后又被修改") {
+	if !strings.Contains(got.Reason, "精修后已被修改") {
 		t.Fatalf("reason 必须标注 polish 后被修改，got %q", got.Reason)
 	}
-	for _, want := range []string{"check_consistency", "polish_draft", "不要直接 commit"} {
+	// 新语义：当前唯一动作 = polish，成功后 check 一次；禁止 edit/commit。
+	for _, want := range []string{
+		"当前唯一动作：调用 polish_draft(chapter=1)",
+		"成功后调用一次 check_consistency",
+		"禁止 edit_chapter / commit_chapter",
+	} {
 		if !strings.Contains(got.Reason, want) {
-			t.Fatalf("reason 必须含恢复序列 %q，got %q", want, got.Reason)
+			t.Fatalf("reason 必须含 %q，got %q", want, got.Reason)
+		}
+	}
+	// 不得再引导"先 check"（此刻 check 会被 FSM 拒绝，浪费 turn）。
+	for _, banned := range []string{"先 check_consistency", "必须重新 check_consistency"} {
+		if strings.Contains(got.Reason, banned) {
+			t.Fatalf("reason 不得含 %q（不得引导先 check），got %q", banned, got.Reason)
 		}
 	}
 	// RequiredNextAction 传播同一 reason（模型决策依据唯一来源）。
 	na := got.RequiredNextAction()
-	if na == nil || na.Action != "polish_draft" || !strings.Contains(na.Reason, "精修后又被修改") {
+	if na == nil || na.Action != "polish_draft" || !strings.Contains(na.Reason, "精修后已被修改") {
 		t.Fatalf("RequiredNextAction 必须携带专门 reason，got %+v", na)
 	}
 
@@ -978,7 +989,7 @@ func TestComputeChapterStage_PostPolishEditReason(t *testing.T) {
 		LatestConsistency: consistencyCP(1, d),
 	}
 	if g := ComputeChapterStage(inFirst); g.Stage != ChapterStageNeedsPolish ||
-		strings.Contains(g.Reason, "精修后又被修改") {
+		strings.Contains(g.Reason, "精修后已被修改") {
 		t.Fatalf("首次精修不得误报 post-polish edit：stage=%s reason=%q", g.Stage, g.Reason)
 	}
 
@@ -989,7 +1000,7 @@ func TestComputeChapterStage_PostPolishEditReason(t *testing.T) {
 		LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "draft", "old-model"),
 	}
 	if g := ComputeChapterStage(inModel); g.Stage != ChapterStageNeedsPolish ||
-		strings.Contains(g.Reason, "精修后又被修改") {
+		strings.Contains(g.Reason, "精修后已被修改") {
 		t.Fatalf("模型不符不得误报 post-polish edit：stage=%s reason=%q", g.Stage, g.Reason)
 	}
 
@@ -1000,8 +1011,41 @@ func TestComputeChapterStage_PostPolishEditReason(t *testing.T) {
 		LatestConsistency: consistencyCP(8, d), LatestPolish: polishCP(7, d, "draft", ""),
 	}
 	if g := ComputeChapterStage(inStage); g.Stage != ChapterStageNeedsPolish ||
-		strings.Contains(g.Reason, "精修后又被修改") {
+		strings.Contains(g.Reason, "精修后已被修改") {
 		t.Fatalf("stage 不符不得误报 post-polish edit：stage=%s reason=%q", g.Stage, g.Reason)
+	}
+}
+
+// TestComputeChapterStage_PostPolishEditBansEditAndCommit 补充验证：post-polish
+// edit 场景的 needs_polish reason 必须明确禁止 edit_chapter / commit_chapter
+// （两者正是生产日志中 digest 失效的最大来源），且不允许集只有 polish_draft。
+func TestComputeChapterStage_PostPolishEditBansEditAndCommit(t *testing.T) {
+	d := dig("draft-content")
+	d3 := dig("draft-after-edit")
+	in := ChapterStageInput{
+		PipelineEnabled: true, StyleReviewMode: domain.StyleQualityCritic,
+		Chapter: 1, DraftExists: true, DraftDigest: d3,
+		LatestConsistency: consistencyCP(8, d3), LatestPolish: polishCP(7, d, "draft", ""),
+	}
+	got := ComputeChapterStage(in)
+	if got.Stage != ChapterStageNeedsPolish {
+		t.Fatalf("stage = %s, want needs_polish", got.Stage)
+	}
+	for _, banned := range []string{"禁止 edit_chapter", "禁止 edit_chapter / commit_chapter", "commit_chapter"} {
+		if !strings.Contains(got.Reason, banned) {
+			t.Fatalf("reason 必须明确禁止 %q，got %q", banned, got.Reason)
+		}
+	}
+	// 允许集只有 polish：edit/commit/check/review 全部不在列。
+	for _, a := range []ChapterAction{
+		ChapterActionEdit, ChapterActionCommit, ChapterActionCheck, ChapterActionReview, ChapterActionDraft,
+	} {
+		if got.Allows(a) {
+			t.Fatalf("needs_polish(post-polish edit) 不得允许 %s，allowed=%v", a, got.Allowed)
+		}
+	}
+	if !got.Allows(ChapterActionPolish) {
+		t.Fatalf("needs_polish(post-polish edit) 必须允许 polish_draft，allowed=%v", got.Allowed)
 	}
 }
 
