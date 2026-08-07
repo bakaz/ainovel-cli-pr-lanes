@@ -553,7 +553,7 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 	if !strings.Contains(ac.SystemPrompt, "文风精修师") {
 		t.Error("polisher system prompt should come from polisher.md")
 	}
-	if !strings.Contains(ac.SystemPrompt, "没有任何工具") {
+	if !strings.Contains(ac.SystemPrompt, "不提供任何工具") {
 		t.Error("polisher prompt should state it has no tools")
 	}
 	if ac.PromptCacheKey == "" || ac.PromptCacheKey == runnerAgentCacheKey(t, runner, "writer") {
