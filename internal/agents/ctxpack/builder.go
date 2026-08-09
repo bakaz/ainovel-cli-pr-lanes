@@ -25,6 +25,7 @@ type writerStoreSummaryState struct {
 	snapshots         []domain.CharacterSnapshot
 	foreshadow        []domain.ForeshadowEntry
 	characterState    []domain.CharacterStateEntry
+	worldRules        []domain.WorldRule
 	timeline          []domain.TimelineEvent
 	styleRules        *domain.WritingStyleRules
 	pendingReviews    []writerPendingReview
@@ -54,11 +55,17 @@ func buildWriterStoreSummaryText(s *store.Store, budgetTokens int) (string, bool
 	if budgetTokens <= 0 {
 		budgetTokens = defaultStoreSummaryBudgetTokens
 	}
-	parts := renderWriterStoreSections(state, budgetTokens, writerStoreSummarySections(state))
-	if len(parts) == 0 {
-		return "", false, nil
+	sections := writerStoreSummarySections(state)
+	// 渲染前预扣前缀与段间分隔符开销（正式估算器），保证最终完整文本落入预算
+	overhead := corecontext.EstimateTokens(agentcore.UserMsg("以下内容来自小说持久化 store，用于在压缩后恢复写作上下文。\n\n"))
+	if len(sections) > 1 {
+		overhead += (len(sections) - 1) * 2 // 段间 "\n\n" 保守余量
 	}
-	return "以下内容来自小说持久化 store，用于在压缩后恢复写作上下文。\n\n" + strings.Join(parts, "\n\n"), true, nil
+	wrap := func(parts []string) string {
+		return "以下内容来自小说持久化 store，用于在压缩后恢复写作上下文。\n\n" + strings.Join(parts, "\n\n")
+	}
+	full, ok := renderStoreTextWithFinalCheck(state, budgetTokens, overhead, sections, wrap)
+	return full, ok, nil
 }
 
 func buildWriterRestoreText(s *store.Store, budgetTokens int) (string, bool, error) {
@@ -78,11 +85,47 @@ func buildWriterRestoreText(s *store.Store, budgetTokens int) (string, bool, err
 	if budgetTokens <= 0 {
 		budgetTokens = restoreBudgetTokens
 	}
-	parts := renderWriterStoreSections(state, budgetTokens, writerRestoreSections(state))
-	if len(parts) == 0 {
-		return "", false, nil
+	sections := writerRestoreSections(state)
+	// 渲染前预扣 wrapper 与段间分隔符开销（正式估算器），保证最终完整文本
+	// （含 <post-compact-context> wrapper）落入预算，避免 buildMessage 拒绝。
+	overhead := corecontext.EstimateTokens(agentcore.UserMsg("<post-compact-context>\n\n</post-compact-context>"))
+	if len(sections) > 1 {
+		overhead += (len(sections) - 1) * 2 // 段间 "\n\n" 保守余量
 	}
-	return "<post-compact-context>\n" + strings.Join(parts, "\n\n") + "\n</post-compact-context>", true, nil
+	wrap := func(parts []string) string {
+		return "<post-compact-context>\n" + strings.Join(parts, "\n\n") + "\n</post-compact-context>"
+	}
+	full, ok := renderStoreTextWithFinalCheck(state, budgetTokens, overhead, sections, wrap)
+	return full, ok, nil
+}
+
+// renderStoreTextWithFinalCheck 渲染 sections 并对最终完整文本做预算兜底：
+// 分项估算非严格可加（估算器按完整文本重新判断 CJK/ASCII dominance），完整文本
+// 可能超出预算——按超出比例收缩预算重渲染（最多 3 轮）；仍超则返回 false，
+// 不把超预算结果交给 buildMessage（避免恢复包被整体拒绝）。
+func renderStoreTextWithFinalCheck(state *writerStoreSummaryState, budgetTokens, overhead int, sections []writerStoreSection, wrap func([]string) string) (string, bool) {
+	parts := renderWriterStoreSections(state, budgetTokens-overhead, sections)
+	if len(parts) == 0 {
+		return "", false
+	}
+	full := wrap(parts)
+	for attempt := 0; attempt < 3 && corecontext.EstimateTokens(agentcore.UserMsg(full)) > budgetTokens; attempt++ {
+		cur := corecontext.EstimateTokens(agentcore.UserMsg(full))
+		ratio := float64(budgetTokens) / float64(cur)
+		newBudget := int(float64(budgetTokens-overhead)*ratio*0.95) + overhead
+		if newBudget <= overhead {
+			return "", false
+		}
+		parts = renderWriterStoreSections(state, newBudget-overhead, sections)
+		if len(parts) == 0 {
+			return "", false
+		}
+		full = wrap(parts)
+	}
+	if corecontext.EstimateTokens(agentcore.UserMsg(full)) > budgetTokens {
+		return "", false
+	}
+	return full, true
 }
 
 func loadWriterStoreSummaryState(s *store.Store) (*writerStoreSummaryState, bool, error) {
@@ -139,6 +182,10 @@ func loadWriterStoreSummaryState(s *store.Store) (*writerStoreSummaryState, bool
 		return nil, false, err
 	}
 	state.characterState, err = s.World.LoadCharacterState()
+	if err != nil {
+		return nil, false, err
+	}
+	state.worldRules, err = s.World.LoadWorldRules()
 	if err != nil {
 		return nil, false, err
 	}
@@ -199,6 +246,7 @@ func loadWriterRestoreState(s *store.Store) (*writerStoreSummaryState, error) {
 	state.snapshots, _ = s.Characters.LoadLatestSnapshots()
 	state.foreshadow, _ = s.World.LoadActiveForeshadow()
 	state.characterState, _ = s.World.LoadCharacterState()
+	state.worldRules, _ = s.World.LoadWorldRules()
 	state.pendingReviews, _ = loadPendingReviewsForStoreState(s, chapter)
 	state.styleRules, _ = s.World.LoadStyleRules()
 	state.timeline, _ = s.World.LoadRecentTimeline(chapter, profile.TimelineWindow)
@@ -212,7 +260,8 @@ func loadWriterRestoreState(s *store.Store) (*writerStoreSummaryState, error) {
 		isEmptySummarySection(state.pendingReviews) &&
 		isEmptySummarySection(state.recentSummaries) &&
 		isEmptySummarySection(state.foreshadow) &&
-		isEmptySummarySection(state.characterState) {
+		isEmptySummarySection(state.characterState) &&
+		isEmptySummarySection(state.worldRules) {
 		return nil, nil
 	}
 	return state, nil
@@ -221,17 +270,31 @@ func loadWriterRestoreState(s *store.Store) (*writerStoreSummaryState, error) {
 type writerStoreSection struct {
 	heading string
 	data    any
+	// canon 表示关键状态段（计划/大纲/CharacterState/伏笔/WorldRules）：
+	// 渲染分两轮——canon 段先各自按独立预算份额渲染，某段超份额时独立
+	// 截断，不阻止后续 canon 段；optional 段（进度/摘要/快照/时间线/风格
+	// 规则等）第二轮消费剩余预算。
+	canon bool
 }
+
+// progressCompletedTail 进度段仅保留最近 N 章 completed_chapters 明细。
+// 长书（数千章）的完整明细会独占上下文预算，且对续写无增量信息——
+// completed_count 已给出总量，明细只需覆盖最近章节用于衔接。
+const progressCompletedTail = 5
 
 func writerStoreProgressSection(state *writerStoreSummaryState) map[string]any {
 	if state == nil || state.progress == nil {
 		return nil
 	}
+	completed := state.progress.CompletedChapters
+	if len(completed) > progressCompletedTail {
+		completed = completed[len(completed)-progressCompletedTail:]
+	}
 	return map[string]any{
 		"phase":               state.progress.Phase,
 		"flow":                state.progress.Flow,
 		"current_chapter":     state.chapter,
-		"completed_chapters":  state.progress.CompletedChapters,
+		"completed_chapters":  completed,
 		"completed_count":     len(state.progress.CompletedChapters),
 		"current_volume":      state.progress.CurrentVolume,
 		"current_arc":         state.progress.CurrentArc,
@@ -239,18 +302,24 @@ func writerStoreProgressSection(state *writerStoreSummaryState) map[string]any {
 	}
 }
 
+// writerStoreSummarySections 列出全部输出段。渲染分两轮（见
+// renderWriterStoreSections）：canon 段（当前章节计划/当前章节大纲/角色
+// 受控状态/活跃伏笔/世界规则）各自保留预算份额，任意单个段（如 24KiB
+// 的 WorldRules）不能独占余量导致其他 canon 段丢失；optional 段（进度/
+// 待修问题/摘要/快照/时间线/风格规则）第二轮消费剩余预算。
 func writerStoreSummarySections(state *writerStoreSummaryState) []writerStoreSection {
 	return []writerStoreSection{
 		{heading: "当前进度", data: writerStoreProgressSection(state)},
+		{heading: "当前章节计划", data: state.chapterPlan, canon: true},
+		{heading: "当前章节大纲", data: state.currentOutline, canon: true},
+		{heading: "角色受控状态", data: state.characterState, canon: true},
+		{heading: "活跃伏笔", data: state.foreshadow, canon: true},
+		{heading: "世界规则", data: state.worldRules, canon: true},
+		{heading: "待修审稿问题", data: state.pendingReviews},
 		{heading: "最近章节摘要", data: state.recentSummaries},
-		{heading: "当前章节计划", data: state.chapterPlan},
-		{heading: "当前章节大纲", data: state.currentOutline},
 		{heading: "当前弧摘要", data: state.currentArcSummary},
 		{heading: "当前卷摘要", data: state.currentVolSummary},
 		{heading: "角色快照", data: state.snapshots},
-		{heading: "活跃伏笔", data: state.foreshadow},
-		{heading: "角色受控状态", data: state.characterState},
-		{heading: "待修审稿问题", data: state.pendingReviews},
 		{heading: "最近时间线", data: state.timeline},
 		{heading: "风格规则", data: state.styleRules},
 	}
@@ -259,13 +328,14 @@ func writerStoreSummarySections(state *writerStoreSummaryState) []writerStoreSec
 func writerRestoreSections(state *writerStoreSummaryState) []writerStoreSection {
 	return []writerStoreSection{
 		{heading: "当前进度", data: writerStoreProgressSection(state)},
-		{heading: "当前章节计划", data: state.chapterPlan},
-		{heading: "当前章节大纲", data: state.currentOutline},
+		{heading: "当前章节计划", data: state.chapterPlan, canon: true},
+		{heading: "当前章节大纲", data: state.currentOutline, canon: true},
+		{heading: "角色受控状态", data: state.characterState, canon: true},
+		{heading: "活跃伏笔", data: state.foreshadow, canon: true},
+		{heading: "世界规则", data: state.worldRules, canon: true},
 		{heading: "待修审稿问题", data: state.pendingReviews},
-		{heading: "角色快照", data: state.snapshots},
 		{heading: "最近章节摘要", data: state.recentSummaries},
-		{heading: "活跃伏笔", data: state.foreshadow},
-		{heading: "角色受控状态", data: state.characterState},
+		{heading: "角色快照", data: state.snapshots},
 		{heading: "当前弧摘要", data: state.currentArcSummary},
 		{heading: "当前卷摘要", data: state.currentVolSummary},
 		{heading: "最近时间线", data: state.timeline},
@@ -273,22 +343,165 @@ func writerRestoreSections(state *writerStoreSummaryState) []writerStoreSection 
 	}
 }
 
+// renderWriterStoreSections 分两轮渲染：
+//   - 第一轮：canon 段。每个 canon 段按"剩余预算/剩余段数"取独立份额，
+//     段实际占用小于份额时余量回池；超份额时独立截断到份额内（标记
+//     [已截断]）并继续渲染后续 canon 段——任何单个段都不能独占全部余量。
+//   - 第二轮：optional 段按列表顺序消费剩余预算，首个超限段截断并停止
+//     （保持原"截断即止"语义）。
 func renderWriterStoreSections(state *writerStoreSummaryState, budgetTokens int, sections []writerStoreSection) []string {
 	if state == nil || len(sections) == 0 || budgetTokens <= 0 {
 		return nil
 	}
-	parts := make([]string, 0, len(sections))
-	remaining := budgetTokens
+	var canon, optional []writerStoreSection
 	for _, sec := range sections {
 		if isEmptySummarySection(sec.data) {
 			continue
 		}
-		stop := appendJSONSection(&parts, sec.heading, sec.data, &remaining)
+		if sec.canon {
+			canon = append(canon, sec)
+		} else {
+			optional = append(optional, sec)
+		}
+	}
+
+	parts := make([]string, 0, len(sections))
+	remaining := budgetTokens
+
+	// 第一轮：canon 段，各自独立份额。
+	for i, sec := range canon {
+		if remaining <= 0 {
+			break
+		}
+		share := remaining / (len(canon) - i)
+		used := appendCanonSection(&parts, sec.heading, sec.data, share)
+		remaining -= used
+	}
+
+	// 第二轮：optional 段消费剩余预算。
+	for _, sec := range optional {
+		if remaining <= 0 {
+			break
+		}
+		stop := appendOptionalSection(&parts, sec.heading, sec.data, &remaining)
 		if stop {
 			break
 		}
 	}
 	return parts
+}
+
+// appendCanonSection 以独立份额渲染 canon 段：tokens ≤ share 时完整输出；
+// 超份额时按正式估算器截断到份额内并标记 [已截断]。返回该段实际消耗的
+// token 数（真实估算，保证不侵占后续 canon 段份额）。
+func appendCanonSection(parts *[]string, heading string, data any, share int) int {
+	if parts == nil || share <= 0 {
+		return 0
+	}
+	b, err := json.Marshal(data)
+	if err != nil {
+		return 0
+	}
+	text := string(b)
+	tokens := estimateCompactSectionTokens(heading, text)
+	if tokens <= share {
+		*parts = append(*parts, fmt.Sprintf("## %s\n%s", heading, text))
+		return tokens
+	}
+	truncated, used := truncateSectionToBudget(heading, text, " [已截断]", share)
+	if truncated == "" {
+		return 0
+	}
+	*parts = append(*parts, truncated)
+	return used
+}
+
+// appendOptionalSection 渲染 optional 段：超剩余预算时截断并停止（返回 true），
+// 与旧 appendJSONSection 的非 canon 语义一致。
+func appendOptionalSection(parts *[]string, heading string, data any, remaining *int) bool {
+	if parts == nil || remaining == nil || *remaining <= 0 {
+		return true
+	}
+	b, err := json.Marshal(data)
+	if err != nil {
+		return false
+	}
+	text := string(b)
+	tokens := estimateCompactSectionTokens(heading, text)
+	if tokens > *remaining {
+		if *remaining <= 100 {
+			return true
+		}
+		truncated, used := truncateSectionToBudget(heading, text, " [已截断]", *remaining)
+		if truncated == "" {
+			return true
+		}
+		*parts = append(*parts, truncated)
+		*remaining -= used
+		return true
+	}
+	*parts = append(*parts, fmt.Sprintf("## %s\n%s", heading, text))
+	*remaining -= tokens
+	return false
+}
+
+// truncateSectionToBudget 对完整 section 文本（heading+正文+标记）用正式估算器
+// （corecontext.EstimateTokens，CJK runes*1.5）做 rune 安全二分截断，返回截断后
+// 文本与真实估算 token 数。heading 本身超预算时降级截断 heading；完全放不下返回空。
+func truncateSectionToBudget(heading, body, marker string, budgetTokens int) (string, int) {
+	if budgetTokens <= 0 {
+		return "", 0
+	}
+	prefix := "## " + heading + "\n"
+	full := prefix + body
+	if corecontext.EstimateTokens(agentcore.UserMsg(full)) <= budgetTokens {
+		return full, corecontext.EstimateTokens(agentcore.UserMsg(full))
+	}
+	// heading 本身是否放得下
+	if corecontext.EstimateTokens(agentcore.UserMsg(prefix)) > budgetTokens {
+		rs := []rune(prefix)
+		lo, hi := 0, len(rs)
+		for lo < hi {
+			mid := (lo + hi + 1) / 2
+			if corecontext.EstimateTokens(agentcore.UserMsg(string(rs[:mid]))) <= budgetTokens {
+				lo = mid
+			} else {
+				hi = mid - 1
+			}
+		}
+		if lo == 0 {
+			return "", 0
+		}
+		out := string(rs[:lo])
+		return out, corecontext.EstimateTokens(agentcore.UserMsg(out))
+	}
+	// 最小候选（无正文 + 截断标记）检查：heading 可容纳但 heading+marker 不可容纳时，
+	// 正文二分无合法候选（best=0 也超预算）——必须降级 heading-only，否则返回超预算文本。
+	minimum := prefix + marker
+	if corecontext.EstimateTokens(agentcore.UserMsg(minimum)) > budgetTokens {
+		return prefix, corecontext.EstimateTokens(agentcore.UserMsg(prefix))
+	}
+	// 二分正文 rune 数：prefix + body[:n] + marker ≤ budgetTokens
+	bodyRunes := []rune(body)
+	best := 0
+	lo, hi := 0, len(bodyRunes)
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		cand := prefix + string(bodyRunes[:mid]) + marker
+		if corecontext.EstimateTokens(agentcore.UserMsg(cand)) <= budgetTokens {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	out := prefix + string(bodyRunes[:best]) + marker
+	used := corecontext.EstimateTokens(agentcore.UserMsg(out))
+	if used > budgetTokens {
+		// 最终保险：估算器非严格可加，极端情况下仍可能超——降级 heading-only
+		return prefix, corecontext.EstimateTokens(agentcore.UserMsg(prefix))
+	}
+	return out, used
 }
 
 func loadPendingReviewsForStoreState(s *store.Store, chapter int) ([]writerPendingReview, error) {
@@ -379,30 +592,6 @@ func loadLayeredSummariesForStoreState(s *store.Store, progress *domain.Progress
 			state.currentArcSummary = sum
 		}
 	}
-}
-
-func appendJSONSection(parts *[]string, heading string, data any, remaining *int) bool {
-	if parts == nil || remaining == nil || *remaining <= 0 {
-		return true
-	}
-	b, err := json.Marshal(data)
-	if err != nil {
-		return false
-	}
-	text := string(b)
-	tokens := estimateCompactSectionTokens(heading, text)
-	if tokens > *remaining {
-		if *remaining <= 100 {
-			return true
-		}
-		text = truncateJSONToTokens(b, *remaining-20)
-		*parts = append(*parts, fmt.Sprintf("## %s\n%s [已截断]", heading, text))
-		*remaining = 0
-		return true
-	}
-	*parts = append(*parts, fmt.Sprintf("## %s\n%s", heading, text))
-	*remaining -= tokens
-	return false
 }
 
 func estimateCompactSectionTokens(heading, body string) int {

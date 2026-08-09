@@ -123,8 +123,9 @@ func Run(ctx context.Context, deps Deps, opts Options) (<-chan Event, error) {
 			emit(StageChapter, chNum, total, fmt.Sprintf("分析第 %d/%d 章：%s", chNum, total, ch.Title), nil)
 
 			activeHooks, _ := deps.Store.World.LoadActiveForeshadow()
+			charState, _ := deps.Store.World.LoadCharacterState()
 			analysis, err := AnalyzeChapter(ctx, deps.LLM, deps.Prompts.Analyzer,
-				chNum, ch.Title, ch.Content, premise, charactersBlock, activeHooks)
+				chNum, ch.Title, ch.Content, premise, charactersBlock, activeHooks, charState)
 			if err != nil {
 				emit(StageError, chNum, total, fmt.Sprintf("第 %d 章分析失败", chNum), err)
 				return

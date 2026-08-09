@@ -34,6 +34,8 @@ type ChapterAnalysis struct {
 
 // AnalyzeChapter 用一次 LLM 调用，从单章正文反推 commit_chapter 所需事实。
 // hooksContext 是已知伏笔池的快照（可空），用于让 LLM 复用既有 ID。
+// characterState 是本章开章前的权威状态基线（可空），用于让 LLM 不重复输出
+// 未变化的状态、并对正文与基线的冲突保持警觉。
 func AnalyzeChapter(
 	ctx context.Context,
 	llm LLMChat,
@@ -42,6 +44,7 @@ func AnalyzeChapter(
 	chapterTitle, chapterContent string,
 	premise, charactersBlock string,
 	activeHooks []domain.ForeshadowEntry,
+	characterState []domain.CharacterStateEntry,
 ) (*ChapterAnalysis, error) {
 	if llm == nil {
 		return nil, fmt.Errorf("llm is nil")
@@ -50,7 +53,7 @@ func AnalyzeChapter(
 		return nil, fmt.Errorf("chapter %d: empty content", chapter)
 	}
 
-	user := buildAnalyzerUserPrompt(chapter, chapterTitle, chapterContent, premise, charactersBlock, activeHooks)
+	user := buildAnalyzerUserPrompt(chapter, chapterTitle, chapterContent, premise, charactersBlock, activeHooks, characterState)
 	resp, err := llm.Generate(ctx, []agentcore.Message{
 		agentcore.SystemMsg(systemPrompt),
 		agentcore.UserMsg(user),
@@ -68,6 +71,7 @@ func buildAnalyzerUserPrompt(
 	chapter int,
 	title, content, premise, charactersBlock string,
 	hooks []domain.ForeshadowEntry,
+	characterState []domain.CharacterStateEntry,
 ) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "请分析第 %d 章正文，输出 10 个 === TAG === 段。\n\n", chapter)
@@ -84,6 +88,22 @@ func buildAnalyzerUserPrompt(
 		sb.WriteString("## 已知角色（参考）\n\n")
 		sb.WriteString(charactersBlock)
 		sb.WriteString("\n\n")
+	}
+
+	if len(characterState) > 0 {
+		sb.WriteString("## 已知角色状态（开章基线）\n\n")
+		sb.WriteString("以下为本章开始时的权威状态基线。基线中已有且本章未变化的状态**不要重复输出**；")
+		sb.WriteString("**只有正文展示了明确变化过程**（装置拆装/状态转变等描写）才输出新当前值；")
+		sb.WriteString("正文与基线冲突但**没有明确变化过程**时，**不输出该冲突值为新当前值**（保留基线，把异常写进 SUMMARY 或 KEY_EVENTS）；")
+		sb.WriteString("正文无解释地与基线冲突时**不得静默覆盖**。\n\n")
+		for _, cs := range characterState {
+			fmt.Fprintf(&sb, "- `%s` `%s`：%s", cs.Entity, cs.Field, cs.Value)
+			if cs.UpdatedChapter > 0 {
+				fmt.Fprintf(&sb, "（截至第 %d 章）", cs.UpdatedChapter)
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
 	}
 
 	if len(hooks) > 0 {

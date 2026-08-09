@@ -282,6 +282,8 @@ JSON 数组，每条含：category、rule、boundary。
 
 要求：参考前一弧的节奏和风格；延续前弧留下的伏笔和钩子；判断本弧适合回收哪些未回收伏笔。大纲服务于故事，不是约束已经发生事实的合同。
 
+**stale 伏笔治理（展开弧时必做）**：对照 `foreshadow_ledger` 检查全部久挂（stale）伏笔——`last_touched_at` 超 100 章未推进（无则回退 `planted_at` 计）。与本弧相关且适合推进/兑现的 → 分配到本弧具体章节 `advance`/`resolve`；正文事实或规划已确认原承诺失效/被取消/不再成立的 → `retire`（带 `reason`）；本弧暂不处理但**原承诺仍然有效**的 → 明确保留至后续弧。**没有当前回收计划本身不是 retire 理由**；不得为清台账把无关伏笔硬塞进本弧。
+
 **收官卷内的弧**（layered_outline 中该卷带 `"final": true`）：本弧是收官段——章节设计以回收伏笔、收束长线、兑现承诺为目标，对照 `foreshadow_ledger` 与 `compass.long.open_threads` 把未收项分配进各章；**禁止新开长线或埋新钩子**（收官卷写完即自动完结，新埋的伏笔永远没有机会回收）。若这是收官卷的最后一弧，末章要正面回答 `compass.long.ending_direction` 的核心命题。
 
 **版本说明**：V3 运行时 `save_foundation(type="append_volume"/"expand_arc")` **不允许** scale 参数（schema 层面拒绝），Core4 按自身版本契约传递。本约束专为 V3 运行时设计，不构成对 Core4 的禁止——Core4 应遵循其版本约定。

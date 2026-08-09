@@ -657,8 +657,50 @@ func (t *ContextTool) buildChapterSelectedMemory(envelope *chapterContextEnvelop
 	}
 }
 
+// compactForeshadowEntry 伏笔台账紧凑投影（Editor 全量视图专用）：
+// 保留审计/回收所需字段，description 截断以控制体积。
+// 独立 key（foreshadow_ledger_full）不在 trimByBudget 的 trimOrder 中，
+// 预算紧张时不会被普通 trim 删除——Editor 的完整台账是审阅硬需求。
+type compactForeshadowEntry struct {
+	ID            string `json:"id"`
+	Status        string `json:"status"`
+	Horizon       string `json:"horizon,omitempty"`
+	PlantedAt     int    `json:"planted_at"`
+	LastTouchedAt int    `json:"last_touched_at,omitempty"`
+	Description   string `json:"description"`
+}
+
+// compactForeshadowDescriptionRunes 投影中 description 的截断上限（rune 数）。
+const compactForeshadowDescriptionRunes = 60
+
+func compactForeshadowLedger(entries []domain.ForeshadowEntry) []compactForeshadowEntry {
+	out := make([]compactForeshadowEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, compactForeshadowEntry{
+			ID:            e.ID,
+			Status:        e.Status,
+			Horizon:       e.Horizon,
+			PlantedAt:     e.PlantedAt,
+			LastTouchedAt: e.LastTouchedAt,
+			Description:   truncateRunes(e.Description, compactForeshadowDescriptionRunes),
+		})
+	}
+	return out
+}
+
 func (t *ContextTool) buildChapterEpisodicMemory(envelope *chapterContextEnvelope, state contextBuildState, warn func(string, error)) {
-	if len(state.foreshadow) > 0 && len(state.storyThreads) == 0 {
+	// 伏笔台账角色分流：
+	//   - editor：始终注入完整 active ledger 的紧凑投影（foreshadow_ledger_full，
+	//     全条目、description 截断）——全局审阅需要全量视野，不依赖
+	//     selected_memory.story_threads 的精选逻辑；独立 key 不在 trimOrder
+	//     中，预算紧张时不会被普通 trim 删除。
+	//   - writer/polisher：维持现状——精选 story_threads（≤12），仅在精选
+	//     为空/过稀时把完整台账回退进 episodic_memory.foreshadow_ledger。
+	if t.role == "editor" {
+		if len(state.foreshadow) > 0 {
+			envelope.Episodic["foreshadow_ledger_full"] = compactForeshadowLedger(state.foreshadow)
+		}
+	} else if len(state.foreshadow) > 0 && len(state.storyThreads) == 0 {
 		envelope.Episodic["foreshadow_ledger"] = state.foreshadow
 	}
 

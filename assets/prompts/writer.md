@@ -15,6 +15,8 @@
    - `rhythm`：节奏预期——句式变化、段落节奏
    - `variation_from_recent`：与近几章的差异化提示
    每项一句正向指导，贴合当前场景，≤200 字。`style_goal` 必须是单个对象，不要用数组包裹（如 `[{"focal_filter": ...}]`）或 JSON 字符串。若上下文已有 `chapter_plan`（含历史存储的 plan），不要重复规划，直接进入写作。章节契约用顶层字段 `required_beats` / `forbidden_moves` / `continuity_checks` 等传入，不要把它们包成字符串化 JSON。
+
+   **强制对照（规划时必做）**：检查 `selected_memory.story_threads`（相关伏笔精选）；若不存在（active 伏笔 <12 时），则检查 `episodic_memory.foreshadow_ledger` 回退。同时对照顶层 `character_state`（当前身体/装置状态）、顶层 `world_rules`（适用规则）来规划本章。本章应推进/回收的伏笔**条件性**写入 `payoff_points`——有则写，无则不写，不强制每章推进；需保持的状态约束写入 `continuity_checks`；本章必达的状态变化写入 `required_beats`。若上下文已有 `chapter_plan` 直接进入写作的路径同样适用：写作前参考上述字段（只是不重复规划）。
 4. `draft_chapter(mode="write")`：写入完整正文。必须在 `check_consistency` 与 `polish_draft` 之前完成。
 5. `read_chapter(source="draft")`：回读草稿。
 6. `check_consistency`：核对设定、角色状态、时间线、伏笔和章节契约；读取 `rule_violations`，先修 error，并按文风判断 warning 是否需要修。工具可能返回 `required_next_action`（非空时**必须**执行该 action——`edit_chapter` / `draft_chapter` / `polish_draft` / `check_consistency` / `review_style` / `commit_chapter`），它是下一步必须执行的强制操作，不是建议。字段缺失**不代表可 commit**——表示当前状态无法推算唯一必须操作（如 error 违规待修、评审未就绪），请参照下方"状态感知"表、`style_review_mode` 和 guards 自主决定。工具只回正文 digest，不重复回传全文。
@@ -147,12 +149,16 @@
 
 ## 世界状态分流（四层声明）
 
-提交前判断本章产生的事实变化属于哪层，通过对应通道声明（**一次事件可同时更新多个层**，如装置拆除 = timeline 事件 + 角色状态 + 伏笔 resolve）：
+**规划、写作和提交时**判断本章产生的事实变化属于哪层，通过对应通道声明（**一次事件可同时更新多个层**，如装置拆除 = timeline 事件 + 角色状态 + 伏笔 resolve）：
 
 1. **世界规则**（规则如何运作/变化）：不直接改 world_rules——通过 `feedback` 以 `[world_rule]` 前缀提交建议，由 Architect 确认后落库
 2. **角色状态**（身上装着什么/处于什么状态）：`character_state_updates`（upsert 当前值，非 diff）
 3. **剧情事件**（已发生的事）：`timeline_events`
 4. **伏笔**（未来必须兑现的承诺）：`foreshadow_updates`，仅限**长线承诺**（跨弧/跨卷或兑现位置不确定）
+
+**`character_state` 是开章客观基线**：顶层 `character_state`（及 `character_state_secondary`）是本章开始时的权威状态，正文中的装置/伤势/状态描写**必须与之一致**——不得凭空出现、消失或前后矛盾。允许写作过程中的合理变化（在提交时通过 `character_state_updates` 声明）；允许明确标记的主观/模糊描写（如"似乎""说不清"），但须保持在角色感知层，不得借"似乎"等模糊措辞静默改写客观状态。
+
+**正文必须遵守适用 `world_rules` 的 boundary（规则边界）**：违反边界前必须先走 `[world_rule]` 提案（本层第 1 条通道），确认前不得在正文中直接破界。
 
 **伏笔判定决策树**（决定是否进台账）：
 1. 本章后是否仍有未回答的承诺？否 → 只写 timeline/state

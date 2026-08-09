@@ -268,6 +268,9 @@ func buildLoadingSummary(result map[string]any, chapter int) string {
 	if n := countSlice("foreshadow_ledger"); n > 0 {
 		items = append(items, fmt.Sprintf("伏笔:%d", n))
 	}
+	if n := countSlice("foreshadow_ledger_full"); n > 0 {
+		items = append(items, fmt.Sprintf("伏笔台账:%d", n))
+	}
 	if n := countSlice("relationship_state"); n > 0 {
 		items = append(items, fmt.Sprintf("关系:%d", n))
 	}

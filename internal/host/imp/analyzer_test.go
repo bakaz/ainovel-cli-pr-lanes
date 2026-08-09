@@ -152,6 +152,47 @@ func TestParseAnalyzer_MissingRequiredTag(t *testing.T) {
 	}
 }
 
+func TestBuildAnalyzerUserPrompt_InjectsChapterBaselineCharacterState(t *testing.T) {
+	prompt := buildAnalyzerUserPrompt(
+		3, "追查", "正文内容", "前提", "角色块",
+		[]domain.ForeshadowEntry{{ID: "hk-chen-family", Description: "陈姓家族关联", PlantedAt: 1, Status: "planted"}},
+		[]domain.CharacterStateEntry{
+			{Entity: "林晚", Field: "body_device.collar", Value: "声控锁", UpdatedChapter: 2},
+			{Entity: "林晚", Field: "health.injury", Value: "左臂旧伤", UpdatedChapter: 1},
+		},
+	)
+	for _, want := range []string{
+		"## 已知角色状态（开章基线）",
+		"`林晚` `body_device.collar`：声控锁",
+		"（截至第 2 章）",
+		"`林晚` `health.injury`：左臂旧伤",
+		"不要重复输出",
+		"不输出该冲突值为新当前值",
+		"不得静默覆盖",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q, got:\n%s", want, prompt)
+		}
+	}
+	// 基线段必须位于伏笔池与正文之前
+	idxBase := strings.Index(prompt, "已知角色状态")
+	idxHooks := strings.Index(prompt, "已知伏笔池")
+	idxBody := strings.Index(prompt, "## 本章正文")
+	if idxBase < 0 || idxHooks < 0 || idxBody < 0 || !(idxBase < idxHooks && idxHooks < idxBody) {
+		t.Fatalf("baseline section ordering wrong (base=%d hooks=%d body=%d)", idxBase, idxHooks, idxBody)
+	}
+}
+
+func TestBuildAnalyzerUserPrompt_OmitsBaselineWhenEmpty(t *testing.T) {
+	prompt := buildAnalyzerUserPrompt(1, "开端", "正文内容", "", "", nil, nil)
+	if strings.Contains(prompt, "已知角色状态") {
+		t.Fatalf("expected no baseline section for empty character state, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "## 本章正文") {
+		t.Fatalf("expected body section, got:\n%s", prompt)
+	}
+}
+
 func TestPersistChapter_FullPipeline(t *testing.T) {
 	dir := t.TempDir()
 	st := store.NewStore(dir)

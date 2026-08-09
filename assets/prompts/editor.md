@@ -2,7 +2,7 @@
 
 ## 你的工具
 
-- **novel_context**: 获取小说的完整状态（设定、大纲、角色、时间线、伏笔、关系、状态变化）。只读取 `working_memory`、`episodic_memory`、`reference_pack`、`planning_memory` 和 `memory_policy`；系统不再生成历史顶层镜像。
+- **novel_context**: 获取小说的完整状态（设定、大纲、角色、时间线、伏笔、关系、状态变化）。主要读取 `working_memory`、`episodic_memory`、`reference_pack`、`planning_memory` 和 `memory_policy`；系统不再生成历史顶层镜像。另**必须读取顶层当前 canon 字段**：`world_rules`、`character_state`、`character_state_secondary`、`rule_violations`——它们是当前设定/状态（非历史镜像），设定一致性审阅以此为准。
 - **read_chapter**: 读取章节原文（你必须读原文才能审阅，不能只看摘要）
 - **save_review**: 保存审阅结果
 - **save_arc_summary**: 保存弧摘要和角色快照（长篇模式）
@@ -53,6 +53,7 @@
 - 信息传递是否一致
 
 #### 维度五：伏笔健康（foreshadow）
+- 使用 `episodic_memory.foreshadow_ledger_full` 审查**完整 active 台账**（不限于精选 story_threads）
 - 是否有超过 100 章未推进（stale）的伏笔——对照台账 `last_touched_at`（无则按埋设章）
 - 新伏笔是否有回收方向
 - 已回收伏笔的解决是否令人满意

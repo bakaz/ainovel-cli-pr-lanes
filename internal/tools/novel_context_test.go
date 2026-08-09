@@ -974,6 +974,136 @@ func TestContextToolFallsBackToFullForeshadowWhenSelectionIsTooSparse(t *testing
 	}
 }
 
+// TestContextToolForeshadowLedgerRoleSplit：editor 始终拿到完整 active 台账；
+// writer/polisher 维持精选（≤12）且不触发 episodic 全量回退。
+func TestContextToolForeshadowLedgerRoleSplit(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "开端", CoreEvent: "林晚初入试炼场"},
+		{Chapter: 2, Title: "试炼前夜", CoreEvent: "内门试炼", Scenes: domain.SceneList{{Action: "整理线索"}, {Action: "决定赴约"}}},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Progress.Init("test", 8); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	// 15 条 active 伏笔：6 条与本章 focus（试炼）相关，9 条无关填充。
+	// 账龄全部 < 100（chapter=2, planted=1），无 stale 回填，writer 精选应恰好 6 条。
+	var ledger []domain.ForeshadowEntry
+	for i := 1; i <= 6; i++ {
+		ledger = append(ledger, domain.ForeshadowEntry{
+			ID: fmt.Sprintf("trial_%d", i), Description: fmt.Sprintf("内门试炼第 %d 个伏笔", i),
+			PlantedAt: 1, Status: "planted",
+		})
+	}
+	for i := 1; i <= 9; i++ {
+		ledger = append(ledger, domain.ForeshadowEntry{
+			ID: fmt.Sprintf("filler_%d", i), Description: fmt.Sprintf("无关线索 %d", i),
+			PlantedAt: 1, Status: "planted",
+		})
+	}
+	if err := s.World.SaveForeshadowLedger(ledger); err != nil {
+		t.Fatalf("SaveForeshadowLedger: %v", err)
+	}
+
+	runFor := func(role string) map[string]any {
+		tool := NewContextToolForRole(s, References{}, "default", role)
+		args, err := json.Marshal(map[string]any{"chapter": 2})
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		result, err := tool.Execute(context.Background(), args)
+		if err != nil {
+			t.Fatalf("Execute(%s): %v", role, err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(result, &payload); err != nil {
+			t.Fatalf("Unmarshal(%s): %v", role, err)
+		}
+		return payload
+	}
+
+	// writer：精选 ≤12，episodic 不注入完整台账
+	wp := runFor("writer")
+	wEpi := wp["episodic_memory"].(map[string]any)
+	if _, ok := wEpi["foreshadow_ledger"]; ok {
+		t.Fatal("writer: expected NO full foreshadow_ledger in episodic_memory when selection is non-sparse")
+	}
+	wSel, ok := wp["selected_memory"].(map[string]any)
+	if !ok {
+		t.Fatal("writer: expected selected_memory")
+	}
+	raw, _ := json.Marshal(wSel["story_threads"])
+	var wThreads []domain.RecallItem
+	if err := json.Unmarshal(raw, &wThreads); err != nil {
+		t.Fatalf("unmarshal writer story_threads: %v", err)
+	}
+	if len(wThreads) == 0 || len(wThreads) > 12 {
+		t.Fatalf("writer: expected 1..12 selected story_threads, got %d", len(wThreads))
+	}
+	if len(wThreads) != 6 {
+		t.Fatalf("writer: expected 6 relevant selected threads, got %d: %+v", len(wThreads), wThreads)
+	}
+
+	// editor：episodic 完整 15 条（紧凑投影 foreshadow_ledger_full）
+	ep := runFor("editor")
+	eEpi := ep["episodic_memory"].(map[string]any)
+	rawLedger, ok := eEpi["foreshadow_ledger_full"]
+	if !ok {
+		t.Fatal("editor: expected full foreshadow_ledger_full in episodic_memory")
+	}
+	raw, _ = json.Marshal(rawLedger)
+	var eLedger []compactForeshadowEntry
+	if err := json.Unmarshal(raw, &eLedger); err != nil {
+		t.Fatalf("unmarshal editor ledger: %v", err)
+	}
+	if len(eLedger) != 15 {
+		t.Fatalf("editor: expected full 15 foreshadow entries, got %d", len(eLedger))
+	}
+	seen := map[string]bool{}
+	for _, e := range eLedger {
+		seen[e.ID] = true
+		if e.Status != "planted" || e.PlantedAt != 1 {
+			t.Fatalf("editor: projection dropped audit fields for %s: %+v", e.ID, e)
+		}
+	}
+	for i := 1; i <= 9; i++ {
+		if !seen[fmt.Sprintf("filler_%d", i)] {
+			t.Fatalf("editor: missing filler_%d in full ledger", i)
+		}
+	}
+	if _, ok := eEpi["foreshadow_ledger"]; ok {
+		t.Fatal("editor: expected compact projection under foreshadow_ledger_full, not the raw key")
+	}
+
+	// trim 保护：预算紧张时普通 trim 会删 outline/timeline 等低优先级 key，
+	// 但 foreshadow_ledger_full 不在 trimOrder 中，完整台账必须保留。
+	trimByBudget(ep, 1)
+	if _, ok := ep["_trimmed"]; !ok {
+		t.Fatal("editor: expected trim to have run under tiny budget")
+	}
+	eEpiAfter := ep["episodic_memory"].(map[string]any)
+	rawAfter, ok := eEpiAfter["foreshadow_ledger_full"]
+	if !ok {
+		t.Fatal("editor: foreshadow_ledger_full was removed by trimByBudget")
+	}
+	raw, _ = json.Marshal(rawAfter)
+	var after []compactForeshadowEntry
+	if err := json.Unmarshal(raw, &after); err != nil {
+		t.Fatalf("unmarshal surviving ledger: %v", err)
+	}
+	if len(after) != 15 {
+		t.Fatalf("editor: surviving ledger lost entries, got %d", len(after))
+	}
+	if _, ok := ep["outline"]; ok {
+		t.Fatal("editor: expected low-priority outline to be trimmed before the protected ledger")
+	}
+}
+
 func containsRecallSummary(items []domain.RecallItem, want string) bool {
 	for _, item := range items {
 		if strings.Contains(item.Summary, want) {
