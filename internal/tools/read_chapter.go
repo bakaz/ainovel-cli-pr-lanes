@@ -36,7 +36,7 @@ func (t *ReadChapterTool) Schema() map[string]any {
 		schema.Property("to", schema.Int("结束章节号（读范围时使用）")),
 		schema.Property("source", schema.Enum("来源", "final", "draft")).Required(),
 		schema.Property("character", schema.String("角色名（提取对话片段时使用）")),
-		schema.Property("max_runes", schema.Int("每章最大字符数（范围读取时截取，默认 2000）")),
+		schema.Property("max_runes", schema.Int("每章最大字符数（范围读取时截取，默认 10000）")),
 	)
 }
 
@@ -81,10 +81,10 @@ func (t *ReadChapterTool) Execute(_ context.Context, args json.RawMessage) (json
 
 	// 模式 2：范围读取
 	if a.From > 0 && a.To > 0 {
-		maxRunes := a.MaxRunes
-		if maxRunes <= 0 {
-			maxRunes = 2000
-		}
+	maxRunes := a.MaxRunes
+	if maxRunes <= 0 {
+		maxRunes = 10000
+	}
 		texts, err := t.store.Drafts.LoadChapterRange(a.From, a.To, maxRunes)
 		if err != nil {
 			return nil, fmt.Errorf("load chapter range: %w", err)

@@ -97,7 +97,7 @@ const WriterTurnPrefixPrompt = `这是一个对话轮次的前缀部分，因太
 // restoreBudgetTokens is the maximum total token budget for the post-compact
 // restore message. Sized to hold a typical chapter plan + outline + compressed
 // character snapshots without re-stuffing the freshly compacted context.
-const restoreBudgetTokens = 6000
+const restoreBudgetTokens = 8000
 
 // WriterRestorePack holds pre-assembled context that the Writer needs after
 // compression. It is refreshed by the orchestrator at key lifecycle points

@@ -67,9 +67,9 @@ JSON 数组，每条 `{entity, field, old_value, new_value, reason}`：
 JSON 数组，每条 `{entity, field, value, reason, evidence}`：
 - 角色/实体受控状态的**当前值**（upsert 语义，不是 diff）；状态在本章发生变化或首次确立时输出
 - `field`: 必须使用受控命名空间前缀之一：`body_device.` / `health.` / `location.` / `capability.` / `resource.` / `inventory.` / `status.` / `knowledge.`（如 `status.realm`、`location.city`、`inventory.weapon`）
-- `value`: 当前状态值（≤400 字）
+- `value`: 当前状态值（≤800 字）
 - `reason`: 状态变化原因（可选）
-- `evidence`: 正文引文（可选，≤160 字）
+- `evidence`: 正文引文（可选，≤300 字）
 
 无状态变化时输出 `[]`。
 

@@ -12,7 +12,7 @@ import (
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
-const defaultStoreSummaryBudgetTokens = 7000
+const defaultStoreSummaryBudgetTokens = 10000
 
 type writerStoreSummaryState struct {
 	progress          *domain.Progress

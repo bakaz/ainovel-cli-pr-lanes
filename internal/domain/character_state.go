@@ -27,11 +27,11 @@ type CharacterStateUpdate struct {
 
 const (
 	// MaxCharacterValueRunes 单个状态值的最大长度（字符数）。
-	MaxCharacterValueRunes = 400
+	MaxCharacterValueRunes = 800
 	// MaxCharacterEvidenceRunes 状态证据引文的最大长度（字符数）。
-	MaxCharacterEvidenceRunes = 160
+	MaxCharacterEvidenceRunes = 300
 	// MaxFieldsPerEntity 单个实体允许的字段数上限。
-	MaxFieldsPerEntity = 50
+	MaxFieldsPerEntity = 100
 )
 
 // CharacterStateFieldPrefixes field 命名空间前缀白名单。

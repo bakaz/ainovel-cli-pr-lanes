@@ -41,7 +41,7 @@ type ForeshadowUpdate struct {
 }
 
 // MaxForeshadowEvidenceRunes advance/resolve 证据引文的长度上限（rune 数）。
-const MaxForeshadowEvidenceRunes = 160
+const MaxForeshadowEvidenceRunes = 300
 
 // ForeshadowTransitionAllowed 校验 action 对当前状态的转换合法性（§4.1 转换表）。
 // currentStatus 为空串表示"不存在/空状态"。返回 nil 或带 ID/状态/action 信息的错误。

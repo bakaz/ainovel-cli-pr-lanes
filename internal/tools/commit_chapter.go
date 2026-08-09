@@ -84,9 +84,9 @@ func (t *CommitChapterTool) Schema() map[string]any {
 	characterStateSchema := schema.Object(
 		schema.Property("entity", schema.String("角色名或实体名")).Required(),
 		schema.Property("field", schema.String("受控命名空间：body_device./health./location./capability./resource./inventory./status./knowledge.")).Required(),
-		schema.Property("value", schema.String("当前状态值（≤400 字，upsert 语义）")).Required(),
+		schema.Property("value", schema.String("当前状态值（≤800 字，upsert 语义）")).Required(),
 		schema.Property("reason", schema.String("状态变化原因")),
-		schema.Property("evidence", schema.String("正文引文（≤160 字）")),
+		schema.Property("evidence", schema.String("正文引文（≤300 字）")),
 	)
 	relationshipSchema := schema.Object(
 		schema.Property("character_a", schema.String("角色 A")).Required(),

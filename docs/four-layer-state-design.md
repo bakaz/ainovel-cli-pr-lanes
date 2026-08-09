@@ -63,7 +63,7 @@
 - entity/field 非空；field 受控命名空间，初始清单：
   `body_device.*`（身体装置）/ `health.*` / `location.*` / `capability.*` / `resource.*` / `inventory.*` / `status.*` / `knowledge.<fact-id>`（信息差：value ∈ unknown|suspects|knows|believes:<内容>）
 - 近义字段不得新增 key（迁移时归并，如"身体状态/双乳状态/右乳状态"→ `body_device.*`）
-- 单 value ≤400 字、单 evidence ≤160 字、单实体字段数 ≤50（可测试常量）
+- 单 value ≤800 字、单 evidence ≤300 字、单实体字段数 ≤100（可测试常量）
 - 允许删除：显式 `value=""` + reason 或 delete action（二选一，定稿：`value="已移除"` 语义 + reason，不新增 delete action）
 - 权威顺序：`character_state 当前值 > 最新 snapshot > characters 基础设定`
 
@@ -96,7 +96,7 @@
 
 - action 扩展为 `plant|advance|resolve|retire`；不做 reopen
 - horizon 仅 plant 可设，后续动作修改 horizon → 拒绝
-- advance/resolve 的 evidence = **正文精确短引文**（长度 ≤160 字，`MaxForeshadowEvidenceRunes`），preflight 用 Contains 校验其存在于本章草稿；advance 无证据不得更新 last_touched_at（防空泛"推进"刷新账龄）
+- advance/resolve 的 evidence = **正文精确短引文**（长度 ≤300 字，`MaxForeshadowEvidenceRunes`），preflight 用 Contains 校验其存在于本章草稿；advance 无证据不得更新 last_touched_at（防空泛"推进"刷新账龄）
 - retire：reason 必填，不要求正文引文（取消承诺非剧情事实）
 - plant 对已存在 ID 的"只填空字段"行为（world.go:132-141 现状）保留语义：不复位状态
 
