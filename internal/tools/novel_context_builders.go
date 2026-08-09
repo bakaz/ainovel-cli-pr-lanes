@@ -640,8 +640,8 @@ func (t *ContextTool) buildChapterWorkingMemory(envelope *chapterContextEnvelope
 	if state.chapter > 1 {
 		if prevText, err := t.store.Drafts.LoadChapterText(state.chapter - 1); err == nil && prevText != "" {
 			runes := []rune(prevText)
-			if len(runes) > 800 {
-				runes = runes[len(runes)-800:]
+			if len(runes) > 2000 {
+				runes = runes[len(runes)-2000:]
 			}
 			envelope.Working["previous_tail"] = string(runes)
 		}
