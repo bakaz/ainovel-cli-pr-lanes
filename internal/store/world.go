@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
+	"github.com/voocel/ainovel-cli/internal/errs"
 	"github.com/voocel/ainovel-cli/internal/rules"
 )
 
@@ -113,6 +114,24 @@ func (s *WorldStore) LoadForeshadowLedger() ([]domain.ForeshadowEntry, error) {
 }
 
 // UpdateForeshadow 批量应用伏笔增量操作。
+// 状态机（未知 action / 未知 ID 一律返回错误，禁止静默忽略）：
+//
+//	当前状态    plant           advance           resolve           retire
+//	不存在      允许(必填       拒绝             拒绝              拒绝
+//	           desc+horizon)
+//	planted    幂等(只填空字段)  允许(evidence必填) 允许(evidence必填) 允许(reason必填)
+//	advanced   拒绝             允许(evidence必填) 允许(evidence必填) 允许(reason必填)
+//	resolved   拒绝             拒绝              幂等(返回 nil)    拒绝
+//	retired    拒绝             拒绝              拒绝              幂等(返回 nil)
+//
+// 转换合法性判断统一收敛到 domain.ForeshadowTransitionAllowed（与 commit preflight
+// 共用同一纯函数）；本函数在其上补充 ID 存在性、必填字段与时间不变量处理。
+// 已存在的"空状态"（旧数据遗留）条目先归一化为 planted 再调用转换函数，
+// 保持既有兼容行为（空状态可 advance/resolve/retire/重复 plant）。
+//
+// 时间不变量：resolved 必设 resolved_at；retired 必设 closed_at+close_reason；
+// 非 resolved 清理 resolved_at；非 retired 清理 closed_at/close_reason。
+// horizon 仅 plant 设置，后续 action 携带的 horizon 一律忽略（不可改）。
 func (s *WorldStore) UpdateForeshadow(chapter int, updates []domain.ForeshadowUpdate) error {
 	return s.io.WithWriteLock(func() error {
 		var entries []domain.ForeshadowEntry
@@ -125,20 +144,45 @@ func (s *WorldStore) UpdateForeshadow(chapter int, updates []domain.ForeshadowUp
 		for i, e := range entries {
 			idx[e.ID] = i
 		}
+		// transitionStatus 归一化：空状态视为 planted（旧数据兼容），
+		// 保证 domain.ForeshadowTransitionAllowed 的判定与既有行为一致。
+		transitionStatus := func(e domain.ForeshadowEntry) string {
+			if e.Status == "" {
+				return "planted"
+			}
+			return e.Status
+		}
 		for _, u := range updates {
+			i, exists := idx[u.ID]
 			switch u.Action {
 			case "plant":
-				if i, ok := idx[u.ID]; ok {
-					if entries[i].Description == "" {
-						entries[i].Description = u.Description
+				if exists {
+					// 幂等仅适用于 planted（含遗留空状态）条目：只填空字段，不覆盖已有值；
+					// horizon 仅在本条目为空时补填。advanced/resolved/retired 拒绝重复 plant。
+					if err := domain.ForeshadowTransitionAllowed(transitionStatus(entries[i]), u); err != nil {
+						return fmt.Errorf("%w: %v", errs.ErrToolArgs, err)
 					}
-					if entries[i].PlantedAt == 0 {
-						entries[i].PlantedAt = chapter
+					e := &entries[i]
+					if e.Description == "" {
+						e.Description = u.Description
 					}
-					if entries[i].Status == "" {
-						entries[i].Status = "planted"
+					if e.PlantedAt == 0 {
+						e.PlantedAt = chapter
+					}
+					if e.Status == "" {
+						e.Status = "planted"
+					}
+					if e.Horizon == "" && (u.Horizon == "cross_arc" || u.Horizon == "book") {
+						e.Horizon = u.Horizon
 					}
 					continue
+				}
+				// 不存在：允许创建，description + horizon 必填
+				if strings.TrimSpace(u.Description) == "" {
+					return fmt.Errorf("foreshadow %q: action %q requires description: %w", u.ID, u.Action, errs.ErrToolArgs)
+				}
+				if u.Horizon != "cross_arc" && u.Horizon != "book" {
+					return fmt.Errorf("foreshadow %q: action %q requires horizon (cross_arc|book): %w", u.ID, u.Action, errs.ErrToolArgs)
 				}
 				idx[u.ID] = len(entries)
 				entries = append(entries, domain.ForeshadowEntry{
@@ -146,16 +190,67 @@ func (s *WorldStore) UpdateForeshadow(chapter int, updates []domain.ForeshadowUp
 					Description: u.Description,
 					PlantedAt:   chapter,
 					Status:      "planted",
+					Horizon:     u.Horizon,
 				})
 			case "advance":
-				if i, ok := idx[u.ID]; ok {
-					entries[i].Status = "advanced"
+				if !exists {
+					return fmt.Errorf("foreshadow %q: unknown id: %w", u.ID, errs.ErrToolArgs)
 				}
+				if err := domain.ForeshadowTransitionAllowed(transitionStatus(entries[i]), u); err != nil {
+					return fmt.Errorf("%w: %v", errs.ErrToolArgs, err)
+				}
+				if strings.TrimSpace(u.Evidence) == "" {
+					return fmt.Errorf("foreshadow %q: action %q requires evidence: %w", u.ID, u.Action, errs.ErrToolArgs)
+				}
+				e := &entries[i]
+				e.Status = "advanced"
+				e.LastTouchedAt = chapter
+				e.LastEvidence = u.Evidence
+				e.ResolvedAt = 0
+				e.ClosedAt = 0
+				e.CloseReason = ""
 			case "resolve":
-				if i, ok := idx[u.ID]; ok {
-					entries[i].Status = "resolved"
-					entries[i].ResolvedAt = chapter
+				if !exists {
+					return fmt.Errorf("foreshadow %q: unknown id: %w", u.ID, errs.ErrToolArgs)
 				}
+				if err := domain.ForeshadowTransitionAllowed(transitionStatus(entries[i]), u); err != nil {
+					return fmt.Errorf("%w: %v", errs.ErrToolArgs, err)
+				}
+				if entries[i].Status == "resolved" {
+					// 幂等：重复 resolve 返回 nil
+					continue
+				}
+				if strings.TrimSpace(u.Evidence) == "" {
+					return fmt.Errorf("foreshadow %q: action %q requires evidence: %w", u.ID, u.Action, errs.ErrToolArgs)
+				}
+				e := &entries[i]
+				e.Status = "resolved"
+				e.ResolvedAt = chapter
+				e.ResolutionEvidence = u.Evidence
+				e.LastTouchedAt = chapter
+				e.ClosedAt = 0
+				e.CloseReason = ""
+			case "retire":
+				if !exists {
+					return fmt.Errorf("foreshadow %q: unknown id: %w", u.ID, errs.ErrToolArgs)
+				}
+				if err := domain.ForeshadowTransitionAllowed(transitionStatus(entries[i]), u); err != nil {
+					return fmt.Errorf("%w: %v", errs.ErrToolArgs, err)
+				}
+				if entries[i].Status == "retired" {
+					// 幂等：重复 retire 返回 nil
+					continue
+				}
+				if strings.TrimSpace(u.Reason) == "" {
+					return fmt.Errorf("foreshadow %q: action %q requires reason: %w", u.ID, u.Action, errs.ErrToolArgs)
+				}
+				e := &entries[i]
+				e.Status = "retired"
+				e.ClosedAt = chapter
+				e.CloseReason = u.Reason
+				e.ResolvedAt = 0
+			default:
+				return fmt.Errorf("foreshadow %q: unknown action %q: %w", u.ID, u.Action, errs.ErrToolArgs)
 			}
 		}
 		if err := s.io.WriteJSONUnlocked("foreshadow_ledger.json", entries); err != nil {
@@ -165,7 +260,7 @@ func (s *WorldStore) UpdateForeshadow(chapter int, updates []domain.ForeshadowUp
 	})
 }
 
-// LoadActiveForeshadow 返回未回收的伏笔条目。
+// LoadActiveForeshadow 返回未回收（非 resolved / 非 retired）的伏笔条目。
 func (s *WorldStore) LoadActiveForeshadow() ([]domain.ForeshadowEntry, error) {
 	all, err := s.LoadForeshadowLedger()
 	if err != nil {
@@ -173,7 +268,7 @@ func (s *WorldStore) LoadActiveForeshadow() ([]domain.ForeshadowEntry, error) {
 	}
 	var active []domain.ForeshadowEntry
 	for _, e := range all {
-		if e.Status != "resolved" {
+		if e.Status != "resolved" && e.Status != "retired" {
 			active = append(active, e)
 		}
 	}
@@ -239,27 +334,33 @@ func (s *WorldStore) UpdateRelationships(changes []domain.RelationshipEntry) err
 // AppendStateChanges 追加角色状态变化。同一状态变化重复提交时按稳定 key 去重。
 func (s *WorldStore) AppendStateChanges(changes []domain.StateChange) error {
 	return s.io.WithWriteLock(func() error {
-		var existing []domain.StateChange
-		if err := s.io.ReadJSONUnlocked("meta/state_changes.json", &existing); err != nil {
-			if !os.IsNotExist(err) {
-				return err
-			}
-		}
-		seen := make(map[string]struct{}, len(existing)+len(changes))
-		for _, c := range existing {
-			seen[stateChangeKey(c)] = struct{}{}
-		}
-		all := existing
-		for _, c := range changes {
-			key := stateChangeKey(c)
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			all = append(all, c)
-		}
-		return s.io.WriteJSONUnlocked("meta/state_changes.json", all)
+		return s.appendStateChangesUnlocked(changes)
 	})
+}
+
+// appendStateChangesUnlocked 在持有写锁的前提下追加状态变化（幂等去重）。
+// 供 AppendStateChanges 及 UpsertCharacterState（同一写锁内派生变化）复用。
+func (s *WorldStore) appendStateChangesUnlocked(changes []domain.StateChange) error {
+	var existing []domain.StateChange
+	if err := s.io.ReadJSONUnlocked("meta/state_changes.json", &existing); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	seen := make(map[string]struct{}, len(existing)+len(changes))
+	for _, c := range existing {
+		seen[stateChangeKey(c)] = struct{}{}
+	}
+	all := existing
+	for _, c := range changes {
+		key := stateChangeKey(c)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		all = append(all, c)
+	}
+	return s.io.WriteJSONUnlocked("meta/state_changes.json", all)
 }
 
 // LoadStateChanges 读取全部状态变化记录。
@@ -591,11 +692,32 @@ func renderForeshadow(entries []domain.ForeshadowEntry) string {
 	b.WriteString("# 伏笔账本\n\n")
 	for _, e := range entries {
 		status := e.Status
-		if e.ResolvedAt > 0 {
+		switch {
+		case e.ResolvedAt > 0:
 			status = fmt.Sprintf("已回收（第 %d 章）", e.ResolvedAt)
+		case e.Status == "retired":
+			status = "已移除"
+		case e.Status == "advanced":
+			status = "已推进"
 		}
-		fmt.Fprintf(&b, "- **[%s]** %s — 埋设于第 %d 章，状态：%s\n",
-			e.ID, e.Description, e.PlantedAt, status)
+		line := fmt.Sprintf("- **[%s]** %s — 埋设于第 %d 章，状态：%s", e.ID, e.Description, e.PlantedAt, status)
+		if e.Horizon != "" {
+			line += fmt.Sprintf("，跨度：%s", e.Horizon)
+		}
+		if e.LastTouchedAt > 0 {
+			line += fmt.Sprintf("，最近推进：第 %d 章", e.LastTouchedAt)
+		}
+		b.WriteString(line)
+		if e.Status == "retired" && e.ClosedAt > 0 {
+			reason := e.CloseReason
+			if reason == "" {
+				reason = "未说明"
+			}
+			b.WriteString(fmt.Sprintf("（第 %d 章移除：%s）", e.ClosedAt, reason))
+		} else if e.ResolvedAt > 0 && e.ResolutionEvidence != "" {
+			b.WriteString(fmt.Sprintf("（证据：%s）", e.ResolutionEvidence))
+		}
+		b.WriteString("\n")
 	}
 	return b.String()
 }

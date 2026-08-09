@@ -354,3 +354,11 @@ type WorldRule struct {
 	Rule     string `json:"rule"`     // 规则描述
 	Boundary string `json:"boundary"` // 不可违反的边界
 }
+
+// world_rules 量控上限（四层状态机制）：
+//   - MaxWorldRulesEntries 为条数软上限：超出仅告警（提示合并/移除过期规则），允许保存；
+//   - MaxWorldRulesBytes 为总序列化字节硬上限：超出拒绝保存（防止规则集膨胀挤占上下文预算）。
+const (
+	MaxWorldRulesEntries = 30
+	MaxWorldRulesBytes   = 24576
+)

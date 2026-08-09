@@ -1,0 +1,72 @@
+package domain
+
+import (
+	"fmt"
+	"strings"
+	"unicode/utf8"
+)
+
+// CharacterStateEntry 角色/实体受控状态条目。(entity, field) 构成唯一键。
+// field 使用受控命名空间（如 body_device.xxx），防止自由文本污染状态层。
+type CharacterStateEntry struct {
+	Entity         string `json:"entity"`
+	Field          string `json:"field"` // 受控命名空间，如 body_device.xxx
+	Value          string `json:"value"`
+	UpdatedChapter int    `json:"updated_chapter"`
+	Evidence       string `json:"evidence,omitempty"`
+}
+
+// CharacterStateUpdate 角色状态更新操作（upsert 语义）。
+type CharacterStateUpdate struct {
+	Entity   string `json:"entity"`
+	Field    string `json:"field"`
+	Value    string `json:"value"`
+	Reason   string `json:"reason,omitempty"`   // 状态变化原因（派生到 state_changes）
+	Evidence string `json:"evidence,omitempty"` // 正文引文，最长 MaxCharacterEvidenceRunes
+}
+
+const (
+	// MaxCharacterValueRunes 单个状态值的最大长度（字符数）。
+	MaxCharacterValueRunes = 400
+	// MaxCharacterEvidenceRunes 状态证据引文的最大长度（字符数）。
+	MaxCharacterEvidenceRunes = 160
+	// MaxFieldsPerEntity 单个实体允许的字段数上限。
+	MaxFieldsPerEntity = 50
+)
+
+// CharacterStateFieldPrefixes field 命名空间前缀白名单。
+var CharacterStateFieldPrefixes = []string{
+	"body_device.", "health.", "location.", "capability.",
+	"resource.", "inventory.", "status.", "knowledge.",
+}
+
+// ValidCharacterStateField 校验 field 是否属于受控命名空间。
+func ValidCharacterStateField(field string) bool {
+	for _, p := range CharacterStateFieldPrefixes {
+		if strings.HasPrefix(field, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateCharacterStateUpdate 校验角色状态更新：entity/field 非空、field 在受控
+// 命名空间内、value 长度 ≤ MaxCharacterValueRunes、evidence 长度 ≤ MaxCharacterEvidenceRunes。
+func ValidateCharacterStateUpdate(u CharacterStateUpdate) error {
+	if strings.TrimSpace(u.Entity) == "" {
+		return fmt.Errorf("character state: entity 不能为空")
+	}
+	if strings.TrimSpace(u.Field) == "" {
+		return fmt.Errorf("character state: field 不能为空")
+	}
+	if !ValidCharacterStateField(u.Field) {
+		return fmt.Errorf("character state: field %q 不在受控命名空间内（允许前缀：%v）", u.Field, CharacterStateFieldPrefixes)
+	}
+	if runes := utf8.RuneCountInString(u.Value); runes > MaxCharacterValueRunes {
+		return fmt.Errorf("character state: %s.%s 值长度 %d 超过上限 %d 个字符", u.Entity, u.Field, runes, MaxCharacterValueRunes)
+	}
+	if runes := utf8.RuneCountInString(u.Evidence); runes > MaxCharacterEvidenceRunes {
+		return fmt.Errorf("character state: %s.%s evidence 长度 %d 超过上限 %d 个字符", u.Entity, u.Field, runes, MaxCharacterEvidenceRunes)
+	}
+	return nil
+}

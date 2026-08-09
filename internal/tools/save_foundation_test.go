@@ -3491,3 +3491,116 @@ func TestSaveFoundationV3_CharactersWorldRulesRejectInvalidScale(t *testing.T) {
 		}
 	}
 }
+
+// ── world_rules 量控（四层状态机制）──
+
+func worldRuleArgs(rules []domain.WorldRule) (json.RawMessage, error) {
+	return json.Marshal(map[string]any{"type": "world_rules", "content": rules})
+}
+
+// TestSaveFoundation_WorldRulesSoftLimitWarns 恰好 30 条（软上限）→ 保存成功且返回 warning。
+func TestSaveFoundation_WorldRulesSoftLimitWarns(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	tool := NewSaveFoundationTool(st, testContract)
+
+	var rules []domain.WorldRule
+	for i := 0; i < domain.MaxWorldRulesEntries; i++ {
+		rules = append(rules, domain.WorldRule{Category: "magic", Rule: fmt.Sprintf("规则 %d", i)})
+	}
+	args, err := worldRuleArgs(rules)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	out, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("soft limit must not reject save: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if result["warning"] == nil {
+		t.Fatal("expected warning for rules at soft limit")
+	}
+	loaded, _ := st.World.LoadWorldRules()
+	if len(loaded) != domain.MaxWorldRulesEntries {
+		t.Fatalf("expected %d saved rules, got %d", domain.MaxWorldRulesEntries, len(loaded))
+	}
+}
+
+// TestSaveFoundation_WorldRulesByteLimitRejects 序列化字节超 24576 → 拒绝保存且磁盘不变。
+func TestSaveFoundation_WorldRulesByteLimitRejects(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	// 先正常保存一条小规则，验证拒绝时不会覆盖已有数据。
+	if err := st.World.SaveWorldRules([]domain.WorldRule{{Category: "other", Rule: "既有规则"}}); err != nil {
+		t.Fatalf("seed SaveWorldRules: %v", err)
+	}
+	tool := NewSaveFoundationTool(st, testContract)
+
+	// 10 条 × (700+700 字) 规则文本，紧凑/缩进序列化均超过 24576 字节。
+	long := strings.Repeat("长", 700)
+	var rules []domain.WorldRule
+	for i := 0; i < 10; i++ {
+		rules = append(rules, domain.WorldRule{Category: "magic", Rule: long, Boundary: long})
+	}
+	data, _ := json.MarshalIndent(rules, "", "  ")
+	if len(data) <= domain.MaxWorldRulesBytes {
+		t.Fatalf("test fixture too small: %d bytes, need > %d", len(data), domain.MaxWorldRulesBytes)
+	}
+	args, err := worldRuleArgs(rules)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	_, err = tool.Execute(context.Background(), args)
+	if err == nil {
+		t.Fatal("world_rules exceeding byte hard limit must be rejected")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("%d", domain.MaxWorldRulesBytes)) {
+		t.Fatalf("rejection should mention the byte limit, got: %v", err)
+	}
+	loaded, _ := st.World.LoadWorldRules()
+	if len(loaded) != 1 || loaded[0].Rule != "既有规则" {
+		t.Fatalf("rejected save must not touch disk, got %+v", loaded)
+	}
+}
+
+// TestSaveFoundation_WorldRulesNormalSave 小规则集正常保存且无 warning。
+func TestSaveFoundation_WorldRulesNormalSave(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	tool := NewSaveFoundationTool(st, testContract)
+
+	args, err := worldRuleArgs([]domain.WorldRule{
+		{Category: "magic", Rule: "灵力守恒"},
+		{Category: "geography", Rule: "北境常年冰封", Boundary: "火山地带除外"},
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	out, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("normal world_rules save should succeed: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if result["warning"] != nil {
+		t.Fatalf("expected no warning for small ruleset, got %v", result["warning"])
+	}
+	loaded, _ := st.World.LoadWorldRules()
+	if len(loaded) != 2 {
+		t.Fatalf("expected 2 saved rules, got %d", len(loaded))
+	}
+}

@@ -37,8 +37,11 @@ JSON 数组，每条 `{time, event, characters}`：
 
 ### === FORESHADOW ===
 
-JSON 数组，每条 `{id, action, description}`：
-- `action`: `plant`（首次埋设，必须给 description）/ `advance`（推进）/ `resolve`（回收）
+JSON 数组，每条 `{id, action, description, horizon, evidence, reason}`：
+- `action`: `plant`（首次埋设，必须给 description + horizon）/ `advance`（推进，必须给 evidence）/ `resolve`（回收，必须给 evidence）/ `retire`（取消承诺，必须给 reason）
+- `horizon`: 仅 plant 必填：`cross_arc`（跨弧长线）/ `book`（贯穿全书）
+- `evidence`: advance/resolve 必填：正文中的精确短引文（逐字复制自本章正文，用于校验引文确实出现）
+- `reason`: 仅 retire 必填：取消承诺的原因
 - 已知伏笔池中的 ID 必须复用，不要新造 ID 覆盖。
 
 无伏笔操作时输出 `[]`。
@@ -59,6 +62,17 @@ JSON 数组，每条 `{entity, field, old_value, new_value, reason}`：
 
 无变化时输出 `[]`。
 
+### === CHARACTER_STATE ===
+
+JSON 数组，每条 `{entity, field, value, reason, evidence}`：
+- 角色/实体受控状态的**当前值**（upsert 语义，不是 diff）；状态在本章发生变化或首次确立时输出
+- `field`: 必须使用受控命名空间前缀之一：`body_device.` / `health.` / `location.` / `capability.` / `resource.` / `inventory.` / `status.` / `knowledge.`（如 `status.realm`、`location.city`、`inventory.weapon`）
+- `value`: 当前状态值（≤400 字）
+- `reason`: 状态变化原因（可选）
+- `evidence`: 正文引文（可选，≤160 字）
+
+无状态变化时输出 `[]`。
+
 ### === HOOK_TYPE ===
 
 本章末尾的钩子类型，**单选**之一：`crisis` / `mystery` / `desire` / `emotion` / `choice`
@@ -73,6 +87,6 @@ JSON 数组，每条 `{entity, field, old_value, new_value, reason}`：
 ## 关键规则
 
 1. 一切从正文出发，不要臆造。
-2. 输出必须严格使用 9 个 TAG，顺序固定，**全部出现**（无内容用 `[]` 或留空字符串）。
+2. 输出必须严格使用 10 个 TAG，顺序固定，**全部出现**（无内容用 `[]` 或留空字符串）。
 3. JSON 段内字符串值的双引号必须转义为 `\"`、换行为 `\n`，禁止字面双引号或控制字符。
 4. **只输出标签和标签内的内容**，不要前置寒暄、不要后置总结。

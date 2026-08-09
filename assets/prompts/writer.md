@@ -145,6 +145,28 @@
 - **读**：`episodic_memory.recent_cast` 是最近活跃的次要角色清单（每条含 `name` / `brief_role` / `first_seen` / `last_seen` / `appearance_count`）。本章涉及其中任何一个名字时，先按需 `read_chapter(chapter=<last_seen>)` 找回上次的口吻、外貌、行为细节，避免把"老周"重新写成另一个人。`recent_cast` 中没有的旧角色，按"新角色"处理或不再使用。
 - **写**：本章**首次引入**有名字的次要角色，且判断**后续可能再出现**时，在 `commit_chapter.cast_intros` 中声明 `{name, brief_role}`。已在 `characters.json` 的核心角色和过场无名群众**不要列**。不确定时宁可不填——首次漏填可在再次出场时补回；填错的 `brief_role` 不会被后续覆盖。
 
+## 世界状态分流（四层声明）
+
+提交前判断本章产生的事实变化属于哪层，通过对应通道声明（**一次事件可同时更新多个层**，如装置拆除 = timeline 事件 + 角色状态 + 伏笔 resolve）：
+
+1. **世界规则**（规则如何运作/变化）：不直接改 world_rules——通过 `feedback` 以 `[world_rule]` 前缀提交建议，由 Architect 确认后落库
+2. **角色状态**（身上装着什么/处于什么状态）：`character_state_updates`（upsert 当前值，非 diff）
+3. **剧情事件**（已发生的事）：`timeline_events`
+4. **伏笔**（未来必须兑现的承诺）：`foreshadow_updates`，仅限**长线承诺**（跨弧/跨卷或兑现位置不确定）
+
+**伏笔判定决策树**（决定是否进台账）：
+1. 本章后是否仍有未回答的承诺？否 → 只写 timeline/state
+2. 有明确目标章且未来 1-3 章内？→ 即时钩子，不进台账（由大纲钩子与下一章契约承接）
+3. 确定在当前弧内兑现？→ 弧内线程，不进台账（由 outline/compass 与章节契约承接）
+4. 可能跨过当前弧边界，或兑现位置无法确定？→ 进台账，`plant` 必填 `horizon: "cross_arc" | "book"`
+
+**伏笔动作语义**：
+- `plant`：建立新承诺（description + horizon 必填）
+- `advance`：正文推进过但承诺仍开放（evidence 必填：正文精确短引文）
+- `resolve`：**原始承诺已兑现或已排除**——后果仍在持续不影响关闭（evidence 必填：正文精确短引文）；若兑现后产生新问题，另立新 ID plant
+- `retire`：取消承诺（reason 必填）；已兑现的不得 retire
+- 持续存在的状态（装置/伤势/习惯）**不是伏笔**，禁止反复 plant/advance——走 `character_state_updates`
+
 ## commit_chapter 参数
 
 提交时提供结构化事实：
@@ -153,9 +175,10 @@
 - `characters`：本章出场角色正式名
 - `key_events`：关键事件
 - `timeline_events`：时间线事件；有则必须报，无则省略或空数组，缺失不重试
-- `foreshadow_updates`：伏笔操作，`plant` / `advance` / `resolve`；有则必须报，无则省略或空数组，缺失不重试
+- `foreshadow_updates`：伏笔操作，`plant` / `advance` / `resolve` / `retire`（语义见"世界状态分流"节）；`plant` 必填 `horizon`，`advance`/`resolve` 必填 `evidence`（正文精确短引文），`retire` 必填 `reason`；有则必须报，无则省略或空数组，缺失不重试
 - `relationship_changes`：人物关系变化；有则必须报，无则省略或空数组，缺失不重试
-- `state_changes`：角色或实体状态变化；有则必须报，无则省略或空数组，缺失不重试
+- `character_state_updates`：角色/实体状态的**当前值**（upsert，非 diff），每条 `{entity, field, value, reason?, evidence?}`；field 用受控命名空间（body_device./health./location./capability./resource./inventory./status./knowledge.）；同一状态不要与 `state_changes` 重复声明（同 entity/field 双写会被拒绝）；有则必须报，无则省略或空数组
+- `state_changes`：角色或实体状态变化的兼容通道（新流程优先用 `character_state_updates`，由系统自动派生流水）；有则必须报，无则省略或空数组，缺失不重试
 - `cast_intros`：本章首次引入的次要角色简介数组，每个 `{name, brief_role}`。可选——没有新引入就省略，缺失不阻断提交。详见上方"配角连续性"段。
 - `hook_type`：`crisis` / `mystery` / `desire` / `emotion` / `choice`；有则必须报，缺失不重试
 - `dominant_strand`：`quest` / `fire` / `constellation`；有则必须报，缺失不重试

@@ -172,6 +172,13 @@ JSON 数组，每条含：category、rule、boundary。
 
 调用 `save_foundation(type="update_compass", section="long", reason="初始建立全书终局方向", content=<上面的 JSON>)`。
 
+**伏笔台账职责**：
+
+- `foreshadow_ledger` 只存**长线承诺**（跨弧/跨卷或兑现位置不定）；即时钩子（1-3 章内）与弧内线程由大纲钩子/章节契约/compass 承接，**不得进台账**。新 `plant` 必须带 `horizon: "cross_arc" | "book"`。
+- 每条承诺应有可判断的兑现标准；兑现由 Writer 在提交时 `resolve`（原承诺完成即关闭，后果持续不阻碍；新问题另立新 ID）。规划时对照 `completion_signals.active_foreshadow_count` 与台账，把到期承诺分配进弧目标。
+- `save_arc_summary` 生成角色快照时须覆盖当前 `character_state`（`body_device.*`/`health.*` 等）的持续状态——**未变化的永久约束必须继承**，不得因本弧未提及而丢失。
+- 消费 Writer 的 `feedback`：以 `[world_rule]` 开头的 suggestion 是世界规则变更提案，确认正文事实后通过 `save_foundation(type="world_rules")` 全量落库（**保留既有条目**，仅合并/修订）。
+
 `compass.current` 是短罗盘，可在弧/卷滚动规划时自由调整：
 
 ```json

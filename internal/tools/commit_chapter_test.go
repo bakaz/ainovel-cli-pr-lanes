@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -239,6 +240,10 @@ func TestCommitChapterReplayAfterPartialCommitDoesNotDuplicateWorldState(t *test
 		ID:          "f1",
 		Action:      "plant",
 		Description: "黑影身份",
+		Horizon:     "book",
+	}}
+	charState := []domain.CharacterStateUpdate{{
+		Entity: "林墨", Field: "status.realm", Value: "练气期", Reason: "突破",
 	}}
 
 	// 模拟 commit_chapter 已写入世界状态，但尚未 MarkChapterComplete 时进程崩溃。
@@ -251,6 +256,9 @@ func TestCommitChapterReplayAfterPartialCommitDoesNotDuplicateWorldState(t *test
 	if err := s.World.UpdateForeshadow(1, foreshadow); err != nil {
 		t.Fatalf("UpdateForeshadow seed: %v", err)
 	}
+	if err := s.World.UpsertCharacterState(1, charState); err != nil {
+		t.Fatalf("UpsertCharacterState seed: %v", err)
+	}
 	if err := s.Signals.SavePendingCommit(domain.PendingCommit{
 		Chapter: 1,
 		Stage:   domain.CommitStageStateApplied,
@@ -261,13 +269,14 @@ func TestCommitChapterReplayAfterPartialCommitDoesNotDuplicateWorldState(t *test
 
 	tool := NewCommitChapterTool(s)
 	args, _ := json.Marshal(map[string]any{
-		"chapter":            1,
-		"summary":            "林墨遇到黑影并突破",
-		"characters":         []string{"林墨"},
-		"key_events":         []string{"遇到黑影", "突破"},
-		"timeline_events":    timeline,
-		"state_changes":      stateChanges,
-		"foreshadow_updates": foreshadow,
+		"chapter":                 1,
+		"summary":                 "林墨遇到黑影并突破",
+		"characters":              []string{"林墨"},
+		"key_events":              []string{"遇到黑影", "突破"},
+		"timeline_events":         timeline,
+		"state_changes":           stateChanges,
+		"foreshadow_updates":      foreshadow,
+		"character_state_updates": charState,
 	})
 	if _, err := tool.Execute(context.Background(), args); err != nil {
 		t.Fatalf("Execute replay: %v", err)
@@ -278,12 +287,28 @@ func TestCommitChapterReplayAfterPartialCommitDoesNotDuplicateWorldState(t *test
 		t.Fatalf("timeline duplicated after replay, got %d: %+v", len(events), events)
 	}
 	changes, _ := s.World.LoadStateChanges()
-	if len(changes) != 1 {
+	// 预期 2 条：手工 seed 的 realm + UpsertCharacterState seed 派生的 status.realm；
+	// 重放后不得再新增（realm 走 AppendStateChanges 去重、status.realm 走同值跳过派生）。
+	if len(changes) != 2 {
 		t.Fatalf("state changes duplicated after replay, got %d: %+v", len(changes), changes)
+	}
+	realmCount := 0
+	for _, c := range changes {
+		if c.Field == "status.realm" {
+			realmCount++
+		}
+	}
+	if realmCount != 1 {
+		t.Fatalf("character state derived change duplicated after replay, got %+v", changes)
 	}
 	ledger, _ := s.World.LoadForeshadowLedger()
 	if len(ledger) != 1 {
 		t.Fatalf("foreshadow duplicated after replay, got %d: %+v", len(ledger), ledger)
+	}
+	// character_state 重放幂等：同值 upsert 不重复、派生 state_changes 不重复
+	entries, _ := s.World.LoadCharacterState()
+	if len(entries) != 1 || entries[0].Value != "练气期" {
+		t.Fatalf("character state after replay wrong: %+v", entries)
 	}
 	pending, _ := s.Signals.LoadPendingCommit()
 	if pending != nil {
@@ -887,12 +912,12 @@ func TestCommitChapterLayeredNoAutoCompleteWithOpenThreads(t *testing.T) {
 
 // ── 批次 4：重写提交 world_state_mode 安全闸门 ───────────────────────────
 //
-// 背景：剧情级重写（PendingRewrites 路径）曾静默丢弃 4 组世界状态变更
+// 背景：剧情级重写（PendingRewrites 路径）曾静默丢弃 5 组世界状态变更
 // （TimelineEvents/ForeshadowUpdates/RelationshipChanges/StateChanges），
 // 正文与世界账本永久失配且无报错。本批次强制重写提交显式声明
 // world_state_mode（preserve/replace）：
 //   - 缺失或非法值 → Precondition 拒绝（不写终稿、不 drain 队列）；
-//   - preserve → 现有 executeRewriteCommit 行为（4 组世界状态变更一律不应用）；
+//   - preserve → 现有 executeRewriteCommit 行为（5 组世界状态变更一律不应用）；
 //   - replace → 无可重放历史时显式拒绝（世界状态重放能力尚未就绪）。
 
 // rewriteModeStore 构造重写队列基础 store：第 2 章已完成并入队，草稿已改为
@@ -929,7 +954,7 @@ func rewriteModeStore(t *testing.T, finalText, draftText string) *store.Store {
 
 // TestCommitChapterRewritePreserveKeepsWorldState 验证 preserve 重写提交后
 // 四类世界账本（Timeline/Foreshadow/Relationship/State）一律不更新——
-// 即使模型在参数里附带 4 组世界状态字段（纯文风重写模型可能产出的噪声）。
+// 即使模型在参数里附带 5 组世界状态字段（纯文风重写模型可能产出的噪声）。
 func TestCommitChapterRewritePreserveKeepsWorldState(t *testing.T) {
 	const final = "已提交的终稿。她心里骂自己丢人，真不要脸。"
 	s := rewriteModeStore(t, final, "返工后的草稿。她心里骂自己丢人，真不要脸。")
@@ -937,7 +962,7 @@ func TestCommitChapterRewritePreserveKeepsWorldState(t *testing.T) {
 	// 世界账本已有第 2 章的原始记录（章节首次提交时写入）。
 	seededTimeline := []domain.TimelineEvent{{Chapter: 2, Time: "午后", Event: "林墨遇袭", Characters: []string{"林墨"}}}
 	seededState := []domain.StateChange{{Chapter: 2, Entity: "林墨", Field: "境界", OldValue: "凡人", NewValue: "练气"}}
-	seededForeshadow := []domain.ForeshadowUpdate{{ID: "f1", Action: "plant", Description: "黑影身份"}}
+	seededForeshadow := []domain.ForeshadowUpdate{{ID: "f1", Action: "plant", Description: "黑影身份", Horizon: "book"}}
 	seededRelationships := []domain.RelationshipEntry{{CharacterA: "林墨", CharacterB: "李清砚", Relation: "师从", Chapter: 2}}
 	if err := s.World.AppendTimelineEvents(seededTimeline); err != nil {
 		t.Fatalf("seed timeline: %v", err)
@@ -958,7 +983,7 @@ func TestCommitChapterRewritePreserveKeepsWorldState(t *testing.T) {
 		"world_state_mode":     "preserve",
 		"timeline_events":      []domain.TimelineEvent{{Chapter: 2, Time: "子夜", Event: "重写后事件", Characters: []string{"林墨"}}},
 		"state_changes":        []domain.StateChange{{Chapter: 2, Entity: "林墨", Field: "境界", OldValue: "练气", NewValue: "金丹"}},
-		"foreshadow_updates":   []domain.ForeshadowUpdate{{ID: "f2", Action: "plant", Description: "重写伏笔"}},
+		"foreshadow_updates":   []domain.ForeshadowUpdate{{ID: "f2", Action: "plant", Description: "重写伏笔", Horizon: "book"}},
 		"relationship_changes": []domain.RelationshipEntry{{CharacterA: "林墨", CharacterB: "李清砚", Relation: "决裂", Chapter: 2}},
 	})
 	if _, err := tool.Execute(context.Background(), args); err != nil {
@@ -1119,7 +1144,7 @@ func TestCommitChapterRewriteReplaceRejected(t *testing.T) {
 		"world_state_mode":     "replace",
 		"timeline_events":      []domain.TimelineEvent{{Chapter: 2, Time: "子夜", Event: "重写后事件", Characters: []string{"林墨"}}},
 		"state_changes":        []domain.StateChange{{Chapter: 2, Entity: "林墨", Field: "境界", OldValue: "练气", NewValue: "金丹"}},
-		"foreshadow_updates":   []domain.ForeshadowUpdate{{ID: "f2", Action: "plant", Description: "重写伏笔"}},
+		"foreshadow_updates":   []domain.ForeshadowUpdate{{ID: "f2", Action: "plant", Description: "重写伏笔", Horizon: "book"}},
 		"relationship_changes": []domain.RelationshipEntry{{CharacterA: "林墨", CharacterB: "李清砚", Relation: "决裂", Chapter: 2}},
 	})
 	_, err := tool.Execute(context.Background(), args)
@@ -1145,5 +1170,379 @@ func TestCommitChapterRewriteReplaceRejected(t *testing.T) {
 	events, _ := s.World.LoadTimeline()
 	if len(events) != 1 || events[0].Event != "林墨遇袭" {
 		t.Fatalf("拒绝后 timeline 不得被替换或追加，got %+v", events)
+	}
+}
+
+// ── 批次 4b：foreshadow/character_state preflight（commit 新通道）─────────
+//
+// preflight 是 commit_chapter 新增的写入前参数闸门：foreshadow 语义校验
+// （含 evidence 草稿引文、未知 ID、冲突 action）+ character_state 校验 +
+// 双写冲突检测。任一失败整体拒绝，pending/终稿/摘要/账本全部零变化。
+
+// preflightStore 构造 preflight 测试基础 store：第 1 章草稿已写入，
+// 草稿正文包含引文 "黑影一闪而过"（供 advance/resolve 的 evidence 校验）。
+func preflightStore(t *testing.T) *store.Store {
+	t.Helper()
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 10); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Drafts.SaveDraft(1, "第一章正文。黑影一闪而过，林墨警觉起来。她心里骂自己丢人，真不要脸。"); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	return s
+}
+
+// seedPlantedF1 预埋已 planted 的伏笔 f1（advance/resolve 用例需要）。
+func seedPlantedF1(t *testing.T, s *store.Store) {
+	t.Helper()
+	if err := s.World.UpdateForeshadow(1, []domain.ForeshadowUpdate{{
+		ID: "f1", Action: "plant", Description: "黑影身份", Horizon: "book",
+	}}); err != nil {
+		t.Fatalf("seed foreshadow f1: %v", err)
+	}
+}
+
+// seedForeshadowF1 把伏笔 f1 推进到指定状态（planted/advanced/resolved/retired）。
+func seedForeshadowF1(t *testing.T, s *store.Store, state string) {
+	t.Helper()
+	seedPlantedF1(t, s)
+	switch state {
+	case "planted":
+	case "advanced":
+		if err := s.World.UpdateForeshadow(1, []domain.ForeshadowUpdate{{
+			ID: "f1", Action: "advance", Evidence: "黑影一闪而过",
+		}}); err != nil {
+			t.Fatalf("seed advanced f1: %v", err)
+		}
+	case "resolved":
+		if err := s.World.UpdateForeshadow(1, []domain.ForeshadowUpdate{{
+			ID: "f1", Action: "resolve", Evidence: "黑影一闪而过",
+		}}); err != nil {
+			t.Fatalf("seed resolved f1: %v", err)
+		}
+	case "retired":
+		if err := s.World.UpdateForeshadow(1, []domain.ForeshadowUpdate{{
+			ID: "f1", Action: "retire", Reason: "弃线",
+		}}); err != nil {
+			t.Fatalf("seed retired f1: %v", err)
+		}
+	default:
+		t.Fatalf("unknown state %q", state)
+	}
+}
+
+// preflightCommitArgsJSON 构造 commit_chapter 参数（chapter=1 + 最小必填 + extra 合并）。
+func preflightCommitArgsJSON(extra map[string]any) json.RawMessage {
+	args := map[string]any{
+		"chapter":    1,
+		"summary":    "测试提交",
+		"characters": []string{"林墨"},
+		"key_events": []string{"测试"},
+	}
+	for k, v := range extra {
+		args[k] = v
+	}
+	raw, _ := json.Marshal(args)
+	return raw
+}
+
+// captureWorldSnapshot 捕获提交前的世界账本快照（伏笔/角色状态/state_changes）。
+func captureWorldSnapshot(t *testing.T, s *store.Store) map[string]any {
+	t.Helper()
+	ledger, err := s.World.LoadForeshadowLedger()
+	if err != nil {
+		t.Fatalf("LoadForeshadowLedger: %v", err)
+	}
+	charState, err := s.World.LoadCharacterState()
+	if err != nil {
+		t.Fatalf("LoadCharacterState: %v", err)
+	}
+	changes, err := s.World.LoadStateChanges()
+	if err != nil {
+		t.Fatalf("LoadStateChanges: %v", err)
+	}
+	return map[string]any{"ledger": ledger, "character_state": charState, "state_changes": changes}
+}
+
+// assertZeroSideEffects 断言 commit 失败后所有写入目标零变化。
+func assertZeroSideEffects(t *testing.T, s *store.Store, before map[string]any) {
+	t.Helper()
+	if pending, _ := s.Signals.LoadPendingCommit(); pending != nil {
+		t.Fatalf("失败后不得留下 pending commit: %+v", pending)
+	}
+	if text, _ := s.Drafts.LoadChapterText(1); text != "" {
+		t.Fatalf("失败后不得写终稿: %q", text)
+	}
+	if sum, _ := s.Summaries.LoadSummary(1); sum != nil {
+		t.Fatalf("失败后不得写摘要: %+v", sum)
+	}
+	after := captureWorldSnapshot(t, s)
+	for _, key := range []string{"ledger", "character_state", "state_changes"} {
+		if !reflect.DeepEqual(after[key], before[key]) {
+			t.Fatalf("失败后 %s 发生变化: before=%+v after=%+v", key, before[key], after[key])
+		}
+	}
+	if progress, _ := s.Progress.Load(); len(progress.CompletedChapters) != 0 {
+		t.Fatalf("失败后不得推进进度: %+v", progress.CompletedChapters)
+	}
+}
+
+// TestCommitChapterPreflightRejectsWithZeroSideEffects 表驱动验证 preflight
+// 各类失败（缺 horizon/缺 evidence/未知 ID/evidence 不在草稿/非法 character_state/
+// 双写冲突/同 ID 冲突 action）都整体拒绝且零副作用。
+func TestCommitChapterPreflightRejectsWithZeroSideEffects(t *testing.T) {
+	cases := []struct {
+		name string
+		seed func(*testing.T, *store.Store)
+		// commitArgs 的 extra（不传则只提交最小必填）
+		extra map[string]any
+		want  string // 错误消息必须包含的关键子串
+	}{
+		{
+			name: "plant 缺 horizon",
+			extra: map[string]any{
+				"foreshadow_updates": []domain.ForeshadowUpdate{{ID: "f1", Action: "plant", Description: "黑影身份"}},
+			},
+			want: "horizon",
+		},
+		{
+			name: "advance 缺 evidence",
+			seed: seedPlantedF1,
+			extra: map[string]any{
+				"foreshadow_updates": []domain.ForeshadowUpdate{{ID: "f1", Action: "advance"}},
+			},
+			want: "requires evidence",
+		},
+		{
+			name: "advance 未知 ID",
+			extra: map[string]any{
+				"foreshadow_updates": []domain.ForeshadowUpdate{{ID: "ghost", Action: "advance", Evidence: "黑影一闪而过"}},
+			},
+			want: "不存在",
+		},
+		{
+			name: "evidence 不在草稿",
+			seed: seedPlantedF1,
+			extra: map[string]any{
+				"foreshadow_updates": []domain.ForeshadowUpdate{{ID: "f1", Action: "advance", Evidence: "正文中没有的引文"}},
+			},
+			want: "未在正文草稿中出现",
+		},
+		{
+			name: "character_state 非法 field",
+			extra: map[string]any{
+				"character_state_updates": []domain.CharacterStateUpdate{{Entity: "林墨", Field: "freeform", Value: "x"}},
+			},
+			want: "受控命名空间",
+		},
+		{
+			name: "双写冲突",
+			extra: map[string]any{
+				"character_state_updates": []domain.CharacterStateUpdate{{Entity: "林墨", Field: "status.realm", Value: "练气期"}},
+				"state_changes":           []domain.StateChange{{Entity: "林墨", Field: "status.realm", OldValue: "凡人", NewValue: "练气期"}},
+			},
+			want: "双写冲突",
+		},
+		{
+			name: "同 ID 冲突 action",
+			seed: seedPlantedF1,
+			extra: map[string]any{
+				"foreshadow_updates": []domain.ForeshadowUpdate{
+					{ID: "f1", Action: "advance", Evidence: "黑影一闪而过"},
+					{ID: "f1", Action: "resolve", Evidence: "黑影一闪而过"},
+				},
+			},
+			want: "冲突操作",
+		},
+		{
+			name: "resolved 伏笔上 advance 拒绝",
+			seed: func(t *testing.T, s *store.Store) { seedForeshadowF1(t, s, "resolved") },
+			extra: map[string]any{
+				"foreshadow_updates": []domain.ForeshadowUpdate{{ID: "f1", Action: "advance", Evidence: "黑影一闪而过"}},
+			},
+			want: "cannot advance",
+		},
+		{
+			name: "retired 伏笔上 resolve 拒绝",
+			seed: func(t *testing.T, s *store.Store) { seedForeshadowF1(t, s, "retired") },
+			extra: map[string]any{
+				"foreshadow_updates": []domain.ForeshadowUpdate{{ID: "f1", Action: "resolve", Evidence: "黑影一闪而过"}},
+			},
+			want: "cannot resolve",
+		},
+		{
+			name: "advanced 伏笔上 plant 拒绝",
+			seed: func(t *testing.T, s *store.Store) { seedForeshadowF1(t, s, "advanced") },
+			extra: map[string]any{
+				"foreshadow_updates": []domain.ForeshadowUpdate{{ID: "f1", Action: "plant", Description: "新描述", Horizon: "book"}},
+			},
+			want: "cannot plant over status",
+		},
+		{
+			name: "character_state 批内同 key 不同 value 拒绝",
+			extra: map[string]any{
+				"character_state_updates": []domain.CharacterStateUpdate{
+					{Entity: "林墨", Field: "status.realm", Value: "练气期"},
+					{Entity: "林墨", Field: "status.realm", Value: "金丹期"},
+				},
+			},
+			want: "重复且 value 不同",
+		},
+		{
+			name: "character_state 第 51 个字段拒绝",
+			seed: func(t *testing.T, s *store.Store) {
+				entries := make([]domain.CharacterStateEntry, 0, domain.MaxFieldsPerEntity)
+				for i := 0; i < domain.MaxFieldsPerEntity; i++ {
+					entries = append(entries, domain.CharacterStateEntry{
+						Entity: "林墨", Field: fmt.Sprintf("status.f%02d", i), Value: "v",
+					})
+				}
+				if err := s.World.SaveCharacterState(entries); err != nil {
+					t.Fatalf("seed 50 fields: %v", err)
+				}
+			},
+			extra: map[string]any{
+				"character_state_updates": []domain.CharacterStateUpdate{{Entity: "林墨", Field: "status.overflow", Value: "x"}},
+			},
+			want: "字段数已达上限",
+		},
+		{
+			name: "[world_rule] 提案缺规则描述",
+			extra: map[string]any{
+				"feedback": map[string]any{
+					"suggestion": "[world_rule]  ",
+				},
+			},
+			want: "[world_rule] 提案须包含规则描述",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := preflightStore(t)
+			if tc.seed != nil {
+				tc.seed(t, s)
+			}
+			before := captureWorldSnapshot(t, s)
+			tool := NewCommitChapterTool(s)
+			_, err := tool.Execute(context.Background(), preflightCommitArgsJSON(tc.extra))
+			if err == nil {
+				t.Fatal("preflight 必须拒绝")
+			}
+			if !errors.Is(err, errs.ErrToolArgs) {
+				t.Fatalf("应为 ErrToolArgs，got %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("错误消息应包含 %q，got %v", tc.want, err)
+			}
+			assertZeroSideEffects(t, s, before)
+		})
+	}
+}
+
+// TestCommitChapterPreflightAcceptsWorldRuleProposal 验证合法 [world_rule] 提案
+// （suggestion 去除前缀后非空且 ≥10 字符的规则描述）通过 preflight。
+// preflight 本身只读（不产生任何写入），直接调用即天然零副作用。
+func TestCommitChapterPreflightAcceptsWorldRuleProposal(t *testing.T) {
+	s := preflightStore(t)
+	tool := NewCommitChapterTool(s)
+	draft := "第一章正文。黑影一闪而过，林墨警觉起来。她心里骂自己丢人，真不要脸。"
+	if err := tool.preflightCommitArgs(1, draft, nil, nil, nil, &domain.OutlineFeedback{
+		Suggestion: "[world_rule] 奶税转型：官府对奶税的态度从宽松转向严苛，需要新增规则约束。",
+	}); err != nil {
+		t.Fatalf("合法 [world_rule] 提案应通过 preflight，got %v", err)
+	}
+	// 非 [world_rule] 前缀的普通建议不受格式校验约束。
+	if err := tool.preflightCommitArgs(1, draft, nil, nil, nil, &domain.OutlineFeedback{
+		Suggestion: "短",
+	}); err != nil {
+		t.Fatalf("非 [world_rule] 提案不应受规则描述长度约束，got %v", err)
+	}
+}
+
+// TestCommitChapterCharacterStateUpserts 验证 character_state_updates 正常落库：
+// (entity,field) 唯一键 upsert + 派生 state_changes + 完成提交。
+func TestCommitChapterCharacterStateUpserts(t *testing.T) {
+	s := preflightStore(t)
+	tool := NewCommitChapterTool(s)
+	raw, err := tool.Execute(context.Background(), preflightCommitArgsJSON(map[string]any{
+		"character_state_updates": []domain.CharacterStateUpdate{
+			{Entity: "林墨", Field: "status.realm", Value: "练气期", Reason: "突破", Evidence: "黑影一闪而过"},
+			{Entity: "林墨", Field: "location.city", Value: "云州城"},
+		},
+	}))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if out["committed"] != true {
+		t.Fatalf("committed = %v, want true", out["committed"])
+	}
+
+	entries, err := s.World.LoadCharacterState()
+	if err != nil {
+		t.Fatalf("LoadCharacterState: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 character state entries, got %+v", entries)
+	}
+	byField := map[string]domain.CharacterStateEntry{}
+	for _, e := range entries {
+		byField[e.Field] = e
+	}
+	if e := byField["status.realm"]; e.Value != "练气期" || e.UpdatedChapter != 1 || e.Evidence != "黑影一闪而过" {
+		t.Errorf("status.realm entry wrong: %+v", e)
+	}
+	if e := byField["location.city"]; e.Value != "云州城" || e.UpdatedChapter != 1 {
+		t.Errorf("location.city entry wrong: %+v", e)
+	}
+	// 派生 state_changes：每 upsert 一条（含 reason）
+	changes, _ := s.World.LoadStateChanges()
+	if len(changes) != 2 {
+		t.Fatalf("expected 2 derived state changes, got %+v", changes)
+	}
+	got := map[string]domain.StateChange{}
+	for _, c := range changes {
+		got[c.Field] = c
+	}
+	if c := got["status.realm"]; c.Entity != "林墨" || c.Reason != "突破" || c.NewValue != "练气期" {
+		t.Errorf("derived state change status.realm wrong: %+v", c)
+	}
+	if c := got["location.city"]; c.NewValue != "云州城" {
+		t.Errorf("derived state change location.city wrong: %+v", c)
+	}
+	if pending, _ := s.Signals.LoadPendingCommit(); pending != nil {
+		t.Fatalf("pending commit should be cleared, got %+v", pending)
+	}
+}
+
+// TestCommitChapterRewritePreserveSkipsCharacterState 验证 preserve 重写提交
+// 不应用 character_state_updates（与 timeline/foreshadow/relationships/state 一致），
+// 即使参数里携带该字段。
+func TestCommitChapterRewritePreserveSkipsCharacterState(t *testing.T) {
+	const final = "已提交的终稿。她心里骂自己丢人，真不要脸。"
+	s := rewriteModeStore(t, final, "返工后的草稿。她心里骂自己丢人，真不要脸。")
+
+	tool := NewCommitChapterTool(s)
+	args, _ := json.Marshal(map[string]any{
+		"chapter": 2, "summary": "重写摘要", "characters": []string{"林墨"}, "key_events": []string{"重写"},
+		"world_state_mode":        "preserve",
+		"character_state_updates": []domain.CharacterStateUpdate{{Entity: "林墨", Field: "status.realm", Value: "金丹期"}},
+	})
+	if _, err := tool.Execute(context.Background(), args); err != nil {
+		t.Fatalf("Execute preserve rewrite: %v", err)
+	}
+	entries, _ := s.World.LoadCharacterState()
+	if len(entries) != 0 {
+		t.Fatalf("preserve 后 character_state 应保持原状，got %+v", entries)
+	}
+	if changes, _ := s.World.LoadStateChanges(); len(changes) != 0 {
+		t.Fatalf("preserve 后不得派生 state_changes，got %+v", changes)
 	}
 }

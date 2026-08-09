@@ -877,6 +877,19 @@ func (t *SaveFoundationTool) Execute(ctx context.Context, args json.RawMessage) 
 
 	case "world_rules":
 		rules := cmd.Payload.([]domain.WorldRule)
+		// 保存前量控校验：条数达到软上限即告警（提示合并/移除过期规则，允许保存）；
+		// 总序列化字节超硬上限则拒绝保存（防止规则集膨胀挤占上下文预算，禁静默截断）。
+		if len(rules) >= domain.MaxWorldRulesEntries {
+			result["warning"] = fmt.Sprintf("world_rules 共 %d 条，达到/超过软上限 %d 条：建议合并或移除过期规则（已保存，仅提示）",
+				len(rules), domain.MaxWorldRulesEntries)
+		}
+		// 与 store 落盘格式一致（MarshalIndent），量测实际持久化字节数。
+		if data, err := json.MarshalIndent(rules, "", "  "); err != nil {
+			return nil, fmt.Errorf("world_rules: serialize: %w: %w", errs.ErrStoreWrite, err)
+		} else if len(data) > domain.MaxWorldRulesBytes {
+			return nil, fmt.Errorf("world_rules 总序列化大小 %d 字节超过硬上限 %d 字节，拒绝保存：请合并/移除过期规则后重试: %w",
+				len(data), domain.MaxWorldRulesBytes, errs.ErrToolArgs)
+		}
 		if err := t.store.World.SaveWorldRules(rules); err != nil {
 			return nil, fmt.Errorf("save world_rules: %w: %w", errs.ErrStoreWrite, err)
 		}

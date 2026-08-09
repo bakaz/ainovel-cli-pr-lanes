@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -20,7 +21,7 @@ const (
 	ThresholdPayoffMissRate   = 0.4 // PayoffMissPattern: payoff 未兑现率上限
 	ThresholdCompassDrift     = 15  // CompassDrift: 指南针未更新章数上限
 	ThresholdTimelineGapRate  = 0.3 // TimelineGaps: 缺失率容忍上限
-	ThresholdForeshadowMin    = 8   // StaleForeshadow: 伏笔停滞最小章数
+	ThresholdForeshadowStale  = 100 // StaleForeshadow: 伏笔停滞固定阈值（章）
 )
 
 // allRules 按 flow → quality → planning → context 排列。
@@ -115,17 +116,29 @@ func buildStats(snap *Snapshot) Stats {
 		st.AvgReviewScore = totalScore / float64(dimCount)
 	}
 
-	// 伏笔统计
+	// 伏笔统计：open 按活跃列表口径（排除 resolved + retired；legacy 空状态视为活跃），
+	// stale 按 effectiveTouchedAt（last_touched_at>0 用其，否则退回 planted_at）判定，
+	// 与 novel_context 的 agingForeshadow 共用固定 100 章阈值，保证诊断与召回口径一致。
 	latest := snap.LatestCompleted()
 	for _, f := range snap.Foreshadow {
-		if f.Status == "planted" || f.Status == "advanced" {
-			st.ForeshadowOpen++
-			if f.Status == "planted" && latest-f.PlantedAt > staleForeshadowThreshold(st.CompletedChapters) {
-				st.ForeshadowStale++
-			}
+		if f.Status == "resolved" || f.Status == "retired" {
+			continue
+		}
+		st.ForeshadowOpen++
+		if touched := effectiveForeshadowTouched(f); touched > 0 && latest-touched >= ThresholdForeshadowStale {
+			st.ForeshadowStale++
 		}
 	}
 	return st
+}
+
+// effectiveForeshadowTouched 返回伏笔的"最近推进"基准章节：
+// 有 LastTouchedAt（advance/resolve 过）用它，否则退回 PlantedAt（旧数据兼容）。
+func effectiveForeshadowTouched(f domain.ForeshadowEntry) int {
+	if f.LastTouchedAt > 0 {
+		return f.LastTouchedAt
+	}
+	return f.PlantedAt
 }
 
 // sortFindings 按严重程度排序：critical > warning > info。
@@ -134,13 +147,4 @@ func sortFindings(findings []Finding) {
 	sort.SliceStable(findings, func(i, j int) bool {
 		return order[findings[i].Severity] < order[findings[j].Severity]
 	})
-}
-
-// staleForeshadowThreshold 根据总章节数计算伏笔停滞阈值。
-func staleForeshadowThreshold(completedChapters int) int {
-	t := completedChapters / 3
-	if t < ThresholdForeshadowMin {
-		return ThresholdForeshadowMin
-	}
-	return t
 }

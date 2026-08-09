@@ -132,12 +132,98 @@ func (t *SaveArcSummaryTool) Execute(_ context.Context, args json.RawMessage) (j
 		return nil, fmt.Errorf("checkpoint arc summary: %w: %w", errs.ErrStoreWrite, err)
 	}
 
-	return json.Marshal(map[string]any{
+	result := map[string]any{
 		"saved": true, "type": "arc_summary",
 		"volume": a.Volume, "arc": a.Arc,
 		"snapshots":         len(a.CharacterSnapshots),
 		"style_rules_saved": styleRulesSaved,
-	})
+	}
+
+	// 快照派生基底：加载 character_state 当前值（按 entity 分组），提示 LLM
+	// 快照应与之兼容——快照是派生摘要，不覆盖 current state。
+	if basis := buildCurrentStateBasis(t.store); len(basis) > 0 {
+		result["current_state_basis"] = basis
+		result["snapshot_hint"] = "以上为 meta/character_state.json 当前值（权威层）。快照应与之兼容：快照是弧末派生摘要，不得与 current state 明显矛盾（如当前存在某装置却写已移除）。"
+		if conflicts := checkSnapshotStateConflicts(a.CharacterSnapshots, basis); len(conflicts) > 0 {
+			result["snapshot_conflict_warnings"] = conflicts
+		}
+	}
+
+	return json.Marshal(result)
+}
+
+// buildCurrentStateBasis 按 entity 分组返回 character_state 当前值摘要。
+// 无状态文件/空状态返回 nil。
+func buildCurrentStateBasis(st *store.Store) map[string]map[string]string {
+	entries, err := st.World.LoadCharacterState()
+	if err != nil || len(entries) == 0 {
+		return nil
+	}
+	grouped := make(map[string]map[string]string, len(entries))
+	for _, e := range entries {
+		m := grouped[e.Entity]
+		if m == nil {
+			m = make(map[string]string)
+			grouped[e.Entity] = m
+		}
+		m[e.Field] = e.Value
+	}
+	return grouped
+}
+
+// snapshotPresenceContradictors 宽松冲突检查关键词：current state 中"装置/状态存在且
+// 持续"的字段（见 currentStateImpliesPresence），快照文本出现这些词视为潜在矛盾
+// （仅告警，不拒绝）。覆盖迁移数据形态：除"完好/痊愈/消失"外，还有"双腿笔直/
+// 手脚自由/已摘除"等表达"装置移除或身体复原"的短语。
+var snapshotPresenceContradictors = []string{
+	"完好", "痊愈", "消失", "不存在", "移除", "去除", "截肢", "已断",
+	"双腿笔直", "手脚自由", "已摘除", "已拆除", "恢复正常", "不受影响",
+}
+
+// currentStateImpliesPresence 判断 current state 字段是否暗示"装置/状态存在且持续"：
+// body_device.* 前缀一律视为装置在位（迁移数据多为安装/持续描述，value 无"存在"字样），
+// 其余字段按 value 关键词兜底判断（"存在/安装/固定/永久/融合/持续"）。
+func currentStateImpliesPresence(field, value string) bool {
+	if strings.HasPrefix(field, "body_device.") {
+		return true
+	}
+	for _, kw := range []string{"存在", "安装", "固定", "永久", "融合", "持续"} {
+		if strings.Contains(value, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkSnapshotStateConflicts 宽松冲突检查：current state 中暗示"装置/状态存在且持续"
+// 的字段（body_device.* 前缀或 value 含"存在/安装/固定"等词），若同名角色快照文本
+// （status/power/motivation/relations）出现矛盾关键词 → 返回警告。
+// 启发式实现：只覆盖最明确的"装置/伤势存在 ↔ 完好/消失"矛盾，不做语义级判断。
+func checkSnapshotStateConflicts(snapshots []domain.CharacterSnapshot, basis map[string]map[string]string) []string {
+	if len(snapshots) == 0 || len(basis) == 0 {
+		return nil
+	}
+	var warnings []string
+	for _, snap := range snapshots {
+		fields, ok := basis[snap.Name]
+		if !ok {
+			continue
+		}
+		text := snap.Status + " " + snap.Power + " " + snap.Motivation + " " + snap.Relations
+		for field, value := range fields {
+			if !currentStateImpliesPresence(field, value) {
+				continue
+			}
+			for _, kw := range snapshotPresenceContradictors {
+				if strings.Contains(text, kw) {
+					warnings = append(warnings, fmt.Sprintf("快照 %s 疑似与 current state 矛盾：current %s.%s=%s，快照文本含“%s”",
+						snap.Name, snap.Name, field, value, kw))
+					break
+				}
+			}
+		}
+	}
+	return warnings
 }
 
 type arcSummaryStyleRules struct {

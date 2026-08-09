@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/voocel/agentcore/schema"
 	"github.com/voocel/ainovel-cli/internal/domain"
@@ -121,6 +122,53 @@ func (t *CheckConsistencyTool) Execute(_ context.Context, args json.RawMessage) 
 	}
 	if summaries, _ := t.store.Summaries.LoadRecentSummaries(a.Chapter, 2); len(summaries) > 0 {
 		result["recent_summaries"] = summaries
+	}
+
+	// 角色受控状态：按当前章正文角色筛选（角色名/别名出现在本章草稿中的实体），
+	// 同时做代码可确定的重复 key 校验（(entity, field) 唯一键重复 → 报告，其余交 LLM）。
+	if entries, _ := t.store.World.LoadCharacterState(); len(entries) > 0 {
+		inChapter := make(map[string]bool)
+		if chars, _ := t.store.Characters.Load(); len(chars) > 0 {
+			for _, c := range chars {
+				if strings.Contains(content, c.Name) {
+					inChapter[c.Name] = true
+				}
+				for _, alias := range c.Aliases {
+					if strings.Contains(content, alias) {
+						inChapter[c.Name] = true
+					}
+				}
+			}
+		}
+		seenKey := make(map[string]struct{}, len(entries))
+		var filtered []domain.CharacterStateEntry
+		var issues []map[string]any
+		for _, e := range entries {
+			if inChapter[e.Entity] || strings.Contains(content, e.Entity) {
+				filtered = append(filtered, e)
+			}
+			key := e.Entity + "\x00" + e.Field
+			if _, dup := seenKey[key]; dup {
+				issues = append(issues, map[string]any{
+					"type": "duplicate_key", "entity": e.Entity, "field": e.Field,
+				})
+			}
+			seenKey[key] = struct{}{}
+		}
+		if len(filtered) > 0 {
+			result["character_state"] = filtered
+		}
+		if len(issues) > 0 {
+			result["character_state_issues"] = issues
+		}
+	}
+
+	// 当前章 plan/contract：让审阅对照本章承诺（required_beats/payoff 等）。
+	if plan, _ := t.store.Drafts.LoadChapterPlan(a.Chapter); plan != nil {
+		result["chapter_plan"] = plan
+		result["chapter_contract"] = plan.Contract
+	} else if entry, _ := t.store.Outline.GetChapterOutline(a.Chapter); entry != nil {
+		result["current_chapter_outline"] = entry
 	}
 
 	// 每次执行都追加新 checkpoint（不做 digest 幂等去重）：review_style 依赖

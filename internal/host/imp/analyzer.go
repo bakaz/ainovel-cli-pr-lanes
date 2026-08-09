@@ -20,15 +20,16 @@ var (
 
 // ChapterAnalysis 是单章反推的结构化产物，字段直接对齐 commit_chapter 入参。
 type ChapterAnalysis struct {
-	Summary             string
-	Characters          []string
-	KeyEvents           []string
-	TimelineEvents      []domain.TimelineEvent
-	ForeshadowUpdates   []domain.ForeshadowUpdate
-	RelationshipChanges []domain.RelationshipEntry
-	StateChanges        []domain.StateChange
-	HookType            string
-	DominantStrand      string
+	Summary               string
+	Characters            []string
+	KeyEvents             []string
+	TimelineEvents        []domain.TimelineEvent
+	ForeshadowUpdates     []domain.ForeshadowUpdate
+	RelationshipChanges   []domain.RelationshipEntry
+	StateChanges          []domain.StateChange
+	CharacterStateUpdates []domain.CharacterStateUpdate
+	HookType              string
+	DominantStrand        string
 }
 
 // AnalyzeChapter 用一次 LLM 调用，从单章正文反推 commit_chapter 所需事实。
@@ -69,7 +70,7 @@ func buildAnalyzerUserPrompt(
 	hooks []domain.ForeshadowEntry,
 ) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "请分析第 %d 章正文，输出 9 个 === TAG === 段。\n\n", chapter)
+	fmt.Fprintf(&sb, "请分析第 %d 章正文，输出 10 个 === TAG === 段。\n\n", chapter)
 	if title != "" {
 		fmt.Fprintf(&sb, "章节标题：%s\n\n", title)
 	}
@@ -149,9 +150,19 @@ func parseAnalyzerOutput(text string) (*ChapterAnalysis, error) {
 	if err := decodeOptionalArray("state_changes", env["STATE_CHANGES"], &a.StateChanges); err != nil {
 		return nil, err
 	}
+	if err := decodeOptionalArray("character_state", env["CHARACTER_STATE"], &a.CharacterStateUpdates); err != nil {
+		return nil, err
+	}
+	// foreshadow 语义校验与 commit_chapter preflight 对齐（不含草稿引文检查：
+	// 本阶段无草稿正文可核对，evidence 仅校验存在性）。
 	for i, fu := range a.ForeshadowUpdates {
-		if fu.Action == "plant" && strings.TrimSpace(fu.Description) == "" {
-			return nil, fmt.Errorf("foreshadow[%d] action=plant requires description (id=%s)", i, fu.ID)
+		if err := fu.Validate(0, nil); err != nil {
+			return nil, fmt.Errorf("foreshadow[%d]: %v", i, err)
+		}
+	}
+	for i, cu := range a.CharacterStateUpdates {
+		if err := domain.ValidateCharacterStateUpdate(cu); err != nil {
+			return nil, fmt.Errorf("character_state[%d]: %v", i, err)
 		}
 	}
 	return a, nil
@@ -216,6 +227,9 @@ func PersistChapter(
 	}
 	if len(a.StateChanges) > 0 {
 		args["state_changes"] = a.StateChanges
+	}
+	if len(a.CharacterStateUpdates) > 0 {
+		args["character_state_updates"] = a.CharacterStateUpdates
 	}
 	_ = title
 

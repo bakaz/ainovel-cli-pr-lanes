@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -180,7 +181,7 @@ func (t *ContextTool) buildSimulationProfile(result map[string]any, sectionKey s
 	result["simulation_profile"] = true
 }
 
-func (t *ContextTool) buildBaseContext(result map[string]any, warn func(string, error)) {
+func (t *ContextTool) buildBaseContext(result map[string]any, chapter int, warn func(string, error)) {
 	if premise, err := t.store.Outline.LoadPremise(); err == nil && premise != "" {
 		result["premise"] = premise
 		if sections := parsePremiseSections(premise); len(sections) > 0 {
@@ -201,8 +202,134 @@ func (t *ContextTool) buildBaseContext(result map[string]any, warn func(string, 
 	}
 	if rules, err := t.store.World.LoadWorldRules(); err == nil && len(rules) > 0 {
 		result["world_rules"] = rules
+		if len(rules) > domain.MaxWorldRulesEntries {
+			appendContextWarning(result, fmt.Sprintf("world_rules 共 %d 条，超过软上限 %d 条：建议合并或移除过期规则（仅提示，不裁剪）",
+				len(rules), domain.MaxWorldRulesEntries))
+		}
 	} else {
 		warn("world_rules", err)
+	}
+	t.buildCharacterStateContext(result, chapter, warn)
+}
+
+// appendContextWarning 向 result["_warnings"] 追加一条告警（Execute 末尾会与
+// warn 回调收集的告警合并，不会互相覆盖）。
+func appendContextWarning(result map[string]any, msg string) {
+	if existing, ok := result["_warnings"].([]string); ok {
+		result["_warnings"] = append(existing, msg)
+		return
+	}
+	result["_warnings"] = []string{msg}
+}
+
+// characterStateBudgetBytes 主角常驻 character_state 投影的序列化软上限（12 KiB）。
+const characterStateBudgetBytes = 12 * 1024
+
+// protagonistNames 从角色档案中识别主角：Tier=core 或 Role 含"主角"。
+// 无任何主角标记时返回 nil（调用方注入全部实体并标注）。
+func protagonistNames(chars []domain.Character) []string {
+	var names []string
+	for _, c := range chars {
+		if c.Tier == "core" || strings.Contains(c.Role, "主角") {
+			names = append(names, c.Name)
+			names = append(names, c.Aliases...)
+		}
+	}
+	return names
+}
+
+// entityMatchesAny 判断实体名是否命中任一角色名/别名（含实体名本身包含该名）。
+func entityMatchesAny(entity string, names []string) bool {
+	for _, n := range names {
+		if entity == n || strings.Contains(entity, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildCharacterStateContext 注入 writer/editor 顶层 character_state 投影：
+//   - 主角核心状态常驻（≤12KiB 序列化保护，超限保留最新 updated_chapter 的字段，
+//     省略数量写入 _warnings）；
+//   - 按当前章大纲/plan 预计出场召回次要角色状态（独立 key character_state_secondary，
+//     在 trimOrder 中位于 relationship_state 之前裁剪）。
+//
+// 主角判定：Tier=core 或 Role 含"主角"；角色档案无主角标记时注入全部并标注 basis。
+func (t *ContextTool) buildCharacterStateContext(result map[string]any, chapter int, warn func(string, error)) {
+	entries, err := t.store.World.LoadCharacterState()
+	if err != nil {
+		warn("character_state", err)
+		return
+	}
+	if len(entries) == 0 {
+		return
+	}
+	chars, _ := t.store.Characters.Load()
+	protags := protagonistNames(chars)
+	protagonistOnly := len(protags) > 0
+
+	// 当前章出场文本：大纲场景/核心事件/标题 + 章节 plan（plan 缺失时退回大纲）。
+	sceneText := ""
+	if entry, err := t.store.Outline.GetChapterOutline(chapter); err == nil && entry != nil {
+		sceneText = domain.FlattenScenes(entry.Scenes) + " " + entry.CoreEvent + " " + entry.Title
+	}
+	if plan, err := t.store.Drafts.LoadChapterPlan(chapter); err == nil && plan != nil {
+		sceneText += " " + plan.Goal + " " + plan.Conflict + " " + plan.Hook
+		for _, beat := range plan.Contract.RequiredBeats {
+			sceneText += " " + beat
+		}
+	}
+
+	// 出场角色名集合（含别名），用于次要角色状态召回。
+	var inSceneNames []string
+	for _, c := range chars {
+		if matchCharacter(sceneText, c) {
+			inSceneNames = append(inSceneNames, c.Name)
+			inSceneNames = append(inSceneNames, c.Aliases...)
+		}
+	}
+
+	var protagonist, secondary []domain.CharacterStateEntry
+	for _, e := range entries {
+		if !protagonistOnly || entityMatchesAny(e.Entity, protags) {
+			protagonist = append(protagonist, e)
+			continue
+		}
+		// 次要角色：仅当本章预计出场才召回（实体名本身出现在文本中也可命中）。
+		if entityMatchesAny(e.Entity, inSceneNames) || strings.Contains(sceneText, e.Entity) {
+			secondary = append(secondary, e)
+		}
+	}
+
+	if len(protagonist) > 0 {
+		proj := map[string]any{
+			"basis": "meta/character_state.json 当前值（权威层，快照/摘要为其派生）",
+		}
+		if !protagonistOnly {
+			proj["basis"] = proj["basis"].(string) + "；未检测到主角标记（Tier=core 或 Role 含主角），注入全部实体"
+		}
+		// 按 updated_chapter 降序：超预算时优先保留最新字段。
+		sort.SliceStable(protagonist, func(i, j int) bool {
+			return protagonist[i].UpdatedChapter > protagonist[j].UpdatedChapter
+		})
+		proj["entries"] = protagonist
+		raw, _ := json.Marshal(proj)
+		omitted := 0
+		for len(raw) > characterStateBudgetBytes && len(protagonist) > 1 {
+			protagonist = protagonist[:len(protagonist)-1]
+			omitted++
+			proj["entries"] = protagonist
+			raw, _ = json.Marshal(proj)
+		}
+		if omitted > 0 {
+			proj["omitted_count"] = omitted
+			appendContextWarning(result, fmt.Sprintf("character_state 投影超出 %d KiB 预算，省略 %d 条最旧字段（保留最新 updated_chapter）",
+				characterStateBudgetBytes/1024, omitted))
+		}
+		result["character_state"] = proj
+	}
+	if len(secondary) > 0 {
+		result["character_state_secondary"] = secondary
 	}
 }
 
@@ -1226,7 +1353,7 @@ func (t *ContextTool) buildArchitectContext(result map[string]any, warn func(str
 	envelope := newArchitectContextEnvelope()
 	result["memory_policy"] = domain.NewArchitectMemoryPolicy()
 	t.buildArchitectPlanning(&envelope, warn)
-	t.buildArchitectFoundation(&envelope, warn)
+	t.buildArchitectFoundation(result, &envelope, warn)
 	t.buildArchitectReferences(&envelope, warn)
 	envelope.apply(result)
 }
@@ -1456,7 +1583,7 @@ func (t *ContextTool) completionSignals(layered []domain.VolumeOutline, compass 
 	return signals
 }
 
-func (t *ContextTool) buildArchitectFoundation(envelope *architectContextEnvelope, warn func(string, error)) {
+func (t *ContextTool) buildArchitectFoundation(result map[string]any, envelope *architectContextEnvelope, warn func(string, error)) {
 	if premise, err := t.store.Outline.LoadPremise(); err == nil && premise != "" {
 		if sections := parsePremiseSections(premise); len(sections) > 0 {
 			envelope.Foundation["premise_sections"] = sections
@@ -1483,6 +1610,10 @@ func (t *ContextTool) buildArchitectFoundation(envelope *architectContextEnvelop
 	}
 	if rules, err := t.store.World.LoadWorldRules(); err == nil && len(rules) > 0 {
 		envelope.Foundation["world_rules"] = rules
+		if len(rules) > domain.MaxWorldRulesEntries {
+			appendContextWarning(result, fmt.Sprintf("world_rules 共 %d 条，超过软上限 %d 条：建议合并或移除过期规则（仅提示，不裁剪）",
+				len(rules), domain.MaxWorldRulesEntries))
+		}
 	} else {
 		warn("world_rules", err)
 	}
@@ -1490,6 +1621,12 @@ func (t *ContextTool) buildArchitectFoundation(envelope *architectContextEnvelop
 		envelope.Foundation["foreshadow_ledger"] = foreshadow
 	} else {
 		warn("foreshadow_ledger", err)
+	}
+	// 角色受控状态全量注入：Architect 规划时需要看到四层当前值全貌。
+	if state, err := t.store.World.LoadCharacterState(); err == nil && len(state) > 0 {
+		envelope.Foundation["character_state"] = state
+	} else {
+		warn("character_state", err)
 	}
 	envelope.Foundation["foundation_status"] = t.foundationStatus()
 	// Writer 反馈池:commit_chapter 落盘的大纲偏离/建议,规划下一弧/卷时必须参考;

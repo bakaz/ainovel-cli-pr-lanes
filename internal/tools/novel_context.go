@@ -98,7 +98,7 @@ func (t *ContextTool) Execute(_ context.Context, args json.RawMessage) (json.Raw
 
 	if a.Chapter > 0 {
 		// Writer 路径：加载全量基础数据 + 章节上下文
-		t.buildBaseContext(result, warn)
+		t.buildBaseContext(result, a.Chapter, warn)
 		seed := newChapterContextEnvelope()
 		state := t.prepareChapterContext(a.Chapter, &seed, warn)
 		seed.apply(result)
@@ -134,6 +134,11 @@ func (t *ContextTool) Execute(_ context.Context, args json.RawMessage) (json.Raw
 	}
 
 	if len(warnings) > 0 {
+		// 合并 builder 直接追加到 result["_warnings"] 的告警（如 character_state 超预算裁剪、
+		// world_rules 超条数提示），避免覆盖。
+		if existing, ok := result["_warnings"].([]string); ok {
+			warnings = append(existing, warnings...)
+		}
 		result["_warnings"] = warnings
 	}
 
@@ -581,6 +586,7 @@ func trimByBudget(result map[string]any, budget int) {
 		"timeline",
 		"recent_state_changes",
 		"foreshadow_ledger",
+		"character_state_secondary",
 		"relationship_state",
 	}
 
@@ -812,11 +818,35 @@ func (t *ContextTool) selectStoryThreads(state contextBuildState) []domain.Recal
 		return nil
 	}
 
-	const maxThreads = 5
+	const maxThreads = 12
+	// 相关性召回最多占 10 个名额；stale 槽至少保留 1 条最旧久挂伏笔。
+	const maxRelevant = 10
+
+	focusTerms := recallFocusTerms(state.currentEntry, state.chapterPlan)
+	focusText := strings.Join(focusTerms, " ")
+
+	// 1. 相关性召回：与当前章 focus 词重叠的伏笔（收集上限 12；存在 stale 时只取 10）。
+	var relevant []domain.ForeshadowEntry
+	for _, entry := range state.foreshadow {
+		if !matchesRecallTerms(entry.ID+" "+entry.Description, focusTerms) && !strings.Contains(focusText, entry.ID) {
+			continue
+		}
+		relevant = append(relevant, entry)
+		if len(relevant) >= maxThreads {
+			break
+		}
+	}
+
+	// 2. 账龄召回：久挂未回收（按 effectiveTouchedAt 最旧优先）。
+	stale := agingForeshadow(state.foreshadow, state.chapter, nil)
+
 	var items []domain.RecallItem
 	seen := make(map[string]struct{})
-	picked := make(map[string]struct{}) // 已选中的伏笔 ID，供账龄回填去重
+	picked := make(map[string]struct{}) // 已选中的伏笔 ID：相关与 stale 同 ID 去重
 	add := func(item domain.RecallItem) {
+		if _, ok := picked[item.Key]; ok {
+			return
+		}
 		key := item.Kind + "|" + item.Key + "|" + item.Summary
 		if _, ok := seen[key]; ok {
 			return
@@ -825,14 +855,7 @@ func (t *ContextTool) selectStoryThreads(state contextBuildState) []domain.Recal
 		picked[item.Key] = struct{}{}
 		items = append(items, item)
 	}
-
-	// 1. 相关性召回：与当前章 focus 词重叠的伏笔。
-	focusTerms := recallFocusTerms(state.currentEntry, state.chapterPlan)
-	focusText := strings.Join(focusTerms, " ")
-	for _, entry := range state.foreshadow {
-		if !matchesRecallTerms(entry.ID+" "+entry.Description, focusTerms) && !strings.Contains(focusText, entry.ID) {
-			continue
-		}
+	addRelevant := func(entry domain.ForeshadowEntry) {
 		add(domain.RecallItem{
 			Kind:    "story_thread",
 			Key:     entry.ID,
@@ -840,44 +863,71 @@ func (t *ContextTool) selectStoryThreads(state contextBuildState) []domain.Recal
 			Reason:  "当前章可能需要承接既有伏笔",
 			Summary: fmt.Sprintf("伏笔“%s”埋于第%d章：%s", entry.ID, entry.PlantedAt, truncateRunes(entry.Description, 30)),
 		})
-		if len(items) >= maxThreads {
-			return items
-		}
 	}
-
-	// 2. 账龄回填：与当前章无关、但久挂未回收的伏笔（最旧优先），补足剩余名额。
-	//    补的是相关性召回天然的盲区——独自悬挂太久、却没在本章撞上关键词的那根线。
-	for _, entry := range agingForeshadow(state.foreshadow, state.chapter, picked) {
+	addStale := func(entry domain.ForeshadowEntry) {
+		touched := effectiveForeshadowTouched(entry)
 		add(domain.RecallItem{
 			Kind:    "story_thread",
 			Key:     entry.ID,
 			Chapter: entry.PlantedAt,
 			Reason:  "伏笔久挂未回收，注意适时推进或回收",
-			Summary: fmt.Sprintf("伏笔“%s”埋于第%d章，已 %d 章未回收：%s", entry.ID, entry.PlantedAt, state.chapter-entry.PlantedAt, truncateRunes(entry.Description, 30)),
+			Summary: fmt.Sprintf("伏笔“%s”埋于第%d章，已 %d 章未回收：%s", entry.ID, entry.PlantedAt, state.chapter-touched, truncateRunes(entry.Description, 30)),
 		})
-		if len(items) >= maxThreads {
-			break
-		}
 	}
 
+	switch {
+	case len(stale) > 0:
+		// 存在 stale：最多 10 条相关 + ≥1 条最旧 stale；空位继续由 stale 补足至 12。
+		for _, entry := range relevant {
+			if len(items) >= maxRelevant {
+				break
+			}
+			addRelevant(entry)
+		}
+		for _, entry := range stale {
+			if len(items) >= maxThreads {
+				break
+			}
+			addStale(entry)
+		}
+	case len(relevant) > 0:
+		// 无 stale：相关线程补满至 12。
+		for _, entry := range relevant {
+			if len(items) >= maxThreads {
+				break
+			}
+			addRelevant(entry)
+		}
+	}
 	return items
 }
 
-// agingForeshadow 返回账龄 ≥ foreshadowAgingChapters 的未回收伏笔，按最旧优先排序，
-// 跳过 picked 中已被相关性召回选中的。入参 all 已是 active（未回收）列表，故无需再过滤状态。
+// effectiveForeshadowTouched 返回伏笔的"最近推进"基准章节：
+// 有 LastTouchedAt（advance/resolve 过）用它，否则退回 PlantedAt（旧数据兼容）。
+func effectiveForeshadowTouched(e domain.ForeshadowEntry) int {
+	if e.LastTouchedAt > 0 {
+		return e.LastTouchedAt
+	}
+	return e.PlantedAt
+}
+
+// agingForeshadow 返回账龄 ≥ foreshadowAgingChapters 的未回收伏笔，按 effectiveTouchedAt
+// （最近推进基准）升序——最久未推进优先。跳过 picked 中已被相关性召回选中的。
+// 入参 all 已是 active（未回收）列表，故无需再过滤状态。
 func agingForeshadow(all []domain.ForeshadowEntry, chapter int, picked map[string]struct{}) []domain.ForeshadowEntry {
 	var aging []domain.ForeshadowEntry
 	for _, e := range all {
 		if _, ok := picked[e.ID]; ok {
 			continue
 		}
-		if e.PlantedAt <= 0 || chapter-e.PlantedAt < foreshadowAgingChapters {
+		touched := effectiveForeshadowTouched(e)
+		if touched <= 0 || chapter-touched < foreshadowAgingChapters {
 			continue
 		}
 		aging = append(aging, e)
 	}
 	sort.SliceStable(aging, func(i, j int) bool {
-		return aging[i].PlantedAt < aging[j].PlantedAt
+		return effectiveForeshadowTouched(aging[i]) < effectiveForeshadowTouched(aging[j])
 	})
 	return aging
 }
@@ -1017,14 +1067,14 @@ func hasMeaningfulOverlap(a, b string) bool {
 	return longestCommonSubstringRunes(ar, br) >= threshold
 }
 
-const storyThreadRecallThreshold = 6
+const storyThreadRecallThreshold = 12
 const storyThreadRecallMinSelected = 2
 
 // foreshadowAgingChapters：一条伏笔自埋设起超过这么多章仍未回收，视为"久挂"。
 // 这类伏笔即使与当前章关键词无关，也回填进 story_threads，避免长篇里被彻底遗忘
 // （相关性召回天然只看见与本章相关的线，看不见独自悬挂太久的那根）。
 // 账龄是纯代码派生的事实（当前章 - 埋设章），只陈述"已挂 N 章未回收"，不下指令。
-const foreshadowAgingChapters = 30
+const foreshadowAgingChapters = 100
 
 func longestCommonSubstringRunes(a, b []rune) int {
 	if len(a) == 0 || len(b) == 0 {

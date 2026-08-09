@@ -140,13 +140,13 @@ func TestForeshadow_UpdateLifecycle(t *testing.T) {
 
 	// plant
 	_ = s.World.UpdateForeshadow(1, []domain.ForeshadowUpdate{
-		{ID: "f1", Action: "plant", Description: "黑影"},
-		{ID: "f2", Action: "plant", Description: "断剑"},
+		{ID: "f1", Action: "plant", Description: "黑影", Horizon: "book"},
+		{ID: "f2", Action: "plant", Description: "断剑", Horizon: "book"},
 	})
 	// advance f1, resolve f2
 	_ = s.World.UpdateForeshadow(3, []domain.ForeshadowUpdate{
-		{ID: "f1", Action: "advance"},
-		{ID: "f2", Action: "resolve"},
+		{ID: "f1", Action: "advance", Evidence: "黑影再次出现"},
+		{ID: "f2", Action: "resolve", Evidence: "断剑正是信物"},
 	})
 
 	all, _ := s.World.LoadForeshadowLedger()
@@ -171,17 +171,20 @@ func TestForeshadow_PlantIsIdempotent(t *testing.T) {
 	s := newTestStore(t)
 
 	_ = s.World.UpdateForeshadow(1, []domain.ForeshadowUpdate{
-		{ID: "f1", Action: "plant", Description: "黑影"},
+		{ID: "f1", Action: "plant", Description: "黑影", Horizon: "book"},
 	})
 	_ = s.World.UpdateForeshadow(1, []domain.ForeshadowUpdate{
-		{ID: "f1", Action: "plant", Description: "黑影"},
+		{ID: "f1", Action: "plant", Description: "黑影", Horizon: "book"},
 	})
 	_ = s.World.UpdateForeshadow(3, []domain.ForeshadowUpdate{
-		{ID: "f1", Action: "advance"},
+		{ID: "f1", Action: "advance", Evidence: "黑影再次出现"},
 	})
-	_ = s.World.UpdateForeshadow(3, []domain.ForeshadowUpdate{
-		{ID: "f1", Action: "plant", Description: "黑影"},
-	})
+	// 已推进（advanced）的条目拒绝重复 plant
+	if err := s.World.UpdateForeshadow(3, []domain.ForeshadowUpdate{
+		{ID: "f1", Action: "plant", Description: "黑影", Horizon: "cross_arc"},
+	}); err == nil {
+		t.Fatal("plant over advanced entry should be rejected")
+	}
 
 	all, _ := s.World.LoadForeshadowLedger()
 	if len(all) != 1 {
@@ -189,6 +192,10 @@ func TestForeshadow_PlantIsIdempotent(t *testing.T) {
 	}
 	if all[0].Status != "advanced" {
 		t.Fatalf("duplicate plant should not downgrade status, got %s", all[0].Status)
+	}
+	// 被拒绝的 plant 不得改写已有 horizon
+	if all[0].Horizon != "book" {
+		t.Fatalf("rejected plant should not override horizon, got %q", all[0].Horizon)
 	}
 }
 

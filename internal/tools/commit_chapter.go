@@ -75,8 +75,18 @@ func (t *CommitChapterTool) Schema() map[string]any {
 	)
 	foreshadowSchema := schema.Object(
 		schema.Property("id", schema.String("伏笔 ID")).Required(),
-		schema.Property("action", schema.Enum("操作", "plant", "advance", "resolve")).Required(),
+		schema.Property("action", schema.Enum("操作", "plant", "advance", "resolve", "retire")).Required(),
 		schema.Property("description", schema.String("伏笔描述（仅 plant 时必需）")),
+		schema.Property("horizon", schema.Enum("伏笔跨度（仅 plant 时必填：跨弧长线或贯穿全书）", "cross_arc", "book")),
+		schema.Property("evidence", schema.String("正文精确短引文（advance/resolve 必填，须逐字出现在本章草稿中）")),
+		schema.Property("reason", schema.String("取消承诺原因（仅 retire 必填）")),
+	)
+	characterStateSchema := schema.Object(
+		schema.Property("entity", schema.String("角色名或实体名")).Required(),
+		schema.Property("field", schema.String("受控命名空间：body_device./health./location./capability./resource./inventory./status./knowledge.")).Required(),
+		schema.Property("value", schema.String("当前状态值（≤400 字，upsert 语义）")).Required(),
+		schema.Property("reason", schema.String("状态变化原因")),
+		schema.Property("evidence", schema.String("正文引文（≤160 字）")),
 	)
 	relationshipSchema := schema.Object(
 		schema.Property("character_a", schema.String("角色 A")).Required(),
@@ -104,6 +114,7 @@ func (t *CommitChapterTool) Schema() map[string]any {
 		schema.Property("foreshadow_updates", schema.Array("伏笔操作", foreshadowSchema)),
 		schema.Property("relationship_changes", schema.Array("关系变化", relationshipSchema)),
 		schema.Property("state_changes", schema.Array("角色/实体状态变化", stateChangeSchema)),
+		schema.Property("character_state_updates", schema.Array("角色/实体受控状态更新（upsert 当前值；与 state_changes 二选一，勿对同一 (entity,field) 双写）", characterStateSchema)),
 		schema.Property("cast_intros", schema.Array("本章首次引入且后续可能再出现的次要角色简介（不含主角及 characters.json 已有角色）", schema.Object(
 			schema.Property("name", schema.String("角色名")).Required(),
 			schema.Property("brief_role", schema.String("一句话定位（如：客栈老板/赌坊打手）")).Required(),
@@ -120,19 +131,20 @@ func (t *CommitChapterTool) Schema() map[string]any {
 func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
 	args = normalizeIntegerStringFields(args, "chapter")
 	var a struct {
-		Chapter             int                        `json:"chapter"`
-		Summary             string                     `json:"summary"`
-		Characters          []string                   `json:"characters"`
-		KeyEvents           []string                   `json:"key_events"`
-		TimelineEvents      []domain.TimelineEvent     `json:"timeline_events"`
-		ForeshadowUpdates   []domain.ForeshadowUpdate  `json:"foreshadow_updates"`
-		RelationshipChanges []domain.RelationshipEntry `json:"relationship_changes"`
-		StateChanges        []domain.StateChange       `json:"state_changes"`
-		CastIntros          []domain.CastIntro         `json:"cast_intros"`
-		HookType            string                     `json:"hook_type"`
-		DominantStrand      string                     `json:"dominant_strand"`
-		WorldStateMode      string                     `json:"world_state_mode"`
-		Feedback            *domain.OutlineFeedback    `json:"feedback"`
+		Chapter               int                           `json:"chapter"`
+		Summary               string                        `json:"summary"`
+		Characters            []string                      `json:"characters"`
+		KeyEvents             []string                      `json:"key_events"`
+		TimelineEvents        []domain.TimelineEvent        `json:"timeline_events"`
+		ForeshadowUpdates     []domain.ForeshadowUpdate     `json:"foreshadow_updates"`
+		RelationshipChanges   []domain.RelationshipEntry    `json:"relationship_changes"`
+		StateChanges          []domain.StateChange          `json:"state_changes"`
+		CharacterStateUpdates []domain.CharacterStateUpdate `json:"character_state_updates"`
+		CastIntros            []domain.CastIntro            `json:"cast_intros"`
+		HookType              string                        `json:"hook_type"`
+		DominantStrand        string                        `json:"dominant_strand"`
+		WorldStateMode        string                        `json:"world_state_mode"`
+		Feedback              *domain.OutlineFeedback       `json:"feedback"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("invalid args: %w: %w", errs.ErrToolArgs, err)
@@ -254,6 +266,13 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 		return nil, fmt.Errorf("no content found for chapter %d: %w", a.Chapter, errs.ErrToolPrecondition)
 	}
 
+	// 1b. preflight（批次 4 新增能力）：foreshadow/character_state 参数语义校验 +
+	// 双写冲突检测。置于一切写入（pending/终稿/摘要/账本）之前：任一失败整体
+	// 拒绝，所有文件零变化。只读（草稿正文 + 伏笔账本），不产生任何写入。
+	if err := t.preflightCommitArgs(a.Chapter, content, a.ForeshadowUpdates, a.StateChanges, a.CharacterStateUpdates, a.Feedback); err != nil {
+		return nil, err
+	}
+
 	now := time.Now().Format(time.RFC3339)
 	pending := domain.PendingCommit{
 		Chapter:        a.Chapter,
@@ -298,6 +317,11 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 			return nil, fmt.Errorf("update foreshadow: %w: %w", errs.ErrStoreWrite, err)
 		}
 	}
+	if len(a.CharacterStateUpdates) > 0 {
+		if err := t.store.World.UpsertCharacterState(a.Chapter, a.CharacterStateUpdates); err != nil {
+			return nil, fmt.Errorf("upsert character state: %w: %w", errs.ErrStoreWrite, err)
+		}
+	}
 	if len(a.RelationshipChanges) > 0 {
 		for i := range a.RelationshipChanges {
 			a.RelationshipChanges[i].Chapter = a.Chapter
@@ -325,6 +349,9 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 	}
 
 	pending.Stage = domain.CommitStageStateApplied
+	// 不做 mutation payload（已决策简化，见 docs/four-layer-state-design.md §已接受偏差 B3）：
+	// 恢复完全依赖 store 幂等（UpsertCharacterState 同值跳过派生、stateChangeKey 去重）
+	// 与调整后的写入顺序（先流水后状态，见 character_state.go），无需标记字段。
 	pending.UpdatedAt = time.Now().Format(time.RFC3339)
 	if err := t.store.Signals.SavePendingCommit(pending); err != nil {
 		return nil, fmt.Errorf("update pending commit stage: %w: %w", errs.ErrStoreWrite, err)
@@ -451,6 +478,136 @@ func (t *CommitChapterTool) appendCommitCheckpoint(chapter int) error {
 	return err
 }
 
+// preflightCommitArgs 对提交参数做写入前的整体校验（一切写操作之前执行，只读）：
+//   - foreshadow_updates：逐条 domain.ForeshadowUpdate.Validate（含 evidence 必须
+//     逐字出现在本章草稿正文）；advance/resolve/retire 的 ID 必须已存在于伏笔账本；
+//     每条按当前状态经 domain.ForeshadowTransitionAllowed 校验转换合法性（§4.1 表，
+//     与 store.UpdateForeshadow 共用同一纯函数——非法转换在写入前拒绝，零副作用）；
+//     同一 ID 在同一提交内不得出现冲突 action（如 advance 与 resolve 并存）。
+//   - character_state_updates：逐条 domain.ValidateCharacterStateUpdate；批内
+//     (entity,field) 重复且 value 不同 → 拒绝；单实体字段数容量预检（现有条数 +
+//     批内新增 ≤ MaxFieldsPerEntity，与 store.UpsertCharacterState 判定一致）。
+//   - 双写冲突：同一 (entity,field) 不得同时出现在 character_state_updates 与
+//     state_changes——受控状态走 character_state_updates 单一通道，避免账本分叉。
+//   - feedback.suggestion：以 [world_rule] 前缀开头的规则提案必须携带规则描述
+//     （去除前缀后非空且 ≥10 字符），防止空壳提案混入世界规则修订流程。
+//
+// 任一失败 → ErrToolArgs 错误整体拒绝；本函数不产生任何写入。
+func (t *CommitChapterTool) preflightCommitArgs(
+	chapter int,
+	draftText string,
+	foreshadow []domain.ForeshadowUpdate,
+	stateChanges []domain.StateChange,
+	charStates []domain.CharacterStateUpdate,
+	feedback *domain.OutlineFeedback,
+) error {
+	evidenceInDraft := func(evidence string) bool {
+		return draftText != "" && strings.Contains(draftText, evidence)
+	}
+	// 加载完整伏笔账本：记录各 ID 的当前状态，供转换合法性校验。
+	// 读取失败时整体拒绝（fail closed）——宁可拒绝提交也不在状态未知时冒险写入。
+	ledger, err := t.store.World.LoadForeshadowLedger()
+	if err != nil {
+		return fmt.Errorf("preflight: 加载伏笔账本失败: %w: %w", errs.ErrStoreRead, err)
+	}
+	statusByID := make(map[string]string, len(ledger))
+	for _, e := range ledger {
+		status := e.Status
+		if status == "" {
+			// 遗留空状态与 store 的 transitionStatus 归一化一致（视为 planted），避免 preflight 与 store 口径分裂。
+			status = "planted"
+		}
+		statusByID[e.ID] = status
+	}
+	actionByID := make(map[string]string, len(foreshadow))
+	for i, u := range foreshadow {
+		if u.Action != "plant" {
+			status, known := statusByID[u.ID]
+			if !known {
+				return fmt.Errorf("foreshadow_updates[%d]: 伏笔 %q 不存在（action=%s 只能作用于已埋设的伏笔）: %w",
+					i, u.ID, u.Action, errs.ErrToolArgs)
+			}
+			// 非法状态转换（resolved 上 advance / retired 上 resolve 等）在写入前拒绝
+			if err := domain.ForeshadowTransitionAllowed(status, u); err != nil {
+				return fmt.Errorf("foreshadow_updates[%d]: %v: %w", i, err, errs.ErrToolArgs)
+			}
+		} else if status, known := statusByID[u.ID]; known {
+			// plant 已存在的 ID：仅 planted（或遗留空状态）可幂等补空；
+			// advanced/resolved/retired 上重复 plant 拒绝。
+			if err := domain.ForeshadowTransitionAllowed(status, u); err != nil {
+				return fmt.Errorf("foreshadow_updates[%d]: %v: %w", i, err, errs.ErrToolArgs)
+			}
+		}
+		if err := u.Validate(chapter, evidenceInDraft); err != nil {
+			return fmt.Errorf("foreshadow_updates[%d]: %v: %w", i, err, errs.ErrToolArgs)
+		}
+		if prev, ok := actionByID[u.ID]; ok && prev != u.Action {
+			return fmt.Errorf("foreshadow_updates: 伏笔 %q 存在冲突操作 %q 与 %q（同一提交内一个 ID 只能有一种操作）: %w",
+				u.ID, prev, u.Action, errs.ErrToolArgs)
+		}
+		actionByID[u.ID] = u.Action
+	}
+	// 单实体字段数容量预检：现有条数 + 批内新增 ≤ MaxFieldsPerEntity
+	// （与 store.UpsertCharacterState 的判定一致；读取失败 fail closed）。
+	stateEntries, err := t.store.World.LoadCharacterState()
+	if err != nil {
+		return fmt.Errorf("preflight: 加载角色状态失败: %w: %w", errs.ErrStoreRead, err)
+	}
+	fieldCount := make(map[string]int, len(stateEntries))
+	existingKeys := make(map[string]struct{}, len(stateEntries))
+	for _, e := range stateEntries {
+		fieldCount[e.Entity]++
+		existingKeys[e.Entity+"\x00"+e.Field] = struct{}{}
+	}
+	seenCharKey := make(map[string]string, len(charStates))
+	for i, u := range charStates {
+		if err := domain.ValidateCharacterStateUpdate(u); err != nil {
+			return fmt.Errorf("character_state_updates[%d]: %v: %w", i, err, errs.ErrToolArgs)
+		}
+		key := u.Entity + "\x00" + u.Field
+		if prev, dup := seenCharKey[key]; dup {
+			if prev != u.Value {
+				return fmt.Errorf("character_state_updates: %s.%s 在同一提交内重复且 value 不同（%q 与 %q），请合并为一条 upsert: %w",
+					u.Entity, u.Field, prev, u.Value, errs.ErrToolArgs)
+			}
+			continue // 同值重复：幂等，允许
+		}
+		seenCharKey[key] = u.Value
+		if _, exists := existingKeys[key]; !exists {
+			if fieldCount[u.Entity] >= domain.MaxFieldsPerEntity {
+				return fmt.Errorf("character_state_updates[%d]: %s 字段数已达上限 %d，拒绝新增 %s: %w",
+					i, u.Entity, domain.MaxFieldsPerEntity, u.Field, errs.ErrToolArgs)
+			}
+			fieldCount[u.Entity]++
+		}
+	}
+	// 双写冲突：(entity,field) 同时出现在 character_state_updates 与 state_changes
+	if len(charStates) > 0 && len(stateChanges) > 0 {
+		keys := make(map[string]bool, len(charStates))
+		for _, u := range charStates {
+			keys[u.Entity+"\x00"+u.Field] = true
+		}
+		for _, sc := range stateChanges {
+			if keys[sc.Entity+"\x00"+sc.Field] {
+				return fmt.Errorf("双写冲突：%s.%s 同时出现在 character_state_updates 与 state_changes，请改用 character_state_updates 一个通道: %w",
+					sc.Entity, sc.Field, errs.ErrToolArgs)
+			}
+		}
+	}
+	// [world_rule] 提案格式校验：feedback.suggestion 以 [world_rule] 前缀开头时，
+	// 去除前缀后必须包含非空且 ≥10 字符的规则描述（防止空壳提案进入规则修订流程）。
+	if feedback != nil {
+		suggestion := strings.TrimSpace(feedback.Suggestion)
+		if strings.HasPrefix(suggestion, "[world_rule]") {
+			desc := strings.TrimSpace(strings.TrimPrefix(suggestion, "[world_rule]"))
+			if desc == "" || utf8.RuneCountInString(desc) < 10 {
+				return fmt.Errorf("feedback.suggestion: [world_rule] 提案须包含规则描述（去除前缀后至少 10 字符）: %w", errs.ErrToolArgs)
+			}
+		}
+	}
+	return nil
+}
+
 // checkRules 对章节正文做机械检查：内置产品底线 Lint（机制残留，始终执行）
 // + 用户规则 Check（读本书快照的 structured；快照缺失退到内置默认，保证机械底线始终在）
 // + 文学腔句式硬闸事实（硬闸已在 Execute 前置阶段拦截；此处同样跑一遍，
@@ -474,8 +631,9 @@ const (
 
 // validateRewriteWorldStateMode 强制重写提交显式声明世界状态处理模式：
 //   - 缺失（""）或非法值 → ErrToolPrecondition 错误（不写终稿、不 drain PendingRewrites）。
-//   - "preserve" → 放行：executeRewriteCommit 现有行为，4 组世界状态变更
-//     （TimelineEvents/ForeshadowUpdates/RelationshipChanges/StateChanges）一律不应用。
+//   - "preserve" → 放行：executeRewriteCommit 现有行为，5 组世界状态变更
+//     （TimelineEvents/ForeshadowUpdates/RelationshipChanges/StateChanges/
+//     CharacterStateUpdates）一律不应用。
 //   - "replace" → 一律显式拒绝（批次 4 范围内无可安全处理的章节）：
 //     按章替换时间线/状态并重放后续章节的世界状态重放能力（world-delta/baseline，
 //     批次 5）尚未就绪；Relationships/Foreshadow 是聚合快照（无发生章、删除后无法恢复），
@@ -487,7 +645,7 @@ func validateRewriteWorldStateMode(chapter int, mode string) error {
 	case "":
 		return fmt.Errorf(
 			"第 %d 章重写提交缺失 world_state_mode：纯文风重写必须传 %q，剧情变化重写必须传 %q。"+
-				"原因：不显式声明会静默丢弃世界状态变更（timeline/foreshadow/relationships/state 与正文失配且无报错）。"+
+				"原因：不显式声明会静默丢弃世界状态变更（timeline/foreshadow/relationships/state/character_state 与正文失配且无报错）。"+
 				"恢复建议：补充 world_state_mode 后重试: %w",
 			chapter, worldStateModePreserve, worldStateModeReplace, errs.ErrToolPrecondition)
 	case worldStateModePreserve:
@@ -508,8 +666,9 @@ func validateRewriteWorldStateMode(chapter int, mode string) error {
 
 // executeRewriteCommit 处理打磨/重写章节的提交：覆盖终稿与摘要、更新字数、drain 队列。
 // 调用方（Execute）已通过 validateRewriteWorldStateMode 强制 world_state_mode：
-//   - preserve：跳过所有世界状态追加（timeline / foreshadow / relationship / state_changes），
-//     这些已在章节原始提交时应用——纯文风重写不改变剧情事实，账本无需变更。
+//   - preserve：跳过所有世界状态追加（timeline / foreshadow / relationship / state_changes /
+//     character_state_updates），这些已在章节原始提交时应用——纯文风重写不改变剧情事实，
+//     账本无需变更。
 //   - replace：被安全闸门显式拒绝，不会走到本函数（世界状态重放能力未就绪）。
 //
 // 已知风险（登记，批次 5 范围）：本路径也不更新 CastIntros/配角名册

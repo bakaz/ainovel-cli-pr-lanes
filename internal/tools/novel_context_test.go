@@ -676,6 +676,12 @@ func TestContextToolSelectedMemoryRecallsStoryThreadsAndReviewLessons(t *testing
 		{ID: "elder_token", Description: "长老手中令牌的来历", PlantedAt: 1, Status: "planted"},
 		{ID: "hidden_gate", Description: "山门背后的隐藏通道", PlantedAt: 1, Status: "planted"},
 		{ID: "trial_bet", Description: "试炼盘口的幕后操盘人", PlantedAt: 1, Status: "planted"},
+		// 填充至 12 条活跃（满足 storyThreadRecallThreshold=12 触发条件）；均与本章 focus 无关。
+		{ID: "filler_1", Description: "山脚市集的旧账", PlantedAt: 1, Status: "planted"},
+		{ID: "filler_2", Description: "柴房杂物间", PlantedAt: 1, Status: "planted"},
+		{ID: "filler_3", Description: "后山药田", PlantedAt: 1, Status: "planted"},
+		{ID: "filler_4", Description: "外门伙房", PlantedAt: 1, Status: "planted"},
+		{ID: "filler_5", Description: "藏经阁旧书", PlantedAt: 1, Status: "planted"},
 	}); err != nil {
 		t.Fatalf("SaveForeshadowLedger: %v", err)
 	}
@@ -762,27 +768,33 @@ func TestContextToolSelectedMemorySurfacesAgingForeshadow(t *testing.T) {
 	}
 	// 当前章主题与所有伏笔都不沾边，确保相关性召回为空，只剩账龄回填生效。
 	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
-		{Chapter: 50, Title: "瘟疫", CoreEvent: "林砚在城南医馆救治瘟疫病患", Scenes: domain.SceneList{{Action: "熬药"}, {Action: "封锁街巷"}}},
+		{Chapter: 200, Title: "瘟疫", CoreEvent: "林砚在城南医馆救治瘟疫病患", Scenes: domain.SceneList{{Action: "熬药"}, {Action: "封锁街巷"}}},
 	}); err != nil {
 		t.Fatalf("SaveOutline: %v", err)
 	}
-	if err := s.Progress.Init("test", 60); err != nil {
+	if err := s.Progress.Init("test", 300); err != nil {
 		t.Fatalf("InitProgress: %v", err)
 	}
-	// 6 条满足召回阈值；前两条账龄 ≥30（久挂），后四条账龄 <30（近期）。
+	// 12 条活跃满足召回阈值；前两条账龄 ≥100（久挂），后四条账龄 <100（近期），其余为填充。
 	if err := s.World.SaveForeshadowLedger([]domain.ForeshadowEntry{
-		{ID: "ancient_seal", Description: "上古封印的裂隙", PlantedAt: 3, Status: "planted"},
-		{ID: "lost_bloodline", Description: "主角失落的血脉来历", PlantedAt: 5, Status: "advanced"},
-		{ID: "market_feud", Description: "昨夜集市的口角", PlantedAt: 47, Status: "planted"},
-		{ID: "rumor_a", Description: "近日传闻甲", PlantedAt: 48, Status: "planted"},
-		{ID: "rumor_b", Description: "近日传闻乙", PlantedAt: 48, Status: "planted"},
-		{ID: "rumor_c", Description: "近日传闻丙", PlantedAt: 49, Status: "planted"},
+		{ID: "ancient_seal", Description: "上古封印的裂隙", PlantedAt: 1, Status: "planted"},
+		{ID: "lost_bloodline", Description: "主角失落的血脉来历", PlantedAt: 3, Status: "advanced"},
+		{ID: "market_feud", Description: "昨夜集市的口角", PlantedAt: 150, Status: "planted"},
+		{ID: "rumor_a", Description: "近日传闻甲", PlantedAt: 155, Status: "planted"},
+		{ID: "rumor_b", Description: "近日传闻乙", PlantedAt: 155, Status: "planted"},
+		{ID: "rumor_c", Description: "近日传闻丙", PlantedAt: 160, Status: "planted"},
+		{ID: "filler_1", Description: "药铺账册", PlantedAt: 170, Status: "planted"},
+		{ID: "filler_2", Description: "医馆后院", PlantedAt: 170, Status: "planted"},
+		{ID: "filler_3", Description: "城南水井", PlantedAt: 175, Status: "planted"},
+		{ID: "filler_4", Description: "街巷封锁令", PlantedAt: 175, Status: "planted"},
+		{ID: "filler_5", Description: "熬药炉", PlantedAt: 180, Status: "planted"},
+		{ID: "filler_6", Description: "药渣堆", PlantedAt: 180, Status: "planted"},
 	}); err != nil {
 		t.Fatalf("SaveForeshadowLedger: %v", err)
 	}
 
 	tool := NewContextToolForRole(s, References{}, "default", "writer")
-	args, err := json.Marshal(map[string]any{"chapter": 50})
+	args, err := json.Marshal(map[string]any{"chapter": 200})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
@@ -4892,5 +4904,411 @@ func TestContextToolRewriteBrief_UsesLatestResultCycle(t *testing.T) {
 	f0 := findings[0].(map[string]any)
 	if f0["evidence"] != "仍太慢" {
 		t.Fatalf("expected latest exhausted evidence, got %v", f0["evidence"])
+	}
+}
+
+// ── selectStoryThreads stale 配额四边界（§5）──
+
+// TestSelectStoryThreads_StaleQuotaBoundaries 覆盖 stale 槽配额四种边界：
+//   - 存在 stale：最多 10 条相关 + ≥1 条最旧 stale；空位继续由 stale 补足至 12
+//   - 无 stale：相关线程补满至 12
+//   - 无相关但有 stale：最旧 stale 补满至 12
+//   - 两者皆无：不输出
+//
+// 另覆盖：相关与 stale 同 ID 去重、stale 按 effectiveTouchedAt（last_touched_at 优先）排序。
+func TestSelectStoryThreads_StaleQuotaBoundaries(t *testing.T) {
+	mkState := func(chapter int, foreshadow []domain.ForeshadowEntry) contextBuildState {
+		return contextBuildState{
+			chapter: chapter,
+			currentEntry: &domain.OutlineEntry{
+				Chapter: chapter, Title: "内门试炼", CoreEvent: "林砚赴约参加试炼",
+				Scenes: domain.SceneList{{Action: "整理线索"}, {Action: "决定赴约"}},
+			},
+			foreshadow: foreshadow,
+		}
+	}
+	relevantDesc := func(i int) string { return fmt.Sprintf("内门试炼第%d重考验", i) }
+	staleDesc := func(i int) string { return fmt.Sprintf("上古封印裂隙%d", i) }
+
+	t.Run("相关+stale混合：相关封顶10+最旧stale2", func(t *testing.T) {
+		var f []domain.ForeshadowEntry
+		for i := 1; i <= 6; i++ {
+			f = append(f, domain.ForeshadowEntry{ID: fmt.Sprintf("rel%d", i), Description: relevantDesc(i), PlantedAt: 100, Status: "planted"})
+		}
+		f = append(f,
+			domain.ForeshadowEntry{ID: "oldest", Description: staleDesc(1), PlantedAt: 1, Status: "planted"},
+			domain.ForeshadowEntry{ID: "mid", Description: staleDesc(2), PlantedAt: 5, Status: "planted"},
+			// 埋设早但最近推进过（ch120）：账龄 30 < 100，不算 stale。
+			domain.ForeshadowEntry{ID: "recently_touched", Description: staleDesc(3), PlantedAt: 1, Status: "advanced", LastTouchedAt: 120},
+		)
+		// 填充至 12 条活跃（满足 storyThreadRecallThreshold=12）；不相关且非 stale。
+		for i := 1; i <= 6; i++ {
+			f = append(f, domain.ForeshadowEntry{ID: fmt.Sprintf("fill%d", i), Description: "无关背景设定", PlantedAt: 140, Status: "planted"})
+		}
+		items := (&ContextTool{}).selectStoryThreads(mkState(150, f))
+		if len(items) != 8 {
+			t.Fatalf("want 8 items (6 relevant + 2 oldest stale), got %d: %+v", len(items), items)
+		}
+		for i := 0; i < 6; i++ {
+			if !strings.HasPrefix(items[i].Key, "rel") {
+				t.Fatalf("item[%d] should be relevant, got %+v", i, items[i])
+			}
+		}
+		if items[6].Key != "oldest" {
+			t.Fatalf("stale slot should be the oldest stale, got %+v", items[6])
+		}
+		if !strings.Contains(items[6].Summary, "未回收") {
+			t.Fatalf("stale item should carry overdue annotation, got %+v", items[6])
+		}
+	})
+
+	t.Run("无stale：相关补满6", func(t *testing.T) {
+		var f []domain.ForeshadowEntry
+		for i := 1; i <= 6; i++ {
+			f = append(f, domain.ForeshadowEntry{ID: fmt.Sprintf("rel%d", i), Description: relevantDesc(i), PlantedAt: 100, Status: "planted"})
+		}
+		for i := 1; i <= 6; i++ {
+			f = append(f, domain.ForeshadowEntry{ID: fmt.Sprintf("fill%d", i), Description: "无关背景设定", PlantedAt: 140, Status: "planted"})
+		}
+		items := (&ContextTool{}).selectStoryThreads(mkState(150, f))
+		if len(items) != 6 {
+			t.Fatalf("want 6 relevant items, got %d: %+v", len(items), items)
+		}
+		for _, it := range items {
+			if !strings.HasPrefix(it.Key, "rel") {
+				t.Fatalf("unexpected item %+v", it)
+			}
+		}
+	})
+
+	t.Run("无相关但有stale：最旧stale补满6", func(t *testing.T) {
+		var f []domain.ForeshadowEntry
+		for i := 1; i <= 6; i++ {
+			f = append(f, domain.ForeshadowEntry{ID: fmt.Sprintf("s%d", i), Description: staleDesc(i), PlantedAt: i * 3, Status: "planted"})
+		}
+		for i := 1; i <= 6; i++ {
+			f = append(f, domain.ForeshadowEntry{ID: fmt.Sprintf("fill%d", i), Description: "无关背景设定", PlantedAt: 140, Status: "planted"})
+		}
+		items := (&ContextTool{}).selectStoryThreads(mkState(150, f))
+		if len(items) != 6 {
+			t.Fatalf("want 6 stale items, got %d: %+v", len(items), items)
+		}
+		for i := 1; i < len(items); i++ {
+			if items[i-1].Key > items[i].Key {
+				t.Fatalf("stale should be ordered oldest-first (by effectiveTouchedAt), got %+v", items)
+			}
+		}
+		if items[0].Key != "s1" {
+			t.Fatalf("oldest stale should be first, got %+v", items[0])
+		}
+	})
+
+	t.Run("两者皆无：不输出", func(t *testing.T) {
+		var f []domain.ForeshadowEntry
+		for i := 1; i <= 6; i++ {
+			f = append(f, domain.ForeshadowEntry{ID: fmt.Sprintf("recent%d", i), Description: staleDesc(i), PlantedAt: 45, Status: "planted"})
+		}
+		items := (&ContextTool{}).selectStoryThreads(mkState(50, f))
+		if len(items) != 0 {
+			t.Fatalf("want no items, got %d: %+v", len(items), items)
+		}
+	})
+
+	t.Run("相关与stale同ID去重", func(t *testing.T) {
+		var f []domain.ForeshadowEntry
+		for i := 1; i <= 5; i++ {
+			f = append(f, domain.ForeshadowEntry{ID: fmt.Sprintf("recent%d", i), Description: staleDesc(i), PlantedAt: 120, Status: "planted"})
+		}
+		// 既是相关（描述含"内门试炼"）又是 stale（埋设 ch1，从未推进）。
+		f = append(f, domain.ForeshadowEntry{ID: "both", Description: "内门试炼邀请的真实目的", PlantedAt: 1, Status: "planted"})
+		for i := 1; i <= 6; i++ {
+			f = append(f, domain.ForeshadowEntry{ID: fmt.Sprintf("fill%d", i), Description: "无关背景设定", PlantedAt: 140, Status: "planted"})
+		}
+		items := (&ContextTool{}).selectStoryThreads(mkState(150, f))
+		if len(items) != 1 || items[0].Key != "both" {
+			t.Fatalf("relevant+stale same ID must dedupe into one item, got %d: %+v", len(items), items)
+		}
+	})
+
+	t.Run("effectiveTouchedAt基准：最近推进过的旧伏笔不算stale", func(t *testing.T) {
+		var f []domain.ForeshadowEntry
+		for i := 1; i <= 5; i++ {
+			f = append(f, domain.ForeshadowEntry{ID: fmt.Sprintf("recent%d", i), Description: staleDesc(i), PlantedAt: 45, Status: "planted"})
+		}
+		f = append(f,
+			domain.ForeshadowEntry{ID: "touched", Description: staleDesc(9), PlantedAt: 1, Status: "advanced", LastTouchedAt: 40},
+		)
+		items := (&ContextTool{}).selectStoryThreads(mkState(50, f))
+		if len(items) != 0 {
+			t.Fatalf("touched at ch40 (gap 10) must not be stale, got %d: %+v", len(items), items)
+		}
+	})
+}
+
+// ── character_state 注入矩阵 ──
+
+// TestContextToolCharacterStateInjection writer/editor 顶层 character_state 投影：
+// 主角（Tier=core / Role=主角）常驻；当前章预计出场的次要角色进 character_state_secondary。
+func TestContextToolCharacterStateInjection(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "入门", CoreEvent: "林砚拜入宗门", Scenes: domain.SceneList{{Action: "拜师"}}},
+		{Chapter: 2, Title: "苏晚现身", CoreEvent: "苏晚在试炼场与林砚重逢", Scenes: domain.SceneList{{Action: "对峙"}}},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Progress.Init("test", 4); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Characters.Save([]domain.Character{
+		{Name: "林砚", Role: "主角", Tier: "core"},
+		{Name: "苏晚", Tier: "secondary"},
+	}); err != nil {
+		t.Fatalf("SaveCharacters: %v", err)
+	}
+	if err := s.World.SaveCharacterState([]domain.CharacterStateEntry{
+		{Entity: "林砚", Field: "body_device.缠足", Value: "存在", UpdatedChapter: 1, Evidence: "正文"},
+		{Entity: "林砚", Field: "status.道途", Value: "练气一层", UpdatedChapter: 1},
+		{Entity: "苏晚", Field: "health.伤势", Value: "左臂旧伤", UpdatedChapter: 1},
+	}); err != nil {
+		t.Fatalf("SaveCharacterState: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+
+	// ch1：苏晚未出场 → 只有主角常驻。
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute(ch1): %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	cs, ok := payload["character_state"].(map[string]any)
+	if !ok {
+		t.Fatal("expected character_state in chapter context")
+	}
+	if n := len(cs["entries"].([]any)); n != 2 {
+		t.Fatalf("protagonist 林砚 should have 2 resident entries, got %d", n)
+	}
+	if _, ok := payload["character_state_secondary"]; ok {
+		t.Fatal("secondary state must not be injected when character not expected in chapter")
+	}
+
+	// ch2：苏晚出场 → secondary 注入。
+	args2, _ := json.Marshal(map[string]any{"chapter": 2})
+	result2, err := tool.Execute(context.Background(), args2)
+	if err != nil {
+		t.Fatalf("Execute(ch2): %v", err)
+	}
+	var payload2 map[string]any
+	if err := json.Unmarshal(result2, &payload2); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	sec, ok := payload2["character_state_secondary"].([]any)
+	if !ok || len(sec) != 1 {
+		t.Fatalf("expected 苏晚 secondary state in ch2, got %+v", payload2["character_state_secondary"])
+	}
+}
+
+// TestContextToolCharacterStateInjectsAllWithoutProtagonistMarker 无主角标记时注入全部并标注。
+func TestContextToolCharacterStateInjectsAllWithoutProtagonistMarker(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "入门", CoreEvent: "林砚拜入宗门"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Progress.Init("test", 3); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	// 角色档案存在但无 core/主角 标记。
+	if err := s.Characters.Save([]domain.Character{
+		{Name: "林砚", Tier: "secondary"},
+		{Name: "苏晚", Tier: "secondary"},
+	}); err != nil {
+		t.Fatalf("SaveCharacters: %v", err)
+	}
+	if err := s.World.SaveCharacterState([]domain.CharacterStateEntry{
+		{Entity: "林砚", Field: "status.道途", Value: "练气一层", UpdatedChapter: 1},
+		{Entity: "苏晚", Field: "health.伤势", Value: "左臂旧伤", UpdatedChapter: 1},
+	}); err != nil {
+		t.Fatalf("SaveCharacterState: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	cs, ok := payload["character_state"].(map[string]any)
+	if !ok {
+		t.Fatal("expected character_state")
+	}
+	if n := len(cs["entries"].([]any)); n != 2 {
+		t.Fatalf("without protagonist marker all entities should be resident, got %d", n)
+	}
+	if !strings.Contains(cs["basis"].(string), "未检测到主角标记") {
+		t.Fatalf("basis should annotate missing protagonist marker, got %q", cs["basis"])
+	}
+}
+
+// TestContextToolCharacterStateBudgetTruncation 投影超 12KiB 时保留最新字段并写 _warnings。
+func TestContextToolCharacterStateBudgetTruncation(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "入门", CoreEvent: "林砚拜入宗门"},
+	}); err != nil {
+		t.Fatalf("SaveOutline: %v", err)
+	}
+	if err := s.Progress.Init("test", 3); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.Characters.Save([]domain.Character{
+		{Name: "林砚", Role: "主角"},
+	}); err != nil {
+		t.Fatalf("SaveCharacters: %v", err)
+	}
+	long := strings.Repeat("长", 300)
+	var entries []domain.CharacterStateEntry
+	for i := 0; i < 30; i++ {
+		entries = append(entries, domain.CharacterStateEntry{
+			Entity: "林砚", Field: fmt.Sprintf("status.f%02d", i), Value: long, UpdatedChapter: i + 1,
+		})
+	}
+	if err := s.World.SaveCharacterState(entries); err != nil {
+		t.Fatalf("SaveCharacterState: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	cs, ok := payload["character_state"].(map[string]any)
+	if !ok {
+		t.Fatal("expected character_state")
+	}
+	kept := cs["entries"].([]any)
+	if len(kept) >= 30 {
+		t.Fatalf("projection should be truncated below budget, kept %d", len(kept))
+	}
+	if cs["omitted_count"] == nil {
+		t.Fatal("expected omitted_count on truncated projection")
+	}
+	warnings, ok := payload["_warnings"].([]any)
+	if !ok {
+		t.Fatal("expected _warnings with omission note")
+	}
+	joined := ""
+	for _, w := range warnings {
+		joined += w.(string)
+	}
+	if !strings.Contains(joined, "省略") {
+		t.Fatalf("expected omission warning, got %v", warnings)
+	}
+}
+
+// TestContextToolArchitectInjectsFullCharacterState architect foundation 注入全量 character_state。
+func TestContextToolArchitectInjectsFullCharacterState(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 3); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	if err := s.World.SaveCharacterState([]domain.CharacterStateEntry{
+		{Entity: "林砚", Field: "status.道途", Value: "练气一层", UpdatedChapter: 1},
+		{Entity: "苏晚", Field: "health.伤势", Value: "左臂旧伤", UpdatedChapter: 1},
+	}); err != nil {
+		t.Fatalf("SaveCharacterState: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "architect")
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	foundation, ok := payload["foundation_memory"].(map[string]any)
+	if !ok {
+		t.Fatal("expected foundation_memory")
+	}
+	cs, ok := foundation["character_state"].([]any)
+	if !ok || len(cs) != 2 {
+		t.Fatalf("architect should see full character_state, got %+v", foundation["character_state"])
+	}
+}
+
+// TestContextToolWorldRulesSoftLimitWarns 注入侧 world_rules 超过软上限时写告警（不裁剪）。
+func TestContextToolWorldRulesSoftLimitWarns(t *testing.T) {
+	dir := t.TempDir()
+	s := store.NewStore(dir)
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.Progress.Init("test", 3); err != nil {
+		t.Fatalf("InitProgress: %v", err)
+	}
+	var rules []domain.WorldRule
+	for i := 0; i <= domain.MaxWorldRulesEntries; i++ {
+		rules = append(rules, domain.WorldRule{Category: "magic", Rule: fmt.Sprintf("规则 %d", i)})
+	}
+	if err := s.World.SaveWorldRules(rules); err != nil {
+		t.Fatalf("SaveWorldRules: %v", err)
+	}
+
+	tool := NewContextToolForRole(s, References{}, "default", "writer")
+	args, _ := json.Marshal(map[string]any{"chapter": 1})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if _, ok := payload["world_rules"]; !ok {
+		t.Fatal("world_rules should remain injected (warn only, no trim)")
+	}
+	warnings, ok := payload["_warnings"].([]any)
+	if !ok {
+		t.Fatal("expected _warnings with world_rules soft limit note")
+	}
+	joined := ""
+	for _, w := range warnings {
+		joined += w.(string)
+	}
+	if !strings.Contains(joined, "world_rules") || !strings.Contains(joined, "软上限") {
+		t.Fatalf("expected world_rules soft limit warning, got %v", warnings)
 	}
 }

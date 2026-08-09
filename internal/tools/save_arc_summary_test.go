@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -141,5 +142,102 @@ func TestSaveArcSummaryAllowsAntiMeteringInTaboosOnly(t *testing.T) {
 	}
 	if _, err := tool.Execute(context.Background(), args); err != nil {
 		t.Fatalf("Execute: %v", err)
+	}
+}
+
+// TestSaveArcSummaryAttachesCurrentStateBasis 结果附带按 entity 分组的 current state 基底，
+// 快照明显与 current state 矛盾（存在装置却写"完好"）时输出 warning 但不拒绝保存。
+func TestSaveArcSummaryAttachesCurrentStateBasis(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.World.SaveCharacterState([]domain.CharacterStateEntry{
+		{Entity: "林砚", Field: "body_device.缠足", Value: "存在", UpdatedChapter: 10},
+		{Entity: "林砚", Field: "status.道途", Value: "练气五层", UpdatedChapter: 12},
+	}); err != nil {
+		t.Fatalf("SaveCharacterState: %v", err)
+	}
+
+	tool := NewSaveArcSummaryTool(s)
+	args, err := json.Marshal(map[string]any{
+		"volume":     1,
+		"arc":        2,
+		"title":      "入山",
+		"summary":    "主角完成入山试炼。",
+		"key_events": []string{"通过试炼"},
+		"character_snapshots": []map[string]any{
+			// 矛盾：current 有 body_device.缠足=存在，快照却写双腿完好。
+			{"name": "林砚", "status": "双腿完好", "motivation": "继续追索"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	out, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute should not reject on loose conflict: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	basis, ok := result["current_state_basis"].(map[string]any)
+	if !ok {
+		t.Fatal("expected current_state_basis in result")
+	}
+	lin, ok := basis["林砚"].(map[string]any)
+	if !ok || lin["body_device.缠足"] != "存在" {
+		t.Fatalf("expected 林砚 body_device.缠足=存在 in basis, got %+v", basis)
+	}
+	warns, ok := result["snapshot_conflict_warnings"].([]any)
+	if !ok || len(warns) == 0 {
+		t.Fatalf("expected conflict warning, got %+v", result["snapshot_conflict_warnings"])
+	}
+	joined := ""
+	for _, w := range warns {
+		joined += w.(string)
+	}
+	if !strings.Contains(joined, "林砚") || !strings.Contains(joined, "完好") {
+		t.Fatalf("conflict warning should mention entity and keyword, got %v", warns)
+	}
+}
+
+// TestSaveArcSummaryNoConflictWithoutSnapshots 无快照或无 current state 时不产冲突 warning。
+func TestSaveArcSummaryNoConflictWithoutSnapshots(t *testing.T) {
+	s := store.NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := s.World.SaveCharacterState([]domain.CharacterStateEntry{
+		{Entity: "林砚", Field: "status.道途", Value: "练气五层", UpdatedChapter: 12},
+	}); err != nil {
+		t.Fatalf("SaveCharacterState: %v", err)
+	}
+	tool := NewSaveArcSummaryTool(s)
+	args, err := json.Marshal(map[string]any{
+		"volume":     1,
+		"arc":        2,
+		"title":      "入山",
+		"summary":    "主角完成入山试炼。",
+		"key_events": []string{"通过试炼"},
+		"character_snapshots": []map[string]any{
+			{"name": "林砚", "status": "双腿完好", "motivation": "继续追索"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	out, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	// current state 无"存在"类值 → 无冲突 warning。
+	if _, ok := result["snapshot_conflict_warnings"]; ok {
+		t.Fatalf("no conflict expected, got %+v", result["snapshot_conflict_warnings"])
 	}
 }

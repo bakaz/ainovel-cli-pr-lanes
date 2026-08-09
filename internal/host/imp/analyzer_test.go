@@ -27,7 +27,7 @@ const validAnalyzerEnvelope = `=== SUMMARY ===
 
 === FORESHADOW ===
 [
-  {"id":"hk-chen-family","action":"plant","description":"陈姓家族与连环失踪案的关联"}
+  {"id":"hk-chen-family","action":"plant","description":"陈姓家族与连环失踪案的关联","horizon":"book"}
 ]
 
 === RELATIONSHIPS ===
@@ -36,6 +36,11 @@ const validAnalyzerEnvelope = `=== SUMMARY ===
 === STATE_CHANGES ===
 [
   {"entity":"林晚","field":"location","old_value":"编辑部","new_value":"档案馆","reason":"循迹追查"}
+]
+
+=== CHARACTER_STATE ===
+[
+  {"entity":"林晚","field":"location.place","value":"陈氏祖宅","reason":"循迹追查"}
 ]
 
 === HOOK_TYPE ===
@@ -59,6 +64,9 @@ func TestParseAnalyzer_Valid(t *testing.T) {
 	if len(got.ForeshadowUpdates) != 1 || got.ForeshadowUpdates[0].ID != "hk-chen-family" {
 		t.Errorf("foreshadow: %+v", got.ForeshadowUpdates)
 	}
+	if got.ForeshadowUpdates[0].Horizon != "book" {
+		t.Errorf("foreshadow horizon: %+v", got.ForeshadowUpdates[0])
+	}
 	if len(got.TimelineEvents) != 2 {
 		t.Errorf("timeline: %+v", got.TimelineEvents)
 	}
@@ -67,6 +75,12 @@ func TestParseAnalyzer_Valid(t *testing.T) {
 	}
 	if len(got.StateChanges) != 1 || got.StateChanges[0].Field != "location" {
 		t.Errorf("state changes: %+v", got.StateChanges)
+	}
+	if len(got.CharacterStateUpdates) != 1 || got.CharacterStateUpdates[0].Field != "location.place" {
+		t.Errorf("character state: %+v", got.CharacterStateUpdates)
+	}
+	if got.CharacterStateUpdates[0].Value != "陈氏祖宅" {
+		t.Errorf("character state value: %+v", got.CharacterStateUpdates[0])
 	}
 }
 
@@ -81,13 +95,52 @@ func TestParseAnalyzer_RejectsInvalidHookType(t *testing.T) {
 func TestParseAnalyzer_RejectsPlantWithoutDescription(t *testing.T) {
 	bad := strings.Replace(
 		validAnalyzerEnvelope,
-		`{"id":"hk-chen-family","action":"plant","description":"陈姓家族与连环失踪案的关联"}`,
+		`{"id":"hk-chen-family","action":"plant","description":"陈姓家族与连环失踪案的关联","horizon":"book"}`,
 		`{"id":"hk-chen-family","action":"plant"}`,
 		1,
 	)
 	if _, err := parseAnalyzerOutput(bad); err == nil ||
 		!strings.Contains(err.Error(), "requires description") {
 		t.Fatalf("want plant-without-desc error, got %v", err)
+	}
+}
+
+func TestParseAnalyzer_RejectsPlantWithoutHorizon(t *testing.T) {
+	bad := strings.Replace(
+		validAnalyzerEnvelope,
+		`{"id":"hk-chen-family","action":"plant","description":"陈姓家族与连环失踪案的关联","horizon":"book"}`,
+		`{"id":"hk-chen-family","action":"plant","description":"陈姓家族与连环失踪案的关联"}`,
+		1,
+	)
+	if _, err := parseAnalyzerOutput(bad); err == nil ||
+		!strings.Contains(err.Error(), "horizon") {
+		t.Fatalf("want plant-without-horizon error, got %v", err)
+	}
+}
+
+func TestParseAnalyzer_RejectsAdvanceWithoutEvidence(t *testing.T) {
+	bad := strings.Replace(
+		validAnalyzerEnvelope,
+		`{"id":"hk-chen-family","action":"plant","description":"陈姓家族与连环失踪案的关联","horizon":"book"}`,
+		`{"id":"hk-chen-family","action":"advance"}`,
+		1,
+	)
+	if _, err := parseAnalyzerOutput(bad); err == nil ||
+		!strings.Contains(err.Error(), "requires evidence") {
+		t.Fatalf("want advance-without-evidence error, got %v", err)
+	}
+}
+
+func TestParseAnalyzer_RejectsBadCharacterStateField(t *testing.T) {
+	bad := strings.Replace(
+		validAnalyzerEnvelope,
+		`{"entity":"林晚","field":"location.place","value":"陈氏祖宅","reason":"循迹追查"}`,
+		`{"entity":"林晚","field":"freeform","value":"陈氏祖宅"}`,
+		1,
+	)
+	if _, err := parseAnalyzerOutput(bad); err == nil ||
+		!strings.Contains(err.Error(), "受控命名空间") {
+		t.Fatalf("want character_state namespace error, got %v", err)
 	}
 }
 

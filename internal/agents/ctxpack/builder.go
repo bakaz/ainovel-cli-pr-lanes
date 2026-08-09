@@ -24,6 +24,7 @@ type writerStoreSummaryState struct {
 	currentVolSummary *domain.VolumeSummary
 	snapshots         []domain.CharacterSnapshot
 	foreshadow        []domain.ForeshadowEntry
+	characterState    []domain.CharacterStateEntry
 	timeline          []domain.TimelineEvent
 	styleRules        *domain.WritingStyleRules
 	pendingReviews    []writerPendingReview
@@ -137,6 +138,10 @@ func loadWriterStoreSummaryState(s *store.Store) (*writerStoreSummaryState, bool
 	if err != nil {
 		return nil, false, err
 	}
+	state.characterState, err = s.World.LoadCharacterState()
+	if err != nil {
+		return nil, false, err
+	}
 	state.timeline, err = s.World.LoadRecentTimeline(chapter, profile.TimelineWindow)
 	if err != nil {
 		return nil, false, err
@@ -193,6 +198,7 @@ func loadWriterRestoreState(s *store.Store) (*writerStoreSummaryState, error) {
 	}
 	state.snapshots, _ = s.Characters.LoadLatestSnapshots()
 	state.foreshadow, _ = s.World.LoadActiveForeshadow()
+	state.characterState, _ = s.World.LoadCharacterState()
 	state.pendingReviews, _ = loadPendingReviewsForStoreState(s, chapter)
 	state.styleRules, _ = s.World.LoadStyleRules()
 	state.timeline, _ = s.World.LoadRecentTimeline(chapter, profile.TimelineWindow)
@@ -205,7 +211,8 @@ func loadWriterRestoreState(s *store.Store) (*writerStoreSummaryState, error) {
 		isEmptySummarySection(state.snapshots) &&
 		isEmptySummarySection(state.pendingReviews) &&
 		isEmptySummarySection(state.recentSummaries) &&
-		isEmptySummarySection(state.foreshadow) {
+		isEmptySummarySection(state.foreshadow) &&
+		isEmptySummarySection(state.characterState) {
 		return nil, nil
 	}
 	return state, nil
@@ -242,6 +249,7 @@ func writerStoreSummarySections(state *writerStoreSummaryState) []writerStoreSec
 		{heading: "当前卷摘要", data: state.currentVolSummary},
 		{heading: "角色快照", data: state.snapshots},
 		{heading: "活跃伏笔", data: state.foreshadow},
+		{heading: "角色受控状态", data: state.characterState},
 		{heading: "待修审稿问题", data: state.pendingReviews},
 		{heading: "最近时间线", data: state.timeline},
 		{heading: "风格规则", data: state.styleRules},
@@ -257,6 +265,7 @@ func writerRestoreSections(state *writerStoreSummaryState) []writerStoreSection 
 		{heading: "角色快照", data: state.snapshots},
 		{heading: "最近章节摘要", data: state.recentSummaries},
 		{heading: "活跃伏笔", data: state.foreshadow},
+		{heading: "角色受控状态", data: state.characterState},
 		{heading: "当前弧摘要", data: state.currentArcSummary},
 		{heading: "当前卷摘要", data: state.currentVolSummary},
 		{heading: "最近时间线", data: state.timeline},

@@ -8,21 +8,27 @@ import (
 )
 
 // StaleForeshadow 检测长期未推进的伏笔。
+// 覆盖全部活跃条目（planted/advanced，排除 resolved/retired），停滞基准为
+// effectiveTouchedAt（last_touched_at>0 用其，否则退回 planted_at），阈值固定 100 章——
+// 与 novel_context 的 agingForeshadow 共用同一基准，保证诊断与召回口径一致。
 func StaleForeshadow(snap *Snapshot) []Finding {
 	if snap.Progress == nil || len(snap.Foreshadow) == 0 {
 		return nil
 	}
 	latest := snap.LatestCompleted()
-	threshold := staleForeshadowThreshold(snap.CompletedCount())
 
 	var stale []string
 	for _, f := range snap.Foreshadow {
-		if f.Status != "planted" {
+		if f.Status == "resolved" || f.Status == "retired" {
 			continue
 		}
-		gap := latest - f.PlantedAt
-		if gap > threshold {
-			stale = append(stale, fmt.Sprintf("%s(ch%d埋下,已过%d章)", f.ID, f.PlantedAt, gap))
+		touched := effectiveForeshadowTouched(f)
+		if touched <= 0 {
+			continue
+		}
+		gap := latest - touched
+		if gap >= ThresholdForeshadowStale {
+			stale = append(stale, fmt.Sprintf("%s(最近推进ch%d,已过%d章)", f.ID, touched, gap))
 		}
 	}
 	if len(stale) == 0 {
@@ -35,7 +41,7 @@ func StaleForeshadow(snap *Snapshot) []Finding {
 		Confidence: ConfMedium,
 		AutoLevel:  AutoNone,
 		Target:     "context.foreshadow",
-		Title:      fmt.Sprintf("伏笔停滞: %d 条超过 %d 章未推进", len(stale), threshold),
+		Title:      fmt.Sprintf("伏笔停滞: %d 条超过 %d 章未推进", len(stale), ThresholdForeshadowStale),
 		Evidence:   strings.Join(stale, "; "),
 		Suggestion: "novel_context 的伏笔提醒加载可能未生效，或 Writer prompt 缺少推进伏笔的指引。检查 foreshadow_ledger 与上下文注入逻辑。",
 	}}
