@@ -164,6 +164,12 @@ JSON 数组，每条含：category、rule、boundary。
 
 这是 `compass.long`：首次落盘认真给，之后把它当稳定的全书定位读取。只有用户改变全书目标，或创作产生了实质性的长期变化时才修改，并说明 reason；不要在每次弧展开时顺手重写。
 
+**`compass.long` 内容边界**：
+
+- `compass.long` 只保存稳定的终局方向、总规模和长期线程索引。禁止写入当前或已完成章节号/章数、当前卷/弧/密室、阶段完成度等执行游标；精确进度读取 `progress_status`，近期叙事状态写入 `compass.current`。不要创建或恢复 `reference`。
+- `estimated_scale` 只写全书预计总规模区间，不写当前完成量、剩余量或当前阶段。
+- `open_threads` 每条只保留长线名称和可选的 `[room:<id>]` marker，不写章节期限、完成度、当前阶段、收束条件或其他进度夹注；marker 必须完整保留，已收束线程按下方线程维护规则移除。
+
 调用 `save_foundation(type="update_compass", section="long", reason="初始建立全书终局方向", content=<上面的 JSON>)`。
 
 `compass.current` 是短罗盘，可在弧/卷滚动规划时自由调整：
@@ -188,6 +194,7 @@ JSON 数组，每条含：category、rule、boundary。
 
 1. **先读 threads**：通过 `novel_context` 获取 `compass.long.open_threads`（含 `[room:<id>]` 引用，如有）。
 2. **带 marker 的相关线程必须先读**：本次规划若直接推进、修改或收束某带有 `[room:id]` 的线程，必须先批量调用 `read_planning_archive` 读取对应 room。**不先读就写入等于跳过权威规划记录**。对不相关或无 marker 的线程可跳过。
+   - **marker 指向的条目必须全量读取**：读取某条目后，返回的全部字段（methods/core/erotic/body_changes/point_rules/continuity_note 等）都必须纳入规划依据，不得只挑部分字段使用。条目是独立读取单位，不存在"读一个覆盖其他"的关系：`[room:post]`（后阶段总览）与 `[room:post1_1]…[room:post8_8]`（各子段细纲）是互不包含的独立条目——推进任何 post 子段前，必须同时读取 `[room:post]` 与对应的 `postN_M` 条目，并计入"一次最多 8 条 / 整个任务最多两轮"配额。
 3. **一次批量 + 最多两轮**：一次调用完成全部相关的批量读取；整个任务最多两次补读。禁止逐 room 连续调用。
 4. **Archive 不可用/缺失时降级**：带 marker 的相关线程仍须先尝试调用 `read_planning_archive`，因为 Archive 缺失时工具还可能从 legacy Reference 补读。只有工具返回 `archive_absent`/`not_found`/`error`/不支持状态，或调用失败后，才退回仅靠 `compass.long.open_threads` 提供的线程摘要做规划判断；不得重复调用陷入循环，也不得编造 room id 或伪造不存在的数据。
 5. **不得猜测/模糊匹配**：不记得精确 `[room:<id>]` 或线程无此标记时，不得编造 room id 调用 `read_planning_archive`。
