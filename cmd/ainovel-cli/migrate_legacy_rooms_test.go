@@ -295,6 +295,8 @@ func writeMinimalConfig(t *testing.T, dir string) (path string) {
 
 // saveCompassAt 在指定的 outputDir 下通过 Outline.SaveCompass 写入 compass。
 // outputDir 即 Store 的根目录，其 meta/ 下写入 compass.json。
+// 复核阻塞项 2（方案 A）：写入完成后立即释放 workspace 锁——migrateLegacyRooms
+// 内部会再建一个可写 Store（同一进程同一 workspace 只允许一个可写实例）。
 func saveCompassAt(t *testing.T, outputDir, referenceJSON string) {
 	t.Helper()
 	st := store.NewStore(outputDir)
@@ -313,6 +315,7 @@ func saveCompassAt(t *testing.T, outputDir, referenceJSON string) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	st.Close()
 }
 
 // setupArchiveAt 在指定的 outputDir 下写入一个空的 planning_archive.json。

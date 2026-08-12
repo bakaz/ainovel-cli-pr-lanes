@@ -89,7 +89,12 @@ func (s *StyleReviewStore) saveUnlocked(ledger domain.StyleReviewLedger) error {
 func (s *StyleReviewStore) Update(chapter int, loader func(ledger *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error)) error {
 	s.io.mu.Lock()
 	defer s.io.mu.Unlock()
+	return s.updateUnlocked(chapter, loader)
+}
 
+// updateUnlocked 是 Update 的无锁实现（调用方必须已持有 s.io.mu 写锁；
+// Store.CommitReviewResult 在跨域临界区内复用，实现"校验+写入"原子化，P0-4）。
+func (s *StyleReviewStore) updateUnlocked(chapter int, loader func(ledger *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error)) error {
 	current, err := s.loadUnlocked(chapter)
 	if err != nil {
 		return err

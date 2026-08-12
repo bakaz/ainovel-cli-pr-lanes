@@ -360,6 +360,8 @@ func TestHostRestoreWRPHook(t *testing.T) {
 	// Replace outline.json with garbage to prove restore reverts it.
 	os.WriteFile(filepath.Join(src, "outline.json"), []byte(`"modified"`), 0o644)
 
+	// 复核阻塞项 2 单写者语义：newTestHost 会再建一个 Store，先释放种子 store 的锁。
+	st.Close()
 	h := newTestHost(t, src)
 	rr, rerr := h.RestoreSnapshot(m.SnapshotID, true)
 	if rerr != nil {
@@ -479,6 +481,8 @@ func TestBackupMidCopyBlocksStart(t *testing.T) {
 		},
 	}})
 	writeProgress(t, st, &domain.Progress{CurrentVolume: 1, CurrentArc: 1, CompletedChapters: []int{2}})
+	// 复核阻塞项 2 单写者语义：newTestHost 会再建一个 Store，先释放种子 store 的锁。
+	st.Close()
 	h := newTestHost(t, src)
 
 	backupErr := make(chan error, 1)
@@ -778,6 +782,9 @@ func TestBackupBoundaryValidMismatched(t *testing.T) {
 		},
 	}})
 	writeProgress(t, st, &domain.Progress{CurrentVolume: 1, CurrentArc: 1, CompletedChapters: []int{2}})
+	// 复核阻塞项 2（方案 A）：同一 workspace 只允许一个可写 Store——铺完种子
+	// 状态后释放，newTestHost 内部 store 才能取锁（种子已持久化在磁盘）。
+	st.Close()
 	h := newTestHost(t, src)
 
 	m, err := h.BackupArc(1, 1)
@@ -795,4 +802,21 @@ func TestBackupBoundaryValidMismatched(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "volume end") {
 		t.Fatalf("non-volume-end should fail: %v", err)
 	}
+}
+
+// ── 15. Host.Close 释放 workspace 排他锁（复核阻塞项 3）──
+
+// TestHostClose_ReleasesWorkspaceLock 验证 Host.Close 释放 workspace 排他锁：
+// 关闭后同一进程可重新 NewStore 同一 workspace（旧实现锁随进程存活，同目录
+// 第二个可写 Store 会被单写者规则拒绝）。
+func TestHostClose_ReleasesWorkspaceLock(t *testing.T) {
+	src := t.TempDir()
+	h := newTestHost(t, src)
+	h.Close()
+
+	st2 := storepkg.NewStore(src)
+	if !st2.Ready() {
+		t.Fatalf("store after host close must be ready, init err=%v", st2.Init())
+	}
+	st2.Close()
 }

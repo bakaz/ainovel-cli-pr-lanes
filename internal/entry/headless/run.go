@@ -56,7 +56,9 @@ func Run(cfg bootstrap.Config, bundle assets.Bundle, opts Options) error {
 	defer eng.Close()
 	// 运行结束 / 出错返回时落一份脱敏诊断，方便 headless 用户贴 issue。
 	// （外部 kill 的挂死不走 defer，仍需在 TUI 里手动 /diag。）
-	defer func() { _, _ = diag.Export(store.NewStore(eng.Dir())) }()
+	// 复核阻塞项 2 只读模式：诊断导出只读，用 NewReadOnlyStore（不取 workspace
+	// 排他锁，引擎关闭前仍可执行；避免同进程第二可写 Store 被拒）。
+	defer func() { _, _ = diag.Export(store.NewReadOnlyStore(eng.Dir())) }()
 
 	prompt := strings.TrimSpace(opts.Prompt)
 	if continuePrompt != "" && prompt != "" {
@@ -251,7 +253,9 @@ func incompleteRecoveryErr(eng engineSource, stats *consumeStats) error {
 	if stats.errorEvents > 0 {
 		problems = append(problems, fmt.Sprintf("error 事件 %d 个", stats.errorEvents))
 	}
-	st := store.NewStore(eng.Dir())
+	// 只读校验恢复状态：用 NewReadOnlyStore（复核阻塞项 2 只读模式，引擎 store
+	// 仍持有写锁时也可安全读取）。
+	st := store.NewReadOnlyStore(eng.Dir())
 	p, err := st.Progress.Load()
 	if err != nil {
 		return &ExitCodeError{Code: 5, Err: fmt.Errorf("恢复状态读取失败（meta/progress.json）: %w", err)}

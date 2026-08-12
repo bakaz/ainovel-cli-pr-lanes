@@ -25,6 +25,7 @@ import (
 	"github.com/voocel/ainovel-cli/internal/arbiter"
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/flow"
+	"github.com/voocel/ainovel-cli/internal/notify"
 	"github.com/voocel/ainovel-cli/internal/projectprofile"
 	"github.com/voocel/ainovel-cli/internal/rules"
 	storepkg "github.com/voocel/ainovel-cli/internal/store"
@@ -1237,6 +1238,623 @@ func TestEngine_IntermediateCheckpointsDoNotMaskDeadlock(t *testing.T) {
 	}
 	if !hasWorkerFailure || !hasDeadlock {
 		t.Fatalf("应先记录 worker_failure 再记录 deadlock: %+v", recs)
+	}
+}
+
+// editTwiceThenSilentModel 复现"僵局咨询轮"：前 2 次调用各做一次 edit_chapter
+// （草稿 digest 变化 → 熔断计数每轮重置、不触发熔断），此后静默成功（零产出）——
+// 路由仍是"写第 1 章"，trackDeadlock 计数到第 3 轮触发 deadlock 咨询。
+type editTwiceThenSilentModel struct {
+	edits atomic.Int32
+}
+
+func (m *editTwiceThenSilentModel) Generate(_ context.Context, msgs []agentcore.Message, _ []agentcore.ToolSpec, _ ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
+	if len(msgs) > 0 && msgs[len(msgs)-1].Role == agentcore.RoleTool {
+		return &agentcore.LLMResponse{Message: testTextMsg("知道了(什么也不做)")}, nil
+	}
+	n := int(m.edits.Add(1))
+	if n <= 2 {
+		return &agentcore.LLMResponse{Message: testToolCallMsg("edit_chapter", map[string]any{
+			"chapter":    1,
+			"old_string": fmt.Sprintf("版本%d", n-1),
+			"new_string": fmt.Sprintf("版本%d", n),
+		})}, nil
+	}
+	return &agentcore.LLMResponse{Message: testTextMsg("知道了(什么也不做)")}, nil
+}
+
+func (m *editTwiceThenSilentModel) GenerateStream(ctx context.Context, msgs []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (<-chan agentcore.StreamEvent, error) {
+	resp, err := m.Generate(ctx, msgs, tools, opts...)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan agentcore.StreamEvent, 1)
+	ch <- agentcore.StreamEvent{Type: agentcore.StreamEventDone, Message: resp.Message, StopReason: resp.Message.StopReason}
+	close(ch)
+	return ch, nil
+}
+
+func (m *editTwiceThenSilentModel) SupportsTools() bool { return true }
+
+// TestEngine_DeadlockRerouteQueuedNextRound 复核缺口 1：deadlock reroute 不直接
+// 在当前循环派发（否则绕过 breaker.Guard）——排队到下一轮完整经过
+// precheck → gate.Allow → breaker.Guard → trackDeadlock → dispatch。
+// 验证：reroute 后该章停滞时熔断仍能拦截（只发生 1 次 Arbiter 咨询，worker 不
+// 在咨询轮同轮执行 reroute 指令）。
+func TestEngine_DeadlockRerouteQueuedNextRound(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("僵局 reroute 试书", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{{Chapter: 1, Title: "第一章", CoreEvent: "开端"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, "版本0 正文初稿"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	writerModel := &editTwiceThenSilentModel{}
+	writer := subagent.Config{
+		Name: "writer", Description: "edit then silent writer",
+		Model: writerModel, SystemPrompt: "test",
+		Tools:    []agentcore.Tool{tools.NewEditChapterTool(st)},
+		MaxTurns: 5,
+	}
+	// 第 1 次咨询 reroute 到 writer（同章重写）；第 2 次咨询 abort（不应到达）。
+	consult := 0
+	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		consult++
+		if consult == 1 {
+			return testTextMsg(`{"action":"reroute","dispatch":{"agent":"writer","task":"重写第 1 章"},"reason":"改走重写"}`)
+		}
+		return testTextMsg(`{"action":"abort","reason":"不应第二次咨询"}`)
+	}}
+
+	var mu sync.Mutex
+	events := &[]Event{}
+	var notifyKind, notifyBody string
+	var dispatched int // beforeRunWorker seam：确定性统计实际派发轮次（不依赖模型调用次数）
+	done := make(chan struct{}, 1)
+	obs := newObserver(st, func(ev Event) {
+		mu.Lock()
+		*events = append(*events, ev)
+		mu.Unlock()
+	}, func(string) {}, func() {})
+	e := &engine{
+		store:           st,
+		workers:         subagent.NewRunner(writer),
+		arbiterModel:    arb,
+		failurePrompt:   "sys",
+		planStartPrompt: "sys",
+		style:           "default",
+		fsmConfig:       tools.ChapterFSMConfig{Enabled: true, PipelineEnabled: true},
+		observer:        obs,
+		refresh:         func() {},
+		beforeRunWorker: func() {
+			mu.Lock()
+			dispatched++
+			mu.Unlock()
+		},
+		emitEvent: func(ev Event) {
+			mu.Lock()
+			*events = append(*events, ev)
+			mu.Unlock()
+		},
+		notify: func(kind, level, title, body string) {
+			mu.Lock()
+			notifyKind, notifyBody = kind, body
+			mu.Unlock()
+		},
+		onDone: func() {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		},
+	}
+	e.gate = NewChapterAdvanceGate(st, func(string) { e.abort() }, func(string, string) {})
+
+	if !e.start(nil) {
+		t.Fatal("engine start")
+	}
+	waitEngineDone(t, done)
+
+	// 1. deadlock 只咨询 1 次（reroute 排队到下一轮后熔断先于第二次咨询触发）。
+	recs, err := st.Decisions.Recent(10)
+	if err != nil {
+		t.Fatalf("decisions: %v", err)
+	}
+	var deadlockCount int
+	for _, r := range recs {
+		if r.Kind == "deadlock" {
+			deadlockCount++
+		}
+	}
+	if deadlockCount != 1 {
+		t.Fatalf("deadlock 咨询次数 = %d, want 1（reroute 不得在当前轮重复咨询/派发）", deadlockCount)
+	}
+
+	// 2. reroute 派发后的停滞轮次被熔断拦截（reroute 指令经过 Guard 观察）。
+	mu.Lock()
+	defer mu.Unlock()
+	if !e.noProgress.ManualRecoveryRequired(1) {
+		t.Fatal("reroute 后章节停滞必须被熔断拦截（manual_recovery_required）")
+	}
+	if notifyKind != notify.KindDeadlock || !strings.Contains(notifyBody, "无进展熔断") {
+		t.Fatalf("熔断通知缺失: kind=%q body=%q", notifyKind, notifyBody)
+	}
+	if strings.Contains(notifyBody, "僵局裁定") {
+		t.Fatalf("不应走到第二次 Arbiter 裁定, body=%q", notifyBody)
+	}
+	var found bool
+	for _, ev := range *events {
+		if ev.Category == "SYSTEM" && strings.Contains(ev.Summary, "无进展熔断") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("必须发出 SYSTEM 熔断事件, events=%+v", *events)
+	}
+	// 3. 确定性派发计数（beforeRunWorker seam）：R1/R2 编辑轮 + R4 reroute 轮 +
+	// R5 路由轮 = 4 次实际派发；R3 咨询轮未派发（reroute 排队）；R6 熔断拦截。
+	// 只计实际派发（复核缺口 2）：咨询轮不提交计数，熔断在第 3 次同状态实际
+	// 派发后触发。
+	if dispatched != 4 {
+		t.Fatalf("实际派发次数 = %d, want 4（R1/R2/R4/R5；R3 咨询轮不派发、R6 熔断拦截）", dispatched)
+	}
+}
+
+// TestEngine_GateDeniedDoesNotCountBreaker 复核缺口 2：breaker 只在 gate 通过、
+// 即将实际派发的指令上计数——gate 拒绝（逐章验收未放行）的轮次 worker 未运行、
+// 不累计；多次 Continue 反复 gate 拒绝不得错误触发 manual_recovery_required。
+func TestEngine_GateDeniedDoesNotCountBreaker(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("逐章验收试书", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{{Chapter: 1, Title: "第一章", CoreEvent: "开端"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, "版本0 正文初稿"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+		t.Fatal(err)
+	}
+	// 逐章验收模式 + 未放行任何章 → gate.Allow 恒拒绝 writer 派发。
+	if err := st.RunMeta.SetAdvanceMode(domain.ChapterAdvanceReview); err != nil {
+		t.Fatal(err)
+	}
+
+	noop := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		return testTextMsg("知道了(什么也不做)")
+	}}
+	writer := subagent.Config{
+		Name: "writer", Description: "noop writer",
+		Model: noop, SystemPrompt: "test", MaxTurns: 5,
+	}
+	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		return testTextMsg(`{"action":"abort","reason":"不应咨询"}`)
+	}}
+
+	var mu sync.Mutex
+	events := &[]Event{}
+	var pauseMsgs []string
+	done := make(chan struct{}, 1)
+	obs := newObserver(st, func(ev Event) {
+		mu.Lock()
+		*events = append(*events, ev)
+		mu.Unlock()
+	}, func(string) {}, func() {})
+	e := &engine{
+		store:           st,
+		workers:         subagent.NewRunner(writer),
+		arbiterModel:    arb,
+		failurePrompt:   "sys",
+		planStartPrompt: "sys",
+		style:           "default",
+		fsmConfig:       tools.ChapterFSMConfig{Enabled: true, PipelineEnabled: true},
+		observer:        obs,
+		refresh:         func() {},
+		emitEvent: func(ev Event) {
+			mu.Lock()
+			*events = append(*events, ev)
+			mu.Unlock()
+		},
+		notify: func(string, string, string, string) {},
+		onDone: func() {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		},
+	}
+	e.gate = NewChapterAdvanceGate(st, func(msg string) {
+		mu.Lock()
+		pauseMsgs = append(pauseMsgs, msg)
+		mu.Unlock()
+		e.abort()
+	}, func(string, string) {})
+
+	// 三次 Continue：每次都 gate 拒绝、worker 从未运行。
+	for i := 0; i < 3; i++ {
+		if !e.start(nil) {
+			t.Fatalf("engine start #%d", i+1)
+		}
+		waitEngineDone(t, done)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(pauseMsgs) != 3 {
+		t.Fatalf("gate 拒绝次数 = %d, want 3（每次 Continue 都被逐章验收拦截）", len(pauseMsgs))
+	}
+	if !strings.Contains(pauseMsgs[0], "逐章验收等待放行") {
+		t.Fatalf("gate 拒绝原因不符: %q", pauseMsgs[0])
+	}
+	// 缺口 2 核心：gate 拒绝的轮次不得累计熔断计数。
+	if e.noProgress.ManualRecoveryRequired(1) {
+		t.Fatal("gate 拒绝的轮次不得触发 manual_recovery_required（worker 从未实际派发）")
+	}
+	for _, ev := range *events {
+		if strings.Contains(ev.Summary, "无进展熔断") {
+			t.Fatalf("gate 拒绝不得产生熔断事件, got %+v", ev)
+		}
+	}
+}
+
+// TestEngine_TrackDeadlockRerouteQueuesNextRound 缺口 1 的确定性单元测试（不依赖
+// 模型调用次数/Worker 调度）：trackDeadlock 在第 3 次同指令时咨询 Arbiter，
+// reroute 裁定后——inst 被置 nil（当前轮不派发）、e.next 排队下一轮、writer
+// reroute 继承当前章节号（Guard 可按章观察）。
+func TestEngine_TrackDeadlockRerouteQueuesNextRound(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("直接测试", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		return testTextMsg(`{"action":"reroute","dispatch":{"agent":"writer","task":"重写第 1 章"},"reason":"改走重写"}`)
+	}}
+	obs := newObserver(st, func(Event) {}, func(string) {}, func() {})
+	e := &engine{
+		store:         st,
+		arbiterModel:  arb,
+		failurePrompt: "sys",
+		fsmConfig:     tools.ChapterFSMConfig{Enabled: true, PipelineEnabled: true},
+		observer:      obs,
+		notify:        func(_, _, _, _ string) {},
+		emitEvent:     func(Event) {},
+		onPause:       func(string) {},
+	}
+
+	inst := &flow.Instruction{Agent: "writer", Task: "写第 1 章", Chapter: 1}
+	for i := 0; i < 2; i++ {
+		if stop := e.trackDeadlock(t.Context(), &inst); stop {
+			t.Fatalf("第 %d 轮不得 stop", i+1)
+		}
+		if inst == nil {
+			t.Fatalf("第 %d 轮 inst 不得被置 nil", i+1)
+		}
+	}
+	// 第 3 轮：咨询 → reroute。
+	if stop := e.trackDeadlock(t.Context(), &inst); stop {
+		t.Fatal("reroute 裁定不得 stop")
+	}
+	if inst != nil {
+		t.Fatalf("reroute 后 inst 必须置 nil（当前轮不派发）, got %+v", inst)
+	}
+	got := e.takeNext()
+	if got == nil || got.Agent != "writer" || got.Task != "重写第 1 章" || got.Chapter != 1 {
+		t.Fatalf("e.next 应为继承章节的 writer reroute, got %+v", got)
+	}
+}
+
+// TestEngine_WriterChapterNormalized 缺口 1：Chapter=0 的 writer 指令（干预派发 /
+// 非 writer→writer reroute / 未绑定章节的原始指令）在 precheck 统一归一化目标
+// 章节——熔断按章观察、派发时 StartChapter 生效（inst.Chapter 已绑定）。
+func TestEngine_WriterChapterNormalized(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("归一化试书", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{{Chapter: 1, Title: "第一章", CoreEvent: "开端"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, "版本0 正文初稿"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	noop := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		return testTextMsg("知道了(什么也不做)")
+	}}
+	writer := subagent.Config{
+		Name: "writer", Description: "noop writer",
+		Model: noop, SystemPrompt: "test", MaxTurns: 5,
+	}
+	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		return testTextMsg(`{"action":"abort","reason":"不应咨询"}`)
+	}}
+
+	var mu sync.Mutex
+	var dispatched int
+	var notifyKind, notifyBody string
+	done := make(chan struct{}, 1)
+	obs := newObserver(st, func(Event) {}, func(string) {}, func() {})
+	e := &engine{
+		store:           st,
+		workers:         subagent.NewRunner(writer),
+		arbiterModel:    arb,
+		failurePrompt:   "sys",
+		planStartPrompt: "sys",
+		style:           "default",
+		fsmConfig:       tools.ChapterFSMConfig{Enabled: true, PipelineEnabled: true},
+		observer:        obs,
+		refresh:         func() {},
+		beforeRunWorker: func() {
+			mu.Lock()
+			dispatched++
+			mu.Unlock()
+		},
+		emitEvent: func(Event) {},
+		notify: func(kind, level, title, body string) {
+			mu.Lock()
+			notifyKind, notifyBody = kind, body
+			mu.Unlock()
+		},
+		onDone: func() {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		},
+	}
+	e.gate = NewChapterAdvanceGate(st, func(string) { e.abort() }, func(string, string) {})
+
+	// 模拟干预派发 / 未绑定章节的 writer 指令（Chapter=0）。
+	if !e.start(&flow.Instruction{Agent: "writer", Task: "写第 1 章"}) {
+		t.Fatal("engine start")
+	}
+	waitEngineDone(t, done)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// 归一化后熔断按章观察：2 次实际派发后第 3 轮熔断。
+	if dispatched != 2 {
+		t.Fatalf("实际派发 = %d, want 2（第 3 轮熔断拦截）", dispatched)
+	}
+	if !e.noProgress.ManualRecoveryRequired(1) {
+		t.Fatal("Chapter=0 归一化后必须被熔断按章跟踪（manual_recovery_required）")
+	}
+	if notifyKind != notify.KindDeadlock || !strings.Contains(notifyBody, "无进展熔断") {
+		t.Fatalf("熔断通知缺失: kind=%q body=%q", notifyKind, notifyBody)
+	}
+	// runWorker 的 StartChapter 执行 → 证明派发时 inst.Chapter 已归一化为 1。
+	progress, err := st.Progress.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress == nil || progress.InProgressChapter != 1 {
+		t.Fatalf("InProgressChapter = %v, want 1（派发时章节已归一化）", progress)
+	}
+}
+
+// TestEngine_WriterChapterUnresolvablePauses 缺口 1：无法推导 writer 目标章节
+// → 显式暂停（返回明确错误、停止派发），不静默放行未绑定章节的 writer 指令
+// （否则可绕过熔断观察）。
+func TestEngine_WriterChapterUnresolvablePauses(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	// 只有 RunMeta（gate 可用）；无 progress 文件 → writerTargetChapter 返回 0。
+	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	noop := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		return testTextMsg("知道了(什么也不做)")
+	}}
+	writer := subagent.Config{
+		Name: "writer", Description: "noop writer",
+		Model: noop, SystemPrompt: "test", MaxTurns: 5,
+	}
+
+	var mu sync.Mutex
+	var dispatched int
+	var notifyBody string
+	done := make(chan struct{}, 1)
+	obs := newObserver(st, func(Event) {}, func(string) {}, func() {})
+	e := &engine{
+		store:           st,
+		workers:         subagent.NewRunner(writer),
+		arbiterModel:    &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message { return testTextMsg(`{"action":"abort","reason":"x"}`) }},
+		failurePrompt:   "sys",
+		planStartPrompt: "sys",
+		style:           "default",
+		fsmConfig:       tools.ChapterFSMConfig{Enabled: true, PipelineEnabled: true},
+		observer:        obs,
+		refresh:         func() {},
+		beforeRunWorker: func() {
+			mu.Lock()
+			dispatched++
+			mu.Unlock()
+		},
+		emitEvent: func(Event) {},
+		notify: func(kind, level, title, body string) {
+			mu.Lock()
+			notifyBody = body
+			mu.Unlock()
+		},
+		onDone: func() {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		},
+	}
+	e.gate = NewChapterAdvanceGate(st, func(string) { e.abort() }, func(string, string) {})
+
+	if !e.start(&flow.Instruction{Agent: "writer", Task: "写某章"}) {
+		t.Fatal("engine start")
+	}
+	waitEngineDone(t, done)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if dispatched != 0 {
+		t.Fatalf("无法推导目标章节时不得派发, got %d", dispatched)
+	}
+	if !strings.Contains(notifyBody, "无法确定目标章节") {
+		t.Fatalf("必须显式暂停并给出明确原因, body=%q", notifyBody)
+	}
+	if e.noProgress.ManualRecoveryRequired(1) {
+		t.Fatal("未派发轮次不得触发熔断标记")
+	}
+}
+
+// TestEngine_NoProgressBreakerNotifiesBlocked P1-9 阻塞项 9.1/9.3：writer 连续
+// 3 轮同一章无进展（成功但零产出、状态不变）→ 无进展熔断触发——熔断原因经
+// 既有通知通道输出（notify + SYSTEM event），并标记 manual_recovery_required。
+func TestEngine_NoProgressBreakerNotifiesBlocked(t *testing.T) {
+	st := storepkg.NewStore(t.TempDir())
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("熔断试书", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.UpdatePhase(domain.PhaseWriting); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Outline.SaveOutline([]domain.OutlineEntry{{Chapter: 1, Title: "第一章", CoreEvent: "开端"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.SetStyleReviewMode(domain.StyleQualityCritic); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, "版本0 正文初稿"); err != nil {
+		t.Fatal(err)
+	}
+	// 与 newTestEngine 一致：RunMeta 必须初始化（AdvanceGate.HandleBoundary 校验）。
+	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// writer 无产出成功（不调用工具、不落任何盘）→ Route 恒派发"写第 1 章"
+	// 且状态快照不变 → 熔断在第 3 轮触发（先于 trackDeadlock 的 Arbiter 咨询）。
+	noop := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		return testTextMsg("知道了(什么也不做)")
+	}}
+	writer := subagent.Config{
+		Name: "writer", Description: "noop writer",
+		Model: noop, SystemPrompt: "test", MaxTurns: 5,
+	}
+	arb := &scriptedChatModel{fn: func([]agentcore.Message) agentcore.Message {
+		return testTextMsg(`{"action":"abort","reason":"熔断应先于 Arbiter 咨询，不应到达"}`)
+	}}
+
+	// 构造带 notify 捕获的引擎（newTestEngine 的 notify 是 no-op）。
+	var mu sync.Mutex
+	events := &[]Event{}
+	var notifyKind, notifyBody string
+	done := make(chan struct{}, 1)
+	obs := newObserver(st, func(ev Event) {
+		mu.Lock()
+		*events = append(*events, ev)
+		mu.Unlock()
+	}, func(string) {}, func() {})
+	e := &engine{
+		store:           st,
+		workers:         subagent.NewRunner(writer),
+		arbiterModel:    arb,
+		failurePrompt:   "sys",
+		planStartPrompt: "sys",
+		style:           "default",
+		fsmConfig:       tools.ChapterFSMConfig{Enabled: true, PipelineEnabled: true},
+		observer:        obs,
+		refresh:         func() {},
+		emitEvent: func(ev Event) {
+			mu.Lock()
+			*events = append(*events, ev)
+			mu.Unlock()
+		},
+		notify: func(kind, level, title, body string) {
+			mu.Lock()
+			notifyKind, notifyBody = kind, body
+			mu.Unlock()
+		},
+		onDone: func() {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		},
+	}
+	e.gate = NewChapterAdvanceGate(st, func(string) { e.abort() }, func(string, string) {})
+
+	if !e.start(nil) {
+		t.Fatal("engine start")
+	}
+	waitEngineDone(t, done)
+
+	// 熔断触发：确定性原因经既有通知通道输出（复用 pauseWithNotify 通道）。
+	mu.Lock()
+	defer mu.Unlock()
+	if notifyKind != notify.KindDeadlock {
+		t.Fatalf("notify kind = %q, want %q（复用僵局通知通道）", notifyKind, notify.KindDeadlock)
+	}
+	for _, want := range []string{"manual_recovery_required", "chapter=1"} {
+		if !strings.Contains(notifyBody, want) {
+			t.Fatalf("notify body 必须含 %q, got: %s", want, notifyBody)
+		}
+	}
+	// SYSTEM 事件可见（headless 输出通道）。
+	var found bool
+	for _, ev := range *events {
+		if ev.Category == "SYSTEM" && strings.Contains(ev.Summary, "无进展熔断") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("必须发出 SYSTEM 熔断事件, events=%+v", *events)
+	}
+	// 熔断标记可查询（等待人工）。
+	if !e.noProgress.ManualRecoveryRequired(1) {
+		t.Fatal("chapter=1 必须标记 manual_recovery_required")
 	}
 }
 

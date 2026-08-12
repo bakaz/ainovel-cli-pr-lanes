@@ -196,8 +196,11 @@ func (h *Host) requireProfileResolved() projectprofile.ResolvedProfile {
 // 所有创作/写入/Provider 方法受 checkMigrationGate 保护并返回 ErrMigrationRequired。
 // 不初始化 Store.Init / RunMeta / model / worker / usage background / engine。
 func newDiagnosticHost(cfg bootstrap.Config, bundle assets.Bundle, outputDir string, profile projectprofile.ResolvedProfile) *Host {
-	store := storepkg.NewStore(outputDir) // 只读 store，不调用 Init()
-	usage := NewUsageTracker(nil, store)  // nil modelSet → Totals() 等返回零值
+	// 复核阻塞项 3：诊断 Host 是纯只读——用 NewReadOnlyStore（不获取 workspace
+	// 排他锁，不阻挡真实写入进程；所有写操作 fail-closed）。旧实现 NewStore 会
+	// 在真实引擎运行时拿不到锁（跨进程/同进程双写均被拒），导致诊断不可用。
+	store := storepkg.NewReadOnlyStore(outputDir)
+	usage := NewUsageTracker(nil, store) // nil modelSet → Totals() 等返回零值
 	h := &Host{
 		cfg:            cfg,
 		bundle:         bundle,

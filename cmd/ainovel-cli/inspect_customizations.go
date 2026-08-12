@@ -142,7 +142,8 @@ func inspectCustomizations(argv []string) int {
 		wantedSources[raw.Label] = true
 	}
 
-	st := store.NewStore(outputDir)
+	// 复核阻塞项 2 只读模式：inspect 只读，不取 workspace 排他锁。
+	st := store.NewReadOnlyStore(outputDir)
 	snapshotPath := filepath.Join(outputDir, "meta", "user_rules.json")
 	report.RuleSnapshot = inspectedRuleSnapshot{Path: snapshotPath, CoversRuleFiles: len(wantedSources) == 0}
 	if snap, loadErr := st.UserRules.Load(); loadErr == nil && snap != nil {

@@ -91,6 +91,13 @@ type engine struct {
 	// ExpectedPolisherModel)会让反思报告的 stage 偏离真实工具拦截,产生
 	// "提示直接提交"与"FSM 拒绝提交"的自相矛盾(P0-2)。
 	fsmConfig tools.ChapterFSMConfig
+	// noProgress 是章节无进展熔断器(P1-7/P1-9):统一观察入口 Guard 覆盖所有
+	// 来源的 writer 派发(正常路由 / initial 指令 / Arbiter reroute / 干预派发),
+	// 连续 3 轮同一章快照完全一致且无新 checkpoint/草稿/账本变化 → 不再自动
+	// 重派该章(返回 nil)并标记 manual_recovery_required,熔断原因经
+	// blockedWithNotify 输出到用户通道,等待人工。
+	// 惰性初始化(run 循环首轮,用当时的 fsmConfig——测试可在构造后覆盖)。
+	noProgress *flow.NoProgressBreaker
 }
 
 // deadlockConsultAt / deadlockAbortAt:repeats 达到前者问 Arbiter,达到后者硬熔断。
@@ -217,6 +224,11 @@ func (e *engine) run(ctx context.Context) {
 		}
 	}
 
+	// P1-7：惰性初始化无进展熔断器（用当前 fsmConfig；测试可在构造后覆盖）。
+	if e.noProgress == nil {
+		e.noProgress = flow.NewNoProgressBreaker(e.fsmConfig)
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -232,6 +244,8 @@ func (e *engine) run(ctx context.Context) {
 
 		inst := e.takeNext()
 		if inst == nil {
+			// 路由（纯函数）：writer 派发的无进展熔断统一在下方 Guard 检查
+			// （覆盖 takeNext/reroute/干预派发等所有来源，P1-9 阻塞项 9.3）。
 			inst = flow.Route(flow.LoadState(e.store))
 		}
 		if inst == nil {
@@ -253,6 +267,16 @@ func (e *engine) run(ctx context.Context) {
 		if !allowed {
 			return
 		}
+		// P1-9 阻塞项 9.3 + 复核缺口 2：统一熔断观察——只在 gate 通过、即将实际
+		// 派发的最终指令上计数（覆盖正常路由 / initial 指令 / Arbiter reroute /
+		// 干预派发等所有来源）。gate 拒绝的轮次 worker 未运行、不累计计数，
+		// 避免多次 Continue 反复 gate 拒绝错误触发 manual_recovery_required。
+		// 熔断 → 确定性原因输出到用户通道并停机等待人工；先于 trackDeadlock
+		// 的 Arbiter 咨询（ch450 类场景咨询→retry 只会继续烧钱）。
+		if e.noProgress != nil && e.noProgress.Guard(e.store, inst) == nil {
+			e.blockedWithNotify(inst)
+			return
+		}
 		if stop := e.trackDeadlock(ctx, &inst); stop {
 			return
 		}
@@ -270,6 +294,12 @@ func (e *engine) run(ctx context.Context) {
 		if e.beforeRunWorker != nil {
 			e.beforeRunWorker()
 		}
+		// 复核缺口 2：实际派发点提交熔断计数——Guard 的预演在此生效。trackDeadlock
+		// 咨询/reroute、Arbiter abort、进度读取失败、上下文取消等未派发分支不提交
+		// （只计实际派发，咨询轮不计入停滞）。
+		if e.noProgress != nil && inst.Chapter > 0 {
+			e.noProgress.Commit(inst.Chapter)
+		}
 		err := e.runWorker(ctx, inst)
 		if ctx.Err() != nil {
 			return
@@ -279,6 +309,11 @@ func (e *engine) run(ctx context.Context) {
 				return
 			}
 		} else {
+			// P1-9 阻塞项 9.2：worker 成功后清理该章错误码（避免熔断理由报告
+			// 上次失败）；成功但无状态变化不重置无进展计数（停滞仍会累计熔断）。
+			if e.noProgress != nil && inst.Chapter > 0 {
+				e.noProgress.ClearError(inst.Chapter)
+			}
 			// Worker 成功——检测新完成的章节并检查弧/卷边界
 			if stop := e.handleCompletedChapters(ctx, before); stop {
 				return
@@ -409,6 +444,13 @@ func (e *engine) precheck(inst *flow.Instruction) *flow.Instruction {
 		} else {
 			ch = writerTargetChapter(e.store)
 		}
+		// 复核缺口 1：归一化最终 writer 目标章节——干预派发 / 非 writer→writer
+		// reroute / 未绑定章节的原始 writer 指令在此统一写回 inst.Chapter
+		// （否则 breaker.Guard 因 Chapter<=0 跳过观察，Chapter=0 的 writer 可
+		// 绕过熔断）。
+		if inst.Chapter <= 0 && ch > 0 {
+			inst.Chapter = ch
+		}
 		if ch > 0 {
 			// 检查 legacy exhausted：阻止 writer dispatch，避免工具调用风暴
 			exhausted, loadErr := e.isStyleReviewExhausted(ch)
@@ -443,8 +485,10 @@ func (e *engine) precheck(inst *flow.Instruction) *flow.Instruction {
 					}
 				}
 			}
-		} else if isV3 {
-			e.pauseWithNotify("engine", "引擎预检 Writer: 无法确定目标章节")
+		} else {
+			// 复核缺口 1：无法推导 writer 目标章节 → 显式暂停（返回明确错误、
+			// 停止派发），不静默放行一个未绑定章节、绕过熔断观察的 writer 指令。
+			e.pauseWithNotify("engine", "引擎预检 Writer: 无法确定目标章节，已停止自动派发，等待人工处理")
 			return &flow.Instruction{}
 		}
 		e.refresh()
@@ -536,7 +580,21 @@ func (e *engine) trackDeadlock(ctx context.Context, inst **flow.Instruction) (st
 	case "retry":
 		return false
 	case "reroute":
-		*inst = &flow.Instruction{Agent: decision.Dispatch.Agent, Task: decision.Dispatch.Task, Reason: decision.Reason}
+		// 复核缺口 1：deadlock reroute 不直接在当前循环派发——reroute 产生于
+		// breaker.Guard 之后，当前循环直接执行会绕过熔断观察。排队到下一轮，
+		// 重新完整经过 precheck → gate.Allow → breaker.Guard → trackDeadlock →
+		// dispatch，保证所有最终 writer 派发都经过 Guard。
+		// DispatchOp 无 chapter 字段：writer reroute 继承当前指令的章节号
+		// （reroute 目标是当前卡住的章节），使 Guard 能按章观察。
+		dispatch := &flow.Instruction{Agent: decision.Dispatch.Agent, Task: decision.Dispatch.Task, Reason: decision.Reason}
+		if dispatch.Agent == "writer" {
+			dispatch.Chapter = in.Chapter
+		}
+		e.mu.Lock()
+		e.next = dispatch
+		e.deferGateForNext = false
+		e.mu.Unlock()
+		*inst = nil // 触发 continue：下一轮 takeNext 消费排队指令
 		return false
 	default: // abort
 		e.pauseWithNotify(notify.KindDeadlock, "僵局裁定: "+decision.Reason)
@@ -621,6 +679,11 @@ func modelNameOf(m agentcore.ChatModel) string {
 // 其余同指令重试一次 → Arbiter → 最保守暂停。
 func (e *engine) handleWorkerError(ctx context.Context, inst *flow.Instruction, werr error) (stop bool) {
 	msg := werr.Error()
+	// P1-7：把本次失败的稳定错误码记入无进展熔断快照（相同错误码保持计数，
+	// 不同错误码视为状态变化重置计数）。
+	if e.noProgress != nil && inst.Chapter > 0 {
+		e.noProgress.RecordError(inst.Chapter, workerErrorCode(werr))
+	}
 	e.emitEvent(Event{Time: time.Now(), Category: "ERROR", Agent: inst.Agent,
 		Summary: truncate(fmt.Sprintf("%s 失败: %s", inst.Agent, msg), 120), Detail: msg, Level: "error"})
 
@@ -666,8 +729,15 @@ func (e *engine) arbitrateWorkerFailure(ctx context.Context, inst *flow.Instruct
 	case "retry":
 		return false
 	case "reroute":
+		// 与 trackDeadlock 的 reroute 同一语义（复核缺口 1）：writer reroute
+		// 继承当前指令的章节号——排队指令下一轮经 takeNext → precheck →
+		// gate.Allow → breaker.Guard 完整管线后派发，Guard 按章观察。
+		dispatch := &flow.Instruction{Agent: decision.Dispatch.Agent, Task: decision.Dispatch.Task, Reason: decision.Reason}
+		if dispatch.Agent == "writer" {
+			dispatch.Chapter = inst.Chapter
+		}
 		e.mu.Lock()
-		e.next = &flow.Instruction{Agent: decision.Dispatch.Agent, Task: decision.Dispatch.Task, Reason: decision.Reason}
+		e.next = dispatch
 		e.deferGateForNext = false
 		e.mu.Unlock()
 		return false
@@ -832,6 +902,32 @@ var errInvalidWriteTarget = errors.New("非法写作目标")
 // agent 未注册(subagent.ErrUnknownAgent)与引擎前置校验失败——不再依赖错误文案。
 func isDeterministicWorkerError(err error) bool {
 	return errors.Is(err, subagent.ErrUnknownAgent) || errors.Is(err, errInvalidWriteTarget)
+}
+
+// workerErrorCode 返回 worker 失败错误的稳定分类码（P1-7 无进展熔断快照用）。
+// best-effort：未分类错误统一 "worker_error"（同一错误码保持熔断计数，
+// 不同错误码视为状态变化重置计数）。
+func workerErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, agentcore.ErrMaxTurns) {
+		return "max_turns"
+	}
+	var te *tools.ChapterTransitionError
+	if errors.As(err, &te) {
+		if te.Stage == tools.ChapterStageBlocked {
+			return "chapter_fsm_blocked"
+		}
+		return "chapter_fsm_denied"
+	}
+	if errors.Is(err, storepkg.ErrPolishCandidateStale) || errors.Is(err, storepkg.ErrReviewStale) {
+		return "candidate_stale"
+	}
+	if errors.Is(err, agentcore.ErrProviderContentFilter) {
+		return "content_filter"
+	}
+	return "worker_error"
 }
 
 func (e *engine) failureFacts(kind string, inst *flow.Instruction, errMsg string) arbiter.FailureFacts {
@@ -1000,6 +1096,25 @@ func (e *engine) pauseWithNotify(kind, body string) {
 	}
 	e.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: body, Level: "warn"})
 	e.abort()
+}
+
+// blockedWithNotify 章节无进展熔断停机（P1-9 阻塞项 9.1）：把确定性熔断原因
+// （含 chapter/stage/required/errorCode/ledger，manual_recovery_required 标记）
+// 输出到用户通道——复用 pauseWithNotify 的既有通知通道（SYSTEM event + 离屏
+// 通知 + host 统一暂停语义），headless 下同样可见明确失败原因。
+func (e *engine) blockedWithNotify(inst *flow.Instruction) {
+	msg := "章节无进展熔断（manual_recovery_required）: "
+	if e.noProgress != nil {
+		if reason := e.noProgress.BlockedReason(inst.Chapter); reason != "" {
+			msg += reason
+		} else {
+			msg += fmt.Sprintf("chapter=%d 连续多轮同一状态无任何 checkpoint/草稿/账本变化，已停止自动重派", inst.Chapter)
+		}
+	} else {
+		msg += fmt.Sprintf("chapter=%d 无进展，已停止自动重派", inst.Chapter)
+	}
+	msg += "。请人工修复 ledger/草稿/候选状态后继续创作"
+	e.pauseWithNotify(notify.KindDeadlock, msg)
 }
 
 // latestCompletedChapter 返回进度中最新完成的章节号。

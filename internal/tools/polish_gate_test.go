@@ -74,6 +74,8 @@ func setupPolishGateStore(t *testing.T, chapter int, draft string, ledgerAt, pol
 			t.Fatalf("patch checkpoint occurred_at: %v", err)
 		}
 		// checkpoint cache 是内存镜像：改写磁盘后重建 store 使其重新加载。
+		// （复核阻塞项 2 单写者语义：重建前必须先释放 workspace 锁。）
+		st.Close()
 		st = store.NewStore(dir)
 	}
 	return st
@@ -1197,6 +1199,8 @@ func TestPolishGate_LegacyMissingTimeTolerated(t *testing.T) {
 		t.Fatal(err)
 	}
 	// polish checkpoint 的 occurred_at 缺失 → 墙钟比较无法进行，按已绑定放行。
+	// （复核阻塞项 2 单写者语义：重建前先释放 workspace 锁。）
+	st.Close()
 	st = stripLastCheckpointOccurredAt(t, dir)
 
 	if err := CheckPolishPipelineGate(st, 1, "mimo-polisher"); err != nil {

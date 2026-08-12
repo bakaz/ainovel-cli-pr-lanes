@@ -54,6 +54,9 @@ func TestConsume_RealHost_ClosedClean(t *testing.T) {
 	if err := st.Progress.Init("test", 100); err != nil {
 		t.Fatal(err)
 	}
+	// 复核阻塞项 2（方案 A）：同一 workspace 只允许一个可写 Store——铺完种子
+	// 状态后释放，Host 内部 store 才能获取锁（种子已持久化在磁盘）。
+	st.Close()
 	eng := newRealHost(t, dir)
 	eng.Close() // 不启动引擎：直接关闭
 
@@ -83,6 +86,8 @@ func TestConsume_RealHost_PendingRewritesExit5(t *testing.T) {
 	if err := st.Progress.SetPendingRewrites([]int{1}, "打磨"); err != nil {
 		t.Fatal(err)
 	}
+	// 复核阻塞项 2（方案 A）：铺完种子状态后释放，Host 内部 store 才能取锁。
+	st.Close()
 	eng := newRealHost(t, dir)
 	eng.Close()
 
@@ -112,6 +117,8 @@ func TestRunContinue_RealHost_ArbiterFailureExit2(t *testing.T) {
 	}
 	cfg := stubHostConfig(dir)
 	cfg.Providers["ollama"] = bootstrap.ProviderConfig{BaseURL: srv.URL}
+	// 复核阻塞项 2（方案 A）：铺完种子状态后释放，Host 内部 store 才能取锁。
+	st.Close()
 	eng, err := host.New(cfg, assets.Load("default", assets.LoadOptions{}))
 	if err != nil {
 		t.Fatalf("host.New: %v", err)

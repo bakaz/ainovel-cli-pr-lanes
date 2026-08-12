@@ -295,6 +295,14 @@ func ComputeChapterStage(in ChapterStageInput) ChapterStageDecision {
 			return decision(ChapterStageRewriteNotStarted,
 				[]ChapterAction{ChapterActionDraft, ChapterActionEdit}, ChapterActionEdit, "重写草稿尚未播种")
 		}
+		// 阻塞项 8：非返工章节存在 terminal ledger 但草稿丢失 → blocked。
+		// CheckStyleReviewMutationGuard 对 terminal 状态拒绝 draft_chapter，返回
+		// needs_draft 会让 FSM 允许一个被 mutation guard 拒绝的动作（与 P1-5
+		// 同类 FSM/guard 不变量破坏）。degraded 除外：guard 允许起草（degraded
+		// 是评审调用故障而非评审结论）。
+		if status.IsTerminal() && status != domain.ReviewStatusDegraded {
+			return blockedDecision("ledger 终态但草稿不存在", "terminal 账本与草稿不一致：停止自动写作并人工恢复草稿/账本")
+		}
 		return decision(ChapterStageNeedsDraft,
 			[]ChapterAction{ChapterActionDraft}, ChapterActionDraft, "新章节尚无草稿")
 	}
@@ -312,6 +320,20 @@ func ComputeChapterStage(in ChapterStageInput) ChapterStageDecision {
 	if status == domain.ReviewStatusRevisionOpen && reviewDigestMatches {
 		return decision(ChapterStageRevisionOpen,
 			[]ChapterAction{ChapterActionDraft, ChapterActionEdit}, ChapterActionEdit, "评审要求修订，当前草稿尚未修改")
+	}
+
+	// P1-5：非返工章节的 terminal ledger 与当前草稿 digest 不匹配 → blocked（人工恢复）。
+	// 必须早于 pipeline freshness 判定：否则（accepted_revised + digest 不匹配 +
+	// polish 陈旧）会先返回 needs_polish——FSM 允许 polish_draft，但
+	// CheckStyleReviewMutationGuard 对 terminal 状态锁定正文、拒绝修改，模型照
+	// required 调用 polish_draft 必被拒，形成 ch450 类死锁（FSM 允许了一个随后
+	// 必然被 mutation guard 拒绝的动作）。同理必须早于 consistency/机械违规分支：
+	// draft/edit 同样被 terminal 锁定，返回 draft_dirty/needs_edit 会让 FSM 与
+	// guard 自相矛盾（P1-6）。
+	// degraded 除外：degraded 是评审调用故障而非评审结论，guard 允许修改
+	// （draft/edit/polish 均放行），needs_review/needs_polish 均合法，不得误伤。
+	if status.IsTerminal() && status != domain.ReviewStatusDegraded && !reviewDigestMatches && !in.InRewriteQueue {
+		return blockedDecision("ledger 终态与当前草稿不匹配", "停止自动写作并修复 ledger/候选状态")
 	}
 
 	consistencyFresh := freshConsistency(in.LatestConsistency, in.DraftDigest)
@@ -380,6 +402,9 @@ func ComputeChapterStage(in ChapterStageInput) ChapterStageDecision {
 			if in.InRewriteQueue {
 				return needsReviewDecision("现有 terminal 属于旧候选，需开启新 epoch")
 			}
+			// P1-5 兜底：非重写章节的 terminal mismatch 已在流水线判定之前拦截为
+			// blocked（见上方 P1-5 分支）；此处仅在绑定校验失败（R!=P 等）时可达，
+			// 保持 blocked 语义不变（纵深防御，不返回 needs_polish）。
 			return blockedDecision("非重写章节的 terminal 账本与当前草稿不匹配", "停止自动写作并人工恢复")
 		default:
 			return blockedDecision("未知评审状态", "检查 style review ledger")

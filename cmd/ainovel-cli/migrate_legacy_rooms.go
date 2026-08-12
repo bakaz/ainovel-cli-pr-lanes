@@ -64,6 +64,15 @@ func migrateLegacyRooms(argv []string) int {
 	}
 
 	st := store.NewStore(outputDir)
+	// 复核阻塞项 4：可写 Store 入口统一 fail-closed——workspace 锁获取失败
+	// （另一进程/本进程另一实例占用）或 checkpoint 数据损坏时不迁移任何文件。
+	if !st.Ready() {
+		if err := st.Init(); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 1
+		}
+	}
+	defer st.Close()
 	result, err := st.MigrateLegacyRooms()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: migrate legacy rooms: %v\n", err)

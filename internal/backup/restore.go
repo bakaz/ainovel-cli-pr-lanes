@@ -89,6 +89,14 @@ func createRescue(sourceDir, backupRoot string) (string, *Manifest, error) {
 		if err != nil || relPath == "." {
 			return nil
 		}
+		// 排除 workspace 跨进程锁文件（P0-1，同 backup.go 的 walk）：锁文件
+		// 不参与数据读写，且 Windows LockFileEx 锁定的字节区间禁止读取。
+		if d.Name() == workspaceLockFileName {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		relForward := filepath.ToSlash(relPath)
 
 		fi, le := os.Lstat(path)

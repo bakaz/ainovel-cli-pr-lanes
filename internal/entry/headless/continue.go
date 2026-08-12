@@ -54,7 +54,8 @@ type continueEngine interface {
 // Progress.Init / ReplayQueue / Resume），也不安装阻塞式终端 AskUser。
 func runContinue(eng continueEngine, stdout, stderr io.Writer, prompt string) error {
 	// P0-4：执行前检查 PendingSteer，非空拒绝执行（退出码 4）。
-	st := store.NewStore(eng.Dir())
+	// 复核阻塞项 2 只读模式：引擎 store 持有写锁时也可安全读取。
+	st := store.NewReadOnlyStore(eng.Dir())
 	meta, err := st.RunMeta.Load()
 	if err != nil {
 		return &ExitCodeError{Code: 3, Err: fmt.Errorf("读取运行元信息失败: %w", err)}
@@ -118,7 +119,8 @@ func runContinue(eng continueEngine, stdout, stderr io.Writer, prompt string) er
 // 不等于成功，需核对 error 事件、PendingRewrites 是否排空与 AdvanceHold 状态。
 // 状态读取失败/关键文件缺失时打印"状态读取失败"，绝不误报为"已排空/无"。
 func printContinueSummary(stderr io.Writer, eng engineSource, stats *consumeStats) {
-	st := store.NewStore(eng.Dir())
+	// 复核阻塞项 2 只读模式：只读校验，不取 workspace 写锁。
+	st := store.NewReadOnlyStore(eng.Dir())
 	fmt.Fprintln(stderr, "── 退出摘要 ──")
 	if stats.errorEvents > 0 {
 		fmt.Fprintf(stderr, "- error 事件: %d（引擎可能异常停止，请检查上方日志）\n", stats.errorEvents)

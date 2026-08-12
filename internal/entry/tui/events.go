@@ -233,7 +233,9 @@ func abortRuntime(rt *host.Host) tea.Cmd {
 
 func loadReport(dir string, reqID int) tea.Cmd {
 	return func() tea.Msg {
-		s := store.NewStore(dir)
+		// 复核阻塞项 2 只读模式：诊断/导出只读，用 NewReadOnlyStore（Host 持有
+		// 写锁时也可生成报告）。
+		s := store.NewReadOnlyStore(dir)
 		// Diagnose = 创作诊断 + 运行时检测，运行时 Finding 也进屏上报告。
 		rep, rc := diag.Diagnose(s)
 		// 复用 rep+rc 写出脱敏诊断文件（导出失败不影响屏上报告）。

@@ -590,12 +590,10 @@ func (s *OutlineStore) LoadPendingOutlineFeedback() []ChapterFeedback {
 }
 
 // ClearOutlineFeedback 清空反馈池(architect 结构操作成功 = 反馈已被参考)。
+// 缺口 3：改用 RemoveFileUnlocked（统一写守卫）替换直接 os.Remove——只读/未
+// ready/Close 后的 Store 不得绕过守卫修改 workspace。
 func (s *OutlineStore) ClearOutlineFeedback() error {
 	s.io.mu.Lock()
 	defer s.io.mu.Unlock()
-	err := os.Remove(s.io.path(outlineFeedbackFile))
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
+	return s.io.RemoveFileUnlocked(outlineFeedbackFile)
 }

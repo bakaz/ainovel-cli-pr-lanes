@@ -421,7 +421,12 @@ func CheckPolishPipelineGate(st *store.Store, chapter int, expectedPolisherModel
 							chapter, boundSeq, polishCP.Seq, errs.ErrToolPrecondition)
 					}
 					// 复核 bound checkpoint 的完整身份。
-					bound := st.Checkpoints.BySeq(boundSeq)
+					// P0-2：BySeq 发现重复 seq（数据损坏）时返回明确错误，fail-closed。
+					bound, err := st.Checkpoints.BySeq(boundSeq)
+					if err != nil {
+						return fmt.Errorf("pipeline：章节 %d 的 checkpoint 数据损坏（seq=%d）：%w: %w",
+							chapter, boundSeq, errs.ErrToolPrecondition, err)
+					}
 					if bound == nil {
 						return fmt.Errorf("pipeline：章节 %d 绑定的 polish checkpoint seq %d 不存在，请重新执行 polish_draft → check_consistency → review_style: %w",
 							chapter, boundSeq, errs.ErrToolPrecondition)

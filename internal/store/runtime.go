@@ -98,21 +98,33 @@ func taskLogPath(taskID string) string {
 }
 
 // Reset 清空运行时队列和任务日志。
+// 缺口 3：不再直接 os.Remove/RemoveAll/MkdirAll 绕过守卫——修改内存状态和
+// 磁盘前先执行统一写守卫（只读/未 ready/Close 后拒绝），并在 IO 写锁下完成
+// 全部磁盘操作（与其它 IO 写互斥）。
 func (s *RuntimeStore) Reset() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 统一写守卫：任何写入口（含直接 OS 写）先经 IO guard 检查。
+	if err := s.io.guardWrite(); err != nil {
+		return err
+	}
+
+	s.io.mu.Lock()
+	defer s.io.mu.Unlock()
+
+	// 守卫通过后才修改内存状态与磁盘（IO 写锁内）。
 	s.seqLoaded = false
 	s.nextSeqNum = 0
 
 	var errs []string
-	if err := os.Remove(filepath.Join(s.io.dir, runtimeQueuePath)); err != nil && !os.IsNotExist(err) {
+	if err := s.io.RemoveFileUnlocked(runtimeQueuePath); err != nil {
 		errs = append(errs, err.Error())
 	}
-	if err := os.RemoveAll(filepath.Join(s.io.dir, "meta", "runtime", "tasks")); err != nil {
+	if err := s.io.RemoveAllUnlocked("meta/runtime/tasks"); err != nil {
 		errs = append(errs, err.Error())
 	}
-	if err := os.MkdirAll(filepath.Join(s.io.dir, "meta", "runtime", "tasks"), 0o755); err != nil {
+	if err := s.io.EnsureDirs([]string{"meta/runtime/tasks"}); err != nil {
 		errs = append(errs, err.Error())
 	}
 	if len(errs) > 0 {

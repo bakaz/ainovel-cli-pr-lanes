@@ -138,16 +138,21 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 
 	store := storepkg.NewStore(cfg.OutputDir)
 	if err := store.Init(); err != nil {
+		// 复核阻塞项 3：构造失败路径释放已获取的 workspace 锁（Close 幂等；
+		// 锁未获取时 Close 为空操作）。
+		store.Close()
 		return nil, fmt.Errorf("init store: %w", err)
 	}
 	// RunMeta 是所有控制语义的事实源，必须在构造模型/后台任务之前完成校验。
 	// 未知 advance mode 直接返回结构化错误；禁止猜测降级后继续写盘。
 	if err := store.RunMeta.Init(cfg.Style, cfg.Provider, cfg.ModelName); err != nil {
+		store.Close()
 		return nil, fmt.Errorf("init run meta: %w", err)
 	}
 
 	models, err := bootstrap.NewModelSet(cfg)
 	if err != nil {
+		store.Close()
 		return nil, fmt.Errorf("create models: %w", err)
 	}
 	slog.Info("模型就绪", "module", "boot", "summary", models.Summary())
@@ -1054,6 +1059,10 @@ func (h *Host) abortWithEvent(summary, level string) bool {
 func (h *Host) Close() {
 	if h.diagnosticOnly {
 		// 只读诊断 Host：绝不写入任何文件、不持久化 usage、不调用 engine/observer。
+		// store 为只读模式（NewReadOnlyStore，无锁）；Close 为空操作（对称清理）。
+		if h.store != nil {
+			h.store.Close()
+		}
 		h.closeOnce.Do(func() {
 			close(h.done)
 			close(h.events)
@@ -1075,6 +1084,12 @@ func (h *Host) Close() {
 	h.usageCtx = nil
 	if err := h.usage.SaveNow(); err != nil {
 		slog.Warn("usage 退出前落盘失败", "module", "usage", "err", err)
+	}
+	// 复核阻塞项 3：释放 workspace 排他锁（Host 生命周期结束；进程退出时 OS
+	// 也会自动释放，此处保证同进程后续可重新获取——如测试的"先铺状态再开
+	// Host"顺序模式）。
+	if h.store != nil {
+		h.store.Close()
 	}
 	h.closeOnce.Do(func() {
 		close(h.done)

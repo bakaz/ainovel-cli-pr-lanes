@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -756,6 +757,21 @@ func (t *ReviewStyleTool) checkMechanicalGate(chapter int) error {
 		chapter, errs.ErrToolPrecondition)
 }
 
+// mechanicalGateFor 构造 accepted 结果落盘前的机械门禁回调（复核阻塞项 7）：
+// 门禁作为回调移入 CommitReviewResult 临界区内、在 CAS 身份校验（stale 检测）
+// 之后以同一草稿快照执行——critic 调用期间草稿被并发修改时先走 stale 检测标记
+// degraded，不会被门禁提前返回错误而遗留 stranded pending。draft 参数由
+// CommitReviewResult 传入（与 digest 校验同一快照，非空）。
+func (t *ReviewStyleTool) mechanicalGateFor(chapter int) func(draft string) error {
+	return func(draft string) error {
+		if !hasErrorViolations(rules.CheckLiteraryProse(draft)) {
+			return nil
+		}
+		return fmt.Errorf("章节 %d 存在 error 级文学腔硬闸违例，不能接受评审结果：请先修改草稿并重新 check_consistency，再 review_style: %w",
+			chapter, errs.ErrToolPrecondition)
+	}
+}
+
 func (t *ReviewStyleTool) appendInitialResult(chapter int, attemptID string, request *domain.StyleReviewRequest, result *domain.StyleReviewResult, draftDigest, basisDigest string) (json.RawMessage, error) {
 	var nextStatus domain.StyleReviewStatus
 	switch result.Verdict {
@@ -767,15 +783,21 @@ func (t *ReviewStyleTool) appendInitialResult(chapter int, attemptID string, req
 		return t.appendDegraded(chapter, attemptID, draftDigest, basisDigest, request, fmt.Errorf("unexpected verdict %q", result.Verdict))
 	}
 
-	// C2 死锁防护：accepted 落盘前重算机械规则，error 级违例 → 拒绝（账本保持 pending）。
+	// C2 死锁防护：accepted 落盘前重算机械规则，error 级违例 → 拒绝。复核阻塞项 7：
+	// 门禁作为回调移入 CommitReviewResult 临界区内、在 CAS 身份校验（stale 检测）
+	// 之后执行——critic 调用期间草稿被并发修改时先标记 stale，不会被门禁提前返回
+	// 错误而遗留 stranded pending。
+	var gate func(draft string) error
 	if nextStatus == domain.ReviewStatusAcceptedInitial {
-		if err := t.checkMechanicalGate(chapter); err != nil {
-			return nil, err
-		}
+		gate = t.mechanicalGateFor(chapter)
 	}
 
+	// P0-4：CAS 校验 + 落盘原子化。critic 调用期间草稿/账本/polish checkpoint 被
+	// 并发修改（ora-1 死锁根因：critic 接受旧候选时另一在途 polish 覆盖草稿）→
+	// accepted 结果不落盘，attempt 在账本中标记 degraded(stale)，返回明确警告让
+	// writer 重新 review。
 	now := time.Now().Format(time.RFC3339)
-	if err := t.store.StyleReview.Update(chapter, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
+	err := t.store.CommitReviewResult(chapter, attemptID, draftDigest, reviewBoundPolishSeq(request), gate, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
 		if cur == nil {
 			return nil, fmt.Errorf("ledger disappeared during update")
 		}
@@ -792,7 +814,11 @@ func (t *ReviewStyleTool) appendInitialResult(chapter int, attemptID string, req
 			Epoch:       cur.MaxEpoch(),
 		})
 		return cur, nil
-	}); err != nil {
+	})
+	if errors.Is(err, store.ErrReviewStale) {
+		return t.staleReviewOutput(chapter, err)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("append initial result: %w", err)
 	}
 
@@ -810,15 +836,18 @@ func (t *ReviewStyleTool) appendFinalResult(chapter int, attemptID string, reque
 		return nil, fmt.Errorf("unexpected verdict %q for final review", result.Verdict)
 	}
 
-	// C2 死锁防护：accepted 落盘前重算机械规则，error 级违例 → 拒绝（账本保持 pending）。
+	// C2 死锁防护：accepted 落盘前重算机械规则，error 级违例 → 拒绝。复核阻塞项 7：
+	// 门禁作为回调移入 CommitReviewResult 临界区内、在 CAS 身份校验（stale 检测）
+	// 之后执行——critic 调用期间草稿被并发修改时先标记 stale，不会被门禁提前返回
+	// 错误而遗留 stranded pending。
+	var gate func(draft string) error
 	if nextStatus == domain.ReviewStatusAcceptedRev {
-		if err := t.checkMechanicalGate(chapter); err != nil {
-			return nil, err
-		}
+		gate = t.mechanicalGateFor(chapter)
 	}
 
+	// P0-4：CAS 校验 + 落盘原子化（同 appendInitialResult）。
 	now := time.Now().Format(time.RFC3339)
-	if err := t.store.StyleReview.Update(chapter, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
+	err := t.store.CommitReviewResult(chapter, attemptID, draftDigest, reviewBoundPolishSeq(request), gate, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
 		if cur == nil {
 			return nil, fmt.Errorf("ledger disappeared during update")
 		}
@@ -858,11 +887,36 @@ func (t *ReviewStyleTool) appendFinalResult(chapter int, attemptID string, reque
 			Epoch:       cur.MaxEpoch(),
 		})
 		return cur, nil
-	}); err != nil {
+	})
+	if errors.Is(err, store.ErrReviewStale) {
+		return t.staleReviewOutput(chapter, err)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("append final result: %w", err)
 	}
 
 	return t.buildSuccessOutput(chapter, result, nextStatus)
+}
+
+// reviewBoundPolishSeq 返回评审 request 绑定的 polish checkpoint seq（无绑定 = 0）。
+// P0-4 CAS 用它校验"绑定的 polish checkpoint 仍是当前 polish"。
+func reviewBoundPolishSeq(request *domain.StyleReviewRequest) int64 {
+	if request == nil {
+		return 0
+	}
+	return request.PolishCheckpointSeq
+}
+
+// staleReviewOutput 返回评审候选过期（P0-4）的 degraded 摘要：accepted 结果未
+// 落盘，attempt 已在账本中标记 stale（degraded 周期），writer 应重新 review。
+func (t *ReviewStyleTool) staleReviewOutput(chapter int, err error) (json.RawMessage, error) {
+	return json.Marshal(StyleReviewOutput{
+		Chapter:  chapter,
+		Verdict:  "degraded",
+		Status:   string(domain.ReviewStatusDegraded),
+		Degraded: true,
+		Error:    err.Error(),
+	})
 }
 
 // appendDegraded 追加 valid degraded terminal entry，永不 strand pending。

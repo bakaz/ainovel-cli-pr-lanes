@@ -16,6 +16,11 @@ import (
 
 const schemaVersion = 1
 
+// workspaceLockFileName 是 store 层 workspace 跨进程锁文件名（P0-1）：
+// 备份 walk 必须排除——锁文件不参与任何数据读写，Windows 上被 LockFileEx
+// 锁定的字节区间禁止其他句柄读取，纳入备份会导致拷贝失败。
+const workspaceLockFileName = ".writer.lock"
+
 // timeNow can be overridden by tests for deterministic timestamps.
 var timeNow = time.Now
 
@@ -247,6 +252,14 @@ func Backup(sourceDir, projectID string, kind SnapshotKind, volume, arc int) (*M
 		}
 		relPath, _ := filepath.Rel(absSrc, path)
 		if relPath == "." {
+			return nil
+		}
+		// 排除 workspace 跨进程锁文件（P0-1）：锁文件不参与任何数据读写，
+		// 备份它无意义，且 Windows LockFileEx 锁定的字节区间禁止其他句柄读取。
+		if d.Name() == workspaceLockFileName {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		// Exclude backup root

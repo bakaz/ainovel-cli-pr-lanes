@@ -171,31 +171,35 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 		return nil, fmt.Errorf("polish_draft: %w", err)
 	}
 
-	// ── 3. 加载草稿 ──
-	content, wordCount, err := t.store.Drafts.LoadChapterContent(a.Chapter)
+	// ── 3. 复核阻塞项 5：原子捕获 polish 输入基线（草稿快照 + digest + 账本状态
+	//    + polish seq 绑定 + mutation 许可判定，统一锁序内一次读取）──
+	// 基线捕获即拒绝不可修改的账本（terminal/pending/exhausted 锁定；重写队列
+	// 豁免与 CheckStyleReviewMutationGuard 同语义）——guard 判定与捕获之间无
+	// 间隙，杜绝"baseline 捕获时 ledger 已 terminal 仍被接受"的窗口。
+	baseline, err := t.store.CapturePolishBaseline(a.Chapter)
 	if err != nil {
 		return nil, fmt.Errorf("load chapter content: %w: %w", errs.ErrStoreRead, err)
 	}
-	if content == "" {
+	if baseline.Content == "" {
 		return nil, fmt.Errorf("no content found for chapter %d: %w", a.Chapter, errs.ErrToolPrecondition)
 	}
-	inputDigest := domain.DigestDraft(content)
-
-	// ── 4. 修改门禁：terminal 评审状态下的章节不允许精修（fail-fast，避免 polisher 空转） ──
-	if err := CheckStyleReviewMutationGuard(t.store, a.Chapter); err != nil {
-		return nil, fmt.Errorf("polish_draft: %w", err)
+	if !baseline.MutationAllowed {
+		return nil, fmt.Errorf("polish_draft: %s: %w", baseline.MutationBlockedReason, errs.ErrToolPrecondition)
 	}
+	content := baseline.Content
+	wordCount := utf8.RuneCountInString(content)
+	inputDigest := baseline.InputDigest
 
-	// ── 5. 构建任务 payload（草稿 + 评审依据 + 已给意见 + 重写 brief）并调用 polisher ──
+	// ── 4. 构建任务 payload（草稿 + 评审依据 + 已给意见 + 重写 brief）并调用 polisher ──
 	taskText := t.buildPolishTask(a.Chapter, content, wordCount, "")
 	outputText, err := t.runPolisherWithEmptyRetry(ctx, a.Chapter, taskText)
 	if err != nil {
 		// 可降级错误（stream idle / provider timeout / network 类 / MaxTurns）→
 		// 写 degraded polish checkpoint 后返回成功摘要；不可降级原样返回。
-		return t.handlePolisherFailure(a.Chapter, inputDigest, wordCount, err)
+		return t.handlePolisherFailure(a.Chapter, inputDigest, wordCount, baseline, err)
 	}
 
-	// ── 6. 输出解析与执行路径（ora-1 形态 2 + ④）： ──
+	// ── 5. 输出解析与执行路径（ora-1 形态 2 + ④）： ──
 	//    - 成功解析为 edit list → edit 路径：内存中基于同一输入快照逐条验证 +
 	//      按优先级部分接受（单条无效只丢弃该条）→ 一次 SaveDraft → 一个最终
 	//      polish checkpoint（Method=edit_list、EditCount=实际应用数、审计字段）。
@@ -208,15 +212,15 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 		if !fallback {
 			return nil, fmt.Errorf("polisher 输出 edit plan 契约错误：%v: %w", parseErr, errs.ErrToolPrecondition)
 		}
-		return t.applyFullTextPolish(a.Chapter, content, wordCount, inputDigest, outputText)
+		return t.applyFullTextPolish(a.Chapter, content, wordCount, inputDigest, outputText, baseline)
 	}
-	return t.applyEditPlan(a.Chapter, content, wordCount, inputDigest, plan)
+	return t.applyEditPlan(a.Chapter, content, wordCount, inputDigest, plan, baseline)
 }
 
 // applyFullTextPolish 是整章重输出回退路径（旧协议）：polisher 输出无法解析为
 // edit plan（非 JSON/围栏/未知字段/纯正文）时进入。现有校验/落盘/checkpoint
 // 全保留（渐进切换：旧协议模型仍可用），仅 checkpoint 增加 Method=full_text 审计字段。
-func (t *PolishDraftTool) applyFullTextPolish(chapter int, content string, wordCount int, inputDigest, outputText string) (json.RawMessage, error) {
+func (t *PolishDraftTool) applyFullTextPolish(chapter int, content string, wordCount int, inputDigest, outputText string, baseline *store.PolishBaseline) (json.RawMessage, error) {
 	// ── 校验：非空 / UTF-8 / 最短长度（防"好的，已完成精修"式短文本被当正文保存）/
 	// 最大长度 / 非纯 JSON / 非代码围栏整体包裹 ──
 	if strings.TrimSpace(outputText) == "" {
@@ -266,7 +270,7 @@ func (t *PolishDraftTool) applyFullTextPolish(chapter int, content string, wordC
 	// 拒绝走与 edit 路径相同的连续收敛（mechRejectStreak 共享，Method=full_text）。
 	if !hasErrorViolations(computeMechanicalViolations(t.store, content, wordCount)) {
 		if hasErrorViolations(computeMechanicalViolations(t.store, outputText, outputRunes)) {
-			_, summary, mErr := t.mechanicalRegression(chapter, inputDigest, wordCount, "full_text", 0)
+			_, summary, mErr := t.mechanicalRegression(chapter, inputDigest, wordCount, "full_text", 0, baseline)
 			if mErr != nil {
 				return nil, mErr
 			}
@@ -274,26 +278,15 @@ func (t *PolishDraftTool) applyFullTextPolish(chapter int, content string, wordC
 		}
 	}
 
-	// ── 7. 保存为草稿（与 draft_chapter 同路径：SaveDraft + draft checkpoint） ──
+	// ── 7+8. P0-3：CAS 校验 + 原子落盘（保存草稿 → draft checkpoint → polish checkpoint）──
+	// 模型调用期间若草稿/账本/polish checkpoint 被并发修改，候选被丢弃（草稿不
+	// 被覆盖），返回明确错误让 writer 重新走流程。
 	outputDigest := domain.DigestDraft(outputText)
-	if err := t.store.Drafts.SaveDraft(chapter, outputText); err != nil {
-		return nil, fmt.Errorf("save polished draft: %w: %w", errs.ErrStoreWrite, err)
-	}
-	if _, err := t.store.Checkpoints.AppendArtifact(
-		domain.ChapterScope(chapter), "draft",
-		fmt.Sprintf("drafts/%02d.draft.md", chapter),
-	); err != nil {
-		return nil, fmt.Errorf("checkpoint draft after polish: %w", err)
-	}
-
-	// ── 8. 写 polish checkpoint（input_digest/output_digest/polisher_model/stage/changed） ──
 	stage := polishStageForChapter(t.store, chapter)
 	changed := outputDigest != inputDigest
 	polisherModel := t.loadPolisherModelName()
-	if _, err := t.store.Checkpoints.AppendPolish(
-		domain.ChapterScope(chapter), "polish",
-		fmt.Sprintf("drafts/%02d.draft.md", chapter),
-		outputDigest,
+	if _, err := t.store.CommitPolishCandidate(
+		chapter, outputText, baseline,
 		domain.PolishCheckpointMeta{
 			InputDigest:   inputDigest,
 			PolisherModel: polisherModel,
@@ -302,7 +295,11 @@ func (t *PolishDraftTool) applyFullTextPolish(chapter int, content string, wordC
 			Method:        "full_text",
 		},
 	); err != nil {
-		return nil, fmt.Errorf("checkpoint polish: %w", err)
+		if errors.Is(err, store.ErrPolishCandidateStale) {
+			return nil, fmt.Errorf("polish candidate stale: draft changed during polish, discard and retry: %w: %w",
+				errs.ErrToolPrecondition, store.ErrPolishCandidateStale)
+		}
+		return nil, fmt.Errorf("polish commit: %w: %w", errs.ErrStoreWrite, err)
 	}
 	// 成功推进：清零机械回归连续计数（本调用已产出合法结果）。
 	t.mechRejectStreak[chapter] = 0
@@ -334,48 +331,38 @@ func (t *PolishDraftTool) applyFullTextPolish(chapter int, content string, wordC
 //     FSM 收敛到 post-check → 返回成功摘要（Degraded=true）。
 //   - 机械回归且无安全子集 → mechRejectStreak（首次 fail-closed，连续 2 次收敛为
 //     rejected checkpoint）；有安全子集时不增加 streak。
-func (t *PolishDraftTool) applyEditPlan(chapter int, content string, wordCount int, inputDigest string, plan *PolishEditPlan) (json.RawMessage, error) {
+func (t *PolishDraftTool) applyEditPlan(chapter int, content string, wordCount int, inputDigest string, plan *PolishEditPlan, baseline *store.PolishBaseline) (json.RawMessage, error) {
 	res, err := ApplyPolishEditPlanDetailed(content, plan, polishCoverageLimitForChapter(t.store, chapter))
 	if err != nil {
 		// 全无效（原始非空且 0 应用）：degraded 收敛，不再第二次调用 polisher。
-		return t.handleEditPlanRejected(chapter, inputDigest, wordCount, res)
+		return t.handleEditPlanRejected(chapter, inputDigest, wordCount, res, baseline)
 	}
-	res2, summary, mErr := t.salvageMechanical(chapter, content, wordCount, inputDigest, res)
+	res2, summary, mErr := t.salvageMechanical(chapter, content, wordCount, inputDigest, res, baseline)
 	if mErr != nil {
 		return nil, mErr
 	}
 	if summary != nil {
 		return summary, nil
 	}
-	return t.applyEditPlanCandidate(chapter, wordCount, inputDigest, res2)
+	return t.applyEditPlanCandidate(chapter, wordCount, inputDigest, res2, baseline)
 }
 
 // applyEditPlanCandidate 是 edit 候选通过内容校验与机械门禁后的公共收尾：
 // 一次 SaveDraft + draft checkpoint + 一个 polish checkpoint（Method=edit_list、
 // EditCount=实际应用数、ProposedEditCount/DroppedEditCount/DropReasons/
 // NormalizedMatchCount/Partial/MatchModes 审计）→ 成功摘要（不回传全文）。
-func (t *PolishDraftTool) applyEditPlanCandidate(chapter int, wordCount int, inputDigest string, res *PolishEditPlanResult) (json.RawMessage, error) {
-	// ── 原子落盘：一次 SaveDraft + draft checkpoint + 一个 polish checkpoint ──
+func (t *PolishDraftTool) applyEditPlanCandidate(chapter int, wordCount int, inputDigest string, res *PolishEditPlanResult, baseline *store.PolishBaseline) (json.RawMessage, error) {
+	// ── P0-3：CAS 校验 + 原子落盘（一次 SaveDraft + draft checkpoint + 一个 polish
+	//    checkpoint）。模型调用期间草稿/账本/polish checkpoint 被并发修改时候选被
+	//    丢弃（草稿不被覆盖），返回明确错误让 writer 重新走流程。 ──
 	candidate := res.Candidate
 	outputDigest := domain.DigestDraft(candidate)
-	if err := t.store.Drafts.SaveDraft(chapter, candidate); err != nil {
-		return nil, fmt.Errorf("save polished draft: %w: %w", errs.ErrStoreWrite, err)
-	}
-	if _, err := t.store.Checkpoints.AppendArtifact(
-		domain.ChapterScope(chapter), "draft",
-		fmt.Sprintf("drafts/%02d.draft.md", chapter),
-	); err != nil {
-		return nil, fmt.Errorf("checkpoint draft after polish: %w", err)
-	}
-
 	stage := polishStageForChapter(t.store, chapter)
 	changed := outputDigest != inputDigest
 	polisherModel := t.loadPolisherModelName()
 	audit := auditFromResult(res)
-	if _, err := t.store.Checkpoints.AppendPolish(
-		domain.ChapterScope(chapter), "polish",
-		fmt.Sprintf("drafts/%02d.draft.md", chapter),
-		outputDigest,
+	if _, err := t.store.CommitPolishCandidate(
+		chapter, candidate, baseline,
 		domain.PolishCheckpointMeta{
 			InputDigest:          inputDigest,
 			PolisherModel:        polisherModel,
@@ -391,7 +378,11 @@ func (t *PolishDraftTool) applyEditPlanCandidate(chapter int, wordCount int, inp
 			MatchModes:           audit.MatchModes,
 		},
 	); err != nil {
-		return nil, fmt.Errorf("checkpoint polish: %w", err)
+		if errors.Is(err, store.ErrPolishCandidateStale) {
+			return nil, fmt.Errorf("polish candidate stale: draft changed during polish, discard and retry: %w: %w",
+				errs.ErrToolPrecondition, store.ErrPolishCandidateStale)
+		}
+		return nil, fmt.Errorf("polish commit: %w: %w", errs.ErrStoreWrite, err)
 	}
 	// 成功推进：清零机械回归连续计数。
 	t.mechRejectStreak[chapter] = 0
@@ -453,7 +444,7 @@ func auditFromResult(res *PolishEditPlanResult) PolishCheckpointAudit {
 //
 // 返回三元组：res2（安全子集结果）、summary（非 nil = 已写 rejected checkpoint
 // 并返回成功摘要）、err（fail-closed 错误）。
-func (t *PolishDraftTool) salvageMechanical(chapter int, content string, wordCount int, inputDigest string, res *PolishEditPlanResult) (*PolishEditPlanResult, json.RawMessage, error) {
+func (t *PolishDraftTool) salvageMechanical(chapter int, content string, wordCount int, inputDigest string, res *PolishEditPlanResult, baseline *store.PolishBaseline) (*PolishEditPlanResult, json.RawMessage, error) {
 	// 门禁前提：polisher 输入无 error 级机械违规（精修不得引入新的机械违规）。
 	if hasErrorViolations(computeMechanicalViolations(t.store, content, wordCount)) {
 		return res, nil, nil
@@ -481,7 +472,7 @@ func (t *PolishDraftTool) salvageMechanical(chapter int, content string, wordCou
 		}
 	}
 	// 仍无法安全（组合违规/剔除后仍违规）→ mechRejectStreak 收敛。
-	return t.mechanicalRegression(chapter, inputDigest, wordCount, "edit_list", res.ProposedEditCount)
+	return t.mechanicalRegression(chapter, inputDigest, wordCount, "edit_list", res.ProposedEditCount, baseline)
 }
 
 // handleMechanicalRegression 处理机械回归拒绝（循环 B 收敛）。edit 路径与
@@ -496,7 +487,7 @@ func (t *PolishDraftTool) salvageMechanical(chapter int, content string, wordCou
 //     与 provider 降级同路径）→ 收敛到 post-check → check → review，防"精修反复
 //     引入机械违规 → 永久 fail-closed 死循环"。返回成功摘要（Degraded=true +
 //     ErrorCategory=mechanical_regression，调用方继续 post-polish check）。
-func (t *PolishDraftTool) mechanicalRegression(chapter int, inputDigest string, wordCount int, method string, proposedEditCount int) (*PolishEditPlanResult, json.RawMessage, error) {
+func (t *PolishDraftTool) mechanicalRegression(chapter int, inputDigest string, wordCount int, method string, proposedEditCount int, baseline *store.PolishBaseline) (*PolishEditPlanResult, json.RawMessage, error) {
 	t.mechRejectStreak[chapter]++
 	if t.mechRejectStreak[chapter] < 2 {
 		return nil, nil, fmt.Errorf("polisher 候选机械回归：候选引入新的 error 级机械违规，拒绝落盘（草稿未变）；连续 2 次将自动收敛为 rejected checkpoint: %w",
@@ -511,7 +502,7 @@ func (t *PolishDraftTool) mechanicalRegression(chapter int, inputDigest string, 
 	}
 	reason := fmt.Sprintf("polisher 候选连续 2 次引入 error 级机械违规，已写入 rejected polish checkpoint（正文未变，digest=%s）",
 		inputDigest)
-	summary, err := t.writeDegradedPolishCheckpoint(chapter, inputDigest, wordCount, "mechanical_regression", method, audit, reason)
+	summary, err := t.writeDegradedPolishCheckpoint(chapter, inputDigest, wordCount, "mechanical_regression", method, audit, reason, baseline)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -525,7 +516,7 @@ func (t *PolishDraftTool) mechanicalRegression(chapter int, inputDigest string, 
 // （Digest=当前草稿、Changed=false、Method=edit_list、EditCount=0 实际应用数、
 // ProposedEditCount/DroppedEditCount/DropReasons 审计）→ FSM 收敛到 post-check →
 // check → review → commit。返回成功摘要（Degraded=true），不再消耗 writer turns。
-func (t *PolishDraftTool) handleEditPlanRejected(chapter int, inputDigest string, wordCount int, res *PolishEditPlanResult) (json.RawMessage, error) {
+func (t *PolishDraftTool) handleEditPlanRejected(chapter int, inputDigest string, wordCount int, res *PolishEditPlanResult, baseline *store.PolishBaseline) (json.RawMessage, error) {
 	category := "edit_plan_invalid"
 	for _, d := range res.Dropped {
 		if d.DropReason == PolishEditDropCoverageLimit {
@@ -543,7 +534,7 @@ func (t *PolishDraftTool) handleEditPlanRejected(chapter int, inputDigest string
 		len(res.Dropped), category, inputDigest)
 	slog.Warn("polisher edit plan 全部 edit 均被丢弃，已写入 rejected/degraded polish checkpoint",
 		"module", "tools", "chapter", chapter, "category", category, "digest", inputDigest, "drop_reasons", reasons)
-	return t.writeDegradedPolishCheckpoint(chapter, inputDigest, wordCount, category, "edit_list", audit, reason)
+	return t.writeDegradedPolishCheckpoint(chapter, inputDigest, wordCount, category, "edit_list", audit, reason, baseline)
 }
 
 // writeDegradedPolishCheckpoint 写 rejected/degraded 性质 polish checkpoint
@@ -552,13 +543,17 @@ func (t *PolishDraftTool) handleEditPlanRejected(chapter int, inputDigest string
 // 机械回归连续拒绝（mechanicalRegression）的收敛共用此路径：FSM 将 degraded
 // 记录视作合法 polish 记录 → 强制 post-polish check → review，防永久 fail-closed
 // 死循环。checkpoint/store 写失败不可收敛：原样返回（账本未留痕，状态不变）。
-func (t *PolishDraftTool) writeDegradedPolishCheckpoint(chapter int, inputDigest string, wordCount int, category, method string, audit PolishCheckpointAudit, reason string) (json.RawMessage, error) {
+//
+// 复核阻塞项 6：写 checkpoint 走 store 层原子方法 CommitDegradedPolishCheckpoint
+// （统一锁序内验证 digest + 账本基线 + polish 基线后追加）——替换旧的"读后再写"
+// 预检，校验与追加之间无窗口；模型调用期间草稿已被并发修改（inputDigest 不再
+// 是当前草稿 digest）时跳过写入、返回 stale 错误，绝不写绑定旧 digest 的陈旧
+// checkpoint。
+func (t *PolishDraftTool) writeDegradedPolishCheckpoint(chapter int, inputDigest string, wordCount int, category, method string, audit PolishCheckpointAudit, reason string, baseline *store.PolishBaseline) (json.RawMessage, error) {
 	polisherModel := t.loadPolisherModelName()
 	stage := polishStageForChapter(t.store, chapter)
-	if _, aErr := t.store.Checkpoints.AppendPolish(
-		domain.ChapterScope(chapter), "polish",
-		fmt.Sprintf("drafts/%02d.draft.md", chapter),
-		inputDigest,
+	if _, aErr := t.store.CommitDegradedPolishCheckpoint(
+		chapter, baseline,
 		domain.PolishCheckpointMeta{
 			InputDigest:          inputDigest,
 			PolisherModel:        polisherModel,
@@ -576,6 +571,10 @@ func (t *PolishDraftTool) writeDegradedPolishCheckpoint(chapter int, inputDigest
 			MatchModes:           audit.MatchModes,
 		},
 	); aErr != nil {
+		if errors.Is(aErr, store.ErrPolishCandidateStale) {
+			return nil, fmt.Errorf("degraded polish candidate stale: draft changed during polish, discard and retry (不写陈旧绑定): %w: %w",
+				errs.ErrToolPrecondition, store.ErrPolishCandidateStale)
+		}
 		return nil, fmt.Errorf("checkpoint polish (degraded): %w", aErr)
 	}
 	slog.Warn("已写入 rejected/degraded polish checkpoint", "module", "tools", "chapter", chapter,
@@ -774,7 +773,7 @@ func classifyPolishDegradableError(err error) (string, bool) {
 // 降级只允许一次：同一 digest 已存在 degraded polish 记录时不再重复降级（原样返回
 // 错误）——正常情况下 FSM 在 degraded 后已不允许再次 polish_draft（stage 为
 // needs_post_polish_check），本守卫是纵深防御，防"降级 → 重派 → 再降级"自循环。
-func (t *PolishDraftTool) handlePolisherFailure(chapter int, inputDigest string, wordCount int, err error) (json.RawMessage, error) {
+func (t *PolishDraftTool) handlePolisherFailure(chapter int, inputDigest string, wordCount int, baseline *store.PolishBaseline, err error) (json.RawMessage, error) {
 	category, degradable := classifyPolishDegradableError(err)
 	if !degradable {
 		return nil, err
@@ -782,13 +781,13 @@ func (t *PolishDraftTool) handlePolisherFailure(chapter int, inputDigest string,
 	if cp := t.store.Checkpoints.LatestByStep(domain.ChapterScope(chapter), "polish"); cp != nil && cp.Degraded && cp.Digest == inputDigest {
 		return nil, err
 	}
-
+	// 复核阻塞项 6：降级留痕走 store 层原子 CAS——模型调用期间草稿/账本/polish
+	// checkpoint 被并发修改时不写绑定旧 digest 的陈旧 degraded checkpoint
+	// （返回 stale 错误，writer 重新走流程）。
 	polisherModel := t.loadPolisherModelName()
 	stage := polishStageForChapter(t.store, chapter)
-	if _, aErr := t.store.Checkpoints.AppendPolish(
-		domain.ChapterScope(chapter), "polish",
-		fmt.Sprintf("drafts/%02d.draft.md", chapter),
-		inputDigest,
+	if _, aErr := t.store.CommitDegradedPolishCheckpoint(
+		chapter, baseline,
 		domain.PolishCheckpointMeta{
 			InputDigest:   inputDigest,
 			PolisherModel: polisherModel,
@@ -798,6 +797,10 @@ func (t *PolishDraftTool) handlePolisherFailure(chapter int, inputDigest string,
 			ErrorCategory: category,
 		},
 	); aErr != nil {
+		if errors.Is(aErr, store.ErrPolishCandidateStale) {
+			return nil, fmt.Errorf("polisher 失败但草稿已在调用期间被修改，不写降级绑定（避免陈旧绑定）: %w: %w",
+				errs.ErrToolPrecondition, store.ErrPolishCandidateStale)
+		}
 		// checkpoint/store 写失败不可降级：原样返回（账本未留痕，状态不变）。
 		return nil, fmt.Errorf("checkpoint polish (degraded): %w", aErr)
 	}

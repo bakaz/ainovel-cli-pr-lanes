@@ -53,7 +53,9 @@ type UsageMetrics struct {
 // 工件读取错误不静默吞：文件不存在视为"无数据"，其余（损坏/无权限）记入 LoadErrors，
 // 避免"读不到 pending 文件"被误判成"没有 pending"而 false pass（fail-loud）。
 func Collect(dir string, runtimeErr error) Collected {
-	s := store.NewStore(dir)
+	// 复核阻塞项 2 只读模式：离线采集只读，用 NewReadOnlyStore（不取 workspace
+	// 排他锁——采集可能发生在引擎仍在运行/刚退出时）。
+	s := store.NewReadOnlyStore(dir)
 	rep, _ := diag.Diagnose(s)
 
 	var loadErrors []string

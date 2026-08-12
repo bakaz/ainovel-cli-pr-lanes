@@ -2554,3 +2554,209 @@ func TestPolishDraft_EditListPartialCheckpointAudit(t *testing.T) {
 		t.Errorf("polisher calls = %d, want 1", calls)
 	}
 }
+
+// ── P0-3：polish 落盘前原子 CAS（防 TOCTOU）────────────────────────────
+
+// TestPolishDraft_CandidateStaleDraftChanged_FullText 覆盖 P0-3 核心场景
+// （ora-1 死锁根因：critic 接受旧候选时另一在途 polish 覆盖草稿）：模型调用
+// 期间草稿被并发修改 → full-text 候选被丢弃（草稿不被覆盖）、不写 polish
+// checkpoint、返回明确 stale 错误。
+func TestPolishDraft_CandidateStaleDraftChanged_FullText(t *testing.T) {
+	const draft = "她站在窗前。这个句子很长很长，长到读起来非常累，一点都不顺口。"
+	st := setupPolishStore(t, 1, draft)
+	concurrent := draft + "\n\n并发修改的内容。"
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		// 模拟模型调用期间另一在途流程覆盖草稿（TOCTOU 窗口）。
+		if err := st.Drafts.SaveDraft(1, concurrent); err != nil {
+			return nil, err
+		}
+		return &agentcore.LLMResponse{Message: polisherText("她倚窗而立。短句更有力，节奏明快。")}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("expected stale error when draft changed during polish")
+	}
+	if !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("expected stale error message, got: %v", err)
+	}
+
+	// 草稿必须保持并发修改后的内容，绝不能被 polisher 候选覆盖。
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != concurrent {
+		t.Fatalf("draft must not be overwritten by stale candidate, got %q", snippet(saved))
+	}
+	// 候选被丢弃：不写 polish checkpoint。
+	if n := polishCheckpointCount(t, st, 1); n != 0 {
+		t.Errorf("no polish checkpoint should be written for stale candidate, got %d", n)
+	}
+}
+
+// TestPolishDraft_CandidateStaleDraftChanged_EditList 同场景的 edit_list 路径：
+// 模型返回 edit 候选、落盘前草稿已被并发修改 → 候选丢弃、草稿不被覆盖。
+func TestPolishDraft_CandidateStaleDraftChanged_EditList(t *testing.T) {
+	draft := mechCleanDraft("她站在窗前，望着远处的灯火。")
+	st := setupPolishStore(t, 1, draft)
+	savePermissiveUserRules(t, st)
+	concurrent := draft + "\n\n并发修改的内容。"
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		if err := st.Drafts.SaveDraft(1, concurrent); err != nil {
+			return nil, err
+		}
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"她站在窗前", "她倚窗而立"}))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("expected stale error, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != concurrent {
+		t.Fatalf("draft must not be overwritten by stale edit-list candidate, got %q", snippet(saved))
+	}
+	if n := polishCheckpointCount(t, st, 1); n != 0 {
+		t.Errorf("no polish checkpoint should be written for stale candidate, got %d", n)
+	}
+}
+
+// TestPolishDraft_CandidateStaleLedgerChanged 覆盖 P0-3 CAS #2：模型调用期间
+// style review 账本被并发修改（新 pending 周期，草稿进入评审锁定期）→ 候选
+// 同样被丢弃。
+func TestPolishDraft_CandidateStaleLedgerChanged(t *testing.T) {
+	draft := mechCleanDraft("她站在窗前，望着远处的灯火。")
+	st := setupPolishStore(t, 1, draft)
+	savePermissiveUserRules(t, st)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		// 模拟模型调用期间另一评审流程创建 pending 账本周期。
+		if err := st.StyleReview.Save(domain.StyleReviewLedger{
+			SchemaVersion: 1, Chapter: 1, Mode: domain.StyleQualityCritic,
+			Cycles: []domain.StyleReviewEntry{{
+				Cycle: 1, Status: domain.ReviewStatusInitialPending,
+				CreatedAt:   time.Now().Format(time.RFC3339),
+				AttemptID:   "concurrent-attempt",
+				DraftDigest: domain.DigestDraft(draft),
+				BasisDigest: "sha256:" + strings.Repeat("b", 64),
+				Request:     &domain.StyleReviewRequest{Prompt: "v1", Model: "m"},
+			}},
+		}); err != nil {
+			return nil, err
+		}
+		return &agentcore.LLMResponse{Message: polisherText(editListJSON([2]string{"她站在窗前", "她倚窗而立"}))}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("expected stale error when ledger changed during polish, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Fatalf("draft must remain unchanged when candidate stale, got %q", snippet(saved))
+	}
+	if n := polishCheckpointCount(t, st, 1); n != 0 {
+		t.Errorf("no polish checkpoint should be written for stale candidate, got %d", n)
+	}
+}
+
+// TestPolishDraft_CandidateStalePolishAdvanced 覆盖 P0-3 CAS #3：模型调用期间
+// 出现更新的 polish checkpoint（顺序绑定被抢先）→ 候选丢弃。
+func TestPolishDraft_CandidateStalePolishAdvanced(t *testing.T) {
+	const draft = "她站在窗前。这个句子很长很长，长到读起来非常累，一点都不顺口。"
+	st := setupPolishStore(t, 1, draft)
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		// 模拟模型调用期间另一流程抢先建立新 polish checkpoint。
+		if _, err := st.Checkpoints.AppendPolish(
+			domain.ChapterScope(1), "polish", "drafts/01.draft.md",
+			"sha256:"+strings.Repeat("a", 64),
+			domain.PolishCheckpointMeta{InputDigest: "sha256:" + strings.Repeat("b", 64), Stage: "draft"},
+		); err != nil {
+			return nil, err
+		}
+		return &agentcore.LLMResponse{Message: polisherText("她倚窗而立。短句更有力，节奏明快。")}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("expected stale error when polish checkpoint advanced, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != draft {
+		t.Fatalf("draft must remain unchanged, got %q", snippet(saved))
+	}
+}
+
+// ── P1-7（P0-3 遗留）：degraded/rejected 收敛路径的 digest 预检 ─────────
+// 正常路径（CommitPolishCandidate）有 CAS 校验；degraded 路径（provider 失败 /
+// 全部 edit 被丢弃 / 机械回归收敛）此前直接写绑定"模型调用开始时 digest"的
+// checkpoint，草稿被并发修改时会留下陈旧绑定。修复后写 checkpoint 前预检
+// digest，不匹配则跳过写入并返回 stale 错误（与正常路径语义一致）。
+
+// TestPolishDraft_DegradedConvergenceStaleDraftNoBinding 覆盖 edit 全丢弃收敛
+// （handleEditPlanRejected → writeDegradedPolishCheckpoint）：模型调用期间草稿
+// 被并发修改 → 不写绑定旧 digest 的陈旧 degraded checkpoint、返回 stale 错误。
+func TestPolishDraft_DegradedConvergenceStaleDraftNoBinding(t *testing.T) {
+	draft := mechCleanDraft("她站在窗前，望着远处的灯火。晚风拂过她的发梢。")
+	st := setupPolishStore(t, 1, draft)
+	concurrent := draft + "\n\n并发修改。"
+	// 整章覆盖 → 超过 50% 覆盖上限 → 全部丢弃 → 收敛路径（degraded）。
+	badPlan := editListJSON([2]string{draft, "她倚窗而立，望向远方的灯火。晚风拂过她的发梢。"})
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		// 模拟模型调用期间草稿被并发修改（TOCTOU 窗口）。
+		if err := st.Drafts.SaveDraft(1, concurrent); err != nil {
+			return nil, err
+		}
+		return &agentcore.LLMResponse{Message: polisherText(badPlan)}, nil
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("expected stale error when draft changed during polish (收敛不写陈旧绑定)")
+	}
+	if !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("expected stale error message, got: %v", err)
+	}
+	// 草稿保持并发修改后的内容，绝不被覆盖。
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != concurrent {
+		t.Fatalf("draft must not be overwritten, got %q", snippet(saved))
+	}
+	// 不写陈旧绑定的 degraded checkpoint。
+	if n := polishCheckpointCount(t, st, 1); n != 0 {
+		t.Errorf("no stale degraded checkpoint should be written, got %d", n)
+	}
+}
+
+// TestPolishDraft_DegradedProviderFailureStaleDraftNoBinding 覆盖 provider 失败
+// 降级路径（handlePolisherFailure）：同样执行 digest 预检，草稿被并发修改时
+// 不写陈旧绑定。
+func TestPolishDraft_DegradedProviderFailureStaleDraftNoBinding(t *testing.T) {
+	const draft = "她站在窗前。这个句子很长很长，长到读起来非常累，一点都不顺口。"
+	st := setupPolishStore(t, 1, draft)
+	concurrent := draft + "\n\n并发修改。"
+	polisher := newMockPolisher(func(i int, _ []agentcore.Message) (*agentcore.LLMResponse, error) {
+		if err := st.Drafts.SaveDraft(1, concurrent); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("provider stream idle timeout: %w", agentcore.ErrProviderStreamIdle)
+	})
+	tool := newEnabledPolishTool(st, polisher)
+
+	_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err == nil {
+		t.Fatal("expected stale error when draft changed during polish (provider 降级不写陈旧绑定)")
+	}
+	if !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("expected stale error message, got: %v", err)
+	}
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != concurrent {
+		t.Fatalf("draft must not be overwritten, got %q", snippet(saved))
+	}
+	if n := polishCheckpointCount(t, st, 1); n != 0 {
+		t.Errorf("no stale degraded checkpoint should be written, got %d", n)
+	}
+}

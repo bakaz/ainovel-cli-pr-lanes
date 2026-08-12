@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -13,7 +14,11 @@ func newTestCheckpointStore(t *testing.T) (*CheckpointStore, string) {
 	t.Helper()
 	dir := t.TempDir()
 	io := newIO(dir)
-	return NewCheckpointStore(io), dir
+	cs, err := NewCheckpointStore(io)
+	if err != nil {
+		t.Fatalf("NewCheckpointStore: %v", err)
+	}
+	return cs, dir
 }
 
 func TestCheckpointStore_AppendAndQuery(t *testing.T) {
@@ -86,7 +91,10 @@ func TestCheckpointStore_AppendPolish(t *testing.T) {
 	}
 
 	// 磁盘 round-trip：新实例从 jsonl 恢复元数据（最新一条）
-	cs2 := NewCheckpointStore(newIO(dir))
+	cs2, err := NewCheckpointStore(newIO(dir))
+	if err != nil {
+		t.Fatalf("NewCheckpointStore: %v", err)
+	}
 	got := cs2.LatestByStep(domain.ChapterScope(3), "polish")
 	if got == nil {
 		t.Fatal("polish checkpoint missing after restore")
@@ -129,14 +137,96 @@ func TestCheckpointStore_BySeq(t *testing.T) {
 	cp1, _ := cs.Append(domain.ChapterScope(1), "plan", "a", "sha256:1")
 	cp2, _ := cs.Append(domain.ChapterScope(1), "draft", "b", "sha256:2")
 
-	if got := cs.BySeq(cp1.Seq); got == nil || got.Step != "plan" {
+	got, err := cs.BySeq(cp1.Seq)
+	if err != nil {
+		t.Fatalf("BySeq(%d): %v", cp1.Seq, err)
+	}
+	if got == nil || got.Step != "plan" {
 		t.Fatalf("BySeq(%d) = %+v, want plan", cp1.Seq, got)
 	}
-	if got := cs.BySeq(cp2.Seq); got == nil || got.Step != "draft" {
+	got, err = cs.BySeq(cp2.Seq)
+	if err != nil {
+		t.Fatalf("BySeq(%d): %v", cp2.Seq, err)
+	}
+	if got == nil || got.Step != "draft" {
 		t.Fatalf("BySeq(%d) = %+v, want draft", cp2.Seq, got)
 	}
-	if got := cs.BySeq(cp2.Seq + 999); got != nil {
+	got, err = cs.BySeq(cp2.Seq + 999)
+	if err != nil {
+		t.Fatalf("BySeq(unknown): %v", err)
+	}
+	if got != nil {
 		t.Fatalf("BySeq(unknown) = %+v, want nil", got)
+	}
+}
+
+// TestCheckpointStore_BySeqDuplicate 验证重复 seq（数据损坏）时 BySeq 返回明确
+// 错误而非任取一条（P0-2：历史根因——重复 seq 下 BySeq 可能取到错误记录）。
+func TestCheckpointStore_BySeqDuplicate(t *testing.T) {
+	dir := t.TempDir()
+	// 手工构造重复 seq 文件：seq=1 出现两次（step=plan / step=polish）。
+	lines := []string{
+		`{"seq":1,"scope":{"kind":"chapter","chapter":1},"step":"plan","occurred_at":"2026-01-01T00:00:00Z"}`,
+		`{"seq":1,"scope":{"kind":"chapter","chapter":1},"step":"polish","occurred_at":"2026-01-01T00:00:01Z"}`,
+	}
+	data := ""
+	for _, l := range lines {
+		data += l + "\n"
+	}
+	jsonlPath := filepath.Join(dir, checkpointsFile)
+	if err := os.MkdirAll(filepath.Dir(jsonlPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jsonlPath, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 加载 fail-closed：NewCheckpointStore 直接报数据损坏错误。
+	if _, err := NewCheckpointStore(newIO(dir)); err == nil {
+		t.Fatal("expected corruption error on duplicate seq at load")
+	} else if !strings.Contains(err.Error(), "重复") {
+		t.Fatalf("expected '重复' corruption error, got: %v", err)
+	}
+
+	// BySeq：手工构造重复 seq 的 cache（绕过加载校验，直接注入）。
+	cs := &CheckpointStore{io: newIO(dir)}
+	cs.cache = []domain.Checkpoint{
+		{Seq: 1, Scope: domain.ChapterScope(1), Step: "plan"},
+		{Seq: 1, Scope: domain.ChapterScope(1), Step: "polish"},
+	}
+	if _, err := cs.BySeq(1); err == nil {
+		t.Fatal("expected corruption error on duplicate seq in BySeq")
+	} else if !strings.Contains(err.Error(), "重复") {
+		t.Fatalf("expected '重复' corruption error, got: %v", err)
+	}
+}
+
+// TestCheckpointStore_LoadNonMonotonic 验证序号倒退（数据损坏）时加载 fail-closed。
+func TestCheckpointStore_LoadNonMonotonic(t *testing.T) {
+	dir := t.TempDir()
+	lines := []string{
+		`{"seq":1,"scope":{"kind":"chapter","chapter":1},"step":"plan","occurred_at":"2026-01-01T00:00:00Z"}`,
+		`{"seq":3,"scope":{"kind":"chapter","chapter":1},"step":"draft","occurred_at":"2026-01-01T00:00:01Z"}`,
+		`{"seq":2,"scope":{"kind":"chapter","chapter":1},"step":"polish","occurred_at":"2026-01-01T00:00:02Z"}`,
+	}
+	data := ""
+	for _, l := range lines {
+		data += l + "\n"
+	}
+	jsonlPath := filepath.Join(dir, checkpointsFile)
+	if err := os.MkdirAll(filepath.Dir(jsonlPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jsonlPath, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := NewCheckpointStore(newIO(dir))
+	if err == nil {
+		t.Fatal("expected corruption error on non-monotonic seq at load")
+	}
+	if !strings.Contains(err.Error(), "倒退") {
+		t.Fatalf("expected '倒退' corruption error, got: %v", err)
 	}
 }
 
@@ -201,14 +291,20 @@ func TestCheckpointStore_Reset(t *testing.T) {
 func TestCheckpointStore_RestoreFromDisk(t *testing.T) {
 	dir := t.TempDir()
 	io1 := newIO(dir)
-	cs1 := NewCheckpointStore(io1)
+	cs1, err := NewCheckpointStore(io1)
+	if err != nil {
+		t.Fatalf("NewCheckpointStore: %v", err)
+	}
 	cs1.Append(domain.ChapterScope(1), "plan", "p", "sha256:1")
 	cs1.Append(domain.ChapterScope(1), "draft", "d", "sha256:2")
 	cs1.Append(domain.ChapterScope(2), "plan", "p2", "sha256:3")
 
 	// 模拟重启：新实例从同一目录加载
 	io2 := newIO(dir)
-	cs2 := NewCheckpointStore(io2)
+	cs2, err := NewCheckpointStore(io2)
+	if err != nil {
+		t.Fatalf("NewCheckpointStore: %v", err)
+	}
 
 	if all := cs2.All(); len(all) != 3 {
 		t.Fatalf("restored cache len want 3 got %d", len(all))

@@ -268,6 +268,9 @@ func TestOutlineFeedbackPool(t *testing.T) {
 	}
 
 	// 跨重启(新 Store 实例)可读——不是内存态
+	// 单写者语义（复核阻塞项 2 方案 A）：同一 workspace 同一进程只允许一个可写
+	// Store，模拟重启前先释放（数据已持久化在磁盘）。
+	s.Close()
 	s2 := NewStore(dir)
 	fbs := s2.Outline.LoadPendingOutlineFeedback()
 	if len(fbs) != 2 || fbs[0].Chapter != 3 || fbs[1].Suggestion != "反派提前登场" {

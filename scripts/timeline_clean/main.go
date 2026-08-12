@@ -57,6 +57,12 @@ func main() {
 	flag.Parse()
 
 	st := store.NewStore(*dir)
+	// 复核阻塞项 4：可写 Store 入口统一 fail-closed（workspace 锁失败 /
+	// checkpoint 损坏时不写盘）。
+	if err := st.Init(); err != nil {
+		fail("store 不可用（workspace 锁或 checkpoint 校验失败）: %v", err)
+	}
+	defer st.Close()
 	world := st.World
 
 	events, err := world.LoadTimeline()

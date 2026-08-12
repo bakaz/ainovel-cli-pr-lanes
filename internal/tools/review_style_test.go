@@ -4426,3 +4426,136 @@ func TestReviewStyle_TaskBasisBeforeDraft(t *testing.T) {
 		t.Errorf("basis JSON（critic_version）必须出现在草稿全文之前\n任务文本:\n%s", taskText)
 	}
 }
+
+// ── P0-4：review 落盘前验证候选（防 TOCTOU）───────────────────────────
+
+// TestReviewStyle_CandidateStaleDraftChanged 覆盖 P0-4 核心场景（ora-1 死锁
+// 根因：critic 接受旧候选时另一在途 polish 覆盖草稿）：critic 调用期间草稿被
+// 并发修改 → accepted_* 结果不落盘、attempt 标记 degraded(stale)、返回 degraded
+// 摘要让 writer 重新 review。
+func TestReviewStyle_CandidateStaleDraftChanged(t *testing.T) {
+	st := setupCriticStore(t, 1, "第一章正文。这是一个测试草稿内容。")
+	concurrent := mechCleanDraft("第一章正文。并发修改后的内容。")
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		// 模拟 critic 调用期间另一在途流程（polish/其它 writer）覆盖草稿。
+		if err := st.Drafts.SaveDraft(1, concurrent); err != nil {
+			return nil, err
+		}
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute must return degraded output (not hard error): %v", err)
+	}
+	var output StyleReviewOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded {
+		t.Fatalf("expected degraded(stale) output, got %+v", output)
+	}
+	if !strings.Contains(output.Error, "stale") {
+		t.Errorf("expected stale warning in output, got %q", output.Error)
+	}
+
+	// accepted_* 不落盘：账本最后周期必须是 degraded（stale 标记），而非 accepted。
+	ledger, err := st.StyleReview.Load(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ledger.CurrentStatus() != domain.ReviewStatusDegraded {
+		t.Fatalf("expected degraded (stale marker), got %s", ledger.CurrentStatus())
+	}
+	last := ledger.CurrentCycle()
+	if last.AttemptID == "" || last.Error == "" {
+		t.Errorf("stale marker must carry attempt + cause, got %+v", last)
+	}
+	// 草稿保持并发修改后的内容。
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != concurrent {
+		t.Errorf("draft = %q, want concurrent content %q", saved, concurrent)
+	}
+}
+
+// TestReviewStyle_CandidateStalePolishAdvanced 覆盖 P0-4 CAS #3：critic 调用
+// 期间出现更新的 polish checkpoint（评审绑定的 polish 不再是当前 polish）→
+// 同样丢弃 accepted 结果并标记 stale。
+func TestReviewStyle_CandidateStalePolishAdvanced(t *testing.T) {
+	st := setupCriticStore(t, 1, "第一章正文。这是一个测试草稿内容。")
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		// 模拟 critic 调用期间另一在途 polish 抢先建立新 checkpoint。
+		if _, err := st.Checkpoints.AppendPolish(
+			domain.ChapterScope(1), "polish", "drafts/01.draft.md",
+			"sha256:"+strings.Repeat("a", 64),
+			domain.PolishCheckpointMeta{InputDigest: "sha256:" + strings.Repeat("b", 64), Stage: "draft"},
+		); err != nil {
+			return nil, err
+		}
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute must return degraded output (not hard error): %v", err)
+	}
+	var output StyleReviewOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || !strings.Contains(output.Error, "stale") {
+		t.Fatalf("expected degraded(stale) output, got %+v", output)
+	}
+	ledger, _ := st.StyleReview.Load(1)
+	if ledger.CurrentStatus() != domain.ReviewStatusDegraded {
+		t.Fatalf("expected degraded (stale marker), got %s", ledger.CurrentStatus())
+	}
+}
+
+// ── 复核阻塞项 7：机械门禁在 CAS 临界区内（stale 检测先于门禁）────────────
+
+// TestReviewStyle_CandidateStaleMechanicalGateOrder 覆盖复核阻塞项 7：critic
+// 调用期间草稿被并发修改为带文学腔 error 的内容 → stale 检测必须先于机械门禁：
+// 返回 degraded(stale) 摘要、账本标记 degraded（不遗留 stranded pending）。
+// 旧实现门禁在 CAS 之外先读新草稿 → 直接返回门禁错误 → pending 滞留死锁。
+func TestReviewStyle_CandidateStaleMechanicalGateOrder(t *testing.T) {
+	st := setupCriticStore(t, 1, "第一章正文。这是一个测试草稿内容。")
+	// 否定修正句 ≥3（12 类硬闸第 1 类，error 级文学腔违例）——与
+	// TestReviewStyle_MechanicalErrorBlocksAccepted 同一违例模式。
+	concurrent := "他不是怕死，而是怕疼。他不是退缩，而是等待。他不是沉默，而是蓄力。"
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		// 模拟 critic 调用期间另一在途流程覆盖草稿为带机械违例的内容。
+		if err := st.Drafts.SaveDraft(1, concurrent); err != nil {
+			return nil, err
+		}
+		return &agentcore.LLMResponse{Message: criticText(productionPassJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute must return degraded output (stale first, not mechanical-gate hard error): %v", err)
+	}
+	var output StyleReviewOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || !strings.Contains(output.Error, "stale") {
+		t.Fatalf("expected degraded(stale) output, got %+v", output)
+	}
+	// 账本标记 degraded（stale），不遗留 stranded pending。
+	ledger, err := st.StyleReview.Load(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ledger.CurrentStatus() != domain.ReviewStatusDegraded {
+		t.Fatalf("expected degraded (stale marker), got %s", ledger.CurrentStatus())
+	}
+	// 草稿保持并发修改后的机械违例内容（未被覆盖）。
+	saved, _, _ := st.Drafts.LoadChapterContent(1)
+	if saved != concurrent {
+		t.Errorf("draft = %q, want concurrent content %q", saved, concurrent)
+	}
+}

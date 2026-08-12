@@ -726,6 +726,170 @@ func TestComputeChapterStage(t *testing.T) {
 			required:   ChapterActionEdit,
 			nextAction: "edit_chapter",
 		},
+		// ── P1-5：terminal ledger 与当前草稿 digest 不匹配（非返工章节）→ blocked ──
+		// ch450 死锁根因：accepted_revised + digest 不匹配 + polish 陈旧时，pipeline
+		// freshness 分支先返回 needs_polish，FSM 允许 polish_draft 但 mutation guard
+		// 对 terminal 锁定拒绝修改 → 模型照 required 调用必被拒，无限重派。
+		// 修复后必须早于 pipeline freshness 返回 blocked。
+		{
+			name: "accepted_revised digest mismatch stale polish -> blocked",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d2,
+				ReviewLedger:      mkLedger(domain.ReviewStatusAcceptedRev, d),
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageBlocked,
+			nextAction: "",
+		},
+		{
+			name: "accepted_initial digest mismatch stale polish -> blocked",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d2,
+				ReviewLedger:      mkLedger(domain.ReviewStatusAcceptedInitial, d),
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageBlocked,
+			nextAction: "",
+		},
+		// overridden 同样是 terminal 锁定（guard 拒绝修改）→ blocked。
+		{
+			name: "overridden digest mismatch stale polish -> blocked",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d2,
+				ReviewLedger:      mkLedger(domain.ReviewStatusOverridden, d),
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageBlocked,
+			nextAction: "",
+		},
+		// P1-6：mismatch 必须早于 consistency/机械违规分支——terminal 锁定的章节
+		// 返回 draft_dirty/needs_edit（允许 draft/edit）同样会被 guard 拒绝。
+		{
+			name: "accepted_initial digest mismatch stale consistency -> blocked",
+			in: ChapterStageInput{
+				StyleReviewMode: critic,
+				DraftExists:     true, DraftDigest: d2,
+				ReviewLedger:      mkLedger(domain.ReviewStatusAcceptedInitial, d),
+				LatestConsistency: consistencyCP(1, d),
+			},
+			want:       ChapterStageBlocked,
+			nextAction: "",
+		},
+		{
+			name: "accepted_initial digest mismatch mech errors -> blocked",
+			in: ChapterStageInput{
+				StyleReviewMode: critic,
+				DraftExists:     true, DraftDigest: d2,
+				ReviewLedger:        mkLedger(domain.ReviewStatusAcceptedInitial, d),
+				LatestConsistency:   consistencyCP(8, d2),
+				HasMechanicalErrors: true,
+			},
+			want:       ChapterStageBlocked,
+			nextAction: "",
+		},
+		// 返工章节（InRewriteQueue）terminal mismatch → 行为不变：guard 允许修改，
+		// stale polish → needs_polish（合法新周期，不是死锁）。
+		{
+			name: "rewrite terminal mismatch stale polish -> needs_polish",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				DraftExists: true, DraftDigest: d2, FinalExists: true, FinalDigest: final,
+				ReviewLedger:      mkLedger(domain.ReviewStatusAcceptedInitial, d),
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCP(7, d, "rewrite", ""),
+			},
+			want:       ChapterStageNeedsPolish,
+			allowed:    []ChapterAction{ChapterActionPolish},
+			required:   ChapterActionPolish,
+			nextAction: "polish_draft",
+		},
+		// 返工章节 + terminal mismatch + polish 新鲜 → 行为不变（needs_review 开新 epoch）。
+		{
+			name: "rewrite terminal mismatch fresh polish -> needs_review",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				DraftExists: true, DraftDigest: d2, FinalExists: true, FinalDigest: final,
+				ReviewLedger:      mkLedger(domain.ReviewStatusAcceptedInitial, d),
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCP(7, d2, "rewrite", ""),
+			},
+			want:       ChapterStageNeedsReview,
+			allowed:    []ChapterAction{ChapterActionReview},
+			required:   ChapterActionReview,
+			nextAction: "review_style",
+		},
+		// degraded 不被 P1-5 误伤：degraded 是评审调用故障（非锁定），guard 允许
+		// 修改，digest 不匹配 + stale polish → needs_polish（合法新周期）。
+		{
+			name: "degraded digest mismatch stale polish -> needs_polish",
+			in: ChapterStageInput{
+				PipelineEnabled: true, StyleReviewMode: critic,
+				DraftExists: true, DraftDigest: d2,
+				ReviewLedger:      mkLedger(domain.ReviewStatusDegraded, d),
+				LatestConsistency: consistencyCP(8, d2), LatestPolish: polishCP(7, d, "draft", ""),
+			},
+			want:       ChapterStageNeedsPolish,
+			allowed:    []ChapterAction{ChapterActionPolish},
+			required:   ChapterActionPolish,
+			nextAction: "polish_draft",
+		},
+		// ── 阻塞项 8：非返工 terminal ledger + 草稿丢失 → blocked（guard 因
+		// terminal 拒绝 draft_chapter，needs_draft 会破坏 FSM/guard 不变量）──
+		{
+			name: "terminal ledger no draft -> blocked",
+			in: ChapterStageInput{
+				StyleReviewMode: critic,
+				ReviewLedger:    mkLedger(domain.ReviewStatusAcceptedInitial, d),
+			},
+			want:       ChapterStageBlocked,
+			nextAction: "",
+		},
+		{
+			name: "accepted_revised ledger no draft -> blocked",
+			in: ChapterStageInput{
+				StyleReviewMode: critic,
+				ReviewLedger:    mkLedger(domain.ReviewStatusAcceptedRev, d),
+			},
+			want:       ChapterStageBlocked,
+			nextAction: "",
+		},
+		// 返工队列 terminal + 无草稿 → 保持 rewrite_not_started（guard 允许
+		// 重写开始：rewriteNotStarted + terminal → 放行）。
+		{
+			name: "rewrite terminal no draft -> rewrite_not_started",
+			in: ChapterStageInput{
+				StyleReviewMode: critic, Completed: true, InRewriteQueue: true,
+				ReviewLedger: mkLedger(domain.ReviewStatusAcceptedInitial, d),
+			},
+			want:       ChapterStageRewriteNotStarted,
+			allowed:    []ChapterAction{ChapterActionDraft, ChapterActionEdit},
+			required:   ChapterActionEdit,
+			nextAction: "edit_chapter",
+		},
+		// degraded + 无草稿 → 保持允许起草（guard 放行 degraded 的修改）。
+		{
+			name: "degraded no draft -> needs_draft",
+			in: ChapterStageInput{
+				StyleReviewMode: critic,
+				ReviewLedger:    mkLedger(domain.ReviewStatusDegraded, d),
+			},
+			want:       ChapterStageNeedsDraft,
+			allowed:    []ChapterAction{ChapterActionDraft},
+			required:   ChapterActionDraft,
+			nextAction: "draft_chapter",
+		},
+		// 无账本 + 无草稿 → 保持 needs_draft（新章节首次起草不受影响）。
+		{
+			name: "no ledger no draft -> needs_draft",
+			in: ChapterStageInput{
+				StyleReviewMode: critic,
+			},
+			want:       ChapterStageNeedsDraft,
+			allowed:    []ChapterAction{ChapterActionDraft},
+			required:   ChapterActionDraft,
+			nextAction: "draft_chapter",
+		},
 	}
 
 	for _, tc := range tests {

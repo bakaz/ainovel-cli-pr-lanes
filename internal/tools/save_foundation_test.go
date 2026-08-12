@@ -933,6 +933,7 @@ func TestSaveFoundationExpandArcValidatesScenes(t *testing.T) {
 	}
 
 	// 2. 缺 goal 的 object scene → 拒绝
+	s.Close()                 // 复核阻塞项 2 单写者语义：重建前释放 workspace 锁
 	s2 := store.NewStore(dir) // 复用同一目录重新加载
 	s2.Progress.Init("test", 5)
 	expansionWithMissing := map[string]any{
@@ -969,6 +970,7 @@ func TestSaveFoundationExpandArcValidatesScenes(t *testing.T) {
 	}
 
 	// 3. 旧 string scenes 兼容通过
+	s2.Close() // 复核阻塞项 2 单写者语义：重建前释放 workspace 锁
 	s3 := store.NewStore(dir)
 	s3.Progress.Init("test", 5)
 	if err := s3.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
@@ -997,6 +999,7 @@ func TestSaveFoundationExpandArcValidatesScenes(t *testing.T) {
 	}
 
 	// 4. action-only object 不是 legacy，应拒绝
+	s3.Close() // 复核阻塞项 2 单写者语义：重建前释放 workspace 锁
 	s4 := store.NewStore(dir)
 	s4.Progress.Init("test", 5)
 	if err := s4.Outline.SaveLayeredOutline([]domain.VolumeOutline{{
@@ -1074,6 +1077,7 @@ func TestSaveFoundationAppendVolumeValidatesScenes(t *testing.T) {
 	}
 
 	// 2. 旧 string scenes 兼容通过
+	s.Close() // 复核阻塞项 2 单写者语义：重建前释放 workspace 锁
 	s2 := store.NewStore(dir)
 	s2.Progress.Init("test", 0)
 	if err := s2.Progress.SetLayered(true); err != nil {
