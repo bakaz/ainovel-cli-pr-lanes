@@ -61,11 +61,17 @@ func (cs *CheckpointStore) loadFromDisk() error {
 
 // validateCheckpointSequence 检查 checkpoint 序列完整性（P0-2，fail closed）：
 // 重复 seq / 序号倒退 / 同 seq 不同 step 身份 → 数据损坏错误，不继续运行。
+// 无 seq 字段的记录（Seq==0，旧格式/手工 seed 记录，如 seeded arc_summary）
+// 不参与序列校验——它们没有 seq 身份，不影响 BySeq/LatestByStep 的 seq 语义。
 func validateCheckpointSequence(cps []domain.Checkpoint) error {
 	stepBySeq := make(map[int64]string, len(cps))
 	prevSeq := int64(0)
-	for i, cp := range cps {
-		if i > 0 && cp.Seq <= prevSeq {
+	seenNonZero := false
+	for _, cp := range cps {
+		if cp.Seq == 0 {
+			continue
+		}
+		if seenNonZero && cp.Seq <= prevSeq {
 			if cp.Seq == prevSeq {
 				return fmt.Errorf("checkpoint 数据损坏：seq=%d 重复（step=%s / step=%s）",
 					cp.Seq, stepBySeq[cp.Seq], cp.Step)
@@ -75,6 +81,7 @@ func validateCheckpointSequence(cps []domain.Checkpoint) error {
 		}
 		stepBySeq[cp.Seq] = cp.Step
 		prevSeq = cp.Seq
+		seenNonZero = true
 	}
 	return nil
 }

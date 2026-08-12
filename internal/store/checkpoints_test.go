@@ -421,3 +421,35 @@ func countLines(data []byte) int {
 	}
 	return n
 }
+
+func TestValidateCheckpointSequenceSkipsNoSeqRecords(t *testing.T) {
+	// 无 seq 字段的旧格式/手工 seed 记录（Seq==0）不参与序列校验。
+	ok := []domain.Checkpoint{
+		{Seq: 1, Step: "draft", Scope: domain.ChapterScope(1)},
+		{Seq: 0, Step: "arc_summary", Scope: domain.Scope{Kind: "arc", Volume: 2, Arc: 1}}, // seeded，无 seq
+		{Seq: 2, Step: "polish", Scope: domain.ChapterScope(1)},
+		{Seq: 3, Step: "commit", Scope: domain.ChapterScope(1)},
+	}
+	if err := validateCheckpointSequence(ok); err != nil {
+		t.Fatalf("expected no error for sequence with no-seq record, got %v", err)
+	}
+
+	// 有 seq 的重复仍报错
+	dup := []domain.Checkpoint{
+		{Seq: 1, Step: "draft", Scope: domain.ChapterScope(1)},
+		{Seq: 1, Step: "plan", Scope: domain.ChapterScope(1)},
+	}
+	if err := validateCheckpointSequence(dup); err == nil {
+		t.Fatal("expected duplicate seq error")
+	}
+
+	// 有 seq 的倒退仍报错
+	reg := []domain.Checkpoint{
+		{Seq: 5, Step: "commit", Scope: domain.ChapterScope(1)},
+		{Seq: 0, Step: "arc_summary", Scope: domain.Scope{Kind: "arc"}}, // 无 seq 跳过
+		{Seq: 3, Step: "plan", Scope: domain.ChapterScope(1)},
+	}
+	if err := validateCheckpointSequence(reg); err == nil {
+		t.Fatal("expected regression seq error")
+	}
+}
