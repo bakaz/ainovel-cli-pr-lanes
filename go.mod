@@ -9,6 +9,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/voocel/agentcore v1.7.13
+	golang.org/x/sys v0.38.0
 	golang.org/x/text v0.40.0
 )
 
@@ -32,5 +33,9 @@ require (
 	github.com/voocel/litellm v1.8.8 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/image v0.44.0 // indirect
-	golang.org/x/sys v0.38.0 // indirect
 )
+
+// Local fork of litellm: relaxes the openai provider's thinking-parameter
+// handling so thinking (disabled/enabled+effort) is passed through to the
+// endpoint for non-reasoning models (e.g. deepseek-v4-flash via proxy).
+replace github.com/voocel/litellm => ./.slim/forks/litellm
