@@ -16,12 +16,13 @@ const (
 	ScopeArchitect RuleScope = "architect"
 	ScopeWriter    RuleScope = "writer"
 	ScopeEditor    RuleScope = "editor"
+	ScopePolisher  RuleScope = "polisher"
 )
 
 func ParseRuleScope(v string) (RuleScope, bool) {
 	s := RuleScope(strings.ToLower(strings.TrimSpace(v)))
 	switch s {
-	case ScopeDefault, ScopeArchitect, ScopeWriter, ScopeEditor:
+	case ScopeDefault, ScopeArchitect, ScopeWriter, ScopeEditor, ScopePolisher:
 		return s, true
 	default:
 		return "", false
@@ -35,12 +36,13 @@ type PreferenceRule struct {
 	Source string `json:"source,omitempty"`
 }
 
-// PreferenceBuckets 保持四个简单分区；UnmarshalJSON 同时兼容 v1 字符串。
+// PreferenceBuckets 保持五个简单分区；UnmarshalJSON 同时兼容 v1 字符串。
 type PreferenceBuckets struct {
 	Default   []PreferenceRule `json:"default,omitempty"`
 	Architect []PreferenceRule `json:"architect,omitempty"`
 	Writer    []PreferenceRule `json:"writer,omitempty"`
 	Editor    []PreferenceRule `json:"editor,omitempty"`
+	Polisher  []PreferenceRule `json:"polisher,omitempty"`
 }
 
 func (b *PreferenceBuckets) UnmarshalJSON(data []byte) error {
@@ -69,6 +71,7 @@ func (b *PreferenceBuckets) Normalize() {
 	b.Architect = normalizePreferenceRules(b.Architect)
 	b.Writer = normalizePreferenceRules(b.Writer)
 	b.Editor = normalizePreferenceRules(b.Editor)
+	b.Polisher = normalizePreferenceRules(b.Polisher)
 }
 
 func (b *PreferenceBuckets) Append(scope RuleScope, source, text string) PreferenceRule {
@@ -127,6 +130,9 @@ func (b PreferenceBuckets) TextForRole(role string) string {
 		scopes = []RuleScope{ScopeDefault, ScopeWriter}
 	case "editor":
 		scopes = []RuleScope{ScopeDefault, ScopeWriter, ScopeEditor}
+	case "polisher":
+		// polisher 既看 writer 规则（精修需遵循写作偏好），也看专属 polisher 规则。
+		scopes = []RuleScope{ScopeDefault, ScopeWriter, ScopePolisher}
 	default:
 		scopes = []RuleScope{ScopeDefault}
 	}
@@ -160,13 +166,15 @@ func (b *PreferenceBuckets) list(scope RuleScope) *[]PreferenceRule {
 		return &b.Writer
 	case ScopeEditor:
 		return &b.Editor
+	case ScopePolisher:
+		return &b.Polisher
 	default:
 		return &b.Default
 	}
 }
 
 func allRuleScopes() []RuleScope {
-	return []RuleScope{ScopeDefault, ScopeArchitect, ScopeWriter, ScopeEditor}
+	return []RuleScope{ScopeDefault, ScopeArchitect, ScopeWriter, ScopeEditor, ScopePolisher}
 }
 
 func newPreferenceRule(source, text string) PreferenceRule {

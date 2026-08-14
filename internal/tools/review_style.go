@@ -1003,10 +1003,10 @@ func buildCriticBasis(st *store.Store, chapter int, criticPromptHash string) dom
 	return buildStyleBasis(st, chapter, criticPromptHash, "editor")
 }
 
-// buildPolishBasis 是 polisher 使用的 basis：用户规则使用 writer 视图
-// （default+writer），与 Writer 角色看到的分区一致；不注入 editor/architect 专属规则。
+// buildPolishBasis 是 polisher 使用的 basis：用户规则使用 polisher 视图
+// （default+writer+polisher——polisher 既遵循写作偏好，也遵循专属 polisher 规则）。
 func buildPolishBasis(st *store.Store, chapter int, polisherPromptHash string) domain.ReviewBasis {
-	return buildStyleBasis(st, chapter, polisherPromptHash, "writer")
+	return buildStyleBasis(st, chapter, polisherPromptHash, "polisher")
 }
 
 // loadScopedCompassProseDialogueTaboos loads the compass with chapter-scoped

@@ -129,6 +129,7 @@ type normalizedPreferences struct {
 	Architect string
 	Writer    string
 	Editor    string
+	Polisher  string
 }
 
 func (p *normalizedPreferences) UnmarshalJSON(data []byte) error {
@@ -142,6 +143,7 @@ func (p *normalizedPreferences) UnmarshalJSON(data []byte) error {
 		Architect string `json:"architect"`
 		Writer    string `json:"writer"`
 		Editor    string `json:"editor"`
+		Polisher  string `json:"polisher"`
 	}
 	if err := json.Unmarshal(data, &buckets); err != nil {
 		return err
@@ -150,6 +152,7 @@ func (p *normalizedPreferences) UnmarshalJSON(data []byte) error {
 	p.Architect = strings.TrimSpace(buckets.Architect)
 	p.Writer = strings.TrimSpace(buckets.Writer)
 	p.Editor = strings.TrimSpace(buckets.Editor)
+	p.Polisher = strings.TrimSpace(buckets.Polisher)
 	return nil
 }
 
@@ -157,6 +160,7 @@ func (p normalizedPreferences) values() (string, map[rules.RuleScope]string) {
 	scoped := map[rules.RuleScope]string{
 		rules.ScopeDefault: p.Default, rules.ScopeArchitect: p.Architect,
 		rules.ScopeWriter: p.Writer, rules.ScopeEditor: p.Editor,
+		rules.ScopePolisher: p.Polisher,
 	}
 	for scope, text := range scoped {
 		if strings.TrimSpace(text) == "" {
