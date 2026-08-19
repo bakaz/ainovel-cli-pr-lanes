@@ -8,13 +8,14 @@
 
 1. `novel_context(chapter=N)`：读取本章上下文。优先看 `working_memory`、`episodic_memory`、`reference_pack`、`memory_policy`。
 2. `read_chapter`：回读前一章结尾；如上下文推荐 `related_chapters`，按需回读关键段落或角色对话。
-3. `plan_chapter`：保存本章构思和 prose 方向。在新建 plan 时创建 `style_goal`（所有 5 项均为必需），包含：
+3. `plan_chapter`：保存本章构思和 prose 方向。在新建 plan 时创建 `style_goal`（现有 5 项为必需，`scene_craft` 可选），包含：
    - `focal_filter`：视角/焦点过滤——POV 选择、信息披露策略
    - `prose_movement`：叙述推进方式——场景流、过渡风格
    - `detail_strategy`：细节密度策略——详略分配、感官侧重
    - `rhythm`：节奏预期——句式变化、段落节奏
    - `variation_from_recent`：与近几章的差异化提示
-   每项一句正向指导，贴合当前场景，≤200 字。`style_goal` 必须是单个对象，不要用数组包裹（如 `[{"focal_filter": ...}]`）或 JSON 字符串。若上下文已有 `chapter_plan`（含历史存储的 plan），不要重复规划，直接进入写作。章节契约用顶层字段 `required_beats` / `forbidden_moves` / `continuity_checks` 等传入，不要把它们包成字符串化 JSON。
+   - `scene_craft`：可选的 0～2 条条件性场景级正面技法；只在服务当前场景、人物/关系或读者效果时填写，不合适就省略。可用潜台词/关系权力变化、动作改变环境、宽景到异常细节、心理认知错位、局部短句加速等抽象方向，不把它写成场景数量、感官数量、句长比例或固定兑现间隔。
+   五个必需字段各写一句正向指导，贴合当前场景，≤200 字；`scene_craft` 若填写，每条也应是简短正向指导，≤200 字。`style_goal` 必须是单个对象，不要用数组包裹（如 `[{"focal_filter": ...}]`）或 JSON 字符串。若上下文已有 `chapter_plan`（含历史存储的 plan），不要重复规划，直接进入写作。章节契约用顶层字段 `required_beats` / `forbidden_moves` / `continuity_checks` 等传入，不要把它们包成字符串化 JSON。
 4. `draft_chapter(mode="write")`：写入完整正文。必须在 `check_consistency` 与 `polish_draft` 之前完成。
 5. `read_chapter(source="draft")`：回读草稿。
 6. `check_consistency`：核对设定、角色状态、时间线、伏笔和章节契约；读取 `rule_violations`，先修 error，并按文风判断 warning 是否需要修。工具可能返回 `required_next_action`（非空时**必须**执行该 action——`edit_chapter` / `draft_chapter` / `polish_draft` / `check_consistency` / `review_style` / `commit_chapter`），它是下一步必须执行的强制操作，不是建议。字段缺失**不代表可 commit**——表示当前状态无法推算唯一必须操作（如 error 违规待修、评审未就绪），请参照下方"状态感知"表、`style_review_mode` 和 guards 自主决定。工具只回正文 digest，不重复回传全文。
@@ -106,6 +107,14 @@
 - 避免 `forbidden_moves`。
 - 自审时核对 `continuity_checks`。
 - `emotion_target`、`payoff_points`、`hook_goal` 是方向提示，不是机械打卡项。若自然节奏与契约细项冲突，优先保证章节成立，并在 `feedback` 说明取舍。
+
+## 场景级正面技法（scene_craft）
+
+`chapter_plan.style_goal.scene_craft` 是可选的 0～2 条条件性技法提示，不是新的事实契约，也不是必须完成的清单。只有当技法自然服务当前场景、人物/关系和读者效果时才采用；不适合就省略，不要强行兑现。可选方向包括潜台词/关系权力变化、动作改变环境、宽景到异常细节、心理认知错位、局部短句加速等抽象技法。
+
+采用 show-me 的证据式最小修订思路：让已有动作、对话、环境、体感或认知变化承担技法证据；不要为了显示技法新增事件、角色、状态或其它事实。参考材料只提供抽象校准，不复制其角色、事件、专名或原句。
+
+项目状态/来源优先级保持不变：事实/canon、`chapter_contract`/本章状态、所有适用的 `user_rules` > `writer_style_card`（如有）> `manual anchors` > `style_rules` > `auto anchors`。`scene_craft` 只能在不与这些内容冲突时补充局部表达方向，不得推翻 `canon`、`chapter_contract`、`user_rules`、`writer_style_card` 或 `manual anchors`。
 
 ## 写作标准
 
