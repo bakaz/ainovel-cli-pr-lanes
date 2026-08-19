@@ -347,9 +347,9 @@ func BuildWorkers(
 		)
 	}
 
-	architectModel := models.ForRoleWithFailover("architect", reportFailover)
-	writerModel := models.ForRoleWithFailover("writer", reportFailover)
-	editorModel := models.ForRoleWithFailover("editor", reportFailover)
+	architectModel := WithTrailingAntiRefusal(models.ForRoleWithFailover("architect", reportFailover), store)
+	writerModel := WithTrailingAntiRefusal(models.ForRoleWithFailover("writer", reportFailover), store)
+	editorModel := WithTrailingAntiRefusal(models.ForRoleWithFailover("editor", reportFailover), store)
 
 	// Writer 的 ContextManager 由工厂每次调用重建，窗口随模型 swap 动态跟随（见下方工厂）。
 	_, writerModelName, _ := models.CurrentSelection("writer")
@@ -382,7 +382,7 @@ func BuildWorkers(
 	cacheBase := promptCacheBase(store.Dir())
 
 	// ── 风格批评者子代理（纯文本一次性评审，无工具） ──
-	criticModel := models.ForRoleWithFailover("critic", reportFailover)
+	criticModel := WithTrailingAntiRefusal(models.ForRoleWithFailover("critic", reportFailover), store)
 	// 批评者提示词身份：实际 prompt 内容的 sha256 前缀（可溯源）
 	promptHash := sha256.Sum256([]byte(bundle.Prompts.StyleCritic))
 	criticPromptHash := "prompt:" + hex.EncodeToString(promptHash[:8])
@@ -560,7 +560,7 @@ func BuildWorkers(
 	// GenerationConfig.MaxTokens=65536 会把 75-97K 字符的 thinking 截断（thinking 与
 	// 最终回答共用 max_tokens 预算），与 MaxTurns 卡死同源——显式放宽为模型真实上限，
 	// 为 thinking+正文留足余量且不超过模型上限。其他 agent 不设置（保持默认 65536）。
-	polisherModel := models.ForRoleWithFailover("polisher", reportFailover)
+	polisherModel := WithTrailingAntiRefusal(models.ForRoleWithFailover("polisher", reportFailover), store)
 	_, polisherModelName, _ := models.CurrentSelection("polisher")
 	polisherContextWindow, polisherSource := cfg.ResolveContextWindow(polisherModelName)
 	bootstrap.LogContextWindowChoice("polisher", polisherModelName, polisherContextWindow, polisherSource)

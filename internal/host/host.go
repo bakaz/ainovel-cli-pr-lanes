@@ -200,7 +200,7 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 		thinkingApplier: applyThinking,
 		askUser:         askUser,
 		writerRestore:   restore,
-		userRules:       userrules.NewService(store, models.Default, rules.DefaultOptions()),
+		userRules:       userrules.NewService(store, agents.WithTrailingAntiRefusal(models.Default, store), rules.DefaultOptions()),
 		usage:           usage,
 		usageCtx:        usageCtx,
 		usageCancel:     usageCancel,
@@ -269,7 +269,7 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 		store:           store,
 		workers:         workers,
 		contract:        contract,
-		arbiterModel:    newUsageTrackedModel(models.Default, usage.Record),
+		arbiterModel:    agents.WithTrailingAntiRefusal(newUsageTrackedModel(models.Default, usage.Record), store),
 		failurePrompt:   bundle.Prompts.ArbiterFailure,
 		planStartPrompt: bundle.Prompts.ArbiterPlanStart,
 		style:           cfg.Style,
@@ -324,7 +324,7 @@ func (h *Host) PrepareUserRules(rawPrompt string) error {
 	if h.isRestoring() {
 		return fmt.Errorf("恢复操作进行中")
 	}
-	svc := userrules.NewService(h.store, h.models.Default, rules.DefaultOptions())
+	svc := userrules.NewService(h.store, agents.WithTrailingAntiRefusal(h.models.Default, h.store), rules.DefaultOptions())
 	snap, err := svc.Build(context.Background(), rawPrompt)
 	if err != nil {
 		return fmt.Errorf("用户规则快照落盘失败，无法继续: %w", err)
@@ -336,7 +336,7 @@ func (h *Host) PrepareUserRules(rawPrompt string) error {
 // ensureUserRules 在恢复路径确保快照存在；缺失时按
 // system_defaults + rules 文件生成。
 func (h *Host) ensureUserRules() {
-	svc := userrules.NewService(h.store, h.models.Default, rules.DefaultOptions())
+	svc := userrules.NewService(h.store, agents.WithTrailingAntiRefusal(h.models.Default, h.store), rules.DefaultOptions())
 	snap, err := svc.GetOrBuild(context.Background())
 	if err != nil {
 		slog.Warn("用户规则快照读取/生成失败，运行时将退到内置默认", "module", "rules", "err", err)
@@ -728,7 +728,7 @@ func newInterventionFailureEvent(err error) Event {
 
 // arbiterModel 返回带用量追踪的裁定模型(token/成本进预算与 usage 系统)。
 func (h *Host) arbiterModel() agentcore.ChatModel {
-	return newUsageTrackedModel(h.models.Default, h.usage.Record)
+	return agents.WithTrailingAntiRefusal(newUsageTrackedModel(h.models.Default, h.usage.Record), h.store)
 }
 
 // InterventionOutcome 一次干预处理的结果（同步调用方用；TUI 异步路径忽略）。
@@ -1743,7 +1743,7 @@ func (h *Host) CoCreateStream(ctx context.Context, history []CoCreateMessage, on
 	if h.isRestoring() {
 		return CoCreateReply{}, fmt.Errorf("恢复操作进行中")
 	}
-	return coCreateStream(ctx, h.models, h.store.Sessions, coCreateSystemPrompt, history, onProgress)
+	return coCreateStream(ctx, h.models, h.store, coCreateSystemPrompt, history, onProgress)
 }
 
 // StageCoCreateStream 阶段共创：在已写内容的基础上规划后续方向。
@@ -1757,7 +1757,7 @@ func (h *Host) StageCoCreateStream(ctx context.Context, history []CoCreateMessag
 	if h.isRestoring() {
 		return CoCreateReply{}, fmt.Errorf("恢复操作进行中")
 	}
-	return coCreateStream(ctx, h.models, h.store.Sessions, stageSystemPrompt(h.store), history, onProgress)
+	return coCreateStream(ctx, h.models, h.store, stageSystemPrompt(h.store), history, onProgress)
 }
 
 // stagePlanPrefix 把共创产出的"后续方向 brief"包装成一条阶段规划干预，交 Arbiter 裁定。
@@ -1887,7 +1887,7 @@ func (h *Host) ImportFrom(ctx context.Context, opts imp.Options) (<-chan imp.Eve
 	deps := imp.Deps{
 		Store:      h.store,
 		CommitTool: tools.NewCommitChapterTool(h.store),
-		LLM:        h.models.ForRole("architect"),
+		LLM:        agents.WithTrailingAntiRefusal(h.models.ForRole("architect"), h.store),
 		Prompts: imp.Prompts{
 			Foundation: h.bundle.Prompts.ImportFoundation,
 			Analyzer:   h.bundle.Prompts.ImportAnalyzer,
@@ -1931,7 +1931,7 @@ func (h *Host) Simulate(ctx context.Context) (<-chan sim.Event, error) {
 	}
 	deps := sim.Deps{
 		Store: h.store,
-		LLM:   h.models.ForRole("architect"),
+		LLM:   agents.WithTrailingAntiRefusal(h.models.ForRole("architect"), h.store),
 		Prompts: sim.Prompts{
 			Source: h.bundle.Prompts.SimulationSource,
 			Merge:  h.bundle.Prompts.SimulationMerge,

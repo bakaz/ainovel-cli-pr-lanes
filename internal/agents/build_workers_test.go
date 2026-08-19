@@ -869,3 +869,30 @@ func TestBuildWorkers_ChapterFSMWiring(t *testing.T) {
 		checkInjected(t, runner, tools.ChapterFSMConfig{Enabled: true})
 	})
 }
+
+func TestBuildWorkers_WrapsModelsWithTrailingReminder(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	bundle := assets.Load("default", assets.LoadOptions{})
+	cfg := bootstrap.Config{
+		Provider: "ollama", ModelName: "dummy-model", Style: "default",
+		Providers: map[string]bootstrap.ProviderConfig{"ollama": {BaseURL: "http://0.0.0.0:0"}},
+	}
+	models, err := bootstrap.NewModelSet(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, _, _, _ := BuildWorkers(cfg, st, models, bundle, nil, nil, projectprofile.NewCore4Contract())
+	for _, name := range []string{"architect_short", "architect_long", "writer", "editor", "polisher"} {
+		ac, ok := runner.AgentConfig(name)
+		if !ok {
+			t.Fatalf("missing agent %s", name)
+		}
+		if !hasTrailingReminder(ac.Model) {
+			t.Errorf("%s model is not wrapped with trailing reminder", name)
+		}
+	}
+}

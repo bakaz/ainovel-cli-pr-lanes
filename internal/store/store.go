@@ -85,6 +85,7 @@ type Store struct {
 	ProjectProfile  *ProjectProfileStore
 	PlanningArchive *PlanningArchiveStore
 	StyleReview     *StyleReviewStore
+	AntiRefusal     *AntiRefusalStore
 
 	crossMu sync.Mutex // 保护跨域原子操作
 
@@ -182,6 +183,7 @@ func newStoreInternal(dir string, readOnly bool, readyErr error, loadCheckpoints
 		ProjectProfile:  NewProjectProfileStore(mkIO()),
 		PlanningArchive: NewPlanningArchiveStore(mkIO()),
 		StyleReview:     NewStyleReviewStore(mkIO()),
+		AntiRefusal:     NewAntiRefusalStore(mkIO()),
 	}
 }
 

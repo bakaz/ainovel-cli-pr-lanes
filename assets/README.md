@@ -9,6 +9,7 @@
 | `references/genres/<style>/` | 题材专属知识（style-references / arc-templates） | 同上，`style != default` 时加载 | `load.go` loadReferences |
 | `rules/` | 已废弃的旧内置规则目录；机械基线已迁到代码，用户规则来自 `~/.ainovel/rules/*.md` / `./.ainovel/rules/*.md` 的自然语言快照 | `userrules.Service` 归一化为 `meta/user_rules.json`；`novel_context` 注入；`commit_chapter` 检查 | 内置基线见 `internal/rules/snapshot.go` 的 `SystemDefaults()`；用户 `.md` 零格式、零 YAML，按自然语言归一化 |
 | `styles/<style>.md` | 题材写作风格指令 | 拼进 **writer** 的 system prompt（`agents/build.go`） | 文件名即 `config.style` 取值。与 `references/genres/<style>/` 是同一题材概念的两种载体：前者是风格指令，后者是知识材料 |
+| `prompts/anti-refusal.md` | 尾部防拒写样例 | 仅当本书有非空 `meta/anti_refusal.md` 时，接到每次 LLM 请求最后一条 system | **不自动落盘**。把样例复制到 `<outputDir>/meta/anti_refusal.md` 才注入；缺文件/空文件不注入。不进角色 overlay、不进 user_rules |
 
 ## 新内容归属判断（五问）
 

@@ -28,6 +28,14 @@ type customizationInspection struct {
 	StyleRules      inspectedFile         `json:"style_rules"`
 	StyleAnchors    inspectedStyleAnchors `json:"style_anchors"`
 	OverlayWarnings []string              `json:"overlay_warnings,omitempty"`
+	AntiRefusal     inspectedAntiRefusal  `json:"anti_refusal"`
+}
+
+type inspectedAntiRefusal struct {
+	Path    string `json:"path"`
+	Status  string `json:"status"`
+	SHA256  string `json:"sha256,omitempty"`
+	Warning string `json:"warning,omitempty"`
 }
 
 type inspectedResource struct {
@@ -177,6 +185,11 @@ func inspectCustomizations(argv []string) int {
 	}
 	report.StyleAnchors.Valid = anchorResult.Status == store.StatusValid || anchorResult.Status == store.StatusEmptyValid || anchorResult.Status == store.StatusLegacyFormat
 	report.StyleAnchors.SHA256, _ = fileSHA256(anchorsPath)
+
+	anti := st.AntiRefusal.Load()
+	report.AntiRefusal = inspectedAntiRefusal{
+		Path: anti.Path, Status: string(anti.Status), SHA256: anti.SHA256, Warning: anti.Warning,
+	}
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
