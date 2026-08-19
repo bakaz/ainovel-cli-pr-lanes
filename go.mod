@@ -38,4 +38,4 @@ require (
 // Local fork of litellm: relaxes the openai provider's thinking-parameter
 // handling so thinking (disabled/enabled+effort) is passed through to the
 // endpoint for non-reasoning models (e.g. deepseek-v4-flash via proxy).
-replace github.com/voocel/litellm => ./.slim/forks/litellm
+replace github.com/voocel/litellm => ./third_party/litellm
