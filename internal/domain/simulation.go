@@ -127,6 +127,42 @@ type SimulationCompactProfile struct {
 	RoleGuidance     SimulationRoleGuidance     `json:"role_guidance,omitempty"`
 }
 
+// SimulationRoleProjection is the bounded, role-specific view of a compact
+// simulation profile. It contains abstract reference signals only; source
+// reports and source prose are intentionally not part of this view.
+type SimulationRoleProjection struct {
+	Version     string   `json:"version"`
+	UpdatedAt   string   `json:"updated_at,omitempty"`
+	Role        string   `json:"role"`
+	SourceCount int      `json:"source_count"`
+	SourceFiles []string `json:"source_files,omitempty"`
+
+	RoleGuidance []string `json:"role_guidance,omitempty"`
+
+	// Architect reference DNA: macro pacing, emotional progression, conflict
+	// escalation, and hook construction. It deliberately excludes prose-level
+	// writer signals.
+	MacroPacing          []string              `json:"macro_pacing,omitempty"`
+	EmotionalProgression []string              `json:"emotional_progression,omitempty"`
+	ConflictEscalation   []string              `json:"conflict_escalation,omitempty"`
+	Hooks                *SimulationHookDesign `json:"hooks,omitempty"`
+
+	// Writer reference DNA: abstract prose controls and explicit do-not-copy
+	// constraints. It deliberately excludes plot and outline structures.
+	NarrativeDistance []string `json:"narrative_distance,omitempty"`
+	SentenceRhythm    []string `json:"sentence_rhythm,omitempty"`
+	DetailStrategy    []string `json:"detail_strategy,omitempty"`
+	DialogueVoice     []string `json:"dialogue_voice,omitempty"`
+	DoNotCopy         []string `json:"do_not_copy,omitempty"`
+
+	// Editor reference DNA: audit anchors, similarity-risk signals, and
+	// anti-similarity checks. These are checks and abstractions, not source
+	// excerpts.
+	StyleDrift           []string `json:"style_drift,omitempty"`
+	RhythmSimilarityRisk []string `json:"rhythm_similarity_risk,omitempty"`
+	AntiSimilarityChecks []string `json:"anti_similarity_checks,omitempty"`
+}
+
 func SimulationSourceFingerprint(relativePath, sha256 string) string {
 	return strings.TrimSpace(relativePath) + ":" + strings.TrimSpace(sha256)
 }
@@ -251,6 +287,109 @@ func compactSimulationItems(items []string) []string {
 	out := make([]string, limit)
 	copy(out, items[:limit])
 	return out
+}
+
+// ProjectSimulationProfile returns the compact role view used by
+// novel_context. The persisted SimulationProfile remains the single source
+// model; this helper only projects its existing synthesis fields.
+func ProjectSimulationProfile(p *SimulationProfile, role string) *SimulationRoleProjection {
+	compact := CompactSimulationProfile(p)
+	if compact == nil {
+		return nil
+	}
+	return compact.ProjectRole(role)
+}
+
+// ProjectRole projects an already compact profile for architect, writer, or
+// editor. Unknown roles return nil so callers can preserve the legacy compact
+// view for older/other callers.
+func (p *SimulationCompactProfile) ProjectRole(role string) *SimulationRoleProjection {
+	if p == nil {
+		return nil
+	}
+	role = strings.ToLower(strings.TrimSpace(role))
+	projection := &SimulationRoleProjection{
+		Version:     p.Version,
+		UpdatedAt:   p.UpdatedAt,
+		Role:        role,
+		SourceCount: p.SourceCount,
+		SourceFiles: append([]string(nil), p.SourceFiles...),
+	}
+
+	switch role {
+	case "architect":
+		projection.RoleGuidance = compactSimulationItems(p.RoleGuidance.Architect)
+		projection.MacroPacing = compactSimulationRoleItems(
+			p.PacingDensity.SceneDensity,
+			p.PacingDensity.InformationRelease,
+			p.PacingDensity.CompressionRules,
+		)
+		projection.EmotionalProgression = compactSimulationRoleItems(
+			p.Style.Mood,
+			p.ReaderEngagement.EmotionalDrivers,
+			p.ReaderEngagement.ProgressionRewards,
+		)
+		projection.ConflictEscalation = compactSimulationRoleItems(p.PlotDesign.EscalationPatterns)
+		projection.Hooks = compactSimulationHookDesign(p.HookDesign)
+	case "writer":
+		projection.RoleGuidance = compactSimulationItems(p.RoleGuidance.Writer)
+		projection.NarrativeDistance = compactSimulationRoleItems(
+			p.Style.NarrativeVoice,
+			p.Style.Perspective,
+		)
+		projection.SentenceRhythm = compactSimulationItems(p.Style.SentenceRhythm)
+		projection.DetailStrategy = compactSimulationRoleItems(
+			p.Style.ProseTexture,
+			p.PacingDensity.DialogueActionRatio,
+			p.PacingDensity.CompressionRules,
+		)
+		// Existing simulation profiles have no separate dialogue-voice field;
+		// narrative_voice is the closest abstract voice signal and contains no
+		// source dialogue.
+		projection.DialogueVoice = compactSimulationItems(p.Style.NarrativeVoice)
+		projection.DoNotCopy = compactSimulationItems(p.Style.DoNotCopy)
+	case "editor":
+		projection.RoleGuidance = compactSimulationItems(p.RoleGuidance.Editor)
+		projection.StyleDrift = compactSimulationRoleItems(
+			p.Style.NarrativeVoice,
+			p.Style.Perspective,
+			p.Style.Mood,
+		)
+		projection.RhythmSimilarityRisk = compactSimulationRoleItems(
+			p.Style.SentenceRhythm,
+			p.PacingDensity.SceneDensity,
+			p.PacingDensity.InformationRelease,
+		)
+		projection.AntiSimilarityChecks = compactSimulationRoleItems(
+			p.Style.DoNotCopy,
+			p.RoleGuidance.Editor,
+		)
+	default:
+		return nil
+	}
+	return projection
+}
+
+func compactSimulationRoleItems(groups ...[]string) []string {
+	var items []string
+	for _, group := range groups {
+		items = append(items, group...)
+	}
+	return compactSimulationItems(items)
+}
+
+func compactSimulationHookDesign(h SimulationHookDesign) *SimulationHookDesign {
+	compact := SimulationHookDesign{
+		HookTypes:           compactSimulationItems(h.HookTypes),
+		Placement:           compactSimulationItems(h.Placement),
+		CliffhangerPatterns: compactSimulationItems(h.CliffhangerPatterns),
+		PayoffRules:         compactSimulationItems(h.PayoffRules),
+	}
+	if len(compact.HookTypes) == 0 && len(compact.Placement) == 0 &&
+		len(compact.CliffhangerPatterns) == 0 && len(compact.PayoffRules) == 0 {
+		return nil
+	}
+	return &compact
 }
 
 func MergeSimulationSynthesis(a, b SimulationSynthesis) SimulationSynthesis {

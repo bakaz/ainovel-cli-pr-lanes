@@ -172,12 +172,19 @@ func (t *ContextTool) buildSimulationProfile(result map[string]any, sectionKey s
 	if compact == nil {
 		return
 	}
+	// Keep the persisted compact profile as the only source model, then expose
+	// only the role's bounded abstract reference view. Older/unknown roles keep
+	// the legacy compact shape for compatibility.
+	var view any = compact
+	if roleView := compact.ProjectRole(t.role); roleView != nil {
+		view = roleView
+	}
 	section, ok := result[sectionKey].(map[string]any)
 	if !ok {
 		section = map[string]any{}
 		result[sectionKey] = section
 	}
-	section["simulation_profile"] = compact
+	section["simulation_profile"] = view
 	result["simulation_profile"] = true
 }
 
