@@ -24,23 +24,29 @@ type ChapterPlan struct {
 
 // ChapterStyleGoal 是本章的正面风格目标，指导 Writer 的 prose 调性。
 // 所有维度都应是简洁、正向的指导。
-// 每个字段 ≤ 200 Unicode 字符。
-// Validate 仅检查长度；plan_chapter 调用方需额外确保所有字段非空。
+// 文本字段每个 ≤ 200 Unicode 字符；scene_craft 是可选的条件性场景级技法选择，最多 2 条。
+// Validate 检查长度以及 scene_craft 的数量和条目有效性；plan_chapter 调用方需额外确保五个必填字段非空。
 type ChapterStyleGoal struct {
-	FocalFilter         string `json:"focal_filter,omitempty"`          // 视角/焦点过滤：POV 选择、信息披露策略
-	ProseMovement       string `json:"prose_movement,omitempty"`        // 叙述推进方式：场景流、过渡风格
-	DetailStrategy      string `json:"detail_strategy,omitempty"`       // 细节密度策略：详略分配、感官侧重
-	Rhythm              string `json:"rhythm,omitempty"`                // 节奏预期：句式变化、段落节奏
-	VariationFromRecent string `json:"variation_from_recent,omitempty"` // 与近 X 章的差异化提示
+	FocalFilter         string   `json:"focal_filter,omitempty"`          // 视角/焦点过滤：POV 选择、信息披露策略
+	ProseMovement       string   `json:"prose_movement,omitempty"`        // 叙述推进方式：场景流、过渡风格
+	DetailStrategy      string   `json:"detail_strategy,omitempty"`       // 细节密度策略：详略分配、感官侧重
+	Rhythm              string   `json:"rhythm,omitempty"`                // 节奏预期：句式变化、段落节奏
+	VariationFromRecent string   `json:"variation_from_recent,omitempty"` // 与近 X 章的差异化提示
+	SceneCraft          []string `json:"scene_craft,omitempty"`           // 可选：本章最多 2 条场景级正面技法
 }
 
-// Validate 检查 ChapterStyleGoal 各字段长度是否 ≤ 200 Unicode 字符。
+const (
+	chapterStyleGoalMaxRunes       = 200
+	chapterStyleGoalMaxSceneCraft  = 2
+	chapterStyleGoalSceneCraftHint = "scene_craft 是可选的条件性场景级正面技法选择，不是场景、感官或短句计数清单"
+)
+
+// Validate 检查 ChapterStyleGoal 各字段长度，以及 scene_craft 的数量和条目有效性。
 // nil 接收器返回 nil（兼容旧存序列化数据）。
 func (g *ChapterStyleGoal) Validate() error {
 	if g == nil {
 		return nil
 	}
-	maxFieldRunes := 200
 	fields := map[string]string{
 		"focal_filter":          g.FocalFilter,
 		"prose_movement":        g.ProseMovement,
@@ -50,8 +56,22 @@ func (g *ChapterStyleGoal) Validate() error {
 	}
 	for name, val := range fields {
 		runes := utf8.RuneCountInString(val)
-		if runes > maxFieldRunes {
-			return fmt.Errorf("style_goal.%s 长度 %d 超过上限 %d 个字符", name, runes, maxFieldRunes)
+		if runes > chapterStyleGoalMaxRunes {
+			return fmt.Errorf("style_goal.%s 长度 %d 超过上限 %d 个字符", name, runes, chapterStyleGoalMaxRunes)
+		}
+	}
+
+	if len(g.SceneCraft) > chapterStyleGoalMaxSceneCraft {
+		return fmt.Errorf("style_goal.scene_craft 最多 %d 条（%s），当前 %d 条", chapterStyleGoalMaxSceneCraft, chapterStyleGoalSceneCraftHint, len(g.SceneCraft))
+	}
+	for i, craft := range g.SceneCraft {
+		trimmed := strings.TrimSpace(craft)
+		runes := utf8.RuneCountInString(trimmed)
+		if runes == 0 {
+			return fmt.Errorf("style_goal.scene_craft[%d] 去除首尾空白后不能为空（%s）", i, chapterStyleGoalSceneCraftHint)
+		}
+		if runes > chapterStyleGoalMaxRunes {
+			return fmt.Errorf("style_goal.scene_craft[%d] 长度 %d 超过上限 %d 个字符（%s）", i, runes, chapterStyleGoalMaxRunes, chapterStyleGoalSceneCraftHint)
 		}
 	}
 	return nil

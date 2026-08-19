@@ -25,7 +25,7 @@ func NewPlanChapterTool(store *store.Store, contract *projectprofile.SceneBeatCo
 
 func (t *PlanChapterTool) Name() string { return "plan_chapter" }
 func (t *PlanChapterTool) Description() string {
-	return "保存章节写作构思。Agent 自主决定规划粒度，不强制场景拆分。style_goal 必须传单个对象，不要用数组包裹"
+	return "保存章节写作构思。Agent 自主决定规划粒度，不强制场景拆分。style_goal 必须传单个对象；其中 scene_craft 是可选的条件性场景级正面技法选择（最多 2 条），不是场景、感官或短句计数清单。不要用数组包裹"
 }
 func (t *PlanChapterTool) Label() string { return "规划章节" }
 
@@ -50,13 +50,19 @@ func (t *PlanChapterTool) Schema() map[string]any {
 		schema.Property("hook_goal", schema.String("可选：章末希望驱动的追读欲望或悬念目标")),
 		schema.Property("style_goal", map[string]any{
 			"type":        "object",
-			"description": "本章风格目标：必须提供全部五个正向指导字段（每个字段 ≤200 字）。字段名固定：focal_filter, prose_movement, detail_strategy, rhythm, variation_from_recent。必须传单个对象，不要用数组包裹（如 `[{\"focal_filter\": ...}]`）或 JSON 字符串",
+			"description": "本章风格目标：必须提供全部五个正向指导字段（每个字段 ≤200 字）。字段名固定：focal_filter, prose_movement, detail_strategy, rhythm, variation_from_recent。scene_craft 可选，仅在本章确有帮助时选择 0-2 条场景级正面技法；不限定具体技法枚举，每条 ≤200 个 Unicode 字符。它不是场景数量、感官描写或短句数量的硬性计数清单。必须传单个对象，不要用数组包裹（如 `[{\"focal_filter\": ...}]`）或 JSON 字符串",
 			"properties": map[string]any{
 				"focal_filter":          schema.String("视角/焦点过滤：POV 选择、信息披露策略（≤200 字）"),
 				"prose_movement":        schema.String("叙述推进方式：场景流、过渡风格（≤200 字）"),
 				"detail_strategy":       schema.String("细节密度策略：详略分配、感官侧重（≤200 字）"),
 				"rhythm":                schema.String("节奏预期：句式变化、段落节奏（≤200 字）"),
 				"variation_from_recent": schema.String("与近几章的差异化提示（≤200 字）"),
+				"scene_craft": map[string]any{
+					"type":        "array",
+					"description": "可选的条件性场景级正面技法选择：仅在本章有帮助时填写，最多 2 条；不限定具体技法枚举，不是场景、感官或短句计数清单",
+					"items":       schema.String("场景级正面技法（≤200 个 Unicode 字符）"),
+					"maxItems":    2,
+				},
 			},
 			"required": []string{"focal_filter", "prose_movement", "detail_strategy", "rhythm", "variation_from_recent"},
 		}).Required(),

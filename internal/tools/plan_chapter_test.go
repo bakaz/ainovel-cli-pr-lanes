@@ -135,6 +135,7 @@ func TestChapterStyleGoalRoundTrip(t *testing.T) {
 		DetailStrategy:      "重点描写战斗动作和环境感官，省略日常对话",
 		Rhythm:              "短句为主，段落控制在 3-5 行",
 		VariationFromRecent: "相比第 1 章减少景物描写，加快节奏",
+		SceneCraft:          []string{"让动作同时交代空间位置", "关键回应只落一个可回收意象"},
 	}
 	input := map[string]any{
 		"chapter":    1,
@@ -177,6 +178,14 @@ func TestChapterStyleGoalRoundTrip(t *testing.T) {
 	if loaded.StyleGoal.VariationFromRecent != csg.VariationFromRecent {
 		t.Errorf("VariationFromRecent: got %q, want %q", loaded.StyleGoal.VariationFromRecent, csg.VariationFromRecent)
 	}
+	if len(loaded.StyleGoal.SceneCraft) != len(csg.SceneCraft) {
+		t.Fatalf("SceneCraft length: got %d, want %d", len(loaded.StyleGoal.SceneCraft), len(csg.SceneCraft))
+	}
+	for i := range csg.SceneCraft {
+		if loaded.StyleGoal.SceneCraft[i] != csg.SceneCraft[i] {
+			t.Errorf("SceneCraft[%d]: got %q, want %q", i, loaded.StyleGoal.SceneCraft[i], csg.SceneCraft[i])
+		}
+	}
 }
 
 func TestChapterStyleGoalBackwardCompat(t *testing.T) {
@@ -214,6 +223,31 @@ func TestChapterStyleGoalBackwardCompat(t *testing.T) {
 	}
 }
 
+func TestChapterStyleGoalSceneCraftMissingIsValid(t *testing.T) {
+	csg := &domain.ChapterStyleGoal{
+		FocalFilter:         "主角限知视角",
+		ProseMovement:       "线性场景推进",
+		DetailStrategy:      "战斗详写，过渡略写",
+		Rhythm:              "短句加快节奏",
+		VariationFromRecent: "减少景物描写",
+	}
+	if err := csg.Validate(); err != nil {
+		t.Fatalf("missing optional scene_craft should validate: %v", err)
+	}
+
+	b, err := json.Marshal(csg)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var decoded domain.ChapterStyleGoal
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if decoded.SceneCraft != nil {
+		t.Fatalf("missing scene_craft should remain absent after round-trip, got %#v", decoded.SceneCraft)
+	}
+}
+
 func TestChapterStyleGoalRejectsOverlongField(t *testing.T) {
 	long := string(make([]byte, 300)) // 300 bytes, in ASCII = 300 chars
 	csg := &domain.ChapterStyleGoal{FocalFilter: long}
@@ -233,6 +267,43 @@ func TestChapterStyleGoalAcceptsValidInput(t *testing.T) {
 	}
 	if err := csg.Validate(); err != nil {
 		t.Errorf("expected nil error for valid input, got %v", err)
+	}
+}
+
+func TestChapterStyleGoalRejectsInvalidSceneCraft(t *testing.T) {
+	tests := []struct {
+		name       string
+		sceneCraft []string
+		want       string
+	}{
+		{
+			name:       "too many",
+			sceneCraft: []string{"技法一", "技法二", "技法三"},
+			want:       "最多 2 条",
+		},
+		{
+			name:       "blank after trimming",
+			sceneCraft: []string{" \t\n "},
+			want:       "scene_craft[0]",
+		},
+		{
+			name:       "overlong after trimming",
+			sceneCraft: []string{"  " + strings.Repeat("技", 201) + "  "},
+			want:       "scene_craft[0] 长度",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			csg := &domain.ChapterStyleGoal{SceneCraft: tt.sceneCraft}
+			err := csg.Validate()
+			if err == nil {
+				t.Fatalf("expected validation error for %s", tt.name)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error %q does not contain %q", err, tt.want)
+			}
+		})
 	}
 }
 
@@ -437,6 +508,55 @@ func TestPlanChapterAcceptsCompleteStyleGoal(t *testing.T) {
 	}
 }
 
+func TestPlanChapterRejectsInvalidSceneCraftViaExecute(t *testing.T) {
+	tests := []struct {
+		name       string
+		sceneCraft []string
+		want       string
+	}{
+		{
+			name:       "too many",
+			sceneCraft: []string{"技法一", "技法二", "技法三"},
+			want:       "最多 2 条",
+		},
+		{
+			name:       "blank after trimming",
+			sceneCraft: []string{"  "},
+			want:       "scene_craft[0]",
+		},
+		{
+			name:       "overlong",
+			sceneCraft: []string{strings.Repeat("技", 201)},
+			want:       "scene_craft[0] 长度",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := setupOneChapterStore(t)
+			tool := NewPlanChapterTool(st, testContract)
+			styleGoal := validStyleGoal()
+			styleGoal["scene_craft"] = tt.sceneCraft
+			input := map[string]any{
+				"chapter":    1,
+				"title":      "测试章",
+				"goal":       "推进剧情",
+				"conflict":   "外部阻力",
+				"hook":       "留下悬念",
+				"style_goal": styleGoal,
+			}
+			b, _ := json.Marshal(input)
+			_, err := tool.Execute(context.Background(), b)
+			if err == nil {
+				t.Fatalf("expected scene_craft validation error for %s", tt.name)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error %q does not contain %q", err, tt.want)
+			}
+		})
+	}
+}
+
 // TestPlanChapterAcceptsUnknownKeys 记录当前 decoder 的行为：未知字段静默忽略。
 // 这是有意为之的合约——Go json.Unmarshal 默认忽略未知 key，
 // 不额外增加 DisallowUnknownFields 以保持向后兼容。
@@ -569,6 +689,59 @@ func TestPlanChapterSchema_StyleGoalRequiredAndExactKeys(t *testing.T) {
 		}
 		if !matched {
 			t.Errorf("unexpected key %q in style_goal.required; expected only %v", key, expectedKeys)
+		}
+	}
+}
+
+func TestPlanChapterSchema_OptionalSceneCraftShape(t *testing.T) {
+	tool := NewPlanChapterTool(nil, nil)
+	s := tool.Schema()
+	props, ok := s["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("schema missing 'properties'")
+	}
+	sgRaw, ok := props["style_goal"]
+	if !ok {
+		t.Fatal("schema missing property 'style_goal'")
+	}
+	sg, ok := sgRaw.(map[string]any)
+	if !ok {
+		t.Fatalf("style_goal schema is %T, want map[string]any", sgRaw)
+	}
+
+	sgProps, ok := sg["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("style_goal schema missing 'properties'")
+	}
+	craftRaw, ok := sgProps["scene_craft"]
+	if !ok {
+		t.Fatal("style_goal schema missing optional property 'scene_craft'")
+	}
+	craft, ok := craftRaw.(map[string]any)
+	if !ok {
+		t.Fatalf("scene_craft schema is %T, want map[string]any", craftRaw)
+	}
+	if got, _ := craft["type"].(string); got != "array" {
+		t.Errorf("scene_craft.type = %q, want %q", got, "array")
+	}
+	if got, ok := craft["maxItems"].(int); !ok || got != 2 {
+		t.Errorf("scene_craft.maxItems = %#v, want int(2)", craft["maxItems"])
+	}
+	items, ok := craft["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("scene_craft.items is %T, want map[string]any", craft["items"])
+	}
+	if got, _ := items["type"].(string); got != "string" {
+		t.Errorf("scene_craft.items.type = %q, want %q", got, "string")
+	}
+
+	required, ok := sg["required"].([]string)
+	if !ok {
+		t.Fatalf("style_goal.required is %T, want []string", sg["required"])
+	}
+	for _, name := range required {
+		if name == "scene_craft" {
+			t.Fatal("scene_craft must remain optional and must not be in style_goal.required")
 		}
 	}
 }
