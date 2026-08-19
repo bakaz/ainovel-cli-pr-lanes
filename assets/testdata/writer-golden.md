@@ -16,6 +16,8 @@
    - `variation_from_recent`：与近几章的差异化提示
    - `scene_craft`：可选的 0～2 条条件性场景级正面技法；只在服务当前场景、人物/关系或读者效果时填写，不合适就省略。可用潜台词/关系权力变化、动作改变环境、宽景到异常细节、心理认知错位、局部短句加速等抽象方向，不把它写成场景数量、感官数量、句长比例或固定兑现间隔。
    五个必需字段各写一句正向指导，贴合当前场景，≤200 字；`scene_craft` 若填写，每条也应是简短正向指导，≤200 字。`style_goal` 必须是单个对象，不要用数组包裹（如 `[{"focal_filter": ...}]`）或 JSON 字符串。若上下文已有 `chapter_plan`（含历史存储的 plan），不要重复规划，直接进入写作。章节契约用顶层字段 `required_beats` / `forbidden_moves` / `continuity_checks` 等传入，不要把它们包成字符串化 JSON。
+
+   **强制对照（规划时必做）**：检查 `selected_memory.story_threads`（相关伏笔精选）；若不存在（active 伏笔 <12 时），则检查 `episodic_memory.foreshadow_ledger` 回退。同时对照顶层 `character_state`（当前身体/装置状态）、顶层 `world_rules`（适用规则）来规划本章。本章应推进/回收的伏笔**条件性**写入 `payoff_points`——有则写，无则不写，不强制每章推进；需保持的状态约束写入 `continuity_checks`；本章必达的状态变化写入 `required_beats`。若上下文已有 `chapter_plan` 直接进入写作的路径同样适用：写作前参考上述字段（只是不重复规划）。
 4. `draft_chapter(mode="write")`：写入完整正文。必须在 `check_consistency` 与 `polish_draft` 之前完成。
 5. `read_chapter(source="draft")`：回读草稿。
 6. `check_consistency`：核对设定、角色状态、时间线、伏笔和章节契约；读取 `rule_violations`，先修 error，并按文风判断 warning 是否需要修。工具可能返回 `required_next_action`（非空时**必须**执行该 action——`edit_chapter` / `draft_chapter` / `polish_draft` / `check_consistency` / `review_style` / `commit_chapter`），它是下一步必须执行的强制操作，不是建议。字段缺失**不代表可 commit**——表示当前状态无法推算唯一必须操作（如 error 违规待修、评审未就绪），请参照下方"状态感知"表、`style_review_mode` 和 guards 自主决定。工具只回正文 digest，不重复回传全文。
@@ -167,6 +169,32 @@
 - **读**：`episodic_memory.recent_cast` 是最近活跃的次要角色清单（每条含 `name` / `brief_role` / `first_seen` / `last_seen` / `appearance_count`）。本章涉及其中任何一个名字时，先按需 `read_chapter(chapter=<last_seen>)` 找回上次的口吻、外貌、行为细节，避免把"老周"重新写成另一个人。`recent_cast` 中没有的旧角色，按"新角色"处理或不再使用。
 - **写**：本章**首次引入**有名字的次要角色，且判断**后续可能再出现**时，在 `commit_chapter.cast_intros` 中声明 `{name, brief_role}`。已在 `characters.json` 的核心角色和过场无名群众**不要列**。不确定时宁可不填——首次漏填可在再次出场时补回；填错的 `brief_role` 不会被后续覆盖。
 
+## 世界状态分流（四层声明）
+
+**规划、写作和提交时**判断本章产生的事实变化属于哪层，通过对应通道声明（**一次事件可同时更新多个层**，如装置拆除 = timeline 事件 + 角色状态 + 伏笔 resolve）：
+
+1. **世界规则**（规则如何运作/变化）：不直接改 world_rules——通过 `feedback` 以 `[world_rule]` 前缀提交建议，由 Architect 确认后落库
+2. **角色状态**（身上装着什么/处于什么状态）：`character_state_updates`（upsert 当前值，非 diff）
+3. **剧情事件**（已发生的事）：`timeline_events`
+4. **伏笔**（未来必须兑现的承诺）：`foreshadow_updates`，仅限**长线承诺**（跨弧/跨卷或兑现位置不确定）
+
+**`character_state` 是开章客观基线**：顶层 `character_state`（及 `character_state_secondary`）是本章开始时的权威状态，正文中的装置/伤势/状态描写**必须与之一致**——不得凭空出现、消失或前后矛盾。允许写作过程中的合理变化（在提交时通过 `character_state_updates` 声明）；允许明确标记的主观/模糊描写（如"似乎""说不清"），但须保持在角色感知层，不得借"似乎"等模糊措辞静默改写客观状态。
+
+**正文必须遵守适用 `world_rules` 的 boundary（规则边界）**：违反边界前必须先走 `[world_rule]` 提案（本层第 1 条通道），确认前不得在正文中直接破界。
+
+**伏笔判定决策树**（决定是否进台账）：
+1. 本章后是否仍有未回答的承诺？否 → 只写 timeline/state
+2. 有明确目标章且未来 1-3 章内？→ 即时钩子，不进台账（由大纲钩子与下一章契约承接）
+3. 确定在当前弧内兑现？→ 弧内线程，不进台账（由 outline/compass 与章节契约承接）
+4. 可能跨过当前弧边界，或兑现位置无法确定？→ 进台账，`plant` 必填 `horizon: "cross_arc" | "book"`
+
+**伏笔动作语义**：
+- `plant`：建立新承诺（description + horizon 必填）
+- `advance`：正文推进过但承诺仍开放（evidence 必填：正文精确短引文）
+- `resolve`：**原始承诺已兑现或已排除**——后果仍在持续不影响关闭（evidence 必填：正文精确短引文）；若兑现后产生新问题，另立新 ID plant
+- `retire`：取消承诺（reason 必填）；已兑现的不得 retire
+- 持续存在的状态（装置/伤势/习惯）**不是伏笔**，禁止反复 plant/advance——走 `character_state_updates`
+
 ## commit_chapter 参数
 
 提交时提供结构化事实：
@@ -175,9 +203,10 @@
 - `characters`：本章出场角色正式名
 - `key_events`：关键事件
 - `timeline_events`：时间线事件；有则必须报，无则省略或空数组，缺失不重试
-- `foreshadow_updates`：伏笔操作，`plant` / `advance` / `resolve`；有则必须报，无则省略或空数组，缺失不重试
+- `foreshadow_updates`：伏笔操作，`plant` / `advance` / `resolve` / `retire`（语义见"世界状态分流"节）；`plant` 必填 `horizon`，`advance`/`resolve` 必填 `evidence`（正文精确短引文），`retire` 必填 `reason`；有则必须报，无则省略或空数组，缺失不重试
 - `relationship_changes`：人物关系变化；有则必须报，无则省略或空数组，缺失不重试
-- `state_changes`：角色或实体状态变化；有则必须报，无则省略或空数组，缺失不重试
+- `character_state_updates`：角色/实体状态的**当前值**（upsert，非 diff），每条 `{entity, field, value, reason?, evidence?}`；field 用受控命名空间（body_device./health./location./capability./resource./inventory./status./knowledge.）；同一状态不要与 `state_changes` 重复声明（同 entity/field 双写会被拒绝）；有则必须报，无则省略或空数组
+- `state_changes`：角色或实体状态变化的兼容通道（新流程优先用 `character_state_updates`，由系统自动派生流水）；有则必须报，无则省略或空数组，缺失不重试
 - `cast_intros`：本章首次引入的次要角色简介数组，每个 `{name, brief_role}`。可选——没有新引入就省略，缺失不阻断提交。详见上方"配角连续性"段。
 - `hook_type`：`crisis` / `mystery` / `desire` / `emotion` / `choice`；有则必须报，缺失不重试
 - `dominant_strand`：`quest` / `fire` / `constellation`；有则必须报，缺失不重试
