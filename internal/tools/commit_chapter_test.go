@@ -16,7 +16,9 @@ import (
 )
 
 func TestCommitChapterSchemaDescribesFeedbackAsObject(t *testing.T) {
-	tool := NewCommitChapterTool(store.NewStore(t.TempDir()))
+	st := store.NewStore(t.TempDir())
+	t.Cleanup(st.Close)
+	tool := NewCommitChapterTool(st)
 	schema := tool.Schema()
 	props, ok := schema["properties"].(map[string]any)
 	if !ok {
@@ -32,6 +34,13 @@ func TestCommitChapterSchemaDescribesFeedbackAsObject(t *testing.T) {
 	}
 	if got := feedback["type"]; got != "object" {
 		t.Fatalf("feedback type = %v, want object", got)
+	}
+	finalTitle, ok := props["final_title"].(map[string]any)
+	if !ok {
+		t.Fatalf("final_title schema missing: %#v", props["final_title"])
+	}
+	if got := finalTitle["type"]; got != "string" {
+		t.Fatalf("final_title type = %v, want string", got)
 	}
 }
 
@@ -145,6 +154,127 @@ func TestCommitChapterAllowsPendingRewrite(t *testing.T) {
 	}
 	if pending != nil {
 		t.Fatalf("expected pending commit cleared, got %+v", pending)
+	}
+}
+
+func TestCommitChapterFinalTitleNormalAndLegacyRepeat(t *testing.T) {
+	s := preflightStore(t)
+	t.Cleanup(s.Close)
+	tool := NewCommitChapterTool(s)
+
+	raw, err := tool.Execute(context.Background(), preflightCommitArgsJSON(map[string]any{
+		"final_title": "  雨夜归人  ",
+	}))
+	if err != nil {
+		t.Fatalf("Execute with final_title: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("Unmarshal result: %v", err)
+	}
+	if got := out["final_title"]; got != "雨夜归人" {
+		t.Fatalf("result final_title = %v, want 雨夜归人", got)
+	}
+	if got, err := s.ChapterTitles.Load(1); err != nil || got != "雨夜归人" {
+		t.Fatalf("stored final_title = %q, err=%v, want 雨夜归人", got, err)
+	}
+
+	// 旧调用不带 final_title；重复提交只能返回并保留已存事实。
+	raw, err = tool.Execute(context.Background(), preflightCommitArgsJSON(nil))
+	if err != nil {
+		t.Fatalf("legacy repeated Execute: %v", err)
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("Unmarshal repeated result: %v", err)
+	}
+	if got := out["final_title"]; got != "雨夜归人" {
+		t.Fatalf("repeated result final_title = %v, want 雨夜归人", got)
+	}
+}
+
+func TestCommitChapterFinalTitleValidationHasNoSideEffects(t *testing.T) {
+	cases := []struct {
+		name  string
+		title string
+	}{
+		{name: "whitespace", title: " \t\n "},
+		{name: "overlong unicode", title: strings.Repeat("章", maxFinalTitleRunes+1)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := preflightStore(t)
+			t.Cleanup(s.Close)
+			before := captureWorldSnapshot(t, s)
+			_, err := NewCommitChapterTool(s).Execute(context.Background(), preflightCommitArgsJSON(map[string]any{
+				"final_title": tc.title,
+			}))
+			if err == nil {
+				t.Fatal("invalid final_title must be rejected")
+			}
+			if !errors.Is(err, errs.ErrToolArgs) {
+				t.Fatalf("invalid final_title should be ErrToolArgs, got %v", err)
+			}
+			assertZeroSideEffects(t, s, before)
+			if got, loadErr := s.ChapterTitles.Load(1); loadErr != nil || got != "" {
+				t.Fatalf("invalid final_title must not persist title, got %q, err=%v", got, loadErr)
+			}
+		})
+	}
+}
+
+func TestCommitChapterRewriteFinalTitleUpdatesAndKeepsOnEmpty(t *testing.T) {
+	const final = "已提交的终稿。她心里骂自己丢人，真不要脸。"
+	s := rewriteModeStore(t, final, "第一次重写正文。她心里骂自己丢人，真不要脸。")
+	t.Cleanup(s.Close)
+	if err := s.ChapterTitles.Save(2, "旧标题"); err != nil {
+		t.Fatalf("seed chapter title: %v", err)
+	}
+	tool := NewCommitChapterTool(s)
+
+	args, _ := json.Marshal(map[string]any{
+		"chapter": 2, "summary": "重写摘要", "characters": []string{"主角"}, "key_events": []string{"重写"},
+		"world_state_mode": "preserve", "final_title": "新标题",
+	})
+	raw, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("rewrite with final_title: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("Unmarshal rewrite result: %v", err)
+	}
+	if got := out["final_title"]; got != "新标题" {
+		t.Fatalf("rewrite result final_title = %v, want 新标题", got)
+	}
+	if got, err := s.ChapterTitles.Load(2); err != nil || got != "新标题" {
+		t.Fatalf("rewritten stored title = %q, err=%v, want 新标题", got, err)
+	}
+
+	if err := s.Progress.SetPendingRewrites([]int{2}, "再次重写"); err != nil {
+		t.Fatalf("SetPendingRewrites: %v", err)
+	}
+	if err := s.Progress.SetFlow(domain.FlowRewriting); err != nil {
+		t.Fatalf("SetFlow: %v", err)
+	}
+	if err := s.Drafts.SaveDraft(2, "第二次重写正文。她心里骂自己丢人，真不要脸。"); err != nil {
+		t.Fatalf("SaveDraft second rewrite: %v", err)
+	}
+	args, _ = json.Marshal(map[string]any{
+		"chapter": 2, "summary": "再次重写摘要", "characters": []string{"主角"}, "key_events": []string{"再次重写"},
+		"world_state_mode": "preserve", "final_title": "",
+	})
+	raw, err = tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("rewrite with empty final_title: %v", err)
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("Unmarshal empty-title rewrite result: %v", err)
+	}
+	if got := out["final_title"]; got != "新标题" {
+		t.Fatalf("empty-title rewrite result = %v, want 新标题", got)
+	}
+	if got, err := s.ChapterTitles.Load(2); err != nil || got != "新标题" {
+		t.Fatalf("empty-title rewrite stored title = %q, err=%v, want 新标题", got, err)
 	}
 }
 

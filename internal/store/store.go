@@ -65,6 +65,7 @@ type Store struct {
 
 	Progress        *ProgressStore
 	Outline         *OutlineStore
+	ChapterTitles   *ChapterTitleStore
 	Drafts          *DraftStore
 	Summaries       *SummaryStore
 	RunMeta         *RunMetaStore
@@ -161,6 +162,7 @@ func newStoreInternal(dir string, readOnly bool, readyErr error, loadCheckpoints
 		state:           state,
 		Progress:        NewProgressStore(mkIO()),
 		Outline:         outline,
+		ChapterTitles:   NewChapterTitleStore(mkIO()),
 		Drafts:          NewDraftStore(mkIO()),
 		Summaries:       NewSummaryStore(mkIO(), outline),
 		RunMeta:         NewRunMetaStore(mkIO()),

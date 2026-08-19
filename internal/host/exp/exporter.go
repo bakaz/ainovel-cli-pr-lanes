@@ -96,6 +96,10 @@ func Run(ctx context.Context, deps Deps, opts Options) (*Result, error) {
 	if progress.Layered {
 		volumes, _ = deps.Store.Outline.LoadLayeredOutline()
 	}
+	finalTitles, err := deps.Store.ChapterTitles.LoadAll()
+	if err != nil {
+		return nil, fmt.Errorf("加载章节最终标题失败：%w", err)
+	}
 
 	outPath := opts.OutPath
 	if outPath == "" {
@@ -115,6 +119,11 @@ func Run(ctx context.Context, deps Deps, opts Options) (*Result, error) {
 	}
 
 	titleIdx := buildTitleIndex(outline)
+	for chapter, title := range finalTitles {
+		if title = strings.TrimSpace(title); title != "" {
+			titleIdx[chapter] = title
+		}
+	}
 	var locations map[int]chapterLocation
 	if len(volumes) > 0 {
 		locations = buildLocations(volumes)

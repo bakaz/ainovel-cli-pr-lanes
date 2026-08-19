@@ -53,7 +53,27 @@ func (t *CommitChapterTool) FSMConfig() ChapterFSMConfig { return t.fsmConfig }
 // 由于嵌入字段会被 JSON marshaler 提升（promoted），序列化结果等同于扁平结构。
 type commitOutput struct {
 	domain.CommitResult
+	FinalTitle     string            `json:"final_title"`
 	RuleViolations []rules.Violation `json:"rule_violations,omitempty"`
+}
+
+const maxFinalTitleRunes = 120
+
+// normalizeFinalTitle 校验并规范化工具层传入的最终标题。
+// 空字符串表示调用方未提供标题；仅空白的显式值则拒绝，避免把已有标题
+// 意外清空。标题长度按 Unicode code point 计算，而不是 UTF-8 字节数。
+func normalizeFinalTitle(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	title := strings.TrimSpace(raw)
+	if title == "" {
+		return "", fmt.Errorf("final_title 不能仅包含空白: %w", errs.ErrToolArgs)
+	}
+	if runes := utf8.RuneCountInString(title); runes > maxFinalTitleRunes {
+		return "", fmt.Errorf("final_title 长度 %d 超过上限 %d 个 Unicode 字符: %w", runes, maxFinalTitleRunes, errs.ErrToolArgs)
+	}
+	return title, nil
 }
 
 func (t *CommitChapterTool) Name() string { return "commit_chapter" }
@@ -107,6 +127,7 @@ func (t *CommitChapterTool) Schema() map[string]any {
 	feedbackSchema["description"] = "对后续大纲的建议对象；必须直接传 JSON object，不要传字符串化 JSON"
 	return schema.Object(
 		schema.Property("chapter", schema.Int("章节号")).Required(),
+		schema.Property("final_title", schema.String("正文完成后确定的读者章节标题（可选，≤120 个 Unicode 字符；省略或空字符串保持已有最终标题）")),
 		schema.Property("summary", schema.String("本章内容摘要（200字以内）")).Required(),
 		schema.Property("characters", schema.Array("本章出场角色名", schema.String(""))).Required(),
 		schema.Property("key_events", schema.Array("本章关键事件", schema.String(""))).Required(),
@@ -132,6 +153,7 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 	args = normalizeIntegerStringFields(args, "chapter")
 	var a struct {
 		Chapter               int                           `json:"chapter"`
+		FinalTitle            string                        `json:"final_title"`
 		Summary               string                        `json:"summary"`
 		Characters            []string                      `json:"characters"`
 		KeyEvents             []string                      `json:"key_events"`
@@ -152,6 +174,18 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 	if a.Chapter <= 0 {
 		return nil, fmt.Errorf("chapter must be > 0: %w", errs.ErrToolArgs)
 	}
+	finalTitle, err := normalizeFinalTitle(a.FinalTitle)
+	if err != nil {
+		return nil, err
+	}
+	storedFinalTitle, err := t.store.ChapterTitles.Load(a.Chapter)
+	if err != nil {
+		return nil, fmt.Errorf("load chapter final title: %w: %w", errs.ErrStoreRead, err)
+	}
+	effectiveFinalTitle := storedFinalTitle
+	if finalTitle != "" {
+		effectiveFinalTitle = finalTitle
+	}
 
 	// 章节流水线强制状态机（Enabled 时）：needs_commit 才允许提交；被拒时
 	// 不创建 pending commit、不写 final。现有 commit gates 保留（纵深防御）。
@@ -170,7 +204,7 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 					return nil, fmt.Errorf("clear pending commit: %w: %w", errs.ErrStoreWrite, cErr)
 				}
 				progress, _ := t.store.Progress.Load()
-				return t.buildSkipResult(a.Chapter, progress)
+				return t.buildSkipResult(a.Chapter, progress, storedFinalTitle)
 			}
 		}
 		return nil, fmt.Errorf("commit_chapter: %w", err)
@@ -222,9 +256,9 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 		inRewriteQueue := progress != nil && slices.Contains(progress.PendingRewrites, a.Chapter)
 		if inRewriteQueue {
 			return t.executeRewriteCommit(a.Chapter, a.Summary, a.Characters, a.KeyEvents,
-				a.HookType, a.DominantStrand, progress)
+				finalTitle, storedFinalTitle, a.HookType, a.DominantStrand, progress)
 		}
-		return t.buildSkipResult(a.Chapter, progress)
+		return t.buildSkipResult(a.Chapter, progress, storedFinalTitle)
 	}
 	existingPending, err := t.store.Signals.LoadPendingCommit()
 	if err != nil {
@@ -290,6 +324,11 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 	// 2. 保存终稿
 	if err := t.store.Drafts.SaveFinalChapter(a.Chapter, content); err != nil {
 		return nil, fmt.Errorf("save final chapter: %w: %w", errs.ErrStoreWrite, err)
+	}
+	if finalTitle != "" {
+		if err := t.store.ChapterTitles.Save(a.Chapter, finalTitle); err != nil {
+			return nil, fmt.Errorf("save chapter final title: %w: %w", errs.ErrStoreWrite, err)
+		}
 	}
 
 	// 3. 保存摘要
@@ -467,7 +506,11 @@ func (t *CommitChapterTool) Execute(_ context.Context, args json.RawMessage) (js
 	if err := t.store.World.SaveRuleViolations(a.Chapter, violations); err != nil {
 		slog.Warn("机械违规落盘失败", "module", "tools", "chapter", a.Chapter, "err", err)
 	}
-	return json.Marshal(commitOutput{CommitResult: result, RuleViolations: violations})
+	return json.Marshal(commitOutput{
+		CommitResult:   result,
+		FinalTitle:     effectiveFinalTitle,
+		RuleViolations: violations,
+	})
 }
 
 func (t *CommitChapterTool) appendCommitCheckpoint(chapter int) error {
@@ -678,6 +721,7 @@ func (t *CommitChapterTool) executeRewriteCommit(
 	chapter int,
 	summary string,
 	characters, keyEvents []string,
+	finalTitle, storedFinalTitle string,
 	hookType, dominantStrand string,
 	progress *domain.Progress,
 ) (json.RawMessage, error) {
@@ -705,6 +749,12 @@ func (t *CommitChapterTool) executeRewriteCommit(
 	// 3. 覆盖终稿
 	if err := t.store.Drafts.SaveFinalChapter(chapter, content); err != nil {
 		return nil, fmt.Errorf("rewrite: save final chapter: %w: %w", errs.ErrStoreWrite, err)
+	}
+	if finalTitle != "" {
+		if err := t.store.ChapterTitles.Save(chapter, finalTitle); err != nil {
+			return nil, fmt.Errorf("rewrite: save chapter final title: %w: %w", errs.ErrStoreWrite, err)
+		}
+		storedFinalTitle = finalTitle
 	}
 
 	// 3. 覆盖摘要
@@ -784,6 +834,7 @@ func (t *CommitChapterTool) executeRewriteCommit(
 	}
 	return json.Marshal(map[string]any{
 		"chapter":         chapter,
+		"final_title":     storedFinalTitle,
 		"rewritten":       true,
 		"mode":            mode,
 		"word_count":      wordCount,
@@ -798,7 +849,7 @@ func (t *CommitChapterTool) executeRewriteCommit(
 
 // buildSkipResult 为"章节已完成的重复提交"构造与正常 commit 对齐的事实返回。
 // 协调者据此做后续决策（writer/editor/architect 派发），而不会因为拿到 prose 提示而幻觉。
-func (t *CommitChapterTool) buildSkipResult(chapter int, progress *domain.Progress) (json.RawMessage, error) {
+func (t *CommitChapterTool) buildSkipResult(chapter int, progress *domain.Progress, finalTitle string) (json.RawMessage, error) {
 	_, wordCount, _ := t.store.Drafts.LoadChapterContent(chapter)
 
 	result := domain.CommitResult{
@@ -831,7 +882,7 @@ func (t *CommitChapterTool) buildSkipResult(chapter int, progress *domain.Progre
 		result.Flow = string(progress.Flow)
 	}
 
-	return json.Marshal(result)
+	return json.Marshal(commitOutput{CommitResult: result, FinalTitle: finalTitle})
 }
 
 // loadCoreCharacterNameSet 加载 characters.json 中已有的角色名集合（含别名）。

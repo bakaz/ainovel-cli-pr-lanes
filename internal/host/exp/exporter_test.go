@@ -1,8 +1,11 @@
 package exp
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,6 +76,71 @@ func TestRun_HappyPath_DefaultsToNovelDir(t *testing.T) {
 	// premise 不进导出（创作蓝图，非读者内容）
 	if strings.Contains(text, "光与影的故事。") {
 		t.Errorf("premise must not appear in export:\n%s", text)
+	}
+}
+
+func TestRun_FinalTitlesOverrideOutlineForTXTAndEPUB(t *testing.T) {
+	s, dir := newTestStore(t, "光斑", []int{1, 2})
+	if err := s.Outline.SaveOutline([]domain.OutlineEntry{
+		{Chapter: 1, Title: "计划标题一"},
+		{Chapter: 2, Title: "计划标题二"},
+	}); err != nil {
+		t.Fatalf("save outline: %v", err)
+	}
+	if err := s.ChapterTitles.Save(1, "正文标题一"); err != nil {
+		t.Fatalf("save final title: %v", err)
+	}
+
+	txtPath := filepath.Join(dir, "titles.txt")
+	if _, err := Run(context.Background(), Deps{Store: s}, Options{OutPath: txtPath}); err != nil {
+		t.Fatalf("Run TXT: %v", err)
+	}
+	txt, err := os.ReadFile(txtPath)
+	if err != nil {
+		t.Fatalf("read TXT: %v", err)
+	}
+	txtText := string(txt)
+	for _, want := range []string{"第 1 章  正文标题一", "第 2 章  计划标题二"} {
+		if !strings.Contains(txtText, want) {
+			t.Errorf("TXT missing %q:\n%s", want, txtText)
+		}
+	}
+	if strings.Contains(txtText, "计划标题一") {
+		t.Errorf("TXT should replace outline title for chapter 1:\n%s", txtText)
+	}
+
+	epubPath := filepath.Join(dir, "titles.epub")
+	if _, err := Run(context.Background(), Deps{Store: s}, Options{OutPath: epubPath}); err != nil {
+		t.Fatalf("Run EPUB: %v", err)
+	}
+	epub, err := os.ReadFile(epubPath)
+	if err != nil {
+		t.Fatalf("read EPUB: %v", err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(epub), int64(len(epub)))
+	if err != nil {
+		t.Fatalf("read EPUB zip: %v", err)
+	}
+	files := make(map[string]string, len(zr.File))
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatalf("open EPUB entry %s: %v", f.Name, err)
+		}
+		data, readErr := io.ReadAll(rc)
+		_ = rc.Close()
+		if readErr != nil {
+			t.Fatalf("read EPUB entry %s: %v", f.Name, readErr)
+		}
+		files[f.Name] = string(data)
+	}
+	for _, want := range []string{"第 1 章 正文标题一", "第 2 章 计划标题二"} {
+		if !strings.Contains(files["OEBPS/chapter001.xhtml"]+files["OEBPS/chapter002.xhtml"], want) {
+			t.Errorf("EPUB missing %q", want)
+		}
+	}
+	if strings.Contains(files["OEBPS/chapter001.xhtml"], "计划标题一") {
+		t.Errorf("EPUB should replace outline title for chapter 1: %s", files["OEBPS/chapter001.xhtml"])
 	}
 }
 
