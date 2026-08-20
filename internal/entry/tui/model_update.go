@@ -174,6 +174,9 @@ func (m Model) handleBaseKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEscape:
 		if m.mode == modeRunning && m.snapshot.IsRunning {
+			m.idleWritingActive = false
+			m.idleWritingStartPending = false
+			m.idleWritingSuspended = true
 			return m, abortRuntime(m.runtime)
 		}
 		m.textarea.Reset()
@@ -314,6 +317,8 @@ func (m Model) handleEnterKey() (tea.Model, tea.Cmd) {
 		m.cocreate = newCoCreateState(text)
 		return m, m.sendCoCreate()
 	case modeRunning:
+		m.idleWritingActive = false
+		m.idleWritingStartPending = false
 		// 不本地回显 USER 事件 —— Host.Continue/Steer 入口已 emit "USER" 事件，
 		// 走 events channel 回流到 TUI。架构 §2.3：观察层只观察，不产生事实。
 		if !m.snapshot.IsRunning {
@@ -434,7 +439,7 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			m.err = msg.err
 			return m, fetchSnapshot(m.runtime), true
 		}
-		if msg.resumed && m.mode == modeNew {
+		if (msg.resumed || msg.deferred) && m.mode == modeNew {
 			enableMouse := m.enterRunning()
 			m.resizeTextarea()
 			m.textarea.Placeholder = defaultSteerPlaceholder()
@@ -478,7 +483,39 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		m.refreshDetailViewport()
 		m.refreshStateViewport()
 		return m, tickSnapshot(m.runtime), true
+	case idleWritingTickMsg:
+		next, cmd := m.handleIdleWritingTick(time.Time(msg))
+		return next, cmd, true
+	case idleWritingStartResultMsg:
+		m.idleWritingStartPending = false
+		if msg.err != nil {
+			m.idleWritingActive = false
+			m.applyEvent(host.Event{Time: time.Now(), Category: "ERROR", Summary: "闲时写作启动失败：" + msg.err.Error(), Level: "error"})
+			m.refreshEventViewport()
+			return m, fetchSnapshot(m.runtime), true
+		}
+		if !msg.started {
+			return m, fetchSnapshot(m.runtime), true
+		}
+		m.idleWritingActive = true
+		m.err = nil
+		m.mode = modeRunning
+		m.textarea.Placeholder = defaultSteerPlaceholder()
+		m.refreshEventViewport()
+		return m, tea.Batch(fetchSnapshot(m.runtime), m.textarea.Focus()), true
+	case idleWritingPauseResultMsg:
+		m.idleWritingActive = false
+		if msg.stopped {
+			m.abortPending = true
+			m.textarea.Placeholder = "高峰时间到，正在暂停闲时写作..."
+		}
+		return m, fetchSnapshot(m.runtime), true
 	case doneMsg:
+		m.idleWritingStartPending = false
+		// 每次运行结束都释放当前会话的 ownership；若是自然停止，下一次
+		// tick 仍可按开关与 stop reason 重新接力，故障/人工暂停则不会盲目重启。
+		m.idleWritingActive = false
+		m.snapshot.LastStopReason = msg.stopReason
 		m.snapshot.IsRunning = false
 		m.refreshEventViewport()
 		m.refreshStreamViewport()

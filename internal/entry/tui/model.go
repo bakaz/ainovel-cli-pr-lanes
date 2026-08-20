@@ -53,56 +53,59 @@ var toolSpinnerFrames = []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯"
 
 // Model 是 TUI 的顶层状态。
 type Model struct {
-	runtime         *host.Host
-	askBridge       *askUserBridge
-	askState        *askUserState
-	cocreate        *cocreateState
-	help            *helpState
-	modelSwitch     *modelSwitchState
-	report          *reportState
-	version         string
-	importer        *importState
-	importSeq       int
-	simulator       *simulationState
-	simSeq          int
-	restoreStaged   string // snapshot selected by /restore; execution needs a separate confirmation
-	restoreInFlight bool   // true while a restore is executing; rejects additional stage/confirm
-	compItems       []commandPaletteItem
-	compIdx         int
-	compActive      bool
-	snapshot        host.UISnapshot
-	events          []host.Event
-	eventIndex      map[string]int   // event.ID → m.events 下标；调用类事件到达时原地更新
-	viewport        viewport.Model   // 事件流 viewport
-	streamVP        viewport.Model   // 流式输出 viewport
-	detailVP        viewport.Model   // 右侧详情 viewport
-	stateVP         viewport.Model   // 左侧状态侧栏 viewport（可滚动）
-	streamRounds    []string
-	textarea        textarea.Model
-	width           int
-	height          int
-	autoScroll      bool
-	streamScroll    bool      // 流式面板自动跟随
-	streamDirty     bool      // streamRounds 有未刷新的 delta；由 streamFlushTick 60fps 合并
-	lastKeyAt       time.Time // 上次非 Enter 按键时间；KeyEnter 节流防粘贴 \n 流误触发提交
-	inputHistory    []string  // 已提交的输入历史（去重：相邻不重复）
-	historyIdx      int       // 当前浏览索引；== len(inputHistory) 表示"未浏览，正在编辑草稿"
-	historyDraft    string    // 进入历史浏览前保存的草稿，回到末端时恢复
-	focusPane       focusPane
-	hoverPane       focusPane
-	hoverActive     bool
-	mode            appMode
-	starting        bool // UI 已进入工作台，Host 正在执行启动初始化
-	startupMode     startupMode
-	cocreateSeq     int
-	reportSeq       int
-	err             error
-	spinnerIdx      int
-	toolSpinnerIdx  int  // 事件流进行中行的独立帧索引（150ms tick，不影响顶栏/星星）
-	cursorIdx       int  // 流式光标帧索引（独立 tick）
-	quitPending     bool // 双次 Ctrl+C 退出确认
-	abortPending    bool // 等待 Done 回来的手动暂停
-	mouseOff        bool // true 时已禁用鼠标上报，让用户原生拖拽选中复制；再次切换恢复
+	runtime                 *host.Host
+	askBridge               *askUserBridge
+	askState                *askUserState
+	cocreate                *cocreateState
+	help                    *helpState
+	modelSwitch             *modelSwitchState
+	report                  *reportState
+	version                 string
+	importer                *importState
+	importSeq               int
+	simulator               *simulationState
+	simSeq                  int
+	restoreStaged           string // snapshot selected by /restore; execution needs a separate confirmation
+	restoreInFlight         bool   // true while a restore is executing; rejects additional stage/confirm
+	compItems               []commandPaletteItem
+	compIdx                 int
+	compActive              bool
+	snapshot                host.UISnapshot
+	events                  []host.Event
+	eventIndex              map[string]int // event.ID → m.events 下标；调用类事件到达时原地更新
+	viewport                viewport.Model // 事件流 viewport
+	streamVP                viewport.Model // 流式输出 viewport
+	detailVP                viewport.Model // 右侧详情 viewport
+	stateVP                 viewport.Model // 左侧状态侧栏 viewport（可滚动）
+	streamRounds            []string
+	textarea                textarea.Model
+	width                   int
+	height                  int
+	autoScroll              bool
+	streamScroll            bool      // 流式面板自动跟随
+	streamDirty             bool      // streamRounds 有未刷新的 delta；由 streamFlushTick 60fps 合并
+	lastKeyAt               time.Time // 上次非 Enter 按键时间；KeyEnter 节流防粘贴 \n 流误触发提交
+	inputHistory            []string  // 已提交的输入历史（去重：相邻不重复）
+	historyIdx              int       // 当前浏览索引；== len(inputHistory) 表示"未浏览，正在编辑草稿"
+	historyDraft            string    // 进入历史浏览前保存的草稿，回到末端时恢复
+	focusPane               focusPane
+	hoverPane               focusPane
+	hoverActive             bool
+	mode                    appMode
+	starting                bool // UI 已进入工作台，Host 正在执行启动初始化
+	startupMode             startupMode
+	cocreateSeq             int
+	reportSeq               int
+	err                     error
+	spinnerIdx              int
+	toolSpinnerIdx          int  // 事件流进行中行的独立帧索引（150ms tick，不影响顶栏/星星）
+	cursorIdx               int  // 流式光标帧索引（独立 tick）
+	quitPending             bool // 双次 Ctrl+C 退出确认
+	abortPending            bool // 等待 Done 回来的手动暂停
+	idleWritingActive       bool // 当前运行由闲时调度启动
+	idleWritingStartPending bool
+	idleWritingSuspended    bool // 用户显式暂停后，本次 TUI 会话不自动重启；/idle-writing on 可解除
+	mouseOff                bool // true 时已禁用鼠标上报，让用户原生拖拽选中复制；再次切换恢复
 }
 
 // NewModel 创建 TUI Model。
@@ -163,6 +166,7 @@ func (m Model) Init() tea.Cmd {
 		tickToolSpinner(),
 		tickCursor(),
 		tickStreamFlush(),
+		tickIdleWriting(),
 	)
 }
 
@@ -547,6 +551,10 @@ func (m *Model) syncRuntimePlaceholder() {
 	}
 	if m.starting {
 		m.textarea.Placeholder = "正在初始化创作..."
+		return
+	}
+	if m.snapshot.IdleWritingEnabled && m.snapshot.IdleWritingInPeak && !m.snapshot.IsRunning && m.snapshot.Phase != "complete" {
+		m.textarea.Placeholder = "闲时写作已开启；当前为北京时间高峰，12:00/18:00 后自动恢复"
 		return
 	}
 	switch m.snapshot.RuntimeState {

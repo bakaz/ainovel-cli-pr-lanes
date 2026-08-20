@@ -83,6 +83,34 @@ func TestInitRunMeta_PreservesHistory(t *testing.T) {
 	}
 }
 
+func TestRunMetaIdleWritingTogglePersistsAcrossInit(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.RunMeta.Init("fantasy", "openrouter", "model"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := store.RunMeta.SetIdleWritingEnabled(true); err != nil {
+		t.Fatalf("SetIdleWritingEnabled: %v", err)
+	}
+	if err := store.RunMeta.Init("suspense", "openrouter", "model-2"); err != nil {
+		t.Fatalf("re-Init: %v", err)
+	}
+	meta, err := store.RunMeta.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if meta == nil || !meta.IdleWritingEnabled {
+		t.Fatalf("idle writing should survive Init, got %+v", meta)
+	}
+	if err := store.RunMeta.SetIdleWritingEnabled(false); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	meta, err = store.RunMeta.Load()
+	if err != nil || meta.IdleWritingEnabled {
+		t.Fatalf("idle writing should be disabled, meta=%+v err=%v", meta, err)
+	}
+}
+
 func TestSetAndClearPendingSteer(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)

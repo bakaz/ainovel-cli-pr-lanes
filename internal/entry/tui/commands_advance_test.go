@@ -21,6 +21,10 @@ func TestAdvanceCommandsAreRegistered(t *testing.T) {
 	if !hasPaletteItem(items, "review") || !hasPaletteItem(items, "next") {
 		t.Fatalf("advance commands missing from palette: %+v", items)
 	}
+	idle, ok := registry.Find("idle-writing")
+	if !ok || len(idle.Aliases) != 1 || idle.Aliases[0] != "idle" {
+		t.Fatalf("idle writing command should be registered with /idle alias: %+v", idle)
+	}
 }
 
 func TestReviewWaitingPlaceholder(t *testing.T) {

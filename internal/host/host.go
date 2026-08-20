@@ -81,12 +81,13 @@ type Host struct {
 	streamCh chan string
 	done     chan struct{}
 
-	mu         sync.Mutex
-	lifecycle  lifecycle
-	cocreating bool           // 阶段共创占用：paused 窗口内堵住 import/simulate/continue 的并发介入
-	restoring  bool           // restore in progress; blocks startEngine/Resume/intervention
-	activeOps  sync.WaitGroup // async import/simulation in-flight; Restore waits
-	closeOnce  sync.Once
+	mu             sync.Mutex
+	lifecycle      lifecycle
+	lastStopReason string         // 最近一次停止原因；用于闲时调度避免重启故障停机
+	cocreating     bool           // 阶段共创占用：paused 窗口内堵住 import/simulate/continue 的并发介入
+	restoring      bool           // restore in progress; blocks startEngine/Resume/intervention
+	activeOps      sync.WaitGroup // async import/simulation in-flight; Restore waits
+	closeOnce      sync.Once
 
 	interMu sync.Mutex // 干预裁定 FIFO 串行(同一时刻至多一次在途咨询)
 
@@ -478,6 +479,7 @@ func (h *Host) startEngineLocked(initial *flow.Instruction) bool {
 	h.observer.setAborting(false)
 	previous := h.lifecycle
 	h.lifecycle = lifecycleRunning
+	h.lastStopReason = ""
 	if !h.engine.start(initial) {
 		h.lifecycle = previous
 		return false
@@ -492,6 +494,33 @@ func (h *Host) Resume() (string, error) {
 	}
 	h.interMu.Lock()
 	defer h.interMu.Unlock()
+	return h.resumeLocked()
+}
+
+// ResumeForTUI 是 TUI 启动时的恢复入口。闲时写作开启且当前处于北京时间高峰时，
+// 只返回可恢复标签而不启动 Engine，交由 TUI 在下一个闲时窗口调度；其它恢复
+// 语义与 Resume 完全一致。
+func (h *Host) ResumeForTUI(now time.Time) (label string, deferred bool, err error) {
+	if err := h.checkMigrationGate(); err != nil {
+		return "", false, err
+	}
+	meta, err := h.store.RunMeta.Load()
+	if err != nil {
+		return "", false, err
+	}
+	label, err = resumeLabel(h.store)
+	if err != nil || label == "" || meta == nil || !meta.IdleWritingEnabled || !IdleWritingStatusAt(now).InPeak {
+		if err != nil {
+			return "", false, err
+		}
+		label, err = h.Resume()
+		return label, false, err
+	}
+	return label, true, nil
+}
+
+// resumeLocked 是 Resume 的实际实现；调用方必须持有 interMu。
+func (h *Host) resumeLocked() (string, error) {
 	h.mu.Lock()
 	if h.lifecycle == lifecycleRunning {
 		h.mu.Unlock()
@@ -558,6 +587,58 @@ func (h *Host) Resume() (string, error) {
 	// lifecycle 由 startEngine / runEnded 管理,此处不再覆写——
 	// 引擎立即结束(完本等)时覆写会把终态改回 running。
 	return label, nil
+}
+
+// StartIdleWriting 在北京时间非高峰时段尝试自动恢复一轮创作。
+// 它只接受 auto 推进模式，并拒绝带有待处理干预/一次性暂停意图的项目，
+// 因而不会绕过逐章验收或人工故障处理。返回 started=false 表示当前条件不满足，
+// 不是错误；真正的恢复失败才返回 error。
+func (h *Host) StartIdleWriting(now time.Time) (started bool, err error) {
+	if err := h.checkMigrationGate(); err != nil {
+		return false, err
+	}
+	if IdleWritingStatusAt(now).InPeak {
+		return false, nil
+	}
+
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+
+	meta, err := h.store.RunMeta.Load()
+	if err != nil {
+		return false, err
+	}
+	if meta == nil || !meta.IdleWritingEnabled || meta.AdvanceMode != domain.ChapterAdvanceAuto ||
+		meta.PendingSteer != "" || meta.AdvanceHold != nil {
+		return false, nil
+	}
+
+	h.mu.Lock()
+	blocked := h.lifecycle == lifecycleRunning || h.lifecycle == lifecycleCompleted || h.cocreating || h.restoring
+	h.mu.Unlock()
+	if blocked {
+		return false, nil
+	}
+
+	label, err := h.resumeLocked()
+	if err != nil {
+		return false, err
+	}
+	if label == "" {
+		return false, nil
+	}
+	return h.engine.isRunning(), nil
+}
+
+// PauseIdleWriting 在北京时间高峰时间到达时暂停由 TUI 调度的创作。
+// TUI 只会对自己启动的闲时写作调用此方法，不会打断用户手动运行的任务。
+func (h *Host) PauseIdleWriting() bool {
+	return h.abortWithEvent("进入北京时间高峰时段，闲时写作已暂停", "info")
+}
+
+// StopIdleWriting 关闭闲时写作时暂停当前由该调度器启动的引擎。
+func (h *Host) StopIdleWriting() bool {
+	return h.abortWithEvent("闲时写作已关闭，当前自动创作已暂停", "info")
 }
 
 func (h *Host) resumePendingIntervention(text string) {
@@ -760,6 +841,28 @@ func (h *Host) ContinueAndWait(text string) (InterventionOutcome, error) {
 		return InterventionOutcome{}, err
 	}
 	return h.doIntervention(text, true), nil
+}
+
+// SetIdleWritingEnabled 切换闲时写作意图。它只持久化开关，不隐式启动或暂停
+// 当前引擎；TUI 会在开关关闭且当前确由闲时调度运行时另行发起暂停。
+func (h *Host) SetIdleWritingEnabled(enabled bool) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+	if h.isRestoring() {
+		return fmt.Errorf("恢复操作进行中，无法切换闲时写作")
+	}
+	if err := h.store.RunMeta.SetIdleWritingEnabled(enabled); err != nil {
+		return err
+	}
+	label := "已关闭"
+	if enabled {
+		label = "已开启"
+	}
+	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "闲时写作" + label + "（北京时间高峰：09:00–12:00、14:00–18:00）", Level: "info"})
+	return nil
 }
 
 // continueGuard 是 Continue / ContinueAndWait 共享的前置校验与事件回显。
@@ -1038,6 +1141,7 @@ func (h *Host) abortWithEvent(summary, level string) bool {
 	running := h.lifecycle == lifecycleRunning
 	if running {
 		h.lifecycle = lifecyclePaused
+		h.lastStopReason = summary
 	}
 	h.mu.Unlock()
 	if !running {
@@ -1110,6 +1214,7 @@ func (h *Host) runEnded() {
 	progress, _ := h.store.Progress.Load()
 	if progress != nil && progress.Phase == domain.PhaseComplete {
 		h.lifecycle = lifecycleCompleted
+		h.lastStopReason = "创作完成"
 		// 完本收尾:确定性生成(store 已有全部事实,不花 LLM 调用;RFC 末节)。
 		summary := completionSummary(h.store)
 		h.mu.Unlock()
@@ -1123,6 +1228,7 @@ func (h *Host) runEnded() {
 		wasRunning := h.lifecycle == lifecycleRunning
 		if wasRunning {
 			h.lifecycle = lifecycleIdle
+			h.lastStopReason = "引擎自然停止"
 		}
 		completed := 0
 		name := ""
@@ -1248,6 +1354,7 @@ func (h *Host) emitClear() {
 func (h *Host) Snapshot() UISnapshot {
 	h.mu.Lock()
 	state := h.lifecycle
+	lastStopReason := h.lastStopReason
 	provider, model := "", ""
 	if h.models != nil {
 		provider, model, _ = h.models.CurrentSelection("default")
@@ -1259,6 +1366,7 @@ func (h *Host) Snapshot() UISnapshot {
 
 	// 动态解析当前模型的上下文窗口，/model 切换后下一次 Snapshot 自动反映
 	modelWindow, _ := h.cfg.ResolveContextWindow(model)
+	idleSchedule := IdleWritingStatusAt(time.Now())
 	cost, tokIn, tokOut, cacheRead, cacheWrite := h.usage.Totals()
 	saved := h.usage.SavedUSD()
 	overallCapable := h.usage.OverallCacheCapable()
@@ -1296,19 +1404,22 @@ func (h *Host) Snapshot() UISnapshot {
 	}
 
 	snap := UISnapshot{
-		Provider:              provider,
-		ModelName:             model,
-		ModelContextWindow:    modelWindow,
-		ThinkingLevel:         h.cfg.ResolveReasoningEffort("default"),
-		Style:                 h.cfg.Style,
-		RuntimeState:          string(state),
-		IsRunning:             state == lifecycleRunning,
-		TotalInputTokens:      tokIn,
-		TotalOutputTokens:     tokOut,
-		TotalCacheReadTokens:  cacheRead,
-		TotalCacheWriteTokens: cacheWrite,
-		TotalCostUSD:          cost,
-		TotalSavedUSD:         saved,
+		Provider:                  provider,
+		ModelName:                 model,
+		ModelContextWindow:        modelWindow,
+		ThinkingLevel:             h.cfg.ResolveReasoningEffort("default"),
+		Style:                     h.cfg.Style,
+		RuntimeState:              string(state),
+		IsRunning:                 state == lifecycleRunning,
+		LastStopReason:            lastStopReason,
+		IdleWritingInPeak:         idleSchedule.InPeak,
+		IdleWritingNextTransition: idleSchedule.NextTransition,
+		TotalInputTokens:          tokIn,
+		TotalOutputTokens:         tokOut,
+		TotalCacheReadTokens:      cacheRead,
+		TotalCacheWriteTokens:     cacheWrite,
+		TotalCostUSD:              cost,
+		TotalSavedUSD:             saved,
 		BudgetLimitUSD: func() float64 {
 			if h.budget != nil {
 				return h.budget.Limit()
@@ -1349,6 +1460,7 @@ func (h *Host) Snapshot() UISnapshot {
 	if meta, _ := h.store.RunMeta.Load(); meta != nil {
 		snap.PendingSteer = meta.PendingSteer
 		snap.AdvanceMode = string(meta.AdvanceMode)
+		snap.IdleWritingEnabled = meta.IdleWritingEnabled
 		snap.AdvancePermitChapter = meta.AdvancePermitChapter
 		if meta.AdvanceHold != nil {
 			snap.HasAdvanceHold = true

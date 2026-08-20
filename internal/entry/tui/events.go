@@ -15,14 +15,23 @@ import (
 
 // 消息类型
 type (
-	eventMsg       host.Event
-	snapshotMsg    host.UISnapshot
-	doneMsg        struct{ complete bool } // complete=true 全书完成，false 出错停止
-	abortResultMsg struct{ stopped bool }
-	bootstrapMsg   struct {
-		replay  []domain.RuntimeQueueItem
-		resumed bool
+	eventMsg    host.Event
+	snapshotMsg host.UISnapshot
+	doneMsg     struct {
+		complete   bool
+		stopReason string
+	} // complete=true 全书完成，false 出错停止
+	abortResultMsg            struct{ stopped bool }
+	idleWritingStartResultMsg struct {
+		started bool
 		err     error
+	}
+	idleWritingPauseResultMsg struct{ stopped bool }
+	bootstrapMsg              struct {
+		replay   []domain.RuntimeQueueItem
+		resumed  bool
+		deferred bool
+		err      error
 	}
 	reportLoadedMsg struct {
 		reqID      int
@@ -56,6 +65,7 @@ type (
 	streamDeltaMsg     string    // 流式 token 增量
 	streamClearMsg     struct{}  // 清空流式缓冲（新消息开始）
 	streamFlushTickMsg struct{}  // 60fps 节流刷新流式面板（合并 token 级 delta）
+	idleWritingTickMsg time.Time // 闲时写作调度 tick
 	quitResetMsg       struct{}  // 双次 Ctrl+C 超时重置
 	restoreResultMsg   struct {
 		result *backup.RestoreResult
@@ -82,7 +92,7 @@ func listenDone(rt *host.Host) tea.Cmd {
 			return nil
 		}
 		snap := rt.Snapshot()
-		return doneMsg{complete: snap.Phase == "complete"}
+		return doneMsg{complete: snap.Phase == "complete", stopReason: snap.LastStopReason}
 	}
 }
 
@@ -90,6 +100,33 @@ func tickSnapshot(rt *host.Host) tea.Cmd {
 	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
 		return snapshotMsg(rt.Snapshot())
 	})
+}
+
+const idleWritingTickInterval = 15 * time.Second
+
+func tickIdleWriting() tea.Cmd {
+	return tea.Tick(idleWritingTickInterval, func(t time.Time) tea.Msg {
+		return idleWritingTickMsg(t)
+	})
+}
+
+func startIdleWriting(rt *host.Host, now time.Time) tea.Cmd {
+	return func() tea.Msg {
+		started, err := rt.StartIdleWriting(now)
+		return idleWritingStartResultMsg{started: started, err: err}
+	}
+}
+
+func pauseIdleWriting(rt *host.Host) tea.Cmd {
+	return func() tea.Msg {
+		return idleWritingPauseResultMsg{stopped: rt.PauseIdleWriting()}
+	}
+}
+
+func stopIdleWriting(rt *host.Host) tea.Cmd {
+	return func() tea.Msg {
+		return idleWritingPauseResultMsg{stopped: rt.StopIdleWriting()}
+	}
 }
 
 func fetchSnapshot(rt *host.Host) tea.Cmd {
@@ -111,14 +148,14 @@ func bootstrapRuntime(rt *host.Host) tea.Cmd {
 		if err != nil {
 			return bootstrapMsg{err: err}
 		}
-		label, err := rt.Resume()
+		label, deferred, err := rt.ResumeForTUI(time.Now())
 		if err != nil {
 			return bootstrapMsg{replay: replay, err: err}
 		}
-		if label == "" && len(replay) == 0 {
+		if label == "" && len(replay) == 0 && !deferred {
 			return nil
 		}
-		return bootstrapMsg{replay: replay, resumed: label != ""}
+		return bootstrapMsg{replay: replay, resumed: label != "" && !deferred, deferred: deferred}
 	}
 }
 

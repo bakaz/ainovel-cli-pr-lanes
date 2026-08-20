@@ -148,6 +148,16 @@ func commandRegistryInstance() commandRegistry {
 			},
 		},
 		{
+			Name:        "idle-writing",
+			Aliases:     []string{"idle"},
+			Group:       "writing",
+			Usage:       "/idle-writing on|off|status",
+			Description: "开关闲时自动续写（北京时间 09:00–12:00、14:00–18:00 高峰暂停）",
+			Run: func(m Model, args []string) (tea.Model, tea.Cmd) {
+				return m.handleIdleWritingCommand(args)
+			},
+		},
+		{
 			Name:        "style-critic",
 			Group:       "writing",
 			Usage:       "/style-critic on|off",

@@ -39,30 +39,34 @@ func (e Event) Running() bool {
 
 // UISnapshot 是 TUI 渲染所需的聚合状态快照。
 type UISnapshot struct {
-	Provider             string
-	NovelName            string
-	ModelName            string
-	ModelContextWindow   int // 当前默认模型的上下文窗口（随 /model 切换实时解析）
-	ThinkingLevel        string
-	Style                string
-	RuntimeState         string // idle / running / pausing / paused / completed
-	StatusLabel          string
-	Phase                string
-	Flow                 string
-	TotalChapters        int
-	CompletedCount       int
-	TotalWordCount       int
-	InProgressChapter    int
-	PendingRewrites      []int
-	RewriteReason        string
-	PendingSteer         string
-	AdvanceMode          string
-	AdvancePermitChapter int
-	HasAdvanceHold       bool
-	AdvanceHoldReason    string
-	RecoveryLabel        string
-	IsRunning            bool
-	Agents               []AgentSnapshot
+	Provider                  string
+	NovelName                 string
+	ModelName                 string
+	ModelContextWindow        int // 当前默认模型的上下文窗口（随 /model 切换实时解析）
+	ThinkingLevel             string
+	Style                     string
+	RuntimeState              string // idle / running / pausing / paused / completed
+	StatusLabel               string
+	Phase                     string
+	Flow                      string
+	TotalChapters             int
+	CompletedCount            int
+	TotalWordCount            int
+	InProgressChapter         int
+	PendingRewrites           []int
+	RewriteReason             string
+	PendingSteer              string
+	AdvanceMode               string
+	AdvancePermitChapter      int
+	HasAdvanceHold            bool
+	AdvanceHoldReason         string
+	RecoveryLabel             string
+	IsRunning                 bool
+	LastStopReason            string
+	IdleWritingEnabled        bool
+	IdleWritingInPeak         bool
+	IdleWritingNextTransition time.Time
+	Agents                    []AgentSnapshot
 
 	// 上下文
 	ContextTokens         int

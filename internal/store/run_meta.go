@@ -87,6 +87,7 @@ func (s *RunMetaStore) Init(style, provider, model string) error {
 			meta.AdvancePermitChapter = existing.AdvancePermitChapter
 			meta.AdvanceHold = existing.AdvanceHold
 			meta.StyleReviewMode = existing.StyleReviewMode
+			meta.IdleWritingEnabled = existing.IdleWritingEnabled
 			meta.LastAuthorModel = existing.LastAuthorModel
 		}
 		if meta.AdvanceMode == "" {
@@ -99,6 +100,22 @@ func (s *RunMetaStore) Init(style, provider, model string) error {
 			return err
 		}
 		return s.saveUnlocked(meta)
+	})
+}
+
+// SetIdleWritingEnabled 持久化闲时写作开关。
+// 调度器只在 TUI 进程内运行；持久化的只是用户意图，便于下次打开项目继续使用。
+func (s *RunMetaStore) SetIdleWritingEnabled(enabled bool) error {
+	return s.io.WithWriteLock(func() error {
+		meta, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if meta == nil {
+			return fmt.Errorf("run meta 未初始化")
+		}
+		meta.IdleWritingEnabled = enabled
+		return s.saveUnlocked(*meta)
 	})
 }
 

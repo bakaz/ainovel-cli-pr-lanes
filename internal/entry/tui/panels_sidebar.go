@@ -52,6 +52,10 @@ func renderStateContent(snap host.UISnapshot, contentW int) string {
 		}
 	}
 	overview.WriteString(renderField("字数", formatNumber(snap.TotalWordCount)))
+	overview.WriteString(renderField("闲时写作", snapshotIdleWritingLabel(snap)))
+	if snap.IdleWritingEnabled && !snap.IdleWritingNextTransition.IsZero() {
+		overview.WriteString(renderField("下次切换", snap.IdleWritingNextTransition.Format("01-02 15:04")))
+	}
 	if label, ch := inProgressDisplay(snap); label != "" {
 		overview.WriteString(renderField(label, fmt.Sprintf("第 %d 章", ch)))
 	}
@@ -275,6 +279,19 @@ func snapshotRuntimeStateLabel(state string) string {
 	default:
 		return "空闲"
 	}
+}
+
+func snapshotIdleWritingLabel(snap host.UISnapshot) string {
+	if !snap.IdleWritingEnabled {
+		return "关闭"
+	}
+	if snap.IdleWritingInPeak {
+		return "开启·高峰暂停"
+	}
+	if snap.IsRunning {
+		return "开启·运行中"
+	}
+	return "开启·等待空闲"
 }
 
 func snapshotFlowLabel(flow string) string {
