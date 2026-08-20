@@ -16,15 +16,54 @@ import (
 type Deps struct {
 	Store      *store.Store
 	CommitTool *tools.CommitChapterTool
-	LLM        LLMChat // 同一模型即可，foundation/analyzer 都是结构化反推
-	Prompts    Prompts
-	Contract   *projectprofile.SceneBeatContract // v3 契约（可能为 nil，Core4 兼容）
+	// LLM 是旧版兼容入口：当 AnalyzeLLM / SynthesizeLLM 未提供时作为回退。
+	LLM LLMChat
+	// 三个导入语义函数可以使用独立模型。SegmentLLM 为空时保留本地
+	// 确定性标题切分，不额外消耗一次模型调用。
+	SegmentLLM    LLMChat
+	AnalyzeLLM    LLMChat
+	SynthesizeLLM LLMChat
+	Prompts       Prompts
+	Contract      *projectprofile.SceneBeatContract // v3 契约（可能为 nil，Core4 兼容）
 }
 
-// Prompts 是 imp 流程使用的两段提示词。
+// Prompts 是 imp 流程使用的提示词。
 type Prompts struct {
-	Foundation string // 反推 foundation
-	Analyzer   string // 反推单章
+	Segment    string // 语义切分（仅显式配置 import_segment 时启用）
+	Synthesize string // 反推 foundation / 全书综合
+	Analyze    string // 反推单章
+
+	// Foundation / Analyzer 保留给旧调用方；新调用方应使用上面的阶段名。
+	Foundation string
+	Analyzer   string
+}
+
+func (d Deps) analyzeModel() LLMChat {
+	if d.AnalyzeLLM != nil {
+		return d.AnalyzeLLM
+	}
+	return d.LLM
+}
+
+func (d Deps) synthesizeModel() LLMChat {
+	if d.SynthesizeLLM != nil {
+		return d.SynthesizeLLM
+	}
+	return d.LLM
+}
+
+func (p Prompts) analyzePrompt() string {
+	if strings.TrimSpace(p.Analyze) != "" {
+		return p.Analyze
+	}
+	return p.Analyzer
+}
+
+func (p Prompts) synthesizePrompt() string {
+	if strings.TrimSpace(p.Synthesize) != "" {
+		return p.Synthesize
+	}
+	return p.Foundation
 }
 
 // Run 执行完整 import 流程：split → foundation → chapter loop。
@@ -35,7 +74,7 @@ type Prompts struct {
 //   - 任意一步失败都直接结束，发 StageError 事件；
 //   - chapter 阶段对已完成章节静默跳过（commit_chapter 的幂等是兜底，但跳过 LLM 更省 token）。
 func Run(ctx context.Context, deps Deps, opts Options) (<-chan Event, error) {
-	if deps.Store == nil || deps.CommitTool == nil || deps.LLM == nil {
+	if deps.Store == nil || deps.CommitTool == nil || deps.analyzeModel() == nil || deps.synthesizeModel() == nil {
 		return nil, fmt.Errorf("deps incomplete")
 	}
 	if strings.TrimSpace(opts.SourcePath) == "" {
@@ -56,7 +95,14 @@ func Run(ctx context.Context, deps Deps, opts Options) (<-chan Event, error) {
 
 		// ── 1. 切分 ──
 		emit(StageSplitting, 0, 0, "切分章节...", nil)
-		chapters, err := SplitFile(opts.SourcePath)
+		var chapters []Chapter
+		var err error
+		if deps.SegmentLLM != nil && strings.TrimSpace(deps.Prompts.Segment) != "" {
+			emit(StageSplitting, 0, 0, "语义切分章节（import_segment）...", nil)
+			chapters, err = SegmentFile(ctx, deps.SegmentLLM, deps.Prompts.Segment, opts.SourcePath)
+		} else {
+			chapters, err = SplitFile(opts.SourcePath)
+		}
 		if err != nil {
 			emit(StageError, 0, 0, "切分失败", err)
 			return
@@ -76,11 +122,11 @@ func Run(ctx context.Context, deps Deps, opts Options) (<-chan Event, error) {
 		if needsFoundation(deps.Store, opts) {
 			emit(StageFoundation, 0, total, "反推 Foundation 中（一次 LLM 调用）...", nil)
 			// v3 契约：在 foundation prompt 后追加字段指导
-			foundationPrompt := deps.Prompts.Foundation
+			foundationPrompt := deps.Prompts.synthesizePrompt()
 			if deps.Contract != nil && deps.Contract.ImportGuidance() != "" {
 				foundationPrompt += "\n\n" + deps.Contract.ImportGuidance()
 			}
-			fr, err := ReverseFoundation(ctx, deps.LLM, foundationPrompt, chapters, deps.Contract)
+			fr, err := ReverseFoundation(ctx, deps.synthesizeModel(), foundationPrompt, chapters, deps.Contract)
 			if err != nil {
 				emit(StageError, 0, total, "Foundation 反推失败", err)
 				return
@@ -124,7 +170,7 @@ func Run(ctx context.Context, deps Deps, opts Options) (<-chan Event, error) {
 
 			activeHooks, _ := deps.Store.World.LoadActiveForeshadow()
 			charState, _ := deps.Store.World.LoadCharacterState()
-			analysis, err := AnalyzeChapter(ctx, deps.LLM, deps.Prompts.Analyzer,
+			analysis, err := AnalyzeChapter(ctx, deps.analyzeModel(), deps.Prompts.analyzePrompt(),
 				chNum, ch.Title, ch.Content, premise, charactersBlock, activeHooks, charState)
 			if err != nil {
 				emit(StageError, chNum, total, fmt.Sprintf("第 %d 章分析失败", chNum), err)

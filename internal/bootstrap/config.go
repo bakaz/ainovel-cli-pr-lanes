@@ -137,12 +137,17 @@ type RoleConfig struct {
 // critic 配置为可选，未配时回落默认模型。
 // polisher 配置为可选，未配时回落默认模型；配置存在即视为启用精修流水线
 // （另见 Config.ChapterPipelineEnabled）。
+// import_* 是导入流程三个语义函数的模型档位；import_analyze/import_synthesize
+// 未配置时由导入调用方回落 architect，import_segment 未配置时保留确定性切分。
 var knownRoles = map[string]bool{
-	"architect": true,
-	"writer":    true,
-	"editor":    true,
-	"critic":    true,
-	"polisher":  true,
+	"architect":         true,
+	"writer":            true,
+	"editor":            true,
+	"critic":            true,
+	"polisher":          true,
+	"import_segment":    true,
+	"import_analyze":    true,
+	"import_synthesize": true,
 }
 
 // Config 小说应用配置。
@@ -262,7 +267,7 @@ func (c *Config) ValidateBase() error {
 			return err
 		}
 		if !knownRoles[role] {
-			return fmt.Errorf("unknown role %q in roles config (valid: architect/writer/editor/critic/polisher): %w", role, errs.ErrConfig)
+			return fmt.Errorf("unknown role %q in roles config (valid: architect/writer/editor/critic/polisher/import_segment/import_analyze/import_synthesize): %w", role, errs.ErrConfig)
 		}
 		if rc.Provider == "" || rc.Model == "" {
 			return fmt.Errorf("role %q must have both provider and model: %w", role, errs.ErrConfig)

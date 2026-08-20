@@ -35,6 +35,7 @@ var supportedPromptFiles = []string{
 	"writer.md",
 	"editor.md",
 	"polisher.md",
+	"import-segment.md",
 	"import-foundation.md",
 	"import-chapter-analyzer.md",
 	"simulation-source.md",
@@ -83,10 +84,14 @@ func applyPromptOverrides(bundle *Bundle, root string, report *OverlayReport) {
 			}
 		} else {
 			switch file {
+			case "import-segment.md":
+				bundle.Prompts.ImportSegment = raw
 			case "import-foundation.md":
 				bundle.Prompts.ImportFoundation = raw
+				bundle.Prompts.ImportSynthesize = raw
 			case "import-chapter-analyzer.md":
 				bundle.Prompts.ImportAnalyzer = raw
+				bundle.Prompts.ImportAnalyze = raw
 			case "simulation-source.md":
 				bundle.Prompts.SimulationSource = raw
 			case "simulation-merge.md":
@@ -282,6 +287,7 @@ func (b *Bundle) recordEmbeddedSources(style string) {
 	prompts := map[string]string{
 		"architect-short.md": b.Prompts.ArchitectShort, "architect-long.md": b.Prompts.ArchitectLong,
 		"writer.md": b.Prompts.Writer, "editor.md": b.Prompts.Editor, "polisher.md": b.Prompts.Polisher,
+		"import-segment.md":    b.Prompts.ImportSegment,
 		"import-foundation.md": b.Prompts.ImportFoundation, "import-chapter-analyzer.md": b.Prompts.ImportAnalyzer,
 		"simulation-source.md": b.Prompts.SimulationSource, "simulation-merge.md": b.Prompts.SimulationMerge,
 		"arbiter-plan-start.md": b.Prompts.ArbiterPlanStart, "arbiter-intervention.md": b.Prompts.ArbiterIntervention,
@@ -329,6 +335,8 @@ func (b Bundle) EffectiveResource(key string) (string, bool) {
 		return b.Prompts.Editor, true
 	case "prompts/polisher.md":
 		return b.Prompts.Polisher, true
+	case "prompts/import-segment.md":
+		return b.Prompts.ImportSegment, true
 	case "prompts/import-foundation.md":
 		return b.Prompts.ImportFoundation, true
 	case "prompts/import-chapter-analyzer.md":

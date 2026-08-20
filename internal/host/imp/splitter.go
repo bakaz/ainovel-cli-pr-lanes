@@ -49,15 +49,22 @@ var defaultChapterRegex = regexp.MustCompile(
 
 // SplitFile 把单个文本文件切分成章节列表。
 func SplitFile(path string) ([]Chapter, error) {
-	data, err := os.ReadFile(path)
+	text, err := readSourceText(path)
 	if err != nil {
-		return nil, fmt.Errorf("read source: %w", err)
+		return nil, err
 	}
-	text := utils.DecodeText(data)
 	if strings.TrimSpace(text) == "" {
 		return nil, fmt.Errorf("source file is empty: %s", path)
 	}
 	return splitText(text, defaultChapterRegex), nil
+}
+
+func readSourceText(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read source: %w", err)
+	}
+	return utils.DecodeText(data), nil
 }
 
 // splitText 是纯函数版切分，便于单测。

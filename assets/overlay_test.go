@@ -45,6 +45,40 @@ func TestApplyOverridesWhitelistPrecedenceAndSources(t *testing.T) {
 	}
 }
 
+func TestImportPromptAliasesAndOverlay(t *testing.T) {
+	bundle := Load("default", LoadOptions{})
+	if bundle.Prompts.ImportSegment == "" || bundle.Prompts.ImportAnalyze == "" || bundle.Prompts.ImportSynthesize == "" {
+		t.Fatal("导入三种新 prompt 资源都应非空")
+	}
+	if bundle.Prompts.ImportAnalyze != bundle.Prompts.ImportAnalyzer {
+		t.Fatal("ImportAnalyze 应兼容映射到旧 ImportAnalyzer 资源")
+	}
+	if bundle.Prompts.ImportSynthesize != bundle.Prompts.ImportFoundation {
+		t.Fatal("ImportSynthesize 应兼容映射到旧 ImportFoundation 资源")
+	}
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "prompts", "import-segment.md"), "SEGMENT_OVERRIDE")
+	writeFile(t, filepath.Join(root, "prompts", "import-foundation.md"), "SYNTHESIZE_OVERRIDE")
+	writeFile(t, filepath.Join(root, "prompts", "import-chapter-analyzer.md"), "ANALYZE_OVERRIDE")
+	report := ApplyOverrides(&bundle, "default", []string{root})
+	if bundle.Prompts.ImportSegment != "SEGMENT_OVERRIDE" {
+		t.Fatalf("ImportSegment overlay missing: %q", bundle.Prompts.ImportSegment)
+	}
+	if bundle.Prompts.ImportFoundation != "SYNTHESIZE_OVERRIDE" || bundle.Prompts.ImportSynthesize != "SYNTHESIZE_OVERRIDE" {
+		t.Fatalf("foundation/synthesize compatibility overlay missing: foundation=%q synthesize=%q", bundle.Prompts.ImportFoundation, bundle.Prompts.ImportSynthesize)
+	}
+	if bundle.Prompts.ImportAnalyzer != "ANALYZE_OVERRIDE" || bundle.Prompts.ImportAnalyze != "ANALYZE_OVERRIDE" {
+		t.Fatalf("analyzer/analyze compatibility overlay missing: analyzer=%q analyze=%q", bundle.Prompts.ImportAnalyzer, bundle.Prompts.ImportAnalyze)
+	}
+	if len(report.Applied) != 3 {
+		t.Fatalf("expected three import overlays, got %+v", report.Applied)
+	}
+	if src := bundle.Sources["prompts/import-segment.md"]; src.Kind != "file" || len(src.SHA256) != 64 {
+		t.Fatalf("segment source not auditable: %+v", src)
+	}
+}
+
 func TestStyleCriticOverlay_RejectedOnInvalidUTF8(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "prompts", "style-critic.md")

@@ -12,14 +12,19 @@ import (
 // 记录身份用 agent="arbiter"(UsageTracker 对未知角色按 Default 价目计费)。
 type usageTrackedModel struct {
 	inner  agentcore.ChatModel
+	role   string
 	record func(agentName, task string, msg agentcore.AgentMessage)
 }
 
 func newUsageTrackedModel(inner agentcore.ChatModel, record func(string, string, agentcore.AgentMessage)) agentcore.ChatModel {
+	return newRoleUsageTrackedModel(inner, "arbiter", record)
+}
+
+func newRoleUsageTrackedModel(inner agentcore.ChatModel, role string, record func(string, string, agentcore.AgentMessage)) agentcore.ChatModel {
 	if record == nil {
 		return inner
 	}
-	tracked := &usageTrackedModel{inner: inner, record: record}
+	tracked := &usageTrackedModel{inner: inner, role: role, record: record}
 	if capabilities, ok := inner.(llm.CapabilityProvider); ok {
 		return &capabilityUsageTrackedModel{usageTrackedModel: tracked, capabilities: capabilities}
 	}
@@ -40,7 +45,7 @@ func (m *capabilityUsageTrackedModel) Capabilities() llm.Capabilities {
 func (m *usageTrackedModel) Generate(ctx context.Context, msgs []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
 	resp, err := m.inner.Generate(ctx, msgs, tools, opts...)
 	if err == nil && resp != nil {
-		m.record("arbiter", "", resp.Message)
+		m.record(m.role, "", resp.Message)
 	}
 	return resp, err
 }

@@ -90,7 +90,10 @@
 
   // 可选。按角色覆盖默认模型；未配的角色使用上面的 model。
   // reasoning_effort 也可按角色覆盖；未配时继承顶层 reasoning_effort。
-  // 角色：architect / writer / editor / critic / polisher。critic / polisher 未配时回落默认模型。
+  // 角色：architect / writer / editor / critic / polisher / import_segment /
+  // import_analyze / import_synthesize。
+  // 未配置的普通角色回落默认模型；import_analyze/import_synthesize 未配置时回落 architect；
+  // import_segment 未配置时保留本地确定性章节切分，显式配置后才启用语义切分。
   // fallbacks 在主模型失败时按序尝试。
   // 注意：这里的 provider 同样是"指针"，必须指向 providers 里存在的 key。
   // "roles": {
@@ -100,7 +103,10 @@
   //     "reasoning_effort": "high",
   //     "fallbacks": [{ "provider": "openrouter", "model": "google/gemini-3.0-pro" }]
   //   },
-  //   "architect": { "provider": "openrouter", "model": "google/gemini-3.1-pro" }
+  //   "architect": { "provider": "openrouter", "model": "google/gemini-3.1-pro" },
+  //   "import_segment": { "provider": "openrouter", "model": "google/gemini-3.0-flash" },
+  //   "import_analyze": { "provider": "openrouter", "model": "google/gemini-3.0-flash" },
+  //   "import_synthesize": { "provider": "openrouter", "model": "google/gemini-3.1-pro" }
   // },
 
   // 可选。章节精修流水线模式。""（默认）= 不启用（行为与旧版本一致）；

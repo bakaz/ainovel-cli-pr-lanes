@@ -377,7 +377,7 @@ output/novel/meta/simulation_profile.json
 
 #### 按角色使用不同模型
 
-通过 `roles` 字段为不同智能体分配不同的模型，未配置的角色使用默认模型：
+通过 `roles` 字段为不同智能体分配不同的模型。普通角色未配置时使用默认模型；导入阶段的分析/综合未配置时使用 `architect`，语义切分只有显式配置 `import_segment` 才启用：
 
 ```jsonc
 {
@@ -393,12 +393,15 @@ output/novel/meta/simulation_profile.json
     "writer": { "provider": "anthropic", "model": "claude-sonnet-4", "reasoning_effort": "medium" },
     "editor": { "provider": "openrouter", "model": "google/gemini-2.5-pro", "reasoning_effort": "medium" },
     "polisher": { "provider": "anthropic", "model": "claude-sonnet-4", "reasoning_effort": "low" },
-    "critic": { "provider": "openrouter", "model": "google/gemini-2.5-flash", "reasoning_effort": "low" }
+    "critic": { "provider": "openrouter", "model": "google/gemini-2.5-flash", "reasoning_effort": "low" },
+    "import_segment": { "provider": "openrouter", "model": "google/gemini-2.5-flash", "reasoning_effort": "low" },
+    "import_analyze": { "provider": "openrouter", "model": "google/gemini-2.5-pro", "reasoning_effort": "medium" },
+    "import_synthesize": { "provider": "openrouter", "model": "google/gemini-2.5-pro", "reasoning_effort": "high" }
   }
 }
 ```
 
-可配置的角色：`architect` / `writer` / `editor`。语义裁定 Arbiter 统一使用 default 模型，当前不开放独立角色配置。
+可配置的角色：`architect` / `writer` / `editor` / `critic` / `polisher`，以及导入流程的 `import_segment` / `import_analyze` / `import_synthesize`。三个导入角色均可单独指定模型；未配置 `import_segment` 时保留本地确定性章节切分，未配置 `import_analyze` / `import_synthesize` 时回落到 `architect`。其它未配置角色回落默认模型。语义裁定 Arbiter 统一使用 default 模型，当前不开放独立角色配置。
 
 #### 自定义代理
 

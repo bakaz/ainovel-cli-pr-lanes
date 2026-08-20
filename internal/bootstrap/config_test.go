@@ -164,6 +164,24 @@ func TestPolisherRole_ValidateAndFallback(t *testing.T) {
 	}
 }
 
+func TestImportRoles_Validate(t *testing.T) {
+	cfg := Config{
+		Provider:  "openrouter",
+		ModelName: "default-model",
+		Providers: map[string]ProviderConfig{
+			"openrouter": {APIKey: "sk-test-123456"},
+		},
+		Roles: map[string]RoleConfig{
+			"import_segment":    {Provider: "openrouter", Model: "segment-model"},
+			"import_analyze":    {Provider: "openrouter", Model: "analyze-model"},
+			"import_synthesize": {Provider: "openrouter", Model: "synthesize-model"},
+		},
+	}
+	if err := cfg.ValidateBase(); err != nil {
+		t.Fatalf("三个导入角色配置应通过校验: %v", err)
+	}
+}
+
 // TestChapterPipeline_ValidationAndDetection 验证 chapter_pipeline 开关的校验与启用判定。
 func TestChapterPipeline_ValidationAndDetection(t *testing.T) {
 	base := func() Config {

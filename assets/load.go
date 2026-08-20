@@ -31,6 +31,12 @@ type Prompts struct {
 	Writer           string // 协议模板,含 {{VOICE}} 占位符;终稿经 BuildWriterPrompt 组装
 	Editor           string
 	Polisher         string // 文风精修师（独立 Runner，仅精修已有草稿，不评审不提交）
+	ImportSegment    string // 语义切分：识别章节/卷/附属文本边界
+	ImportAnalyze    string // 连续批次逐章事实提取
+	ImportSynthesize string // 分层综合与卷弧划分
+	// ImportFoundation and ImportAnalyzer are legacy names retained for callers
+	// using the original two-prompt import contract. They mirror the corresponding
+	// ImportSynthesize and ImportAnalyze resources.
 	ImportFoundation string
 	ImportAnalyzer   string
 	SimulationSource string
@@ -212,14 +218,19 @@ func loadReferences(style string, opts LoadOptions) tools.References {
 }
 
 func loadPrompts() Prompts {
+	foundation := mustRead(promptsFS, "prompts/import-foundation.md")
+	analyzer := mustRead(promptsFS, "prompts/import-chapter-analyzer.md")
 	return Prompts{
 		ArchitectShort:   WithSimulationGuidance(mustRead(promptsFS, "prompts/architect-short.md"), "architect"),
 		ArchitectLong:    WithSimulationGuidance(mustRead(promptsFS, "prompts/architect-long.md"), "architect"),
 		Writer:           WithSimulationGuidance(mustRead(promptsFS, "prompts/writer.md"), "writer"),
 		Editor:           WithSimulationGuidance(mustRead(promptsFS, "prompts/editor.md"), "editor"),
 		Polisher:         WithSimulationGuidance(mustRead(promptsFS, "prompts/polisher.md"), "polisher"),
-		ImportFoundation: mustRead(promptsFS, "prompts/import-foundation.md"),
-		ImportAnalyzer:   mustRead(promptsFS, "prompts/import-chapter-analyzer.md"),
+		ImportSegment:    mustRead(promptsFS, "prompts/import-segment.md"),
+		ImportAnalyze:    analyzer,
+		ImportSynthesize: foundation,
+		ImportFoundation: foundation,
+		ImportAnalyzer:   analyzer,
 		SimulationSource: mustRead(promptsFS, "prompts/simulation-source.md"),
 		SimulationMerge:  mustRead(promptsFS, "prompts/simulation-merge.md"),
 

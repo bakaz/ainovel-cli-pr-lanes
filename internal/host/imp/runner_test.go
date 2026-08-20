@@ -301,3 +301,44 @@ func TestRunner_ResumeFromSkipsFoundation(t *testing.T) {
 		t.Errorf("want 2 chapter LLM calls (foundation skipped), got %d", llm.calls.Load())
 	}
 }
+
+func TestRunner_UsesStageSpecificModels(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "novel.txt")
+	body := strings.Repeat("正文段落，足够字数以通过 LoadChapterContent 校验。她心里骂自己丢人，真不要脸。\n", 30)
+	first := "第一章 初遇\n" + body
+	secondStart := strings.Count(first, "\n") + 1
+	if err := os.WriteFile(src, []byte(first+"第二章 循迹\n"+body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st := store.NewStore(filepath.Join(dir, "out"))
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("stage-model-test", 0); err != nil {
+		t.Fatal(err)
+	}
+	segment := &segmentTestLLM{response: fmt.Sprintf("=== CHAPTERS ===\n[{\"title\":\"初遇\",\"start_line\":1},{\"title\":\"循迹\",\"start_line\":%d}]", secondStart)}
+	synthesize := &scriptedLLM{responses: []string{validEnvelope}}
+	analyze := &scriptedLLM{responses: []string{validAnalyzerEnvelope, validAnalyzerEnvelope}}
+	events, err := Run(context.Background(), Deps{
+		Store:         st,
+		CommitTool:    tools.NewCommitChapterTool(st),
+		SegmentLLM:    segment,
+		AnalyzeLLM:    analyze,
+		SynthesizeLLM: synthesize,
+		Prompts:       Prompts{Segment: "segment", Synthesize: "synthesize", Analyze: "analyze"},
+	}, Options{SourcePath: src})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ev := range events {
+		if ev.Err != nil {
+			t.Fatalf("import errored: %v", ev.Err)
+		}
+	}
+	if segment.calls != 1 || synthesize.calls.Load() != 1 || analyze.calls.Load() != 2 {
+		t.Fatalf("stage model calls: segment=%d synthesize=%d analyze=%d", segment.calls, synthesize.calls.Load(), analyze.calls.Load())
+	}
+}

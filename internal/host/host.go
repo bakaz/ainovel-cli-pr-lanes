@@ -2476,6 +2476,35 @@ func parseRunControlTime(value string) time.Time {
 	return t
 }
 
+// importRoleModel 返回导入语义函数使用的模型。
+// 未显式配置 import_analyze/import_synthesize 时，按上游语义回落到 architect；
+// import_segment 由调用方显式启用。其余导入运行时逻辑仍由本地 imp 包负责，
+// 避免改变当前的 Store/互斥/checkpoint 行为。
+func (h *Host) importRoleModel(role string) agentcore.ChatModel {
+	modelRole := role
+	if _, _, explicit := h.models.CurrentSelection(role); !explicit {
+		modelRole = "architect"
+	}
+	model := h.models.ForRoleWithFailover(modelRole, func(ev bootstrap.FailoverEvent) {
+		slog.Warn("导入角色 provider 切换",
+			"module", "import",
+			"role", role,
+			"model_role", modelRole,
+			"reason", ev.Reason,
+			"from", fmt.Sprintf("%s/%s", ev.FromProvider, ev.FromModel),
+			"to", fmt.Sprintf("%s/%s", ev.ToProvider, ev.ToModel),
+			"err", ev.Err,
+		)
+	})
+	var record func(string, string, agentcore.AgentMessage)
+	if h.usage != nil {
+		record = h.usage.Record
+	}
+	// 记录实际绑定的模型角色：未配置 import_* 时是 architect，避免 usage
+	// 统计把回落到 architect 的调用误算成默认模型。
+	return agents.WithTrailingAntiRefusal(newRoleUsageTrackedModel(model, modelRole, record), h.store)
+}
+
 // ImportFrom 启动一次外部小说反推导入：切分 → 反推 foundation → 逐章分析落盘。
 // 与 Engine 运行互斥；导入完成后调用方可立即 Resume() 续写。
 // 返回的事件通道由 imp.Run 关闭，调用方负责消费（满则丢弃以防阻塞分析协程）。
@@ -2500,11 +2529,25 @@ func (h *Host) ImportFrom(ctx context.Context, opts imp.Options) (<-chan imp.Eve
 		return h.trackImpOp(ch), nil
 	}
 
+	var segmentLLM agentcore.ChatModel
+	if _, _, explicit := h.models.CurrentSelection("import_segment"); explicit {
+		segmentLLM = h.importRoleModel("import_segment")
+	}
+	synthesizeLLM := h.importRoleModel("import_synthesize")
+	analyzeLLM := h.importRoleModel("import_analyze")
 	deps := imp.Deps{
 		Store:      h.store,
 		CommitTool: tools.NewCommitChapterTool(h.store),
-		LLM:        agents.WithTrailingAntiRefusal(h.models.ForRole("architect"), h.store),
+		// LLM 保留为兼容字段；新流程明确按阶段绑定三个模型。
+		LLM:           synthesizeLLM,
+		SegmentLLM:    segmentLLM,
+		AnalyzeLLM:    analyzeLLM,
+		SynthesizeLLM: synthesizeLLM,
 		Prompts: imp.Prompts{
+			Segment:    h.bundle.Prompts.ImportSegment,
+			Synthesize: h.bundle.Prompts.ImportSynthesize,
+			Analyze:    h.bundle.Prompts.ImportAnalyze,
+			// 保留旧字段，便于外部/测试构造的 Bundle 继续工作。
 			Foundation: h.bundle.Prompts.ImportFoundation,
 			Analyzer:   h.bundle.Prompts.ImportAnalyzer,
 		},
