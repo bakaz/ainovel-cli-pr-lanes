@@ -98,9 +98,10 @@ func TestConsume_RealHost_PendingRewritesExit5(t *testing.T) {
 	}
 }
 
-// TestRunContinue_RealHost_ArbiterFailureExit2 验证真实 ContinueAndWait 链路：
-// 干预裁定走真实 arbiter LLM 调用 → stub provider 返回 401（认证错误，客户端
-// 不重试，立即失败）→ 干预失败 → 退出码 2（真实调用失败路径，非假实现注入）。
+// TestRunContinue_RealHost_ArbiterFailureExit2 验证带具体语义的 ContinueAndWait
+// 链路：非精确控制词的干预裁定走真实 arbiter LLM 调用 → stub provider 返回
+// 401（认证错误，客户端不重试，立即失败）→ 干预失败 → 退出码 2。精确“继续”
+// 是确定性的恢复控制词，另由 Host 测试覆盖，不应在这里期待 Arbiter 调用。
 func TestRunContinue_RealHost_ArbiterFailureExit2(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"invalid api key","type":"auth_error"}}`, http.StatusUnauthorized)
@@ -126,7 +127,7 @@ func TestRunContinue_RealHost_ArbiterFailureExit2(t *testing.T) {
 	defer eng.Close()
 
 	var stderr strings.Builder
-	err = runContinue(eng, &strings.Builder{}, &stderr, "继续")
+	err = runContinue(eng, &strings.Builder{}, &stderr, "继续写作，但先保持当前章节节奏")
 	var ec *ExitCodeError
 	if !errors.As(err, &ec) || ec.Code != 2 {
 		t.Fatalf("arbiter LLM failure must map to ExitCodeError{2}, got %v", err)

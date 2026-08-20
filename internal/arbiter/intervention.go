@@ -154,6 +154,32 @@ func (d *InterventionDecision) ValidateAgainst(f InterventionFacts) error {
 	return nil
 }
 
+// ValidateAgainstInput 在通用事实校验之外，按用户原始输入补充控制词约束。
+//
+// “继续”是确定性的恢复控制词，不是一个需要模型自由编排动作的自然语言
+// 请求。模型即使返回了合法 JSON，也不能借这个输入新增 hold、派单、返工或
+// 长效规则；已有一次性暂停时最多只能取消它。这里保留在 Arbiter 入口的
+// 第二道防线，供重放、非 Host 调用方和未来入口共同使用。
+func (d *InterventionDecision) ValidateAgainstInput(f InterventionFacts, input string) error {
+	if strings.TrimSpace(input) != "继续" {
+		return d.ValidateAgainst(f)
+	}
+	if strings.TrimSpace(d.Reason) == "" {
+		return fmt.Errorf("reason 不能为空")
+	}
+	if d.Rules != "" || d.Reopen != nil || d.Dispatch != nil {
+		return fmt.Errorf("精确“继续”不得包含 rules、reopen 或 dispatch")
+	}
+	if f.HasAdvanceHold {
+		if d.Hold == nil || !d.Hold.Cancel {
+			return fmt.Errorf("已有一次性暂停时，精确“继续”只能输出 hold.cancel=true")
+		}
+	} else if d.Hold != nil {
+		return fmt.Errorf("没有一次性暂停时，精确“继续”不得设置 hold")
+	}
+	return nil
+}
+
 // DecideIntervention 干预分诊。失败语义:返回 error → 调用方显式回显
 // 真实失败原因,且不产生任何写入(宁可不动,不可误动)。
 func DecideIntervention(ctx context.Context, model agentcore.ChatModel, systemPrompt string, facts InterventionFacts, text string) (InterventionDecision, error) {
@@ -162,7 +188,7 @@ func DecideIntervention(ctx context.Context, model agentcore.ChatModel, systemPr
 		Facts        InterventionFacts `json:"facts"`
 	}{Intervention: text, Facts: facts})
 	return decide(ctx, model, systemPrompt, payload, func(d *InterventionDecision) error {
-		return d.ValidateAgainst(facts)
+		return d.ValidateAgainstInput(facts, text)
 	})
 }
 

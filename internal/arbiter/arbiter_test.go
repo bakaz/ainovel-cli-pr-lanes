@@ -206,6 +206,48 @@ func TestInterventionDecision_ValidateAgainst(t *testing.T) {
 	}
 }
 
+func TestInterventionDecision_ValidateAgainstInput_PlainContinue(t *testing.T) {
+	writing := InterventionFacts{Phase: string(domain.PhaseWriting), CompletedChapters: 10}
+	withHold := InterventionFacts{
+		Phase:             string(domain.PhaseWriting),
+		CompletedChapters: 10,
+		HasAdvanceHold:    true,
+	}
+
+	cases := []struct {
+		name    string
+		input   string
+		d       InterventionDecision
+		f       InterventionFacts
+		wantErr bool
+	}{
+		{"无 hold 可省略动作", "继续", InterventionDecision{Reason: "恢复主线"}, writing, false},
+		{"无 hold 仅确认", " 继续 ", InterventionDecision{Answer: "继续推进", Reason: "恢复主线"}, writing, false},
+		{"无 hold 禁止新增 hold", "继续", InterventionDecision{
+			Hold: &AdvanceHoldOp{After: domain.AdvanceHoldAtBoundary, Reason: "误加暂停"}, Reason: "恢复主线",
+		}, writing, true},
+		{"无 hold 禁止派 editor", "继续", InterventionDecision{
+			Dispatch: &DispatchOp{Agent: "editor", Task: "重写第782章"}, Reason: "恢复主线",
+		}, writing, true},
+		{"有 hold 只能取消", "继续", InterventionDecision{
+			Hold: &AdvanceHoldOp{Cancel: true}, Answer: "已恢复", Reason: "取消暂停",
+		}, withHold, false},
+		{"有 hold 禁止并行派单", "继续", InterventionDecision{
+			Hold: &AdvanceHoldOp{Cancel: true}, Dispatch: &DispatchOp{Agent: "editor", Task: "重写第782章"}, Reason: "恢复主线",
+		}, withHold, true},
+		{"有 hold 必须取消", "继续", InterventionDecision{Answer: "继续推进", Reason: "恢复主线"}, withHold, true},
+		{"非精确继续仍走通用规则", "继续，但先改第3章", InterventionDecision{Reason: "无动作"}, writing, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.d.ValidateAgainstInput(tc.f, tc.input)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("wantErr=%v got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
 func TestFailureDecision_Validate(t *testing.T) {
 	ok := FailureDecision{Action: "reroute", Dispatch: &DispatchOp{Agent: "architect_long", Task: "先 expand_arc"}, Reason: "错误指明出路"}
 	if err := ok.Validate(); err != nil {

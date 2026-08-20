@@ -1015,6 +1015,13 @@ func (h *Host) Continue(text string) error {
 	if err := h.continueGuard(text); err != nil {
 		return err
 	}
+	if isPlainResumeSteer(text) {
+		// 精确“继续”是确定性的恢复控制词，不需要唤醒 Arbiter。
+		// 这条路径仍会检查并拒绝未裁决的真实干预，避免把错误任务
+		// 静默带入下一代运行。
+		go h.continuePlain()
+		return nil
+	}
 	go h.doIntervention(text, true)
 	return nil
 }
@@ -1026,7 +1033,69 @@ func (h *Host) ContinueAndWait(text string) (InterventionOutcome, error) {
 	if err := h.continueGuard(text); err != nil {
 		return InterventionOutcome{}, err
 	}
+	if isPlainResumeSteer(text) {
+		return h.continuePlain(), nil
+	}
 	return h.doIntervention(text, true), nil
+}
+
+// continuePlain 执行精确“继续”的确定性恢复。
+// 调用方不需要再经过 Arbiter；但停机期留下的非纯继续干预必须先处理，
+// 否则“继续”不能成为绕过待裁决错误的后门。调用方必须通过 Continue/ContinueAndWait
+// 先完成 continueGuard，本函数内部负责干预互斥。
+func (h *Host) continuePlain() InterventionOutcome {
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+
+	fail := func(err error) InterventionOutcome {
+		if err == nil {
+			err = fmt.Errorf("继续恢复失败")
+		}
+		detail := err.Error()
+		h.emitEvent(Event{
+			Time:     time.Now(),
+			Category: "ERROR",
+			Agent:    "host",
+			Summary:  "继续恢复失败：" + detail,
+			Detail:   detail,
+			Kind:     errorKind(err, detail),
+			Level:    "error",
+		})
+		return InterventionOutcome{OK: false, Failure: err}
+	}
+
+	if h.engine.isRunning() {
+		return fail(fmt.Errorf("引擎已在运行"))
+	}
+	meta, err := h.store.RunMeta.Load()
+	if err != nil {
+		return fail(fmt.Errorf("读取运行元信息失败: %w", err))
+	}
+	if meta != nil && strings.TrimSpace(meta.PendingSteer) != "" && !isPlainResumeSteer(meta.PendingSteer) {
+		return fail(fmt.Errorf("仍有未裁决干预 %q，请先处理该干预后再继续", meta.PendingSteer))
+	}
+	if meta != nil && meta.AdvanceHold != nil {
+		if err := h.store.RunMeta.ClearAdvanceHold(*meta.AdvanceHold); err != nil {
+			return fail(fmt.Errorf("取消一次性暂停失败: %w", err))
+		}
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "已取消一次性暂停", Level: "info"})
+	}
+	// 恢复入口若在退出/取消竞态中留下纯“继续”，把它视为已处理，
+	// 同时复位 FlowSteering；真实干预则在上面已被拒绝，不会被清掉。
+	if meta != nil && meta.PendingSteer != "" {
+		if err := h.store.ClearHandledSteer(); err != nil {
+			return fail(fmt.Errorf("清除残留继续指令失败: %w", err))
+		}
+	}
+
+	label, err := h.resumeLockedAs(domain.RunOriginManual, nil)
+	if err != nil {
+		return fail(err)
+	}
+	if label == "" {
+		return InterventionOutcome{OK: true, EngineRunning: false}
+	}
+	return InterventionOutcome{OK: true, EngineRunning: h.engine.isRunning()}
 }
 
 // SetIdleWritingEnabled 切换闲时写作意图。它只持久化开关，不隐式启动或暂停
