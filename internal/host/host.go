@@ -497,9 +497,9 @@ func (h *Host) Resume() (string, error) {
 	return h.resumeLocked()
 }
 
-// ResumeForTUI 是 TUI 启动时的恢复入口。闲时写作开启且当前处于北京时间高峰时，
-// 只返回可恢复标签而不启动 Engine，交由 TUI 在下一个闲时窗口调度；其它恢复
-// 语义与 Resume 完全一致。
+// ResumeForTUI 是 TUI 启动时的恢复入口。闲时写作或高峰自动暂停开启且当前处于
+// 北京时间高峰时，只返回可恢复标签而不启动 Engine，交由 TUI 在下一个窗口处理；
+// 其它恢复语义与 Resume 完全一致。
 func (h *Host) ResumeForTUI(now time.Time) (label string, deferred bool, err error) {
 	if err := h.checkMigrationGate(); err != nil {
 		return "", false, err
@@ -509,7 +509,9 @@ func (h *Host) ResumeForTUI(now time.Time) (label string, deferred bool, err err
 		return "", false, err
 	}
 	label, err = resumeLabel(h.store)
-	if err != nil || label == "" || meta == nil || !meta.IdleWritingEnabled || !IdleWritingStatusAt(now).InPeak {
+	if err != nil || label == "" || meta == nil ||
+		(!meta.IdleWritingEnabled && !meta.PeakAutoPauseEnabled) ||
+		!IdleWritingStatusAt(now).InPeak {
 		if err != nil {
 			return "", false, err
 		}
@@ -630,8 +632,12 @@ func (h *Host) StartIdleWriting(now time.Time) (started bool, err error) {
 	return h.engine.isRunning(), nil
 }
 
-// PauseIdleWriting 在北京时间高峰时间到达时暂停由 TUI 调度的创作。
-// TUI 只会对自己启动的闲时写作调用此方法，不会打断用户手动运行的任务。
+// PauseForPeak 在北京时间高峰时间到达时暂停当前创作。
+func (h *Host) PauseForPeak() bool {
+	return h.abortWithEvent("进入北京时间高峰时段，当前创作已自动暂停", "info")
+}
+
+// PauseIdleWriting 保留闲时写作调度器的专用入口；高峰暂停本身已对所有创作统一。
 func (h *Host) PauseIdleWriting() bool {
 	return h.abortWithEvent("进入北京时间高峰时段，闲时写作已暂停", "info")
 }
@@ -862,6 +868,28 @@ func (h *Host) SetIdleWritingEnabled(enabled bool) error {
 		label = "已开启"
 	}
 	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "闲时写作" + label + "（北京时间高峰：09:00–12:00、14:00–18:00）", Level: "info"})
+	return nil
+}
+
+// SetPeakAutoPauseEnabled 切换北京时间高峰时段的全局自动暂停意图。
+// 它只持久化开关；TUI 调度器负责按时间检查并暂停当前 Engine。
+func (h *Host) SetPeakAutoPauseEnabled(enabled bool) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+	if h.isRestoring() {
+		return fmt.Errorf("恢复操作进行中，无法切换高峰自动暂停")
+	}
+	if err := h.store.RunMeta.SetPeakAutoPauseEnabled(enabled); err != nil {
+		return err
+	}
+	label := "已关闭"
+	if enabled {
+		label = "已开启"
+	}
+	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "高峰自动暂停" + label + "（北京时间：09:00–12:00、14:00–18:00）", Level: "info"})
 	return nil
 }
 
@@ -1461,6 +1489,7 @@ func (h *Host) Snapshot() UISnapshot {
 		snap.PendingSteer = meta.PendingSteer
 		snap.AdvanceMode = string(meta.AdvanceMode)
 		snap.IdleWritingEnabled = meta.IdleWritingEnabled
+		snap.PeakAutoPauseEnabled = meta.PeakAutoPauseEnabled
 		snap.AdvancePermitChapter = meta.AdvancePermitChapter
 		if meta.AdvanceHold != nil {
 			snap.HasAdvanceHold = true

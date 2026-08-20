@@ -557,6 +557,10 @@ func (m *Model) syncRuntimePlaceholder() {
 		m.textarea.Placeholder = "闲时写作已开启；当前为北京时间高峰，12:00/18:00 后自动恢复"
 		return
 	}
+	if m.snapshot.PeakAutoPauseEnabled && m.snapshot.IdleWritingInPeak && !m.snapshot.IsRunning && m.snapshot.Phase != "complete" {
+		m.textarea.Placeholder = "高峰自动暂停已开启；当前为北京时间高峰，12:00/18:00 后可继续"
+		return
+	}
 	switch m.snapshot.RuntimeState {
 	case "completed":
 		m.textarea.Placeholder = "创作已完成"

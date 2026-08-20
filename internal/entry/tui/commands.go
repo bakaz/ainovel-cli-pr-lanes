@@ -158,6 +158,16 @@ func commandRegistryInstance() commandRegistry {
 			},
 		},
 		{
+			Name:        "idle-start",
+			Group:       "writing",
+			Usage:       "/idle-start [on|off|status]",
+			Description: "高峰时段自动暂停所有创作（包括手动启动）",
+			AutoExecute: true,
+			Run: func(m Model, args []string) (tea.Model, tea.Cmd) {
+				return m.handlePeakAutoPauseCommand(args)
+			},
+		},
+		{
 			Name:        "style-critic",
 			Group:       "writing",
 			Usage:       "/style-critic on|off",

@@ -88,6 +88,7 @@ func (s *RunMetaStore) Init(style, provider, model string) error {
 			meta.AdvanceHold = existing.AdvanceHold
 			meta.StyleReviewMode = existing.StyleReviewMode
 			meta.IdleWritingEnabled = existing.IdleWritingEnabled
+			meta.PeakAutoPauseEnabled = existing.PeakAutoPauseEnabled
 			meta.LastAuthorModel = existing.LastAuthorModel
 		}
 		if meta.AdvanceMode == "" {
@@ -115,6 +116,21 @@ func (s *RunMetaStore) SetIdleWritingEnabled(enabled bool) error {
 			return fmt.Errorf("run meta 未初始化")
 		}
 		meta.IdleWritingEnabled = enabled
+		return s.saveUnlocked(*meta)
+	})
+}
+
+// SetPeakAutoPauseEnabled 持久化高峰时段自动暂停开关。
+func (s *RunMetaStore) SetPeakAutoPauseEnabled(enabled bool) error {
+	return s.io.WithWriteLock(func() error {
+		meta, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if meta == nil {
+			return fmt.Errorf("run meta 未初始化")
+		}
+		meta.PeakAutoPauseEnabled = enabled
 		return s.saveUnlocked(*meta)
 	})
 }

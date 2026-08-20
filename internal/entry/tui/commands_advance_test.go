@@ -25,6 +25,14 @@ func TestAdvanceCommandsAreRegistered(t *testing.T) {
 	if !ok || len(idle.Aliases) != 1 || idle.Aliases[0] != "idle" {
 		t.Fatalf("idle writing command should be registered with /idle alias: %+v", idle)
 	}
+	peak, ok := registry.Find("idle-start")
+	if !ok || !peak.AutoExecute || peak.NeedsIdle || peak.Usage != "/idle-start [on|off|status]" {
+		t.Fatalf("peak auto pause command should be available while running: %+v", peak)
+	}
+	items = builtinCommandItems()
+	if !hasPaletteItem(items, "idle-start") {
+		t.Fatalf("peak auto pause command missing from palette: %+v", items)
+	}
 }
 
 func TestReviewWaitingPlaceholder(t *testing.T) {

@@ -123,6 +123,12 @@ func pauseIdleWriting(rt *host.Host) tea.Cmd {
 	}
 }
 
+func pauseForPeak(rt *host.Host) tea.Cmd {
+	return func() tea.Msg {
+		return idleWritingPauseResultMsg{stopped: rt.PauseForPeak()}
+	}
+}
+
 func stopIdleWriting(rt *host.Host) tea.Cmd {
 	return func() tea.Msg {
 		return idleWritingPauseResultMsg{stopped: rt.StopIdleWriting()}

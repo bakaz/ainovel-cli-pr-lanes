@@ -14,10 +14,11 @@ import (
 func (m Model) handleIdleWritingTick(now time.Time) (tea.Model, tea.Cmd) {
 	next := tickIdleWriting()
 	schedule := host.IdleWritingStatusAt(now)
-	if m.idleWritingActive && m.snapshot.IsRunning && schedule.InPeak && m.askState == nil {
+	if m.snapshot.IsRunning && schedule.InPeak &&
+		(m.idleWritingActive || m.snapshot.PeakAutoPauseEnabled) {
 		m.idleWritingActive = false
 		m.idleWritingStartPending = false
-		return m, tea.Batch(next, pauseIdleWriting(m.runtime))
+		return m, tea.Batch(next, pauseForPeak(m.runtime))
 	}
 	if m.mode != modeRunning || m.starting || m.cocreate != nil || m.askState != nil || m.help != nil ||
 		m.modelSwitch != nil || m.report != nil || m.importer != nil || m.simulator != nil {
@@ -58,6 +59,23 @@ func idleWritingStatusSummary(snap host.UISnapshot, now time.Time) string {
 	return fmt.Sprintf("闲时写作：%s；%s；下次切换北京时间 %s", enabled, window, next)
 }
 
+func peakAutoPauseStatusSummary(snap host.UISnapshot, now time.Time) string {
+	schedule := host.IdleWritingStatusAt(now)
+	enabled := "关闭"
+	if snap.PeakAutoPauseEnabled {
+		enabled = "开启"
+	}
+	window := "当前为闲时"
+	if schedule.InPeak {
+		window = "当前为高峰时段"
+	}
+	next := "-"
+	if !schedule.NextTransition.IsZero() {
+		next = schedule.NextTransition.Format("01-02 15:04")
+	}
+	return fmt.Sprintf("高峰自动暂停：%s；%s；下次切换北京时间 %s", enabled, window, next)
+}
+
 func (m Model) handleIdleWritingCommand(args []string) (tea.Model, tea.Cmd) {
 	if len(args) != 1 || (args[0] != "on" && args[0] != "off" && args[0] != "status") {
 		m.applyEvent(host.Event{Time: time.Now(), Category: "ERROR", Summary: "用法：/idle-writing on|off|status", Level: "error"})
@@ -95,6 +113,41 @@ func (m Model) handleIdleWritingCommand(args []string) (tea.Model, tea.Cmd) {
 		!host.IdleWritingStatusAt(time.Now()).InPeak {
 		m.idleWritingStartPending = true
 		cmds = append(cmds, startIdleWriting(m.runtime, time.Now()))
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// handlePeakAutoPauseCommand 切换北京时间高峰时段的全局自动暂停。
+// 无参数时切换开关，on/off/status 用于显式操作或查询。
+func (m Model) handlePeakAutoPauseCommand(args []string) (tea.Model, tea.Cmd) {
+	if len(args) > 1 || (len(args) == 1 && args[0] != "on" && args[0] != "off" && args[0] != "status") {
+		m.applyEvent(host.Event{Time: time.Now(), Category: "ERROR", Summary: "用法：/idle-start [on|off|status]", Level: "error"})
+		m.refreshEventViewport()
+		return m, nil
+	}
+	if len(args) == 1 && args[0] == "status" {
+		m.applyEvent(host.Event{Time: time.Now(), Category: "SYSTEM", Summary: peakAutoPauseStatusSummary(m.snapshot, time.Now()), Level: "info"})
+		m.refreshEventViewport()
+		return m, nil
+	}
+
+	enabled := !m.snapshot.PeakAutoPauseEnabled
+	if len(args) == 1 {
+		enabled = args[0] == "on"
+	}
+	if err := m.runtime.SetPeakAutoPauseEnabled(enabled); err != nil {
+		m.applyEvent(host.Event{Time: time.Now(), Category: "ERROR", Summary: "切换高峰自动暂停失败：" + err.Error(), Level: "error"})
+		m.refreshEventViewport()
+		return m, nil
+	}
+	m.snapshot.PeakAutoPauseEnabled = enabled
+
+	now := time.Now()
+	cmds := []tea.Cmd{fetchSnapshot(m.runtime)}
+	if enabled && m.snapshot.IsRunning && host.IdleWritingStatusAt(now).InPeak {
+		m.idleWritingActive = false
+		m.idleWritingStartPending = false
+		cmds = append(cmds, pauseForPeak(m.runtime))
 	}
 	return m, tea.Batch(cmds...)
 }

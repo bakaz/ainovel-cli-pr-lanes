@@ -211,14 +211,15 @@ type RunMeta struct {
 	Style                string             `json:"style"`
 	Model                string             `json:"model"`
 	PlanningTier         PlanningTier       `json:"planning_tier,omitempty"`
-	StartPrompt          string             `json:"start_prompt,omitempty"`           // 用户原始创作需求（输入事实，先于启动裁定落盘；裁定失败后据此补裁）
-	PlanStart            *PlanStartRecord   `json:"plan_start,omitempty"`             // 启动裁定事实，规划期崩溃恢复的唯一依据
-	PendingSteer         string             `json:"pending_steer,omitempty"`          // 未完成的 Steer 指令，中断恢复时重新注入
-	AdvanceMode          ChapterAdvanceMode `json:"advance_mode"`                     // 章节推进模式：auto / review
-	AdvancePermitChapter int                `json:"advance_permit_chapter,omitempty"` // review 模式下一次性许可的正向章节
-	AdvanceHold          *AdvanceHold       `json:"advance_hold,omitempty"`           // 当前干预签署的一次性暂停意图
-	StyleReviewMode      StyleQualityMode   `json:"style_review_mode,omitempty"`      // 风格评审质量模式：off / critic；零值等效 off
-	IdleWritingEnabled   bool               `json:"idle_writing_enabled,omitempty"`   // 闲时写作开关；仅 TUI 会话内调度，开关跨重启保留
+	StartPrompt          string             `json:"start_prompt,omitempty"`            // 用户原始创作需求（输入事实，先于启动裁定落盘；裁定失败后据此补裁）
+	PlanStart            *PlanStartRecord   `json:"plan_start,omitempty"`              // 启动裁定事实，规划期崩溃恢复的唯一依据
+	PendingSteer         string             `json:"pending_steer,omitempty"`           // 未完成的 Steer 指令，中断恢复时重新注入
+	AdvanceMode          ChapterAdvanceMode `json:"advance_mode"`                      // 章节推进模式：auto / review
+	AdvancePermitChapter int                `json:"advance_permit_chapter,omitempty"`  // review 模式下一次性许可的正向章节
+	AdvanceHold          *AdvanceHold       `json:"advance_hold,omitempty"`            // 当前干预签署的一次性暂停意图
+	StyleReviewMode      StyleQualityMode   `json:"style_review_mode,omitempty"`       // 风格评审质量模式：off / critic；零值等效 off
+	IdleWritingEnabled   bool               `json:"idle_writing_enabled,omitempty"`    // 闲时写作开关；仅 TUI 会话内调度，开关跨重启保留
+	PeakAutoPauseEnabled bool               `json:"peak_auto_pause_enabled,omitempty"` // 高峰时段自动暂停所有创作，开关跨重启保留
 	// LastAuthorModel 最近一次 writer 派发时生效的模型名（正文写入的真实作者模型）。
 	// 由 Engine 在 runWorker 派发 writer 前记录，供 rewrite_brief 的 author provenance
 	// 使用——不再从 StyleReview 反推（旧实现误取 critic 模型）。

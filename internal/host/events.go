@@ -64,6 +64,7 @@ type UISnapshot struct {
 	IsRunning                 bool
 	LastStopReason            string
 	IdleWritingEnabled        bool
+	PeakAutoPauseEnabled      bool
 	IdleWritingInPeak         bool
 	IdleWritingNextTransition time.Time
 	Agents                    []AgentSnapshot

@@ -111,6 +111,34 @@ func TestRunMetaIdleWritingTogglePersistsAcrossInit(t *testing.T) {
 	}
 }
 
+func TestRunMetaPeakAutoPauseTogglePersistsAcrossInit(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.RunMeta.Init("fantasy", "openrouter", "model"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := store.RunMeta.SetPeakAutoPauseEnabled(true); err != nil {
+		t.Fatalf("SetPeakAutoPauseEnabled: %v", err)
+	}
+	if err := store.RunMeta.Init("suspense", "openrouter", "model-2"); err != nil {
+		t.Fatalf("re-Init: %v", err)
+	}
+	meta, err := store.RunMeta.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if meta == nil || !meta.PeakAutoPauseEnabled {
+		t.Fatalf("peak auto pause should survive Init, got %+v", meta)
+	}
+	if err := store.RunMeta.SetPeakAutoPauseEnabled(false); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	meta, err = store.RunMeta.Load()
+	if err != nil || meta.PeakAutoPauseEnabled {
+		t.Fatalf("peak auto pause should be disabled, meta=%+v err=%v", meta, err)
+	}
+}
+
 func TestSetAndClearPendingSteer(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)
