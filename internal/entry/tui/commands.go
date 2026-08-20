@@ -158,13 +158,13 @@ func commandRegistryInstance() commandRegistry {
 			},
 		},
 		{
-			Name:        "idle-start",
+			Name:        "peak-pause",
 			Group:       "writing",
-			Usage:       "/idle-start [on|off|status]",
-			Description: "高峰时段自动暂停所有创作（包括手动启动）",
+			Usage:       "/peak-pause [on|off|status|skip]",
+			Description: "控制手动创作的高峰自动暂停；skip 仅跳过当前窗口",
 			AutoExecute: true,
 			Run: func(m Model, args []string) (tea.Model, tea.Cmd) {
-				return m.handlePeakAutoPauseCommand(args)
+				return m.handlePeakPauseCommand(args)
 			},
 		},
 		{

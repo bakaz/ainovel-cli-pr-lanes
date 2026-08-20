@@ -40,6 +40,9 @@ func (s *RunMetaStore) loadUnlocked() (*domain.RunMeta, error) {
 	if err := normalizeStyleReviewMode(&meta); err != nil {
 		return nil, err
 	}
+	if err := normalizeRunControl(&meta); err != nil {
+		return nil, err
+	}
 	return &meta, nil
 }
 
@@ -55,6 +58,29 @@ func normalizeStyleReviewMode(meta *domain.RunMeta) error {
 	}
 	if !meta.StyleReviewMode.Valid() {
 		return fmt.Errorf("不支持的 style_review_mode %q，请使用创建该项目的新版 ainovel", meta.StyleReviewMode)
+	}
+	return nil
+}
+
+// normalizeRunControl 在加载边界拒绝未知控制枚举，恢复策略必须 fail closed。
+func normalizeRunControl(meta *domain.RunMeta) error {
+	if meta == nil || meta.Control == nil {
+		return nil
+	}
+	c := meta.Control
+	if c.Origin != "" && !c.Origin.Valid() {
+		return fmt.Errorf("不支持的 run origin %q，请使用创建该项目的新版 ainovel", c.Origin)
+	}
+	if c.LastStop != nil && !c.LastStop.Category.Valid() {
+		return fmt.Errorf("不支持的 stop category %q，请使用创建该项目的新版 ainovel", c.LastStop.Category)
+	}
+	if c.AutoResume != nil {
+		if !c.AutoResume.Trigger.Valid() {
+			return fmt.Errorf("不支持的 resume trigger %q，请使用创建该项目的新版 ainovel", c.AutoResume.Trigger)
+		}
+		if !c.AutoResume.Origin.Valid() {
+			return fmt.Errorf("不支持的 resume origin %q，请使用创建该项目的新版 ainovel", c.AutoResume.Origin)
+		}
 	}
 	return nil
 }
@@ -89,6 +115,7 @@ func (s *RunMetaStore) Init(style, provider, model string) error {
 			meta.StyleReviewMode = existing.StyleReviewMode
 			meta.IdleWritingEnabled = existing.IdleWritingEnabled
 			meta.PeakAutoPauseEnabled = existing.PeakAutoPauseEnabled
+			meta.Control = cloneRunControl(existing.Control)
 			meta.LastAuthorModel = existing.LastAuthorModel
 		}
 		if meta.AdvanceMode == "" {
@@ -133,6 +160,150 @@ func (s *RunMetaStore) SetPeakAutoPauseEnabled(enabled bool) error {
 		meta.PeakAutoPauseEnabled = enabled
 		return s.saveUnlocked(*meta)
 	})
+}
+
+// BeginRun 原子地创建新的运行代次；permit 非 nil 时只允许消费完全匹配的一次性许可。
+func (s *RunMetaStore) BeginRun(origin domain.RunOrigin, startedAt string, permit *domain.ResumePermit) (uint64, error) {
+	if !origin.Valid() {
+		return 0, fmt.Errorf("不支持的 run origin %q", origin)
+	}
+	if startedAt == "" {
+		startedAt = time.Now().Format(time.RFC3339)
+	}
+	var generation uint64
+	err := s.io.WithWriteLock(func() error {
+		meta, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if meta == nil {
+			return fmt.Errorf("run meta 未初始化")
+		}
+		if meta.Control == nil {
+			meta.Control = &domain.RunControl{}
+		}
+		control := meta.Control
+		if permit != nil {
+			if control.AutoResume == nil || *control.AutoResume != *permit {
+				return fmt.Errorf("自动恢复许可已变化或已消费")
+			}
+			if permit.Generation != control.Generation || permit.Origin != origin {
+				return fmt.Errorf("自动恢复许可与当前运行代次不匹配")
+			}
+			if permit.NotBefore != "" {
+				notBefore, parseErr := time.Parse(time.RFC3339, permit.NotBefore)
+				if parseErr != nil {
+					return fmt.Errorf("自动恢复许可时间无效: %w", parseErr)
+				}
+				if time.Now().Before(notBefore) {
+					return fmt.Errorf("自动恢复许可尚未到期")
+				}
+			}
+		}
+		control.Generation++
+		generation = control.Generation
+		control.Active = true
+		control.Origin = origin
+		control.StartedAt = startedAt
+		control.LastStop = nil
+		control.AutoResume = nil
+		return s.saveUnlocked(*meta)
+	})
+	return generation, err
+}
+
+// FinishRun 原子记录运行代次的最终停止原因与可选的一次性恢复许可。
+func (s *RunMetaStore) FinishRun(stop domain.RunStopRecord, permit *domain.ResumePermit) error {
+	if !stop.Category.Valid() {
+		return fmt.Errorf("不支持的 stop category %q", stop.Category)
+	}
+	if stop.StoppedAt == "" {
+		stop.StoppedAt = time.Now().Format(time.RFC3339)
+	}
+	return s.io.WithWriteLock(func() error {
+		meta, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if meta == nil || meta.Control == nil {
+			return fmt.Errorf("run control 未初始化")
+		}
+		control := meta.Control
+		if stop.Generation != control.Generation {
+			return fmt.Errorf("停止记录代次不匹配：期望 %d，收到 %d", control.Generation, stop.Generation)
+		}
+		if permit != nil {
+			if !permit.Trigger.Valid() || !permit.Origin.Valid() || permit.Generation != stop.Generation || permit.Origin != control.Origin {
+				return fmt.Errorf("自动恢复许可不合法")
+			}
+		}
+		control.Active = false
+		control.LastStop = &stop
+		control.AutoResume = cloneResumePermit(permit)
+		return s.saveUnlocked(*meta)
+	})
+}
+
+// SetPeakOverrideUntil 设置当前高峰窗口的一次性跳过截止时间。
+func (s *RunMetaStore) SetPeakOverrideUntil(until string) error {
+	return s.io.WithWriteLock(func() error {
+		meta, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if meta == nil {
+			return fmt.Errorf("run meta 未初始化")
+		}
+		if meta.Control == nil {
+			meta.Control = &domain.RunControl{}
+		}
+		meta.Control.PeakOverrideUntil = until
+		return s.saveUnlocked(*meta)
+	})
+}
+
+// ClearIdleResumePermit 撤销尚未消费的闲时自动恢复许可。
+func (s *RunMetaStore) ClearIdleResumePermit() error {
+	return s.io.WithWriteLock(func() error {
+		meta, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if meta == nil || meta.Control == nil || meta.Control.AutoResume == nil {
+			return nil
+		}
+		if meta.Control.AutoResume.Origin == domain.RunOriginIdleScheduler {
+			meta.Control.AutoResume = nil
+			return s.saveUnlocked(*meta)
+		}
+		return nil
+	})
+}
+
+func cloneRunControl(control *domain.RunControl) *domain.RunControl {
+	if control == nil {
+		return nil
+	}
+	cp := *control
+	cp.LastStop = cloneRunStop(control.LastStop)
+	cp.AutoResume = cloneResumePermit(control.AutoResume)
+	return &cp
+}
+
+func cloneRunStop(stop *domain.RunStopRecord) *domain.RunStopRecord {
+	if stop == nil {
+		return nil
+	}
+	cp := *stop
+	return &cp
+}
+
+func cloneResumePermit(permit *domain.ResumePermit) *domain.ResumePermit {
+	if permit == nil {
+		return nil
+	}
+	cp := *permit
+	return &cp
 }
 
 func validateAdvanceControl(meta domain.RunMeta) error {

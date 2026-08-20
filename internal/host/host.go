@@ -81,15 +81,21 @@ type Host struct {
 	streamCh chan string
 	done     chan struct{}
 
-	mu             sync.Mutex
-	lifecycle      lifecycle
-	lastStopReason string         // 最近一次停止原因；用于闲时调度避免重启故障停机
-	cocreating     bool           // 阶段共创占用：paused 窗口内堵住 import/simulate/continue 的并发介入
-	restoring      bool           // restore in progress; blocks startEngine/Resume/intervention
-	activeOps      sync.WaitGroup // async import/simulation in-flight; Restore waits
-	closeOnce      sync.Once
+	mu               sync.Mutex
+	lifecycle        lifecycle
+	lastStopReason   string // 最近一次停止原因；用于闲时调度避免重启故障停机
+	lastStopCategory domain.StopCategory
+	pendingStop      *pauseRequest
+	stopRecorded     bool
+	finalizing       bool // 正在把本代运行的终态写回 RunMeta；期间禁止新一代启动
+	runGeneration    uint64
+	cocreating       bool           // 阶段共创占用：paused 窗口内堵住 import/simulate/continue 的并发介入
+	restoring        bool           // restore in progress; blocks startEngine/Resume/intervention
+	activeOps        sync.WaitGroup // async import/simulation in-flight; Restore waits
+	closeOnce        sync.Once
 
-	interMu sync.Mutex // 干预裁定 FIFO 串行(同一时刻至多一次在途咨询)
+	interMu   sync.Mutex // 干预裁定 FIFO 串行(同一时刻至多一次在途咨询)
+	runStopMu sync.Mutex // 串行化 RunMeta 终态落盘，避免 Close 与 onDone 重复收尾
 
 	// runCtx 约束宿主侧的 LLM 裁定调用(启动裁定/干预分诊);Close 取消,
 	// 避免退出时仍有裁定在途且无法中断。
@@ -221,7 +227,7 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 	// 预算哨兵:Engine 在每轮循环边界直接调用 HandleBoundary(不再经事件订阅)。
 	if sentinel := NewBudgetSentinel(cfg.Budget,
 		func() float64 { c, _, _, _, _ := usage.Totals(); return c },
-		func(reason string) { h.abortWithEvent(reason, "error") },
+		func(reason string) { h.abortWithStop(domain.StopCategoryBudgetLimit, "budget_limit", reason, "error") },
 		func(level, summary string) {
 			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: summary, Level: level})
 			h.notifier.Send(notify.Notification{Kind: notify.KindBudget, Level: level, Title: "ainovel: 预算", Body: summary})
@@ -239,7 +245,7 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 	// 统一前进闸门：执行一次性 hold，并阻止 review 模式下无许可的新章。
 	h.gate = NewChapterAdvanceGate(store,
 		func(reason string) {
-			h.abortWithEvent(reason, "info")
+			h.abortWithStop(domain.StopCategoryAdvanceHold, "advance_hold", reason, "info")
 			h.notifier.Send(notify.Notification{Kind: notify.KindAdvanceGate, Level: "info", Title: "ainovel: 等待验收", Body: reason})
 		},
 		func(level, summary string) {
@@ -288,8 +294,9 @@ func New(cfg bootstrap.Config, bundle assets.Bundle) (*Host, error) {
 		notify: func(kind, level, title, body string) {
 			h.notifier.Send(notify.Notification{Kind: kind, Level: level, Title: title, Body: body})
 		},
-		onPause: func(summary string) { h.abortWithEvent(summary, "warn") },
-		onDone:  h.runEnded,
+		onPause:           func(summary string) { h.abortWithStop(domain.StopCategoryUnknown, "engine_pause", summary, "warn") },
+		onPauseStructured: func(req pauseRequest) { h.handleEnginePause(req) },
+		onDone:            h.runEnded,
 		backupArc: func(volume, arc int) error {
 			slog.Info("弧边界备份", "module", "host", "volume", volume, "arc", arc)
 			source := h.store.Dir()
@@ -448,14 +455,18 @@ func (h *Host) StartPrepared(rawRequirement string) error {
 // startEngine 为未持 interMu 的调用方提供互斥保护后调用 startEngineLocked。
 // Resume/Continue/StartPrepared/AdvanceOneChapter 等已持 interMu 的调用方
 // 直接调 startEngineLocked。
-func (h *Host) startEngine(initial *flow.Instruction) bool {
+func (h *Host) startEngine(initial *flow.Instruction, origins ...domain.RunOrigin) bool {
 	h.interMu.Lock()
 	defer h.interMu.Unlock()
-	return h.startEngineLocked(initial)
+	return h.startEngineLocked(initial, origins...)
 }
 
 // startEngineLocked 假设 interMu 已持有，直接检查恢复/运行/共创并启动引擎引擎。
-func (h *Host) startEngineLocked(initial *flow.Instruction) bool {
+func (h *Host) startEngineLocked(initial *flow.Instruction, origins ...domain.RunOrigin) bool {
+	return h.startEngineLockedAs(initial, runOriginOrManual(origins...), nil)
+}
+
+func (h *Host) startEngineLockedAs(initial *flow.Instruction, origin domain.RunOrigin, permit *domain.ResumePermit) bool {
 	if err := h.checkMigrationGate(); err != nil {
 		slog.Warn("startEngine 被迁移门拦截", "module", "host", "err", err)
 		return false
@@ -470,21 +481,48 @@ func (h *Host) startEngineLocked(initial *flow.Instruction) bool {
 		slog.Warn("startEngine 被共创占用拦截", "module", "host")
 		return false
 	}
+	if h.finalizing {
+		slog.Warn("startEngine 被运行终态收尾拦截", "module", "host")
+		return false
+	}
 	if h.engine.isRunning() {
 		return false
 	}
 	if h.lifecycle == lifecycleCompleted {
 		return false
 	}
+	generation, err := h.store.RunMeta.BeginRun(origin, time.Now().Format(time.RFC3339), permit)
+	if err != nil {
+		slog.Warn("startEngine 运行控制记录失败", "module", "host", "err", err)
+		return false
+	}
 	h.observer.setAborting(false)
 	previous := h.lifecycle
 	h.lifecycle = lifecycleRunning
 	h.lastStopReason = ""
+	h.lastStopCategory = ""
+	h.pendingStop = nil
+	h.stopRecorded = false
+	h.runGeneration = generation
 	if !h.engine.start(initial) {
 		h.lifecycle = previous
+		_ = h.store.RunMeta.FinishRun(domain.RunStopRecord{
+			Generation: generation,
+			Category:   domain.StopCategoryStartFailed,
+			Code:       "engine_start",
+			Summary:    "Engine 启动失败",
+			StoppedAt:  time.Now().Format(time.RFC3339),
+		}, nil)
 		return false
 	}
 	return true
+}
+
+func runOriginOrManual(origins ...domain.RunOrigin) domain.RunOrigin {
+	if len(origins) > 0 && origins[0].Valid() {
+		return origins[0]
+	}
+	return domain.RunOriginManual
 }
 
 // Resume 恢复模式：从 checkpoint + progress 生成 resume prompt 并启动。
@@ -497,9 +535,13 @@ func (h *Host) Resume() (string, error) {
 	return h.resumeLocked()
 }
 
-// ResumeForTUI 是 TUI 启动时的恢复入口。闲时写作或高峰自动暂停开启且当前处于
-// 北京时间高峰时，只返回可恢复标签而不启动 Engine，交由 TUI 在下一个窗口处理；
-// 其它恢复语义与 Resume 完全一致。
+func (h *Host) resumeLocked() (string, error) {
+	return h.resumeLockedAs(domain.RunOriginManual, nil)
+}
+
+// ResumeForTUI 是 TUI 启动时的自动恢复入口。只有持久化的、代次/来源匹配的
+// ResumePermit 才能自动启动；旧项目、待裁决项目和未知状态均 fail closed，
+// 返回工作台让用户人工确认。高峰窗口内的许可继续等待，不隐式绕过策略。
 func (h *Host) ResumeForTUI(now time.Time) (label string, deferred bool, err error) {
 	if err := h.checkMigrationGate(); err != nil {
 		return "", false, err
@@ -509,20 +551,37 @@ func (h *Host) ResumeForTUI(now time.Time) (label string, deferred bool, err err
 		return "", false, err
 	}
 	label, err = resumeLabel(h.store)
-	if err != nil || label == "" || meta == nil ||
-		(!meta.IdleWritingEnabled && !meta.PeakAutoPauseEnabled) ||
-		!IdleWritingStatusAt(now).InPeak {
-		if err != nil {
-			return "", false, err
-		}
-		label, err = h.Resume()
+	if err != nil || label == "" {
 		return label, false, err
 	}
-	return label, true, nil
+	if meta == nil || meta.Control == nil || meta.Control.AutoResume == nil {
+		return label, true, nil
+	}
+	permit := *meta.Control.AutoResume
+	if permit.Generation != meta.Control.Generation || permit.Origin == "" || !permit.Origin.Valid() {
+		return label, true, nil
+	}
+	if meta.PendingSteer != "" {
+		return label, true, nil
+	}
+	if !resumePermitDue(permit, now) {
+		return label, true, nil
+	}
+	if permit.Origin == domain.RunOriginIdleScheduler && !meta.IdleWritingEnabled {
+		_ = h.store.RunMeta.ClearIdleResumePermit()
+		return label, true, nil
+	}
+	if !h.scheduledResumeAllowed(meta, permit, now) {
+		return label, true, nil
+	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+	label, err = h.resumeLockedAs(permit.Origin, &permit)
+	return label, false, err
 }
 
-// resumeLocked 是 Resume 的实际实现；调用方必须持有 interMu。
-func (h *Host) resumeLocked() (string, error) {
+// resumeLockedAs 是 Resume 的实际实现；调用方必须持有 interMu。
+func (h *Host) resumeLockedAs(origin domain.RunOrigin, permit *domain.ResumePermit) (string, error) {
 	h.mu.Lock()
 	if h.lifecycle == lifecycleRunning {
 		h.mu.Unlock()
@@ -578,11 +637,14 @@ func (h *Host) resumeLocked() (string, error) {
 		pendingSteer = ""
 		slog.Info("已清除残留的纯继续指令", "module", "host")
 	}
+	if permit != nil && pendingSteer != "" {
+		return label, nil
+	}
 	if pendingSteer != "" {
 		h.resumePendingIntervention(pendingSteer)
 	} else {
 		// 只恢复事实,不恢复会话(RFC §6):Engine 从 store 重算路由续跑。
-		if !h.startEngineLocked(nil) {
+		if !h.startEngineLockedAs(nil, origin, permit) {
 			return label, fmt.Errorf("Engine 正在完成上一轮停止，请稍后重试恢复")
 		}
 	}
@@ -591,27 +653,61 @@ func (h *Host) resumeLocked() (string, error) {
 	return label, nil
 }
 
-// StartIdleWriting 在北京时间非高峰时段尝试自动恢复一轮创作。
-// 它只接受 auto 推进模式，并拒绝带有待处理干预/一次性暂停意图的项目，
-// 因而不会绕过逐章验收或人工故障处理。返回 started=false 表示当前条件不满足，
-// 不是错误；真正的恢复失败才返回 error。
+// ScheduleReconcileResult 是 TUI 调度 tick 的 Host 裁定结果。
+type ScheduleReconcileResult struct {
+	Started        bool
+	PauseRequested bool
+}
+
+// ReconcileSchedule 统一处理高峰暂停和持久化恢复许可；TUI 只负责定时调用。
+func (h *Host) ReconcileSchedule(now time.Time) (ScheduleReconcileResult, error) {
+	if err := h.checkMigrationGate(); err != nil {
+		return ScheduleReconcileResult{}, err
+	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+	var result ScheduleReconcileResult
+	if IdleWritingStatusAt(now).InPeak {
+		result.PauseRequested = h.requestPeakPauseLocked(now)
+	}
+	if result.PauseRequested {
+		return result, nil
+	}
+	started, err := h.startScheduledRunLocked(now)
+	result.Started = started
+	return result, err
+}
+
+// StartIdleWriting 在北京时间非高峰时段尝试消费一张自动恢复许可。
+// 许可可以属于 idle_scheduler，也可以属于被高峰暂停的 manual 任务；
+// 但待裁决、闸门、预算和故障状态不会生成许可，因此不会被此入口绕过。
 func (h *Host) StartIdleWriting(now time.Time) (started bool, err error) {
 	if err := h.checkMigrationGate(); err != nil {
 		return false, err
 	}
-	if IdleWritingStatusAt(now).InPeak {
-		return false, nil
-	}
 
 	h.interMu.Lock()
 	defer h.interMu.Unlock()
+	return h.startScheduledRunLocked(now)
+}
 
+func (h *Host) startScheduledRunLocked(now time.Time) (started bool, err error) {
 	meta, err := h.store.RunMeta.Load()
 	if err != nil {
 		return false, err
 	}
-	if meta == nil || !meta.IdleWritingEnabled || meta.AdvanceMode != domain.ChapterAdvanceAuto ||
-		meta.PendingSteer != "" || meta.AdvanceHold != nil {
+	if meta == nil || meta.Control == nil || meta.Control.AutoResume == nil || meta.PendingSteer != "" || meta.AdvanceHold != nil {
+		return false, nil
+	}
+	permit := *meta.Control.AutoResume
+	if permit.Generation != meta.Control.Generation || !resumePermitDue(permit, now) {
+		return false, nil
+	}
+	if permit.Origin == domain.RunOriginIdleScheduler &&
+		(!meta.IdleWritingEnabled || meta.AdvanceMode != domain.ChapterAdvanceAuto) {
+		return false, nil
+	}
+	if !h.scheduledResumeAllowed(meta, permit, now) {
 		return false, nil
 	}
 
@@ -622,7 +718,7 @@ func (h *Host) StartIdleWriting(now time.Time) (started bool, err error) {
 		return false, nil
 	}
 
-	label, err := h.resumeLocked()
+	label, err := h.resumeLockedAs(permit.Origin, &permit)
 	if err != nil {
 		return false, err
 	}
@@ -632,19 +728,103 @@ func (h *Host) StartIdleWriting(now time.Time) (started bool, err error) {
 	return h.engine.isRunning(), nil
 }
 
-// PauseForPeak 在北京时间高峰时间到达时暂停当前创作。
-func (h *Host) PauseForPeak() bool {
-	return h.abortWithEvent("进入北京时间高峰时段，当前创作已自动暂停", "info")
+func resumePermitDue(permit domain.ResumePermit, now time.Time) bool {
+	if permit.NotBefore == "" {
+		return true
+	}
+	notBefore, err := time.Parse(time.RFC3339, permit.NotBefore)
+	return err == nil && !now.Before(notBefore)
 }
 
-// PauseIdleWriting 保留闲时写作调度器的专用入口；高峰暂停本身已对所有创作统一。
+func (h *Host) scheduledResumeAllowed(meta *domain.RunMeta, permit domain.ResumePermit, now time.Time) bool {
+	if meta == nil || !resumePermitDue(permit, now) {
+		return false
+	}
+	schedule := IdleWritingStatusAt(now)
+	if permit.Origin == domain.RunOriginIdleScheduler {
+		return !schedule.InPeak && meta.IdleWritingEnabled
+	}
+	if !schedule.InPeak || !meta.PeakAutoPauseEnabled {
+		return true
+	}
+	return peakOverrideActive(meta.Control, now)
+}
+
+func peakOverrideActive(control *domain.RunControl, now time.Time) bool {
+	if control == nil || control.PeakOverrideUntil == "" {
+		return false
+	}
+	until, err := time.Parse(time.RFC3339, control.PeakOverrideUntil)
+	return err == nil && now.Before(until)
+}
+
+func (h *Host) requestPeakPauseLocked(now time.Time) bool {
+	if !IdleWritingStatusAt(now).InPeak {
+		return false
+	}
+	h.mu.Lock()
+	running := h.lifecycle == lifecycleRunning
+	h.mu.Unlock()
+	if !running {
+		return false
+	}
+	meta, err := h.store.RunMeta.Load()
+	if err != nil || meta == nil {
+		return false
+	}
+	control := meta.Control
+	origin := domain.RunOriginManual
+	if control != nil && control.Origin.Valid() {
+		origin = control.Origin
+	}
+	if origin == domain.RunOriginManual &&
+		(!meta.PeakAutoPauseEnabled || peakOverrideActive(control, now)) {
+		return false
+	}
+	category := domain.StopCategoryPeakPolicy
+	if origin == domain.RunOriginIdleScheduler {
+		category = domain.StopCategoryIdleWindowEnd
+	}
+	schedule := IdleWritingStatusAt(now)
+	req := pauseRequest{
+		category: category,
+		code:     string(category),
+		summary:  "高峰时段已到，已请求在当前任务边界暂停",
+		level:    "info",
+	}
+	if !schedule.NextTransition.IsZero() {
+		req.notBefore = schedule.NextTransition.Format(time.RFC3339)
+	}
+	if !h.engine.requestPause(req) {
+		return false
+	}
+	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: req.summary, Level: "info"})
+	return true
+}
+
+// PauseForPeak 在北京时间高峰时间到达时暂停当前创作。
+func (h *Host) PauseForPeak() bool {
+	return h.ReconcilePeakPause(time.Now())
+}
+
+// ReconcilePeakPause 请求在当前 Worker 完成后暂停当前创作。
+func (h *Host) ReconcilePeakPause(now time.Time) bool {
+	if err := h.checkMigrationGate(); err != nil {
+		return false
+	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+	return h.requestPeakPauseLocked(now)
+}
+
+// PauseIdleWriting 保留闲时写作调度器的专用入口；同样请求安全边界暂停。
 func (h *Host) PauseIdleWriting() bool {
-	return h.abortWithEvent("进入北京时间高峰时段，闲时写作已暂停", "info")
+	return h.ReconcilePeakPause(time.Now())
 }
 
 // StopIdleWriting 关闭闲时写作时暂停当前由该调度器启动的引擎。
 func (h *Host) StopIdleWriting() bool {
-	return h.abortWithEvent("闲时写作已关闭，当前自动创作已暂停", "info")
+	return h.abortWithStop(domain.StopCategoryIdleDisabled, "idle_disabled", "闲时写作已关闭，当前自动创作已暂停", "info")
 }
 
 func (h *Host) resumePendingIntervention(text string) {
@@ -863,6 +1043,11 @@ func (h *Host) SetIdleWritingEnabled(enabled bool) error {
 	if err := h.store.RunMeta.SetIdleWritingEnabled(enabled); err != nil {
 		return err
 	}
+	if !enabled {
+		if err := h.store.RunMeta.ClearIdleResumePermit(); err != nil {
+			return err
+		}
+	}
 	label := "已关闭"
 	if enabled {
 		label = "已开启"
@@ -885,11 +1070,39 @@ func (h *Host) SetPeakAutoPauseEnabled(enabled bool) error {
 	if err := h.store.RunMeta.SetPeakAutoPauseEnabled(enabled); err != nil {
 		return err
 	}
+	if !enabled && h.engine.cancelPeakPolicyPause() {
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "已取消尚未生效的高峰自动暂停请求", Level: "info"})
+	}
 	label := "已关闭"
 	if enabled {
 		label = "已开启"
 	}
 	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "高峰自动暂停" + label + "（北京时间：09:00–12:00、14:00–18:00）", Level: "info"})
+	return nil
+}
+
+// SetPeakPauseSkip 跳过当前北京时间高峰窗口；窗口结束后自动失效。
+// 它不关闭永久开关，也不隐式启动已经停止的 Engine。
+func (h *Host) SetPeakPauseSkip(now time.Time) error {
+	if err := h.checkMigrationGate(); err != nil {
+		return err
+	}
+	h.interMu.Lock()
+	defer h.interMu.Unlock()
+	status := IdleWritingStatusAt(now)
+	if !status.InPeak || status.NextTransition.IsZero() {
+		return fmt.Errorf("当前不在北京时间高峰时段")
+	}
+	if meta, err := h.store.RunMeta.Load(); err == nil && meta != nil && meta.Control != nil && meta.Control.Origin == domain.RunOriginIdleScheduler {
+		return fmt.Errorf("闲时调度任务在高峰必须暂停，/peak-pause skip 只对手动任务生效")
+	}
+	if err := h.store.RunMeta.SetPeakOverrideUntil(status.NextTransition.Format(time.RFC3339)); err != nil {
+		return err
+	}
+	if h.engine.cancelPeakPolicyPause() {
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "已取消尚未生效的本次高峰暂停请求", Level: "info"})
+	}
+	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: fmt.Sprintf("已跳过当前高峰自动暂停，本窗口至 %s", status.NextTransition.Format("15:04")), Level: "info"})
 	return nil
 }
 
@@ -914,6 +1127,14 @@ func (h *Host) continueGuard(text string) error {
 	h.mu.Unlock()
 	if err := h.budget.Refuse(); err != nil {
 		return err
+	}
+	if meta, err := h.store.RunMeta.Load(); err == nil && meta != nil && meta.PeakAutoPauseEnabled {
+		status := IdleWritingStatusAt(time.Now())
+		if status.InPeak && !peakOverrideActive(meta.Control, time.Now()) {
+			until := status.NextTransition.Format("15:04")
+			h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Level: "warn",
+				Summary: fmt.Sprintf("当前为北京时间高峰（至 %s），高峰自动暂停已开启；本次继续允许启动，但会在当前任务安全边界暂停。持续运行请执行 /peak-pause skip，永久关闭请执行 /peak-pause off", until)})
+		}
 	}
 
 	h.emitEvent(Event{Time: time.Now(), Category: "USER", Summary: "[继续] " + text, Level: "info"})
@@ -1165,11 +1386,18 @@ func (h *Host) waitEngineCompletion() {
 }
 
 func (h *Host) abortWithEvent(summary, level string) bool {
+	return h.abortWithStop(domain.StopCategoryManualPause, "manual_pause", summary, level)
+}
+
+func (h *Host) abortWithStop(category domain.StopCategory, code, summary, level string) bool {
 	h.mu.Lock()
 	running := h.lifecycle == lifecycleRunning
 	if running {
 		h.lifecycle = lifecyclePaused
 		h.lastStopReason = summary
+		h.lastStopCategory = category
+		h.pendingStop = &pauseRequest{generation: h.runGeneration, category: category, code: code, summary: summary, level: level}
+		h.stopRecorded = false
 	}
 	h.mu.Unlock()
 	if !running {
@@ -1181,6 +1409,110 @@ func (h *Host) abortWithEvent(summary, level string) bool {
 	h.engine.abort()
 	h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: summary, Level: level})
 	return true
+}
+
+// handleEnginePause 收敛 Engine 在安全边界产生的结构化暂停。
+// 这里不再 Abort：Engine 已经完成当前 Worker，返回 run loop 即可安全停机。
+func (h *Host) handleEnginePause(req pauseRequest) {
+	h.mu.Lock()
+	running := h.lifecycle == lifecycleRunning
+	if running {
+		req.generation = h.runGeneration
+		h.lifecycle = lifecyclePaused
+		h.lastStopReason = req.summary
+		h.lastStopCategory = req.category
+		h.pendingStop = &req
+		h.stopRecorded = false
+	}
+	h.mu.Unlock()
+	if running && req.category != domain.StopCategoryPeakPolicy && req.category != domain.StopCategoryIdleWindowEnd {
+		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: req.summary, Level: req.level})
+	}
+}
+
+func (h *Host) recordRunStop(req pauseRequest) error {
+	h.runStopMu.Lock()
+	defer h.runStopMu.Unlock()
+
+	h.mu.Lock()
+	if h.stopRecorded {
+		h.finalizing = false
+		h.mu.Unlock()
+		return nil
+	}
+	expectedGeneration := req.generation
+	if expectedGeneration == 0 {
+		expectedGeneration = h.runGeneration
+	}
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		h.finalizing = false
+		h.mu.Unlock()
+	}()
+
+	meta, err := h.store.RunMeta.Load()
+	if err != nil {
+		return err
+	}
+	if meta == nil || meta.Control == nil {
+		return fmt.Errorf("run control 未初始化")
+	}
+	control := meta.Control
+	if expectedGeneration != 0 && control.Generation != expectedGeneration {
+		return fmt.Errorf("运行代次不匹配: expected=%d actual=%d", expectedGeneration, control.Generation)
+	}
+	category := req.category
+	if category == "" || !category.Valid() {
+		category = domain.StopCategoryUnknown
+	}
+	if req.summary == "" {
+		req.summary = "创作已停止"
+	}
+	stop := domain.RunStopRecord{
+		Generation: expectedGeneration,
+		Category:   category,
+		Code:       req.code,
+		Summary:    req.summary,
+		StoppedAt:  time.Now().Format(time.RFC3339),
+	}
+	if stop.Generation == 0 {
+		stop.Generation = control.Generation
+	}
+	var permit *domain.ResumePermit
+	if category == domain.StopCategoryPeakPolicy || category == domain.StopCategoryIdleWindowEnd {
+		notBefore := req.notBefore
+		if notBefore == "" {
+			schedule := IdleWritingStatusAt(time.Now())
+			if schedule.InPeak && !schedule.NextTransition.IsZero() {
+				notBefore = schedule.NextTransition.Format(time.RFC3339)
+			}
+		}
+		if notBefore != "" && control.Origin.Valid() {
+			permit = &domain.ResumePermit{
+				Generation: control.Generation,
+				Trigger:    domain.ResumeTriggerAfterPeak,
+				Origin:     control.Origin,
+				NotBefore:  notBefore,
+			}
+		}
+	} else if category == domain.StopCategorySessionExit && control.Origin.Valid() {
+		permit = &domain.ResumePermit{
+			Generation: control.Generation,
+			Trigger:    domain.ResumeTriggerNextOpen,
+			Origin:     control.Origin,
+			NotBefore:  time.Now().Format(time.RFC3339),
+		}
+	}
+	if err := h.store.RunMeta.FinishRun(stop, permit); err != nil {
+		return err
+	}
+	h.mu.Lock()
+	h.stopRecorded = true
+	h.lastStopReason = stop.Summary
+	h.lastStopCategory = stop.Category
+	h.mu.Unlock()
+	return nil
 }
 
 // Close 终止引擎并关闭事件通道。
@@ -1202,6 +1534,7 @@ func (h *Host) Close() {
 		})
 		return
 	}
+	h.prepareSessionExit()
 	if h.observer != nil {
 		h.observer.setAborting(true)
 	}
@@ -1230,6 +1563,32 @@ func (h *Host) Close() {
 	})
 }
 
+// prepareSessionExit 在关闭前固化 next_open 许可，避免随后关闭 store 后
+// runEnded 无法再写入恢复事实。退出属于会话生命周期，不等同于人工暂停。
+func (h *Host) prepareSessionExit() {
+	h.mu.Lock()
+	if h.lifecycle != lifecycleRunning || h.stopRecorded {
+		h.mu.Unlock()
+		return
+	}
+	h.lifecycle = lifecyclePaused
+	h.finalizing = true
+	req := pauseRequest{
+		generation: h.runGeneration,
+		category:   domain.StopCategorySessionExit,
+		code:       "session_exit",
+		summary:    "会话关闭，已保存下次打开恢复许可",
+		level:      "info",
+	}
+	h.lastStopReason = req.summary
+	h.lastStopCategory = req.category
+	h.pendingStop = &req
+	h.mu.Unlock()
+	if err := h.recordRunStop(req); err != nil {
+		slog.Warn("关闭前记录会话恢复许可失败", "module", "host", "err", err)
+	}
+}
+
 // runEnded 引擎循环结束(任何原因)时由 engine.onDone 回调:按 store 事实定终态。
 //   - Phase=Complete  → 标记 completed，发"创作完成"事件
 //   - 其它            → 标记 idle/paused，发"创作停止"事件
@@ -1241,11 +1600,19 @@ func (h *Host) runEnded() {
 	h.mu.Lock()
 	progress, _ := h.store.Progress.Load()
 	if progress != nil && progress.Phase == domain.PhaseComplete {
+		h.finalizing = true
 		h.lifecycle = lifecycleCompleted
 		h.lastStopReason = "创作完成"
+		h.lastStopCategory = domain.StopCategoryCompleted
+		req := pauseRequest{generation: h.runGeneration, category: domain.StopCategoryCompleted, code: "completed", summary: "创作完成", level: "success"}
+		h.pendingStop = &req
 		// 完本收尾:确定性生成(store 已有全部事实,不花 LLM 调用;RFC 末节)。
 		summary := completionSummary(h.store)
 		h.mu.Unlock()
+		req.summary = summary
+		if err := h.recordRunStop(req); err != nil {
+			slog.Warn("记录创作完成状态失败", "module", "host", "err", err)
+		}
 		slog.Info(summary, "module", "host")
 		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: summary, Level: "success"})
 		h.notifier.Send(notify.Notification{
@@ -1254,10 +1621,21 @@ func (h *Host) runEnded() {
 		})
 	} else {
 		wasRunning := h.lifecycle == lifecycleRunning
+		var req pauseRequest
 		if wasRunning {
+			h.finalizing = true
 			h.lifecycle = lifecycleIdle
 			h.lastStopReason = "引擎自然停止"
+			h.lastStopCategory = domain.StopCategoryNaturalStop
+			req = pauseRequest{generation: h.runGeneration, category: domain.StopCategoryNaturalStop, code: "natural_stop", summary: "引擎自然停止", level: "warn"}
+		} else if h.pendingStop != nil {
+			h.finalizing = true
+			req = *h.pendingStop
+		} else {
+			h.finalizing = true
+			req = pauseRequest{generation: h.runGeneration, category: domain.StopCategoryUnknown, code: "unknown", summary: "引擎停止，停止原因未知", level: "warn"}
 		}
+		h.pendingStop = nil
 		completed := 0
 		name := ""
 		if progress != nil {
@@ -1265,6 +1643,9 @@ func (h *Host) runEnded() {
 			name = progress.NovelName
 		}
 		h.mu.Unlock()
+		if err := h.recordRunStop(req); err != nil {
+			slog.Warn("记录创作停止状态失败", "module", "host", "err", err)
+		}
 		if wasRunning {
 			summary := fmt.Sprintf("引擎停止 (已完成 %d 章)", completed)
 			slog.Warn(summary, "module", "host")
@@ -1383,6 +1764,7 @@ func (h *Host) Snapshot() UISnapshot {
 	h.mu.Lock()
 	state := h.lifecycle
 	lastStopReason := h.lastStopReason
+	lastStopCategory := h.lastStopCategory
 	provider, model := "", ""
 	if h.models != nil {
 		provider, model, _ = h.models.CurrentSelection("default")
@@ -1440,6 +1822,7 @@ func (h *Host) Snapshot() UISnapshot {
 		RuntimeState:              string(state),
 		IsRunning:                 state == lifecycleRunning,
 		LastStopReason:            lastStopReason,
+		LastStopCategory:          string(lastStopCategory),
 		IdleWritingInPeak:         idleSchedule.InPeak,
 		IdleWritingNextTransition: idleSchedule.NextTransition,
 		TotalInputTokens:          tokIn,
@@ -1490,6 +1873,18 @@ func (h *Host) Snapshot() UISnapshot {
 		snap.AdvanceMode = string(meta.AdvanceMode)
 		snap.IdleWritingEnabled = meta.IdleWritingEnabled
 		snap.PeakAutoPauseEnabled = meta.PeakAutoPauseEnabled
+		if meta.Control != nil {
+			snap.RunOrigin = string(meta.Control.Origin)
+			if meta.Control.LastStop != nil {
+				snap.LastStopCategory = string(meta.Control.LastStop.Category)
+				snap.LastStopReason = meta.Control.LastStop.Summary
+			}
+			if meta.Control.AutoResume != nil {
+				snap.AutoResumePending = true
+				snap.AutoResumeNotBefore = parseRunControlTime(meta.Control.AutoResume.NotBefore)
+			}
+			snap.PeakOverrideUntil = parseRunControlTime(meta.Control.PeakOverrideUntil)
+		}
 		snap.AdvancePermitChapter = meta.AdvancePermitChapter
 		if meta.AdvanceHold != nil {
 			snap.HasAdvanceHold = true
@@ -1936,7 +2331,7 @@ func (h *Host) PauseForCoCreate() bool {
 	// 运行中复用 abortWithEvent 停机（running→paused + setAborting + Abort + 事件），与手动
 	// 暂停同序、不另抄一遍；已停止（idle/paused）只置标记，规划完经 Continue 续跑。
 	if running {
-		h.abortWithEvent("进入阶段共创，创作已暂停", "info")
+		h.abortWithStop(domain.StopCategoryCoCreate, "cocreate", "进入阶段共创，创作已暂停", "info")
 	} else {
 		h.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: "进入阶段共创", Level: "info"})
 	}
@@ -1999,6 +2394,17 @@ func truncate(s string, maxRunes int) string {
 		return s
 	}
 	return string(runes[:maxRunes]) + "..."
+}
+
+func parseRunControlTime(value string) time.Time {
+	if value == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 // ImportFrom 启动一次外部小说反推导入：切分 → 反推 foundation → 逐章分析落盘。

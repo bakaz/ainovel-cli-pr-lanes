@@ -486,6 +486,25 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 	case idleWritingTickMsg:
 		next, cmd := m.handleIdleWritingTick(time.Time(msg))
 		return next, cmd, true
+	case scheduleReconcileMsg:
+		if msg.err != nil {
+			m.applyEvent(host.Event{Time: time.Now(), Category: "ERROR", Summary: "闲时调度检查失败：" + msg.err.Error(), Level: "error"})
+			m.refreshEventViewport()
+			return m, fetchSnapshot(m.runtime), true
+		}
+		if msg.result.Started {
+			m.idleWritingStartPending = false
+			m.idleWritingActive = false
+			m.err = nil
+			m.mode = modeRunning
+		}
+		if msg.result.PauseRequested {
+			m.idleWritingActive = false
+			m.idleWritingStartPending = false
+			m.abortPending = true
+			m.textarea.Placeholder = "已请求高峰自动暂停，将在当前任务安全边界生效..."
+		}
+		return m, fetchSnapshot(m.runtime), true
 	case idleWritingStartResultMsg:
 		m.idleWritingStartPending = false
 		if msg.err != nil {
@@ -507,13 +526,13 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		m.idleWritingActive = false
 		if msg.stopped {
 			m.abortPending = true
-			m.textarea.Placeholder = "高峰时间到，正在暂停闲时写作..."
+			m.textarea.Placeholder = "正在暂停创作..."
 		}
 		return m, fetchSnapshot(m.runtime), true
 	case doneMsg:
 		m.idleWritingStartPending = false
-		// 每次运行结束都释放当前会话的 ownership；若是自然停止，下一次
-		// tick 仍可按开关与 stop reason 重新接力，故障/人工暂停则不会盲目重启。
+		// 每次运行结束都释放 TUI 的显示缓存；是否自动接力由 Host 持久化
+		// RunControl/ResumePermit 裁定，TUI 不再根据文案猜测停止原因。
 		m.idleWritingActive = false
 		m.snapshot.LastStopReason = msg.stopReason
 		m.snapshot.IsRunning = false

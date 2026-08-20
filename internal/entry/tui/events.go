@@ -27,7 +27,11 @@ type (
 		err     error
 	}
 	idleWritingPauseResultMsg struct{ stopped bool }
-	bootstrapMsg              struct {
+	scheduleReconcileMsg      struct {
+		result host.ScheduleReconcileResult
+		err    error
+	}
+	bootstrapMsg struct {
 		replay   []domain.RuntimeQueueItem
 		resumed  bool
 		deferred bool
@@ -126,6 +130,13 @@ func pauseIdleWriting(rt *host.Host) tea.Cmd {
 func pauseForPeak(rt *host.Host) tea.Cmd {
 	return func() tea.Msg {
 		return idleWritingPauseResultMsg{stopped: rt.PauseForPeak()}
+	}
+}
+
+func reconcileSchedule(rt *host.Host, now time.Time) tea.Cmd {
+	return func() tea.Msg {
+		result, err := rt.ReconcileSchedule(now)
+		return scheduleReconcileMsg{result: result, err: err}
 	}
 }
 

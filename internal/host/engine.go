@@ -50,7 +50,10 @@ type engine struct {
 	emitEvent func(Event)
 	notify    func(kind, level, title, body string)
 	onPause   func(summary string) // 引擎自主暂停(僵局/失败裁定 abort):走 host 统一暂停语义(lifecycle=paused)
-	onDone    func()               // run 结束(任何原因);host 据 store 事实定终态
+	// onPauseStructured 是生产 Host 的结构化停机回调；保留 onPause 兼容现有
+	// engine 单元测试与轻量构造器。结构化回调优先，禁止用 UI 摘要反推原因。
+	onPauseStructured func(pauseRequest)
+	onDone            func() // run 结束(任何原因);host 据 store 事实定终态
 
 	// 弧/卷边界备份回调。引擎在检测到弧/卷完结章后同步调用。
 	// 返回 error 时引擎必须停止循环（跳过 budget/gate 处理）。
@@ -65,6 +68,7 @@ type engine struct {
 	running bool
 	done    chan struct{}     // close in run() defer after onDone, for true completion signal
 	pending []controlOp       // 干预的控制态动作,边界提交
+	pause   *pauseRequest     // 请求在当前 Worker 完成后的安全边界暂停
 	next    *flow.Instruction // 下一轮优先执行的指令(plan_start / arbiter dispatch)
 	// deferGateForNext 只与 next 同生共灭：hold+dispatch 必须先运行配对的
 	// editor/writer，让它建立返工队列，随后 Gate 才能判断 rewrites_drained。
@@ -100,6 +104,16 @@ type engine struct {
 	noProgress *flow.NoProgressBreaker
 }
 
+// pauseRequest 是 Engine 与 Host 之间的结构化停机请求。
+type pauseRequest struct {
+	generation uint64
+	category   domain.StopCategory
+	code       string
+	summary    string
+	level      string
+	notBefore  string
+}
+
 // deadlockConsultAt / deadlockAbortAt:repeats 达到前者问 Arbiter,达到后者硬熔断。
 // 确定性 Engine 必须对无进展循环给出明确上界(RFC §5)。
 const (
@@ -133,6 +147,7 @@ func (e *engine) start(initial *flow.Instruction) bool {
 	e.cancel = cancel
 	e.running = true
 	e.done = make(chan struct{})
+	e.pause = nil
 	// initial 为空时不覆盖 e.next——停机期干预可能已通过 applyControlOp 排入
 	// 裁定派单(如 editor 返工),start(nil) 抹掉它会让 Route 派 writer 续写,
 	// 与用户意图相反。
@@ -155,6 +170,40 @@ func (e *engine) abort() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// requestPause 请求在当前 Worker 和本轮边界处理完成后暂停，不取消在途 Worker。
+func (e *engine) requestPause(req pauseRequest) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.running || e.pause != nil {
+		return false
+	}
+	e.pause = &req
+	return true
+}
+
+// cancelPeakPolicyPause 撤销尚未被 Engine 消费的手动任务高峰暂停请求。
+// 闲时来源的 idle_window_end 不在这里撤销：闲时任务在高峰必须停下。
+func (e *engine) cancelPeakPolicyPause() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pause == nil || e.pause.category != domain.StopCategoryPeakPolicy {
+		return false
+	}
+	e.pause = nil
+	return true
+}
+
+func (e *engine) takePause() (pauseRequest, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pause == nil {
+		return pauseRequest{}, false
+	}
+	req := *e.pause
+	e.pause = nil
+	return req, true
 }
 
 func (e *engine) isRunning() bool {
@@ -236,10 +285,23 @@ func (e *engine) run(ctx context.Context) {
 		// hold+dispatch 必须先让配对派单建立返工事实；其它情况在派发前统一检查
 		// Gate，保证 boundary hold 和无许可 review 不会多跑一个 Worker。
 		deferGate := e.applyPendingOps(ctx) || e.nextDefersGate()
+		// 政策止损优先于高峰自动暂停：即使高峰请求先到，也不能把预算/验收
+		// 闸门错误包装成可自动恢复的暂停。
+		if e.budget.HandleBoundary() {
+			return
+		}
 		if !deferGate {
 			if e.gate.HandleBoundary() {
 				return
 			}
+		}
+		if req, ok := e.takePause(); ok {
+			if e.onPauseStructured != nil {
+				e.onPauseStructured(req)
+			} else if e.onPause != nil {
+				e.onPause(req.summary)
+			}
+			return
 		}
 
 		inst := e.takeNext()
@@ -1086,16 +1148,38 @@ func (e *engine) recordStale(op controlOp) {
 	}
 }
 
-// pauseWithNotify 引擎自主暂停(僵局熔断/失败裁定 abort):离屏通知 + 走 host 统一
-// 暂停语义(onPause → abortWithEvent:lifecycle=paused + 屏内事件 + cancel ctx)。
+// pauseWithNotify 引擎自主暂停(僵局熔断/失败裁定):离屏通知 + 走 Host 统一
+// 的结构化停止原因；生产路径在当前边界结束后停机，旧测试回调仍可使用 abort 语义。
 func (e *engine) pauseWithNotify(kind, body string) {
 	e.notify(kind, "warn", "ainovel: 引擎暂停", body)
+	req := pauseRequest{category: pauseCategoryForKind(kind), code: kind, summary: body, level: "warn"}
+	if e.onPauseStructured != nil {
+		e.onPauseStructured(req)
+		return
+	}
 	if e.onPause != nil {
 		e.onPause(body)
 		return
 	}
 	e.emitEvent(Event{Time: time.Now(), Category: "SYSTEM", Summary: body, Level: "warn"})
 	e.abort()
+}
+
+func pauseCategoryForKind(kind string) domain.StopCategory {
+	switch kind {
+	case notify.KindAdvanceGate:
+		return domain.StopCategoryReviewGate
+	case notify.KindDeadlock:
+		return domain.StopCategoryFailureBreaker
+	case notify.KindWorkerFailure, notify.KindPlanStart:
+		return domain.StopCategoryDecisionFailed
+	case "backup":
+		return domain.StopCategoryDeterministicErr
+	case "engine":
+		return domain.StopCategoryStateError
+	default:
+		return domain.StopCategoryUnknown
+	}
 }
 
 // blockedWithNotify 章节无进展熔断停机（P1-9 阻塞项 9.1）：把确定性熔断原因

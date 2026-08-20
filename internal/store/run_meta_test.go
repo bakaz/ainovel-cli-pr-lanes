@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 )
@@ -136,6 +137,91 @@ func TestRunMetaPeakAutoPauseTogglePersistsAcrossInit(t *testing.T) {
 	meta, err = store.RunMeta.Load()
 	if err != nil || meta.PeakAutoPauseEnabled {
 		t.Fatalf("peak auto pause should be disabled, meta=%+v err=%v", meta, err)
+	}
+}
+
+func TestRunMetaRunControlLifecycleAndPermitConsumption(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.RunMeta.Init("fantasy", "openrouter", "model"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	first, err := store.RunMeta.BeginRun(domain.RunOriginManual, "2026-08-20T08:00:00+08:00", nil)
+	if err != nil || first != 1 {
+		t.Fatalf("BeginRun first generation: generation=%d err=%v", first, err)
+	}
+	notBefore := time.Now().Add(-time.Minute).Format(time.RFC3339)
+	permit := &domain.ResumePermit{
+		Generation: first,
+		Trigger:    domain.ResumeTriggerAfterPeak,
+		Origin:     domain.RunOriginManual,
+		NotBefore:  notBefore,
+	}
+	if err := store.RunMeta.FinishRun(domain.RunStopRecord{
+		Generation: first,
+		Category:   domain.StopCategoryPeakPolicy,
+		Code:       "peak_policy",
+		Summary:    "高峰暂停",
+	}, permit); err != nil {
+		t.Fatalf("FinishRun peak: %v", err)
+	}
+
+	meta, err := store.RunMeta.Load()
+	if err != nil || meta == nil || meta.Control == nil {
+		t.Fatalf("Load after FinishRun: meta=%+v err=%v", meta, err)
+	}
+	if meta.Control.Active || meta.Control.LastStop == nil || meta.Control.LastStop.Category != domain.StopCategoryPeakPolicy {
+		t.Fatalf("peak stop should be persisted, control=%+v", meta.Control)
+	}
+	if meta.Control.AutoResume == nil || *meta.Control.AutoResume != *permit {
+		t.Fatalf("resume permit should be persisted, control=%+v", meta.Control)
+	}
+	if err := store.RunMeta.Init("suspense", "openrouter", "model-2"); err != nil {
+		t.Fatalf("re-Init should preserve run control: %v", err)
+	}
+	meta, err = store.RunMeta.Load()
+	if err != nil || meta.Control == nil || meta.Control.AutoResume == nil {
+		t.Fatalf("re-Init must preserve one-shot permit, control=%+v err=%v", meta.Control, err)
+	}
+
+	second, err := store.RunMeta.BeginRun(domain.RunOriginManual, "2026-08-20T12:00:00+08:00", permit)
+	if err != nil || second != 2 {
+		t.Fatalf("BeginRun should consume matching permit: generation=%d err=%v", second, err)
+	}
+	meta, err = store.RunMeta.Load()
+	if err != nil || meta.Control == nil || !meta.Control.Active || meta.Control.AutoResume != nil {
+		t.Fatalf("permit should be one-shot and new run active, control=%+v err=%v", meta.Control, err)
+	}
+	if meta.Control.Origin != domain.RunOriginManual {
+		t.Fatalf("origin should be preserved as manual, got %q", meta.Control.Origin)
+	}
+
+	if err := store.RunMeta.FinishRun(domain.RunStopRecord{
+		Generation: second,
+		Category:   domain.StopCategoryManualPause,
+		Summary:    "人工暂停",
+	}, nil); err != nil {
+		t.Fatalf("FinishRun manual pause: %v", err)
+	}
+	meta, err = store.RunMeta.Load()
+	if err != nil || meta.Control.AutoResume != nil {
+		t.Fatalf("manual pause must not create auto resume permit, control=%+v err=%v", meta.Control, err)
+	}
+}
+
+func TestRunMetaRunControlRejectsUnknownEnum(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.RunMeta.Save(domain.RunMeta{
+		Control: &domain.RunControl{
+			Origin: domain.RunOrigin("future_origin"),
+		},
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, err := store.RunMeta.Load(); err == nil {
+		t.Fatal("unknown run origin must fail closed")
 	}
 }
 

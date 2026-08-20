@@ -135,6 +135,103 @@ type MemoryPolicy struct {
 	ReadOnlyThreshold   int    `json:"read_only_threshold,omitempty"`
 }
 
+// RunOrigin 表示当前运行代次由谁启动。
+type RunOrigin string
+
+const (
+	RunOriginManual        RunOrigin = "manual"
+	RunOriginIdleScheduler RunOrigin = "idle_scheduler"
+)
+
+// Valid 报告运行来源是否受当前版本支持。
+func (o RunOrigin) Valid() bool {
+	return o == RunOriginManual || o == RunOriginIdleScheduler
+}
+
+// StopCategory 是运行停止的机器可判定原因；UI 文案不能参与恢复决策。
+type StopCategory string
+
+const (
+	StopCategoryPeakPolicy        StopCategory = "peak_policy"
+	StopCategoryIdleWindowEnd     StopCategory = "idle_window_end"
+	StopCategorySessionExit       StopCategory = "session_exit"
+	StopCategoryCompleted         StopCategory = "completed"
+	StopCategoryManualPause       StopCategory = "manual_pause"
+	StopCategoryIdleDisabled      StopCategory = "idle_disabled"
+	StopCategoryBudgetLimit       StopCategory = "budget_limit"
+	StopCategoryAdvanceHold       StopCategory = "advance_hold"
+	StopCategoryReviewGate        StopCategory = "review_gate"
+	StopCategoryDecisionPending   StopCategory = "decision_pending"
+	StopCategoryDecisionFailed    StopCategory = "decision_failed"
+	StopCategoryFailureBreaker    StopCategory = "failure_breaker"
+	StopCategoryDeterministicErr  StopCategory = "deterministic_error"
+	StopCategoryStateError        StopCategory = "state_error"
+	StopCategoryMigrationRequired StopCategory = "migration_required"
+	StopCategoryCoCreate          StopCategory = "cocreate"
+	StopCategoryRestoreOperation  StopCategory = "restore_operation"
+	StopCategoryUncleanInterrupt  StopCategory = "unclean_interruption"
+	StopCategoryNaturalStop       StopCategory = "natural_stop"
+	StopCategoryStartFailed       StopCategory = "start_failed"
+	StopCategoryUnknown           StopCategory = "unknown"
+)
+
+// Valid 报告停止分类是否受当前版本支持。
+func (c StopCategory) Valid() bool {
+	switch c {
+	case StopCategoryPeakPolicy, StopCategoryIdleWindowEnd, StopCategorySessionExit,
+		StopCategoryCompleted, StopCategoryManualPause, StopCategoryIdleDisabled,
+		StopCategoryBudgetLimit, StopCategoryAdvanceHold, StopCategoryReviewGate,
+		StopCategoryDecisionPending, StopCategoryDecisionFailed, StopCategoryFailureBreaker,
+		StopCategoryDeterministicErr, StopCategoryStateError, StopCategoryMigrationRequired,
+		StopCategoryCoCreate, StopCategoryRestoreOperation, StopCategoryUncleanInterrupt,
+		StopCategoryNaturalStop, StopCategoryStartFailed, StopCategoryUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// ResumeTrigger 表示自动恢复许可的触发方式。
+type ResumeTrigger string
+
+const (
+	ResumeTriggerAfterPeak ResumeTrigger = "after_peak"
+	ResumeTriggerNextOpen  ResumeTrigger = "next_open"
+)
+
+// Valid 报告自动恢复触发方式是否受当前版本支持。
+func (t ResumeTrigger) Valid() bool {
+	return t == ResumeTriggerAfterPeak || t == ResumeTriggerNextOpen
+}
+
+// RunStopRecord 是一次运行代次最终停止的持久化记录。
+type RunStopRecord struct {
+	Generation uint64       `json:"generation"`
+	Category   StopCategory `json:"category"`
+	Code       string       `json:"code,omitempty"`
+	Summary    string       `json:"summary,omitempty"`
+	StoppedAt  string       `json:"stopped_at"`
+}
+
+// ResumePermit 是绑定运行代次和来源的一次性自动恢复许可。
+type ResumePermit struct {
+	Generation uint64        `json:"generation"`
+	Trigger    ResumeTrigger `json:"trigger"`
+	Origin     RunOrigin     `json:"origin"`
+	NotBefore  string        `json:"not_before"`
+}
+
+// RunControl 是跨重启保留的运行状态机事实。
+type RunControl struct {
+	Generation        uint64         `json:"generation,omitempty"`
+	Active            bool           `json:"active,omitempty"`
+	Origin            RunOrigin      `json:"origin,omitempty"`
+	StartedAt         string         `json:"started_at,omitempty"`
+	LastStop          *RunStopRecord `json:"last_stop,omitempty"`
+	AutoResume        *ResumePermit  `json:"auto_resume,omitempty"`
+	PeakOverrideUntil string         `json:"peak_override_until,omitempty"`
+}
+
 // NewContextProfile 根据总章节数计算上下文策略。
 func NewContextProfile(totalChapters int) ContextProfile {
 	switch {
@@ -220,6 +317,7 @@ type RunMeta struct {
 	StyleReviewMode      StyleQualityMode   `json:"style_review_mode,omitempty"`       // 风格评审质量模式：off / critic；零值等效 off
 	IdleWritingEnabled   bool               `json:"idle_writing_enabled,omitempty"`    // 闲时写作开关；仅 TUI 会话内调度，开关跨重启保留
 	PeakAutoPauseEnabled bool               `json:"peak_auto_pause_enabled,omitempty"` // 高峰时段自动暂停所有创作，开关跨重启保留
+	Control              *RunControl        `json:"run_control,omitempty"`             // 运行代次、停止原因和一次性自动恢复许可
 	// LastAuthorModel 最近一次 writer 派发时生效的模型名（正文写入的真实作者模型）。
 	// 由 Engine 在 runWorker 派发 writer 前记录，供 rewrite_brief 的 author provenance
 	// 使用——不再从 StyleReview 反推（旧实现误取 critic 模型）。

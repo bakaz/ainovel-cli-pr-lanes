@@ -63,6 +63,11 @@ type UISnapshot struct {
 	RecoveryLabel             string
 	IsRunning                 bool
 	LastStopReason            string
+	LastStopCategory          string
+	RunOrigin                 string
+	AutoResumePending         bool
+	AutoResumeNotBefore       time.Time
+	PeakOverrideUntil         time.Time
 	IdleWritingEnabled        bool
 	PeakAutoPauseEnabled      bool
 	IdleWritingInPeak         bool
