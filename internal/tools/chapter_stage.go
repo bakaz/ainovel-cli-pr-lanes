@@ -74,6 +74,7 @@ type ChapterStageInput struct {
 	FinalExists           bool
 	FinalDigest           string
 	HasMechanicalErrors   bool
+	OnlyUnderMinError     bool
 	LatestConsistency     *domain.Checkpoint
 	LatestPolish          *domain.Checkpoint
 	ReviewLedger          *domain.StyleReviewLedger
@@ -81,11 +82,12 @@ type ChapterStageInput struct {
 
 // ChapterStageDecision 是一次 FSM 判定的完整结果。
 type ChapterStageDecision struct {
-	Stage    ChapterStage
-	Allowed  []ChapterAction
-	Required ChapterAction
-	Reason   string
-	Recovery string
+	Stage     ChapterStage
+	Allowed   []ChapterAction
+	Required  ChapterAction
+	Reason    string
+	Recovery  string
+	DraftMode string
 }
 
 // Allows 报告动作是否被当前阶段允许。
@@ -125,7 +127,7 @@ func (d ChapterStageDecision) RequiredNextAction() *RequiredNextAction {
 	if action == "" {
 		return nil
 	}
-	return &RequiredNextAction{Action: string(action), Reason: d.Reason}
+	return &RequiredNextAction{Action: string(action), Reason: d.Reason, Mode: d.DraftMode}
 }
 
 // ── 共享判定 helper ──────────────────────────────────────────────────
@@ -217,6 +219,7 @@ func reviewBindingValid(in ChapterStageInput, cycle *domain.StyleReviewEntry) bo
 type RequiredNextAction struct {
 	Action string `json:"action"`
 	Reason string `json:"reason"`
+	Mode   string `json:"mode,omitempty"`
 }
 
 // ── 判定构造器 ───────────────────────────────────────────────────────
@@ -359,7 +362,15 @@ func ComputeChapterStage(in ChapterStageInput) ChapterStageDecision {
 			allowed = append(allowed, ChapterActionEdit)
 			required = ChapterActionEdit
 		}
-		return decision(ChapterStageNeedsEdit, allowed, required, "一致性检查仍有 error 级机械违规")
+		reason := "一致性检查仍有 error 级机械违规"
+		draftMode := ""
+		if in.OnlyUnderMinError && !in.InRewriteQueue && status == "" && required == ChapterActionDraft {
+			reason = "当前唯一 error 是章节字数低于下限；已有正文应调用 draft_chapter(mode=append) 续写，禁止用 mode=write 整章重写。"
+			draftMode = "append"
+		}
+		d := decision(ChapterStageNeedsEdit, allowed, required, reason)
+		d.DraftMode = draftMode
+		return d
 	}
 
 	if in.PipelineEnabled {
@@ -471,8 +482,12 @@ func ResolveChapterStage(st *store.Store, chapter int, cfg ChapterFSMConfig) (Ch
 	// 6. 草稿存在时重跑机械违规判定（checkpoint 未持久化 violation verdict；
 	//    重跑确定性且无需模型），只取 hasErrorViolations。
 	hasErrors := false
+	onlyUnderMinError := false
 	if draftExists {
-		hasErrors = hasErrorViolations(computeMechanicalViolations(st, draft, utf8.RuneCountInString(draft)))
+		wordCount := utf8.RuneCountInString(draft)
+		violations := computeMechanicalViolations(st, draft, wordCount)
+		hasErrors = hasErrorViolations(violations)
+		onlyUnderMinError = onlyUnderMinChapterWordsError(st, draft, wordCount)
 	}
 
 	in := ChapterStageInput{
@@ -487,6 +502,7 @@ func ResolveChapterStage(st *store.Store, chapter int, cfg ChapterFSMConfig) (Ch
 		FinalExists:           finalExists,
 		FinalDigest:           finalDigest,
 		HasMechanicalErrors:   hasErrors,
+		OnlyUnderMinError:     onlyUnderMinError,
 		LatestConsistency:     latestConsistency,
 		LatestPolish:          latestPolish,
 		ReviewLedger:          ledger,

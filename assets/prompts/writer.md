@@ -20,8 +20,8 @@
    **强制对照（规划时必做）**：检查 `selected_memory.story_threads`（相关伏笔精选）；若不存在（active 伏笔 <12 时），则检查 `episodic_memory.foreshadow_ledger` 回退。同时对照顶层 `character_state`（当前身体/装置状态）、顶层 `world_rules`（适用规则）来规划本章。本章应推进/回收的伏笔**条件性**写入 `payoff_points`——有则写，无则不写，不强制每章推进；需保持的状态约束写入 `continuity_checks`；本章必达的状态变化写入 `required_beats`。若上下文已有 `chapter_plan` 直接进入写作的路径同样适用：写作前参考上述字段（只是不重复规划）。
 4. `draft_chapter(mode="write")`：写入完整正文。必须在 `check_consistency` 与 `polish_draft` 之前完成。
 5. `read_chapter(source="draft")`：回读草稿。
-6. `check_consistency`：核对设定、角色状态、时间线、伏笔和章节契约；读取 `rule_violations`，先修 error，并按文风判断 warning 是否需要修。工具可能返回 `required_next_action`（非空时**必须**执行该 action——`edit_chapter` / `draft_chapter` / `polish_draft` / `check_consistency` / `review_style` / `commit_chapter`），它是下一步必须执行的强制操作，不是建议。字段缺失**不代表可 commit**——表示当前状态无法推算唯一必须操作（如 error 违规待修、评审未就绪），请参照下方"状态感知"表、`style_review_mode` 和 guards 自主决定。工具只回正文 digest，不重复回传全文。
-7. 如发现硬伤或 error 级违规，用 `draft_chapter(mode="write")` 整章覆盖或 `edit_chapter` 定点修改，修改后**重新** `check_consistency`，直到无 error 违规；之后若 `check_consistency` 的 `required_next_action` 为 `polish_draft`（流水线要求先精修），先执行 `polish_draft` 再继续。
+6. `check_consistency`：核对设定、角色状态、时间线、伏笔和章节契约；读取 `rule_violations`，先修 error，并按文风判断 warning 是否需要修。工具可能返回 `required_next_action`（非空时**必须**执行该 action——`edit_chapter` / `draft_chapter` / `polish_draft` / `check_consistency` / `review_style` / `commit_chapter`），它是下一步必须执行的强制操作，不是建议；若同时返回 `mode: "append"` 或 `word_count_guidance.status: "under_min"`，必须用 `draft_chapter(mode="append")` 续写已有草稿，禁止改用 `mode="write"`。字段缺失**不代表可 commit**——表示当前状态无法推算唯一必须操作（如 error 违规待修、评审未就绪），请参照下方"状态感知"表、`style_review_mode` 和 guards 自主决定。工具只回正文 digest，不重复回传全文。
+7. 如发现硬伤或 error 级违规，先区分错误类型：若 `word_count_guidance.status` 为 `under_min` 且 `required_next_action.mode` 为 `append`，只调用 `draft_chapter(mode="append")` 续写现有草稿，不要整章重写；其它 error 才用 `draft_chapter(mode="write")` 整章覆盖或 `edit_chapter` 定点修改。修改后**重新** `check_consistency`，直到无 error 违规；之后若 `check_consistency` 的 `required_next_action` 为 `polish_draft`（流水线要求先精修），先执行 `polish_draft` 再继续。
 8. `polish_draft(chapter=N)`：对草稿做文风精修——独立精修模型（roles.polisher）在不改变剧情事实的前提下，只修文风/节奏/色气与已给评审意见。工具内部保存打磨后的草稿并返回前后摘要（`input_digest`/`output_digest`/`changed`）。若返回 `skipped=true`，说明当前项目未启用精修流水线，直接跳过此步，不影响后续。**精修后必须重新 `check_consistency`**，不要自行再抠字眼、压缩句子、润色措辞——后续 `check_consistency` 与 `review_style` 会基于打磨后的版本把关（见下方"文风审查模式"）。
 9. `check_consistency`：精修后重新核验（顺序必须是 polish_draft → check_consistency → review_style；若 `required_next_action` 为 `check_consistency`，直接执行它）。
 10. `review_style(chapter=N)`（仅 critic 模式，见下方"文风审查模式"）：若 `verdict` 为 `revise`（进入 `revision_open`），回到第 5 步：edit/draft 修改 → check → polish → check → review，直到 `verdict` 为 `pass`。
@@ -86,6 +86,7 @@
 - 若草稿完整、对题、覆盖本章契约，跳过规划和写作，直接 `check_consistency` 自审；随后按返回的 `required_next_action` 继续（`polish_draft` → `check_consistency` → `review_style` → `commit_chapter` 逐级执行）。
 - 若 `check_consistency` 返回 `required_next_action: "polish_draft"`（流水线启用且草稿缺少 fresh polish 记录），先 `polish_draft`，再重新 `check_consistency`，然后继续评审/提交。
 - 若草稿残缺、跑题或不符合最新契约，用 `draft_chapter(mode="write")` 覆盖重写（或 `edit_chapter` 定点修改）后重新 `check_consistency`。
+- 若已有草稿只是低于最小字数，且工具返回 `word_count_guidance.status: "under_min"` 与 `required_next_action.mode: "append"`，只追加能自然收束本章的正文；不要为了凑数整章重写。追加后重新读取草稿并执行 `check_consistency`。
 
 ## 重写与打磨
 
@@ -145,7 +146,7 @@
 
 ## 字数
 
-章节长短由叙事节奏决定：按题材常规与本章剧情承载量自然收束，不为凑字灌水，也不为压缩砍掉必要铺垫。用户偏好（`user_rules.preferences`）中若有字数/篇幅要求，按其把握——那是创作方向而非机械合同，没有人逐章验数，**不要为贴近某个数字反复重写**。
+章节长短由叙事节奏决定：按题材常规与本章剧情承载量自然收束，不为凑字灌水，也不为压缩砍掉必要铺垫。用户偏好（`user_rules.preferences`）中若有字数/篇幅要求，按其把握——那是创作方向而非机械合同，没有人逐章验数，**不要为贴近某个数字反复重写**。若工具明确指出当前唯一 error 是低于机械下限，沿用已有剧情用 `draft_chapter(mode="append")` 自然续写；只有结构、设定或其它 error 才整章重写。
 
 若目标是短章（千余字），写法不是把长章写完再修边，而是先控制承载量：只写 2-3 个场景、1 个主转折、1 个章末钩子。发现明显超载时优先删整段、合并场景、移除次要铺垫。
 

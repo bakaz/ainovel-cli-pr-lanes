@@ -9,6 +9,7 @@ import (
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/errs"
+	"github.com/voocel/ainovel-cli/internal/rules"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -142,5 +143,52 @@ func TestDraftChapterRejectsInvalidMode(t *testing.T) {
 				t.Fatalf("chapter must not become in progress, got %d", progress.InProgressChapter)
 			}
 		})
+	}
+}
+func TestDraftChapterUnderMinWriteRequiresAppend(t *testing.T) {
+	st := fsmEnabledStore(t, 1, "")
+	snap := rules.BuildSnapshot([]rules.Candidate{
+		rules.SystemDefaults(),
+		{
+			Source: "test",
+			Structured: rules.Structured{
+				ChapterWords: &rules.WordRange{Min: 3000, Max: 6000},
+			},
+		},
+	})
+	if err := st.UserRules.Save(&snap); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewDraftChapterTool(st, testContract)
+	tool.SetChapterFSMConfig(fsmEnabledCfg())
+	short := "# 第一章\n他走到窗前，心里骂自己丢人，真不要脸。"
+	writeArgs := func(content, mode string) json.RawMessage {
+		raw, err := json.Marshal(map[string]any{
+			"chapter": 1, "content": content, "mode": mode,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	if _, err := tool.Execute(context.Background(), writeArgs(short, "write")); err != nil {
+		t.Fatalf("initial write must pass: %v", err)
+	}
+
+	_, err := tool.Execute(context.Background(), writeArgs("整章重写版本。", "write"))
+	if err == nil || !errors.Is(err, errs.ErrToolPrecondition) || !strings.Contains(err.Error(), "mode=append") {
+		t.Fatalf("under-min overwrite should require append, got %v", err)
+	}
+	got, loadErr := st.Drafts.LoadDraft(1)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if got != short {
+		t.Fatalf("guard must not overwrite draft: got %q, want %q", got, short)
+	}
+
+	if _, err := tool.Execute(context.Background(), writeArgs("续写一段。", "append")); err != nil {
+		t.Fatalf("append should pass after guard: %v", err)
 	}
 }
