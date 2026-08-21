@@ -53,55 +53,59 @@ var toolSpinnerFrames = []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯"
 
 // Model 是 TUI 的顶层状态。
 type Model struct {
-	runtime         *host.Host
-	askBridge       *askUserBridge
-	askState        *askUserState
-	cocreate        *cocreateState
-	help            *helpState
-	modelSwitch     *modelSwitchState
-	report          *reportState
-	version         string
-	importer        *importState
-	importSeq       int
-	simulator       *simulationState
-	simSeq          int
-	restoreStaged   string // snapshot selected by /restore; execution needs a separate confirmation
-	restoreInFlight bool   // true while a restore is executing; rejects additional stage/confirm
-	compItems       []commandPaletteItem
-	compIdx         int
-	compActive      bool
-	snapshot        host.UISnapshot
-	events          []host.Event
-	eventIndex      map[string]int // event.ID → m.events 下标；调用类事件到达时原地更新
-	viewport        viewport.Model // 事件流 viewport
-	streamVP        viewport.Model // 流式输出 viewport
-	detailVP        viewport.Model // 右侧详情 viewport
-	stateVP         viewport.Model // 左侧状态侧栏 viewport（可滚动）
-	streamRounds    []string
-	textarea        textarea.Model
-	width           int
-	height          int
-	autoScroll      bool
-	streamScroll    bool      // 流式面板自动跟随
-	streamDirty     bool      // streamRounds 有未刷新的 delta；由 streamFlushTick 60fps 合并
-	lastKeyAt       time.Time // 上次非 Enter 按键时间；KeyEnter 节流防粘贴 \n 流误触发提交
-	inputHistory    []string  // 已提交的输入历史（去重：相邻不重复）
-	historyIdx      int       // 当前浏览索引；== len(inputHistory) 表示"未浏览，正在编辑草稿"
-	historyDraft    string    // 进入历史浏览前保存的草稿，回到末端时恢复
-	focusPane       focusPane
-	hoverPane       focusPane
-	hoverActive     bool
-	mode            appMode
-	starting        bool // UI 已进入工作台，Host 正在执行启动初始化
-	startupMode     startupMode
-	cocreateSeq     int
-	reportSeq       int
-	err             error
-	spinnerIdx      int
-	toolSpinnerIdx  int  // 事件流进行中行的独立帧索引（150ms tick，不影响顶栏/星星）
-	cursorIdx       int  // 流式光标帧索引（独立 tick）
-	quitPending     bool // 双次 Ctrl+C 退出确认
-	abortPending    bool // 等待 Done 回来的手动暂停
+	runtime            *host.Host
+	askBridge          *askUserBridge
+	askState           *askUserState
+	cocreate           *cocreateState
+	help               *helpState
+	modelSwitch        *modelSwitchState
+	report             *reportState
+	version            string
+	importer           *importState
+	importSeq          int
+	simulator          *simulationState
+	simSeq             int
+	restoreStaged      string // snapshot selected by /restore; execution needs a separate confirmation
+	restoreInFlight    bool   // true while a restore is executing; rejects additional stage/confirm
+	compItems          []commandPaletteItem
+	compIdx            int
+	compActive         bool
+	snapshot           host.UISnapshot
+	events             []host.Event
+	eventIndex         map[string]int // event.ID → m.events 下标；调用类事件到达时原地更新
+	viewport           viewport.Model // 事件流 viewport
+	streamVP           viewport.Model // 流式输出 viewport
+	detailVP           viewport.Model // 右侧详情 viewport
+	stateVP            viewport.Model // 左侧状态侧栏 viewport（可滚动）
+	streamRounds       []string
+	textarea           textarea.Model
+	width              int
+	height             int
+	autoScroll         bool
+	streamScroll       bool      // 流式面板自动跟随
+	streamDirty        bool      // streamRounds 有未刷新的 delta；由按需 tick 合并
+	flushPending       bool      // 已有一个待处理的流式刷新 tick，避免重复挂定时器
+	lastKeyAt          time.Time // 上次非 Enter 按键时间；KeyEnter 节流防粘贴 \n 流误触发提交
+	inputHistory       []string  // 已提交的输入历史（去重：相邻不重复）
+	historyIdx         int       // 当前浏览索引；== len(inputHistory) 表示"未浏览，正在编辑草稿"
+	historyDraft       string    // 进入历史浏览前保存的草稿，回到末端时恢复
+	focusPane          focusPane
+	hoverPane          focusPane
+	hoverActive        bool
+	mode               appMode
+	starting           bool // UI 已进入工作台，Host 正在执行启动初始化
+	startupMode        startupMode
+	cocreateSeq        int
+	reportSeq          int
+	err                error
+	spinnerIdx         int
+	toolSpinnerIdx     int  // 事件流进行中行的独立帧索引（150ms tick，不影响顶栏/星星）
+	cursorIdx          int  // 流式光标帧索引（独立 tick）
+	spinnerPending     bool // 顶栏动画已有待处理 tick
+	toolSpinnerPending bool // 事件流动画已有待处理 tick
+	cursorPending      bool // 流式光标已有待处理 tick
+	quitPending        bool // 双次 Ctrl+C 退出确认
+	abortPending       bool // 等待 Done 回来的手动暂停
 	// 以下字段仅兼容旧的 TUI 消息回显；自动恢复资格不由本地缓存决定，统一由 Host.RunControl 裁定。
 	idleWritingActive       bool
 	idleWritingStartPending bool
@@ -163,10 +167,6 @@ func (m Model) Init() tea.Cmd {
 		listenStream(m.runtime),
 		tickSnapshot(m.runtime),
 		bootstrapRuntime(m.runtime),
-		tickSpinner(),
-		tickToolSpinner(),
-		tickCursor(),
-		tickStreamFlush(),
 		tickIdleWriting(),
 	)
 }
@@ -223,6 +223,49 @@ func (m *Model) hasRunningEvent() bool {
 		}
 	}
 	return false
+}
+
+// finalizeStaleEngineEvents 收束引擎停止时实时事件通道可能遗失的结束态。
+//
+// DISPATCH/TOOL 的开始与结束事件共用 ID，但实时通道满载时可能只收到开始
+// 事件；运行队列仍会保留完整结束态。若不在 doneMsg 处兜底，这类孤儿行会让
+// hasRunningEvent 永远为真，工具 spinner 便会在引擎已暂停后持续重绘事件面板。
+// DECISION 不在这里处理：停机后的用户干预裁定仍可能合法地处于进行中。
+func (m *Model) finalizeStaleEngineEvents(now time.Time) {
+	for i := range m.events {
+		ev := &m.events[i]
+		if !ev.Running() || (ev.Category != "DISPATCH" && ev.Category != "TOOL") {
+			continue
+		}
+		ev.FinishedAt = now
+		ev.Discarded = true
+		if !ev.Time.IsZero() && now.After(ev.Time) {
+			ev.Duration = now.Sub(ev.Time)
+		}
+	}
+}
+
+// scheduleAnimationTicks 只在确实存在动画目标时启动定时器。
+// 空闲/高峰暂停状态不需要周期性 View；每个 tick 都是一次性的，pending
+// 标志避免 snapshot/event 消息重复挂载同一动画循环。
+func (m *Model) scheduleAnimationTicks() tea.Cmd {
+	var cmds []tea.Cmd
+	if (m.snapshot.IsRunning || m.starting) && !m.spinnerPending {
+		m.spinnerPending = true
+		cmds = append(cmds, tickSpinner())
+	}
+	if m.hasRunningEvent() && !m.toolSpinnerPending {
+		m.toolSpinnerPending = true
+		cmds = append(cmds, tickToolSpinner())
+	}
+	if m.snapshot.IsRunning && !m.cursorPending {
+		m.cursorPending = true
+		cmds = append(cmds, tickCursor())
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
 // flushStreamIfDirty 将累积的 streamRounds 渲染到 viewport；mark 为已刷。

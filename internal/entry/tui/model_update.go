@@ -26,8 +26,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.resizeTextarea()
 		m.updateViewportSize()
+		// viewport 只保存已经排好版的行；改宽度不会自动重新换行。
+		// 因此 resize 必须按新尺寸重建四个面板，否则事件/流式内容会继续
+		// 使用旧窗口宽度生成的行，表现为不刷新、残留截断或错位。
+		m.refreshEventViewport()
+		m.refreshStreamViewport()
 		m.refreshDetailViewport()
 		m.refreshStateViewport()
+		if m.streamScroll {
+			m.streamVP.GotoBottom()
+		}
+		m.streamDirty = false
 		return m, nil
 	case tea.KeyMsg:
 		return m.handleKeyMsg(msg)
@@ -430,7 +439,7 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		m.applyEvent(ev)
 		m.refreshEventViewport()
 		m.refreshStateViewport()
-		return m, listenEvents(m.runtime), true
+		return m, tea.Batch(listenEvents(m.runtime), m.scheduleAnimationTicks()), true
 	case bootstrapMsg:
 		// 先回放历史事件再处理错误：Resume 被拒（如预算上限）是常规路径，
 		// 用户需要在看得到历史的前提下读到拒绝原因，而不是面对空白事件流。
@@ -443,7 +452,7 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 			enableMouse := m.enterRunning()
 			m.resizeTextarea()
 			m.textarea.Placeholder = defaultSteerPlaceholder()
-			return m, tea.Batch(fetchSnapshot(m.runtime), enableMouse), true
+			return m, tea.Batch(fetchSnapshot(m.runtime), enableMouse, m.scheduleAnimationTicks()), true
 		}
 		return m, fetchSnapshot(m.runtime), true
 	case askUserMsg:
@@ -482,7 +491,7 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		m.refreshStreamViewport()
 		m.refreshDetailViewport()
 		m.refreshStateViewport()
-		return m, tickSnapshot(m.runtime), true
+		return m, tea.Batch(tickSnapshot(m.runtime), m.scheduleAnimationTicks()), true
 	case idleWritingTickMsg:
 		next, cmd := m.handleIdleWritingTick(time.Time(msg))
 		return next, cmd, true
@@ -534,6 +543,7 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		// 每次运行结束都释放 TUI 的显示缓存；是否自动接力由 Host 持久化
 		// RunControl/ResumePermit 裁定，TUI 不再根据文案猜测停止原因。
 		m.idleWritingActive = false
+		m.finalizeStaleEngineEvents(time.Now())
 		m.snapshot.LastStopReason = msg.stopReason
 		m.snapshot.IsRunning = false
 		m.refreshEventViewport()
@@ -638,39 +648,53 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		m.textarea.Placeholder = defaultSteerPlaceholder()
 		return m, tea.Batch(fetchSnapshot(m.runtime), listenDone(m.runtime), m.textarea.Focus()), true
 	case spinnerTickMsg:
+		m.spinnerPending = false
 		m.spinnerIdx = (m.spinnerIdx + 1) % len(spinnerFrames)
-		if m.snapshot.IsRunning {
+		if m.snapshot.IsRunning || m.starting {
 			// 星星 / 顶栏 spinner 的视觉刷新都走这里（350ms）
 			m.refreshEventViewport()
+			m.spinnerPending = true
+			return m, tickSpinner(), true
 		}
-		return m, tickSpinner(), true
+		return m, nil, true
 	case toolSpinnerTickMsg:
+		m.toolSpinnerPending = false
 		m.toolSpinnerIdx = (m.toolSpinnerIdx + 1) % len(toolSpinnerFrames)
 		// 事件流"进行中"行的 spinner 刷新（150ms，独立节奏）。
 		// Arbiter 可在 Engine 停机态处理 Continue/查询，因此不能用 snapshot.IsRunning
 		// 作为动画前提；只要存在调用类 running 事件就刷新。没有时跳过全量重渲。
 		if m.hasRunningEvent() {
 			m.refreshEventViewport()
+			m.toolSpinnerPending = true
+			return m, tickToolSpinner(), true
 		}
-		return m, tickToolSpinner(), true
+		return m, nil, true
 	case cursorTickMsg:
+		m.cursorPending = false
 		m.cursorIdx++
 		if m.snapshot.IsRunning {
 			// cursor 闪烁需要全量重渲流式面板（光标位于 content 末尾）；
 			// 顺便把 dirty 一并清掉，flush tick 紧跟着不必重复刷。
 			m.refreshStreamViewport()
 			m.streamDirty = false
+			m.cursorPending = true
+			return m, tickCursor(), true
 		}
-		return m, tickCursor(), true
+		return m, nil, true
 	case streamDeltaMsg:
 		if len(m.streamRounds) == 0 {
 			m.streamRounds = append(m.streamRounds, "")
 		}
 		m.streamRounds[len(m.streamRounds)-1] += string(msg)
-		// 不立即 refreshStreamViewport，由 streamFlushTick 60fps 合并刷新。
-		// LLM 高速流式期每秒数十 token，逐个刷新等于每秒数十次全量重渲 32 段。
+		// 不立即 refreshStreamViewport，由按需 streamFlushTick 合并刷新。
+		// 只允许一个待处理 tick：高频 delta 只追加内容，不重复挂定时器。
 		m.streamDirty = true
-		return m, listenStream(m.runtime), true
+		cmds := []tea.Cmd{listenStream(m.runtime)}
+		if !m.flushPending {
+			m.flushPending = true
+			cmds = append(cmds, tickStreamFlush())
+		}
+		return m, tea.Batch(cmds...), true
 	case streamClearMsg:
 		// round 边界：先把累积 delta 刷出去，新 round 才能视觉对齐
 		if m.flushStreamIfDirty() && m.streamScroll {
@@ -688,10 +712,12 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		}
 		return m, listenStream(m.runtime), true
 	case streamFlushTickMsg:
+		// tick 是一次性的；本轮处理完后，后续 delta 会按需重新安排。
+		m.flushPending = false
 		if m.flushStreamIfDirty() && m.streamScroll {
 			m.streamVP.GotoBottom()
 		}
-		return m, tickStreamFlush(), true
+		return m, nil, true
 	case quitResetMsg:
 		m.quitPending = false
 		return m, nil, true
@@ -763,7 +789,7 @@ func (m *Model) enterStarting(rawPrompt string) tea.Cmd {
 	m.refreshEventViewport()
 	m.refreshStreamViewport()
 	m.refreshStateViewport()
-	return tea.Batch(m.textarea.Focus(), enableMouse)
+	return tea.Batch(m.textarea.Focus(), enableMouse, m.scheduleAnimationTicks())
 }
 
 func (m *Model) applyStartupPromptEvent(rawPrompt string) {

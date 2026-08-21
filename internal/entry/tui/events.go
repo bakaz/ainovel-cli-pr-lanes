@@ -68,7 +68,7 @@ type (
 	cursorTickMsg      time.Time // 流式光标独立 tick
 	streamDeltaMsg     string    // 流式 token 增量
 	streamClearMsg     struct{}  // 清空流式缓冲（新消息开始）
-	streamFlushTickMsg struct{}  // 60fps 节流刷新流式面板（合并 token 级 delta）
+	streamFlushTickMsg struct{}  // 按需节流刷新流式面板（合并 token 级 delta）
 	idleWritingTickMsg time.Time // 闲时写作调度 tick
 	quitResetMsg       struct{}  // 双次 Ctrl+C 超时重置
 	restoreResultMsg   struct {
@@ -322,11 +322,13 @@ func tickCursor() tea.Cmd {
 	})
 }
 
-// tickStreamFlush 驱动流式面板节流刷新。streamDelta 不再每个 token 立即重渲，
-// 而是 mark dirty；本 tick 每 16ms（~60fps）检查并合并刷新一次，把 LLM 高速流式
-// 期的"每秒数十次全量重渲"压回 60 次上限。
+// tickStreamFlush 驱动一次流式面板节流刷新。
+//
+// 这是一次性 tick，不在 Init 中常驻；首个 streamDelta 到来时才安排，
+// 没有新流式内容时不产生任何刷新消息。33ms 约等于 30 FPS，足以保持
+// 流式输出顺滑，同时给 Bubble Tea 留出处理输入和事件的余量。
 func tickStreamFlush() tea.Cmd {
-	return tea.Tick(16*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(33*time.Millisecond, func(t time.Time) tea.Msg {
 		return streamFlushTickMsg{}
 	})
 }

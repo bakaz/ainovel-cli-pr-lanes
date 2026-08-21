@@ -554,8 +554,23 @@ func (h *Host) ResumeForTUI(now time.Time) (label string, deferred bool, err err
 	if err != nil || label == "" {
 		return label, false, err
 	}
-	if meta == nil || meta.Control == nil || meta.Control.AutoResume == nil {
+	progress, progressErr := h.store.Progress.Load()
+	if progressErr != nil {
+		return label, false, progressErr
+	}
+	if startupResumeBlocked(meta, progress) {
 		return label, true, nil
+	}
+	if meta == nil || meta.Control == nil || meta.Control.AutoResume == nil {
+		if startupResumeDeferred(meta, now) {
+			return label, true, nil
+		}
+		// 兼容旧项目及普通自然中断：旧版启动入口没有要求
+		// RunControl.AutoResume，仍按原语义从已落盘事实自动续跑。
+		h.interMu.Lock()
+		defer h.interMu.Unlock()
+		label, err = h.resumeLockedAs(domain.RunOriginManual, nil)
+		return label, false, err
 	}
 	permit := *meta.Control.AutoResume
 	if permit.Generation != meta.Control.Generation || permit.Origin == "" || !permit.Origin.Valid() {
@@ -696,19 +711,42 @@ func (h *Host) startScheduledRunLocked(now time.Time) (started bool, err error) 
 	if err != nil {
 		return false, err
 	}
-	if meta == nil || meta.Control == nil || meta.Control.AutoResume == nil || meta.PendingSteer != "" || meta.AdvanceHold != nil {
+	if meta == nil || meta.PendingSteer != "" || meta.AdvanceHold != nil {
 		return false, nil
 	}
-	permit := *meta.Control.AutoResume
-	if permit.Generation != meta.Control.Generation || !resumePermitDue(permit, now) {
+	progress, err := h.store.Progress.Load()
+	if err != nil {
+		return false, err
+	}
+	if startupResumeBlocked(meta, progress) {
 		return false, nil
 	}
-	if permit.Origin == domain.RunOriginIdleScheduler &&
-		(!meta.IdleWritingEnabled || meta.AdvanceMode != domain.ChapterAdvanceAuto) {
-		return false, nil
-	}
-	if !h.scheduledResumeAllowed(meta, permit, now) {
-		return false, nil
+
+	var (
+		origin domain.RunOrigin
+		permit *domain.ResumePermit
+	)
+	if meta.Control == nil || meta.Control.AutoResume == nil {
+		// 兼容旧项目：高峰启动时由 ResumeForTUI 延迟，窗口打开后由
+		// 闲时调度器接力；仍要求用户开启闲时写作和 auto 推进。
+		if !meta.IdleWritingEnabled || meta.AdvanceMode != domain.ChapterAdvanceAuto || IdleWritingStatusAt(now).InPeak {
+			return false, nil
+		}
+		origin = domain.RunOriginIdleScheduler
+	} else {
+		p := *meta.Control.AutoResume
+		if p.Generation != meta.Control.Generation || !resumePermitDue(p, now) {
+			return false, nil
+		}
+		if p.Origin == domain.RunOriginIdleScheduler &&
+			(!meta.IdleWritingEnabled || meta.AdvanceMode != domain.ChapterAdvanceAuto) {
+			return false, nil
+		}
+		if !h.scheduledResumeAllowed(meta, p, now) {
+			return false, nil
+		}
+		origin = p.Origin
+		permit = &p
 	}
 
 	h.mu.Lock()
@@ -718,7 +756,7 @@ func (h *Host) startScheduledRunLocked(now time.Time) (started bool, err error) 
 		return false, nil
 	}
 
-	label, err := h.resumeLockedAs(permit.Origin, &permit)
+	label, err := h.resumeLockedAs(origin, permit)
 	if err != nil {
 		return false, err
 	}

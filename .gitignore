@@ -55,6 +55,12 @@ workspace/
 .slim/cache/
 .slim/deepwork/
 .tools/
+
+# Local Codex metadata
+.codex/
+
+# Local build/test artifacts
+.tmp/
 workspace_archived/
 
 # 本地文风素材目录（不入库）
