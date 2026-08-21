@@ -172,7 +172,17 @@ func (io *IO) AppendLine(rel string, data []byte) error {
 	return io.AppendLineUnlocked(rel, data)
 }
 
+func (io *IO) AppendLineBuffered(rel string, data []byte) error {
+	io.mu.Lock()
+	defer io.mu.Unlock()
+	return io.appendLineUnlocked(rel, data, false)
+}
+
 func (io *IO) AppendLineUnlocked(rel string, data []byte) error {
+	return io.appendLineUnlocked(rel, data, true)
+}
+
+func (io *IO) appendLineUnlocked(rel string, data []byte, sync bool) error {
 	// 写生命周期 lease：完整 OS 修改期间持读 lease（Close 等待在途写）。
 	endWrite, err := io.beginWrite()
 	if err != nil {
@@ -190,6 +200,9 @@ func (io *IO) AppendLineUnlocked(rel string, data []byte) error {
 	defer func() { _ = f.Close() }()
 	if _, err = f.Write(data); err != nil {
 		return err
+	}
+	if !sync {
+		return nil
 	}
 	return f.Sync()
 }

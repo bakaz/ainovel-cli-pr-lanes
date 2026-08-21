@@ -2374,6 +2374,13 @@ func (h *Host) ReplayQueue(afterSeq int64) ([]domain.RuntimeQueueItem, error) {
 	return h.store.Runtime.LoadQueueAfter(afterSeq)
 }
 
+func (h *Host) ReplayStreamQueue(afterSeq int64) ([]domain.RuntimeQueueItem, error) {
+	if h.store == nil || h.store.Runtime == nil {
+		return nil, nil
+	}
+	return h.store.Runtime.LoadQueueKindsAfter(afterSeq, domain.RuntimeQueueStreamDelta, domain.RuntimeQueueStreamClear)
+}
+
 // ── 共创 ──
 
 // CoCreateStream 冷启动共创：从零澄清需求，产出整本书的创作指令。

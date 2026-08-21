@@ -77,14 +77,12 @@ type Model struct {
 	streamVP           viewport.Model // 流式输出 viewport
 	detailVP           viewport.Model // 右侧详情 viewport
 	stateVP            viewport.Model // 左侧状态侧栏 viewport（可滚动）
-	streamRounds       []string
+	streamRounds       []streamRound
 	textarea           textarea.Model
 	width              int
 	height             int
 	autoScroll         bool
 	streamScroll       bool      // 流式面板自动跟随
-	streamDirty        bool      // streamRounds 有未刷新的 delta；由按需 tick 合并
-	flushPending       bool      // 已有一个待处理的流式刷新 tick，避免重复挂定时器
 	lastKeyAt          time.Time // 上次非 Enter 按键时间；KeyEnter 节流防粘贴 \n 流误触发提交
 	inputHistory       []string  // 已提交的输入历史（去重：相邻不重复）
 	historyIdx         int       // 当前浏览索引；== len(inputHistory) 表示"未浏览，正在编辑草稿"
@@ -111,6 +109,12 @@ type Model struct {
 	idleWritingStartPending bool
 	idleWritingSuspended    bool
 	mouseOff                bool // true 时已禁用鼠标上报，让用户原生拖拽选中复制；再次切换恢复
+	hitGeomOK               bool
+	hitTopH                 int
+	hitBodyH                int
+	hitLeftW                int
+	hitRightW               int
+	hitEventH               int
 }
 
 // NewModel 创建 TUI Model。
@@ -165,7 +169,7 @@ func (m Model) Init() tea.Cmd {
 		listenAskUser(m.askBridge),
 		listenDone(m.runtime),
 		listenStream(m.runtime),
-		tickSnapshot(m.runtime),
+		tickSnapshot(m.runtime, true),
 		bootstrapRuntime(m.runtime),
 		tickIdleWriting(),
 	)
@@ -176,7 +180,16 @@ func (m *Model) paneAtMouse(x, y int) (focusPane, bool) {
 		return focusEvents, false
 	}
 
-	topH, _, bodyH := m.layoutHeights()
+	topH, bodyH := m.hitTopH, m.hitBodyH
+	leftW, rightW, eventH := m.hitLeftW, m.hitRightW, m.hitEventH
+	if !m.hitGeomOK {
+		var inputH int
+		topH, inputH, bodyH = m.layoutHeights()
+		_ = inputH
+		leftW = m.sidebarWidth()
+		rightW = m.detailWidth()
+		eventH, _ = m.splitHeights(bodyH)
+	}
 	if bodyH < 1 {
 		return focusEvents, false
 	}
@@ -187,8 +200,6 @@ func (m *Model) paneAtMouse(x, y int) (focusPane, bool) {
 		return focusEvents, false
 	}
 
-	leftW := m.sidebarWidth()
-	rightW := m.detailWidth()
 	centerStartX := leftW
 	rightStartX := m.width - rightW
 
@@ -199,7 +210,6 @@ func (m *Model) paneAtMouse(x, y int) (focusPane, bool) {
 		return focusState, true
 	}
 
-	eventH, _ := m.splitHeights(bodyH)
 	if y-bodyStartY < eventH {
 		return focusEvents, true
 	}
@@ -234,7 +244,16 @@ func (m *Model) hasRunningEvent() bool {
 func (m *Model) finalizeStaleEngineEvents(now time.Time) {
 	for i := range m.events {
 		ev := &m.events[i]
-		if !ev.Running() || (ev.Category != "DISPATCH" && ev.Category != "TOOL") {
+		if !ev.Running() {
+			continue
+		}
+		switch ev.Category {
+		case "DISPATCH", "TOOL":
+		case "DECISION":
+			if m.askState != nil {
+				continue
+			}
+		default:
 			continue
 		}
 		ev.FinishedAt = now
@@ -266,17 +285,6 @@ func (m *Model) scheduleAnimationTicks() tea.Cmd {
 		return nil
 	}
 	return tea.Batch(cmds...)
-}
-
-// flushStreamIfDirty 将累积的 streamRounds 渲染到 viewport；mark 为已刷。
-// 返回是否真正刷了，便于调用方决定要不要 GotoBottom。
-func (m *Model) flushStreamIfDirty() bool {
-	if !m.streamDirty {
-		return false
-	}
-	m.refreshStreamViewport()
-	m.streamDirty = false
-	return true
 }
 
 // refreshEventViewport 重新渲染事件流内容并设置 viewport。
@@ -330,7 +338,7 @@ func (m *Model) refreshStateViewport() {
 func (m *Model) updateViewportSize() {
 	centerW := m.eventFlowWidth()
 	rightW := m.detailWidth()
-	bodyH := m.bodyHeight()
+	topH, _, bodyH := m.layoutHeights()
 	eventH, streamH := m.splitHeights(bodyH)
 	m.viewport.Width = centerW - 2
 	m.viewport.Height = eventH - 1 // -1 为 event panel header 行
@@ -345,6 +353,12 @@ func (m *Model) updateViewportSize() {
 	// SetContent 只防越过末行），viewport 会用空行补满底部。SetYOffset 自钳。
 	m.stateVP.SetYOffset(m.stateVP.YOffset)
 	m.detailVP.SetYOffset(m.detailVP.YOffset)
+	m.hitTopH = topH
+	m.hitBodyH = bodyH
+	m.hitLeftW = leftW
+	m.hitRightW = rightW
+	m.hitEventH = eventH
+	m.hitGeomOK = m.width > 0 && m.height > 0
 }
 
 // splitHeights 计算事件流和流式输出的高度分配。

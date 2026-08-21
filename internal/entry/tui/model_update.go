@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -36,7 +35,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.streamScroll {
 			m.streamVP.GotoBottom()
 		}
-		m.streamDirty = false
 		return m, nil
 	case tea.KeyMsg:
 		return m.handleKeyMsg(msg)
@@ -485,13 +483,9 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		}
 		return m, listenAskUser(m.askBridge), true
 	case snapshotMsg:
-		m.snapshot = host.UISnapshot(msg)
-		m.syncRuntimePlaceholder()
-		m.refreshEventViewport()
-		m.refreshStreamViewport()
-		m.refreshDetailViewport()
-		m.refreshStateViewport()
-		return m, tea.Batch(tickSnapshot(m.runtime), m.scheduleAnimationTicks()), true
+		m.applySnapshot(host.UISnapshot(msg))
+		idle := !m.snapshot.IsRunning && !m.starting
+		return m, tea.Batch(tickSnapshot(m.runtime, idle), m.scheduleAnimationTicks()), true
 	case idleWritingTickMsg:
 		next, cmd := m.handleIdleWritingTick(time.Time(msg))
 		return next, cmd, true
@@ -673,51 +667,52 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		m.cursorPending = false
 		m.cursorIdx++
 		if m.snapshot.IsRunning {
-			// cursor 闪烁需要全量重渲流式面板（光标位于 content 末尾）；
-			// 顺便把 dirty 一并清掉，flush tick 紧跟着不必重复刷。
+			// cursor 闪烁需要全量重渲流式面板（光标位于 content 末尾）。
 			m.refreshStreamViewport()
-			m.streamDirty = false
 			m.cursorPending = true
 			return m, tickCursor(), true
 		}
 		return m, nil, true
+	case streamBatchMsg:
+		changed := false
+		for _, op := range msg.ops {
+			if op.clear {
+				m.appendStreamClear()
+				changed = true
+				continue
+			}
+			if m.appendStreamText(op.text) {
+				changed = true
+			}
+		}
+		if changed {
+			m.trimStreamRounds()
+			m.refreshStreamViewport()
+			if m.streamScroll {
+				m.streamVP.GotoBottom()
+			}
+		}
+		if msg.closed {
+			return m, nil, true
+		}
+		return m, m.nextStreamListen(), true
 	case streamDeltaMsg:
-		if len(m.streamRounds) == 0 {
-			m.streamRounds = append(m.streamRounds, "")
+		if m.appendStreamText(string(msg)) {
+			m.trimStreamRounds()
+			m.refreshStreamViewport()
+			if m.streamScroll {
+				m.streamVP.GotoBottom()
+			}
 		}
-		m.streamRounds[len(m.streamRounds)-1] += string(msg)
-		// 不立即 refreshStreamViewport，由按需 streamFlushTick 合并刷新。
-		// 只允许一个待处理 tick：高频 delta 只追加内容，不重复挂定时器。
-		m.streamDirty = true
-		cmds := []tea.Cmd{listenStream(m.runtime)}
-		if !m.flushPending {
-			m.flushPending = true
-			cmds = append(cmds, tickStreamFlush())
-		}
-		return m, tea.Batch(cmds...), true
+		return m, m.nextStreamListen(), true
 	case streamClearMsg:
-		// round 边界：先把累积 delta 刷出去，新 round 才能视觉对齐
-		if m.flushStreamIfDirty() && m.streamScroll {
-			m.streamVP.GotoBottom()
-		}
-		if len(m.streamRounds) == 0 {
-			m.streamRounds = append(m.streamRounds, "")
-		} else if strings.TrimSpace(m.streamRounds[len(m.streamRounds)-1]) != "" {
-			m.streamRounds = append(m.streamRounds, "")
-		}
+		m.appendStreamClear()
 		m.trimStreamRounds()
 		m.refreshStreamViewport()
 		if m.streamScroll {
 			m.streamVP.GotoBottom()
 		}
-		return m, listenStream(m.runtime), true
-	case streamFlushTickMsg:
-		// tick 是一次性的；本轮处理完后，后续 delta 会按需重新安排。
-		m.flushPending = false
-		if m.flushStreamIfDirty() && m.streamScroll {
-			m.streamVP.GotoBottom()
-		}
-		return m, nil, true
+		return m, m.nextStreamListen(), true
 	case quitResetMsg:
 		m.quitPending = false
 		return m, nil, true
@@ -822,6 +817,56 @@ func (m Model) handleCoCreateDoneMsg(msg cocreateDoneMsg) (tea.Model, tea.Cmd) {
 	return m, m.textarea.Focus()
 }
 
+func (m *Model) applySnapshot(next host.UISnapshot) {
+	prev := m.snapshot
+	m.snapshot = next
+	m.syncRuntimePlaceholder()
+	if m.mode == modeNew {
+		return
+	}
+	runningChanged := prev.IsRunning != next.IsRunning || m.starting
+	if runningChanged {
+		m.refreshEventViewport()
+		m.refreshStreamViewport()
+		m.refreshDetailViewport()
+		m.refreshStateViewport()
+		return
+	}
+	if snapshotStateChanged(prev, next) {
+		m.refreshEventViewport()
+		m.refreshStateViewport()
+	}
+	if snapshotDetailChanged(prev, next) {
+		m.refreshDetailViewport()
+	}
+}
+
+func snapshotStateChanged(prev, next host.UISnapshot) bool {
+	return prev.RuntimeState != next.RuntimeState ||
+		prev.CompletedCount != next.CompletedCount ||
+		prev.TotalWordCount != next.TotalWordCount ||
+		prev.InProgressChapter != next.InProgressChapter ||
+		prev.StatusLabel != next.StatusLabel ||
+		prev.TotalCostUSD != next.TotalCostUSD ||
+		prev.TotalInputTokens != next.TotalInputTokens ||
+		prev.TotalOutputTokens != next.TotalOutputTokens ||
+		prev.AutoResumePending != next.AutoResumePending ||
+		prev.IdleWritingInPeak != next.IdleWritingInPeak ||
+		prev.RecoveryLabel != next.RecoveryLabel
+}
+
+func snapshotDetailChanged(prev, next host.UISnapshot) bool {
+	if prev.CurrentVolumeArc != next.CurrentVolumeArc || len(prev.Outline) != len(next.Outline) {
+		return true
+	}
+	if len(next.Outline) == 0 {
+		return false
+	}
+	a := prev.Outline[len(prev.Outline)-1]
+	b := next.Outline[len(next.Outline)-1]
+	return a.Chapter != b.Chapter || a.Title != b.Title
+}
+
 func (m Model) handleTextareaMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.textarea, cmd = m.textarea.Update(msg)
@@ -877,6 +922,35 @@ func (m *Model) applyEvent(ev host.Event) {
 	}
 }
 
+// appendStreamText adds one coalesced stream chunk without copying the round.
+func (m *Model) appendStreamText(text string) bool {
+	if text == "" {
+		return false
+	}
+	if len(m.streamRounds) == 0 {
+		m.streamRounds = append(m.streamRounds, streamRound{})
+	}
+	m.streamRounds[len(m.streamRounds)-1].append(text)
+	return true
+}
+
+func (m *Model) appendStreamClear() {
+	if len(m.streamRounds) == 0 {
+		m.streamRounds = append(m.streamRounds, streamRound{})
+		return
+	}
+	if !m.streamRounds[len(m.streamRounds)-1].empty() {
+		m.streamRounds = append(m.streamRounds, streamRound{})
+	}
+}
+
+func (m Model) nextStreamListen() tea.Cmd {
+	if m.runtime == nil {
+		return nil
+	}
+	return listenStream(m.runtime)
+}
+
 // trimStreamRounds 把 streamRounds 截断到 maxStreamRounds 段；超出从头丢弃。
 // 调用时机：每次 streamClear 新开轮次后、replay 灌完所有历史项后。
 func (m *Model) trimStreamRounds() {
@@ -914,20 +988,9 @@ func (m *Model) applyRuntimeReplay(items []domain.RuntimeQueueItem) {
 			// 等渲染所需字段未随 replay 还原，出来的行残缺不齐。宁可空面板也不要半截数据。
 			continue
 		case domain.RuntimeQueueStreamClear:
-			if len(m.streamRounds) == 0 {
-				m.streamRounds = append(m.streamRounds, "")
-			} else if strings.TrimSpace(m.streamRounds[len(m.streamRounds)-1]) != "" {
-				m.streamRounds = append(m.streamRounds, "")
-			}
+			m.appendStreamClear()
 		case domain.RuntimeQueueStreamDelta:
-			text := host.ReplayDeltaText(item)
-			if text == "" {
-				continue
-			}
-			if len(m.streamRounds) == 0 {
-				m.streamRounds = append(m.streamRounds, "")
-			}
-			m.streamRounds[len(m.streamRounds)-1] += text
+			m.appendStreamText(host.ReplayDeltaText(item))
 		}
 	}
 	m.trimStreamRounds()

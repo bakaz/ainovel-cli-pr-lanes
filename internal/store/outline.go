@@ -6,15 +6,33 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 )
 
 // OutlineStore 管理故事前提、大纲（扁平/分层）和指南针。
-type OutlineStore struct{ io *IO }
+type OutlineStore struct {
+	io *IO
+
+	cacheMu       sync.Mutex
+	outlineCache  []domain.OutlineEntry
+	outlineCached bool
+	layeredCache  []domain.VolumeOutline
+	layeredCached bool
+}
 
 func NewOutlineStore(io *IO) *OutlineStore { return &OutlineStore{io: io} }
+
+func (s *OutlineStore) invalidateOutlineCache() {
+	s.cacheMu.Lock()
+	s.outlineCache = nil
+	s.outlineCached = false
+	s.layeredCache = nil
+	s.layeredCached = false
+	s.cacheMu.Unlock()
+}
 
 // SavePremise 保存故事前提到 premise.md。
 func (s *OutlineStore) SavePremise(content string) error {
@@ -32,23 +50,43 @@ func (s *OutlineStore) LoadPremise() (string, error) {
 
 // SaveOutline 同时保存 outline.json 和 outline.md（原子写入）。
 func (s *OutlineStore) SaveOutline(entries []domain.OutlineEntry) error {
-	return s.io.WithWriteLock(func() error {
+	err := s.io.WithWriteLock(func() error {
 		if err := s.io.WriteJSONUnlocked("outline.json", entries); err != nil {
 			return err
 		}
 		return s.io.WriteMarkdownUnlocked("outline.md", renderOutline(entries))
 	})
+	if err == nil {
+		s.invalidateOutlineCache()
+	}
+	return err
 }
 
 // LoadOutline 从 outline.json 读取结构化大纲。
 func (s *OutlineStore) LoadOutline() ([]domain.OutlineEntry, error) {
+	s.cacheMu.Lock()
+	if s.outlineCached {
+		out := append([]domain.OutlineEntry(nil), s.outlineCache...)
+		s.cacheMu.Unlock()
+		return out, nil
+	}
+	s.cacheMu.Unlock()
+
 	var entries []domain.OutlineEntry
 	if err := s.io.ReadJSON("outline.json", &entries); err != nil {
 		if os.IsNotExist(err) {
+			s.cacheMu.Lock()
+			s.outlineCache = nil
+			s.outlineCached = true
+			s.cacheMu.Unlock()
 			return nil, nil
 		}
 		return nil, err
 	}
+	s.cacheMu.Lock()
+	s.outlineCache = append([]domain.OutlineEntry(nil), entries...)
+	s.outlineCached = true
+	s.cacheMu.Unlock()
 	return entries, nil
 }
 
@@ -68,7 +106,7 @@ func (s *OutlineStore) GetChapterOutline(chapter int) (*domain.OutlineEntry, err
 
 // SaveLayeredOutline 保存分层大纲（长篇模式，原子写入）。
 func (s *OutlineStore) SaveLayeredOutline(volumes []domain.VolumeOutline) error {
-	return s.io.WithWriteLock(func() error {
+	err := s.io.WithWriteLock(func() error {
 		if err := validateAndNormalizeLayeredOutline(volumes); err != nil {
 			return err
 		}
@@ -77,14 +115,30 @@ func (s *OutlineStore) SaveLayeredOutline(volumes []domain.VolumeOutline) error 
 		}
 		return s.io.WriteMarkdownUnlocked("layered_outline.md", renderLayeredOutline(volumes))
 	})
+	if err == nil {
+		s.invalidateOutlineCache()
+	}
+	return err
 }
 
 // LoadLayeredOutline 读取分层大纲，并在内存中校验编号/拓扑契约后返回。
 // 持久化的 Chapter==0 会在内存补齐（不写盘）；非零错号和非法拓扑 fail-closed。
 func (s *OutlineStore) LoadLayeredOutline() ([]domain.VolumeOutline, error) {
+	s.cacheMu.Lock()
+	if s.layeredCached {
+		out := s.layeredCache
+		s.cacheMu.Unlock()
+		return out, nil
+	}
+	s.cacheMu.Unlock()
+
 	var volumes []domain.VolumeOutline
 	if err := s.io.ReadJSON("layered_outline.json", &volumes); err != nil {
 		if os.IsNotExist(err) {
+			s.cacheMu.Lock()
+			s.layeredCache = nil
+			s.layeredCached = true
+			s.cacheMu.Unlock()
 			return nil, nil
 		}
 		return nil, err
@@ -107,6 +161,10 @@ func (s *OutlineStore) LoadLayeredOutline() ([]domain.VolumeOutline, error) {
 			}
 		}
 	}
+	s.cacheMu.Lock()
+	s.layeredCache = volumes
+	s.layeredCached = true
+	s.cacheMu.Unlock()
 	return volumes, nil
 }
 
@@ -124,12 +182,16 @@ func ValidateVolumesLayeredOutline(volumes []domain.VolumeOutline) error {
 
 // ClearLayeredOutline 清理分层大纲文件。
 func (s *OutlineStore) ClearLayeredOutline() error {
-	return s.io.WithWriteLock(func() error {
+	err := s.io.WithWriteLock(func() error {
 		if err := s.io.RemoveFileUnlocked("layered_outline.json"); err != nil {
 			return err
 		}
 		return s.io.RemoveFileUnlocked("layered_outline.md")
 	})
+	if err == nil {
+		s.invalidateOutlineCache()
+	}
+	return err
 }
 
 // GetChapterFromLayered 从分层大纲中按全局章节号查找。
@@ -337,6 +399,7 @@ func (s *OutlineStore) expandArcUnlocked(volumeIdx, arcIdx int, expansion domain
 	if err := s.io.WriteMarkdownUnlocked("outline.md", renderOutline(flat)); err != nil {
 		return nil, err
 	}
+	s.invalidateOutlineCache()
 	return volumes, nil
 }
 
@@ -366,6 +429,7 @@ func (s *OutlineStore) appendVolumeUnlocked(vol domain.VolumeOutline) ([]domain.
 	if err := s.io.WriteMarkdownUnlocked("outline.md", renderOutline(flat)); err != nil {
 		return nil, err
 	}
+	s.invalidateOutlineCache()
 	return volumes, nil
 }
 

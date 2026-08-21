@@ -373,21 +373,15 @@ func renderStreamActivity(frame int) string {
 // renderStreamContent 将流式输出按轮次渲染为语义分块。
 // Agent 调度块（以 ▸ 或 ✻ 开头）用 accent 标题 + dim 指令；正文块跟随终端默认色。
 // cursor 非空时追加在末尾，表示 AI 正在输出。
-func renderStreamContent(rounds []string, width int, cursor string) string {
+func renderStreamContent(rounds []streamRound, width int, cursor string) string {
 	if width < 24 {
 		width = 24
 	}
 
 	var blocks []string
-	for _, round := range rounds {
-		text := strings.TrimSpace(round)
-		if text == "" {
-			continue
-		}
-		if strings.HasPrefix(text, "▸") || strings.HasPrefix(text, "✻") {
-			blocks = append(blocks, renderAgentBlock(text, width))
-		} else {
-			blocks = append(blocks, renderChapterBlock(text, width))
+	for i := range rounds {
+		if block := rounds[i].renderedBlock(width); block != "" {
+			blocks = append(blocks, block)
 		}
 	}
 	result := strings.Join(blocks, "\n\n")
@@ -395,6 +389,28 @@ func renderStreamContent(rounds []string, width int, cursor string) string {
 		result += cursor
 	}
 	return result
+}
+
+func (r *streamRound) renderedBlock(width int) string {
+	if r.empty() {
+		return ""
+	}
+	if r.renderW == width && r.render != "" {
+		return r.render
+	}
+	text := strings.TrimSpace(r.text())
+	if text == "" {
+		return ""
+	}
+	var block string
+	if strings.HasPrefix(text, "▸") || strings.HasPrefix(text, "✻") {
+		block = renderAgentBlock(text, width)
+	} else {
+		block = renderChapterBlock(text, width)
+	}
+	r.render = block
+	r.renderW = width
+	return block
 }
 
 // renderAgentBlock 渲染 Agent 调度块：图标 + 标题 + 分隔线 + 任务指令。
@@ -540,6 +556,33 @@ func orderedListPrefix(line string) string {
 	return line[:end+2]
 }
 
+func runeDisplayWidth(r rune) int {
+	switch {
+	case r == 0 || r == '\n' || r == '\r':
+		return 0
+	case r < 0x7F:
+		if r < 0x20 {
+			return 0
+		}
+		return 1
+	case r >= 0x2E80 && r <= 0x9FFF,
+		r >= 0xA000 && r <= 0xA4CF,
+		r >= 0xAC00 && r <= 0xD7AF,
+		r >= 0xF900 && r <= 0xFAFF,
+		r >= 0xFE10 && r <= 0xFE1F,
+		r >= 0xFE30 && r <= 0xFE4F,
+		r >= 0xFF01 && r <= 0xFF60,
+		r >= 0xFFE0 && r <= 0xFFE6,
+		r >= 0x20000 && r <= 0x2FFFF:
+		return 2
+	default:
+		if r >= 0x1100 && r <= 0x11FF {
+			return 2
+		}
+		return 1
+	}
+}
+
 func wrapRunes(text string, width int) []string {
 	if text == "" {
 		return []string{""}
@@ -553,7 +596,7 @@ func wrapRunes(text string, width int) []string {
 	currentWidth := 0
 
 	for _, r := range text {
-		rw := lipgloss.Width(string(r))
+		rw := runeDisplayWidth(r)
 		if currentWidth > 0 && currentWidth+rw > width {
 			lines = append(lines, strings.TrimRight(current.String(), " "))
 			current.Reset()

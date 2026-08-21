@@ -66,9 +66,8 @@ type (
 	spinnerTickMsg     time.Time
 	toolSpinnerTickMsg time.Time // 事件流工具 spinner 独立 tick（更快、独立于顶栏/星星）
 	cursorTickMsg      time.Time // 流式光标独立 tick
-	streamDeltaMsg     string    // 流式 token 增量
-	streamClearMsg     struct{}  // 清空流式缓冲（新消息开始）
-	streamFlushTickMsg struct{}  // 按需节流刷新流式面板（合并 token 级 delta）
+	streamDeltaMsg     string    // 兼容旧测试/回放调用的单个流式增量
+	streamClearMsg     struct{}  // 兼容旧测试/回放调用的清空流式缓冲
 	idleWritingTickMsg time.Time // 闲时写作调度 tick
 	quitResetMsg       struct{}  // 双次 Ctrl+C 超时重置
 	restoreResultMsg   struct {
@@ -100,8 +99,20 @@ func listenDone(rt *host.Host) tea.Cmd {
 	}
 }
 
-func tickSnapshot(rt *host.Host) tea.Cmd {
-	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+const (
+	snapshotTickRunning = 3 * time.Second
+	snapshotTickIdle    = 15 * time.Second
+)
+
+func tickSnapshot(rt *host.Host, idle bool) tea.Cmd {
+	if rt == nil {
+		return nil
+	}
+	d := snapshotTickRunning
+	if idle {
+		d = snapshotTickIdle
+	}
+	return tea.Tick(d, func(t time.Time) tea.Msg {
 		return snapshotMsg(rt.Snapshot())
 	})
 }
@@ -161,7 +172,7 @@ func restoreSnapshot(rt *host.Host, snapshotID string) tea.Cmd {
 
 func bootstrapRuntime(rt *host.Host) tea.Cmd {
 	return func() tea.Msg {
-		replay, err := rt.ReplayQueue(0)
+		replay, err := rt.ReplayStreamQueue(0)
 		if err != nil {
 			return bootstrapMsg{err: err}
 		}
@@ -322,30 +333,57 @@ func tickCursor() tea.Cmd {
 	})
 }
 
-// tickStreamFlush 驱动一次流式面板节流刷新。
-//
-// 这是一次性 tick，不在 Init 中常驻；首个 streamDelta 到来时才安排，
-// 没有新流式内容时不产生任何刷新消息。33ms 约等于 30 FPS，足以保持
-// 流式输出顺滑，同时给 Bubble Tea 留出处理输入和事件的余量。
-func tickStreamFlush() tea.Cmd {
-	return tea.Tick(33*time.Millisecond, func(t time.Time) tea.Msg {
-		return streamFlushTickMsg{}
-	})
+const (
+	streamBatchWindow   = 33 * time.Millisecond
+	streamBatchMaxBytes = 64 * 1024
+)
+
+// collectStreamBatch continuously drains the source while a short batching
+// window is open. This keeps Host.streamCh from filling during token bursts,
+// while returning at most one Bubble Tea message per window. Clear sentinels
+// are returned in the same ordered batch and terminate that batch immediately,
+// so deltas after the sentinel are read by the next listener.
+func collectStreamBatch(ch <-chan string) streamBatchMsg {
+	first, ok := <-ch
+	if !ok {
+		return streamBatchMsg{closed: true}
+	}
+	ops := make([]streamOp, 0, 8)
+	bytes := 0
+	appendOp := func(delta string) {
+		if delta == host.StreamClearSentinel {
+			ops = append(ops, streamOp{clear: true})
+			return
+		}
+		ops = append(ops, streamOp{text: delta})
+		bytes += len(delta)
+	}
+	appendOp(first)
+	if first == host.StreamClearSentinel {
+		return streamBatchMsg{ops: ops}
+	}
+
+	timer := time.NewTimer(streamBatchWindow)
+	defer timer.Stop()
+	for {
+		select {
+		case delta, ok := <-ch:
+			if !ok {
+				return streamBatchMsg{ops: ops, closed: true}
+			}
+			appendOp(delta)
+			if delta == host.StreamClearSentinel || bytes >= streamBatchMaxBytes {
+				return streamBatchMsg{ops: ops}
+			}
+		case <-timer.C:
+			return streamBatchMsg{ops: ops}
+		}
+	}
 }
 
 func listenStream(rt *host.Host) tea.Cmd {
 	return func() tea.Msg {
-		delta, ok := <-rt.Stream()
-		if !ok {
-			return nil
-		}
-		// sentinel 派发为 streamClearMsg，保证与正常 delta 在同一通道里按 emit
-		// 顺序到达 TUI。双通道时 clearCh 与 streamCh 之间无序，✻ header 经常被
-		// 错塞到上一段 thinking 末尾。
-		if delta == host.StreamClearSentinel {
-			return streamClearMsg{}
-		}
-		return streamDeltaMsg(delta)
+		return collectStreamBatch(rt.Stream())
 	}
 }
 
