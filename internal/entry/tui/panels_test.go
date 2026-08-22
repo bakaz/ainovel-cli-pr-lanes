@@ -114,4 +114,33 @@ func TestAgentContextLineHidesStaleStrategy(t *testing.T) {
 	if !strings.Contains(fresh, "微压缩") {
 		t.Fatalf("fresh compact should show strategy: %q", fresh)
 	}
+	projected := agentContextLine(host.AgentSnapshot{
+		Context: host.AgentContextSnapshot{
+			Tokens:        80000,
+			ContextWindow: 200000,
+			Percent:       40,
+			Scope:         "projected",
+		},
+	})
+	if strings.Contains(projected, "投影") {
+		t.Fatalf("projected scope should stay off the idle line: %q", projected)
+	}
+}
+
+func TestRenderStateContentUsesOutlinePlannedCount(t *testing.T) {
+	out := renderStateContent(host.UISnapshot{
+		Layered:        true,
+		CompletedCount: 30,
+		OutlinePlanned: 837,
+		Outline: []host.OutlineSnapshot{
+			{Chapter: 31, Title: "当前卷窗口"},
+			{Chapter: 32, Title: "下一章"},
+		},
+	}, 32)
+	if !strings.Contains(out, "837") {
+		t.Fatalf("sidebar should show full planned count, got %q", out)
+	}
+	if strings.Contains(out, "2 章") && !strings.Contains(out, "837") {
+		t.Fatalf("sidebar should not use window length as planned count: %q", out)
+	}
 }

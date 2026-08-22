@@ -38,10 +38,13 @@ func renderStateContent(snap host.UISnapshot, contentW int) string {
 	}
 	if snap.Layered {
 		overview.WriteString(renderField("已完成", fmt.Sprintf("%d 章", snap.CompletedCount)))
-		// 分层动态规划：右栏只展示当前弧已展开的章节，"已规划"也用同一个口径，
-		// 否则会把骨架弧 EstimatedChapters 的粗估算（如 92）混进来，与可见大纲对不上。
-		// progress.TotalChapters 那个值仅用于内部 ContextProfile 决策，不要泄漏到 UI。
-		if planned := len(snap.Outline); planned > 0 {
+		// 已规划 = 已展开的真实章节数，不用骨架 EstimatedChapters。右栏 Outline
+		// 只带当前卷窗口，所以这里读 OutlinePlanned 而不是 len(Outline)。
+		planned := snap.OutlinePlanned
+		if planned == 0 {
+			planned = len(snap.Outline)
+		}
+		if planned > 0 {
 			overview.WriteString(renderField("已规划", fmt.Sprintf("%d 章", planned)))
 		}
 	} else {
@@ -668,7 +671,9 @@ func agentContextLine(agent host.AgentSnapshot) string {
 	percentColor := contextPercentColor(ctx.Percent)
 	percentStr := lipgloss.NewStyle().Foreground(percentColor).Render(fmt.Sprintf("ctx %.0f%%", ctx.Percent))
 	parts := []string{percentStr}
-	if scope := contextScopeLabel(ctx.Scope); scope != "" {
+	if scope := contextScopeLabel(ctx.Scope); scope != "" &&
+		(ctx.Scope == "committed" || ctx.Scope == "recovered") &&
+		(ctx.LastChanged || (!ctx.StrategyAt.IsZero() && time.Since(ctx.StrategyAt) < 15*time.Second)) {
 		parts = append(parts, scope)
 	}
 	if strategy := contextStrategyLabel(ctx.Strategy); strategy != "" &&

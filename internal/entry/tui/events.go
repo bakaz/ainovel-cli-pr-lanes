@@ -328,9 +328,13 @@ func tickToolSpinner() tea.Cmd {
 }
 
 func tickCursor() tea.Cmd {
-	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(400*time.Millisecond, func(t time.Time) tea.Msg {
 		return cursorTickMsg(t)
 	})
+}
+
+func quitTUI() tea.Cmd {
+	return tea.Sequence(tea.DisableMouse, tea.Quit)
 }
 
 const (

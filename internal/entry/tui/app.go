@@ -40,6 +40,8 @@ func Run(cfg bootstrap.Config, bundle assets.Bundle, version string) error {
 	// 以支持点击切面板 / 滚轮 / 拖拽侧边栏。
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(dropUnchangedMouseMotion))
 	_, err = p.Run()
+	// Run 正常退出会 restore；Windows 下鼠标追踪偶发残留，再补一次。
+	_ = p.ReleaseTerminal()
 	return err
 }
 

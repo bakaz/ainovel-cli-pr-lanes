@@ -105,6 +105,52 @@ func TestFillDetailsTimelineHiddenWithoutCompleted(t *testing.T) {
 	})
 }
 
+func TestFillDetailsOutlineWindowKeepsPlannedCount(t *testing.T) {
+	st := newFillDetailsStore(t)
+	vol1 := make([]domain.OutlineEntry, 30)
+	vol2 := make([]domain.OutlineEntry, 8)
+	for i := range vol1 {
+		vol1[i] = domain.OutlineEntry{Title: "v1", CoreEvent: "e", Hook: "h"}
+	}
+	for i := range vol2 {
+		vol2[i] = domain.OutlineEntry{Title: "v2", CoreEvent: "e", Hook: "h"}
+	}
+	if err := st.Outline.SaveLayeredOutline([]domain.VolumeOutline{
+		{Index: 1, Title: "第一卷", Theme: "起步", Arcs: []domain.ArcOutline{{Index: 1, Title: "弧1", Goal: "g", Chapters: vol1}}},
+		{Index: 2, Title: "第二卷", Theme: "推进", Arcs: []domain.ArcOutline{{Index: 1, Title: "弧1", Goal: "g", Chapters: vol2}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p, err := st.Progress.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Layered = true
+	p.CurrentVolume = 2
+	p.CurrentArc = 1
+	p.InProgressChapter = 32
+	if err := st.Progress.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	progress, err := st.Progress.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snap := UISnapshot{}
+	(&Host{store: st}).fillDetails(&snap, progress)
+
+	if snap.OutlinePlanned != 38 {
+		t.Fatalf("OutlinePlanned=%d, want 38", snap.OutlinePlanned)
+	}
+	if len(snap.Outline) != 8 {
+		t.Fatalf("right-panel outline len=%d, want current volume 8: %+v", len(snap.Outline), snap.Outline)
+	}
+	if snap.Outline[0].Chapter != 31 || snap.Outline[7].Chapter != 38 {
+		t.Fatalf("volume window %d-%d, want 31-38", snap.Outline[0].Chapter, snap.Outline[7].Chapter)
+	}
+}
+
 func newFillDetailsStore(t *testing.T) *store.Store {
 	t.Helper()
 	st := store.NewStore(t.TempDir())

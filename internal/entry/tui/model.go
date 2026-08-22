@@ -723,15 +723,6 @@ func (m Model) View() string {
 		centerW := m.width - leftW - rightW
 		eventH, streamH := m.splitHeights(bodyH)
 
-		if m.viewport.Width != centerW-2 || m.viewport.Height != eventH-1 {
-			m.viewport.Width = centerW - 2
-			m.viewport.Height = eventH - 1 // -1 为 event panel header 行
-		}
-		if m.streamVP.Width != centerW-2 || m.streamVP.Height != streamH-1 {
-			m.streamVP.Width = centerW - 2
-			m.streamVP.Height = streamH - 1 // -1 为 stream panel header 行
-		}
-
 		eventFlow := renderEventFlowViewport(m.viewport, centerW, eventH, m.paneHighlighted(focusEvents))
 		streamPanel := renderStreamPanel(m.streamVP, centerW, streamH, m.paneHighlighted(focusStream), m.snapshot.IsRunning || m.starting, m.spinnerIdx)
 		center := lipgloss.JoinVertical(lipgloss.Left, eventFlow, streamPanel)

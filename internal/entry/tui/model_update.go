@@ -14,13 +14,23 @@ import (
 const maxPromptEventCols = 160
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// body 高度依赖顶栏/底栏的实时高度（新建页模式栏、多行输入都会改变它），
-	// 每条消息前同步一次，避免 viewport 停在旧高度、面板底部补空行。幂等且廉价。
-	if m.width > 0 {
-		m.updateViewportSize()
+	next, cmd := m.update(msg)
+	mm, ok := next.(Model)
+	if !ok {
+		return next, cmd
 	}
+	// View 禁止改 Model。textarea 多行、顶栏高度变化都在消息处理之后才稳定，
+	// 所以在 Update 末尾同步 viewport 尺寸，供下一帧 View 使用。
+	if mm.width > 0 {
+		mm.updateViewportSize()
+	}
+	return mm, cmd
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		syncBodyTextTheme()
 		m.width = msg.Width
 		m.height = msg.Height
 		m.resizeTextarea()
@@ -55,7 +65,7 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	if msg.Type == tea.KeyCtrlC {
 		if m.quitPending {
-			return m, tea.Quit
+			return m, quitTUI()
 		}
 		m.quitPending = true
 		return m, tea.Tick(time.Second, func(time.Time) tea.Msg { return quitResetMsg{} })
@@ -93,7 +103,7 @@ func (m Model) handleOverlayKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
 func (m Model) handleBlockingModalKey(msg tea.KeyMsg, next func(tea.KeyMsg) (tea.Model, tea.Cmd)) (tea.Model, tea.Cmd, bool) {
 	if msg.Type == tea.KeyCtrlC {
 		if m.quitPending {
-			return m, tea.Quit, true
+			return m, quitTUI(), true
 		}
 		m.quitPending = true
 		return m, tea.Tick(time.Second, func(time.Time) tea.Msg { return quitResetMsg{} }), true
@@ -405,6 +415,9 @@ func (m Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 	} else {
 		m.hoverActive = false
+	}
+	if msg.Action == tea.MouseActionMotion {
+		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -852,19 +865,49 @@ func snapshotStateChanged(prev, next host.UISnapshot) bool {
 		prev.TotalOutputTokens != next.TotalOutputTokens ||
 		prev.AutoResumePending != next.AutoResumePending ||
 		prev.IdleWritingInPeak != next.IdleWritingInPeak ||
-		prev.RecoveryLabel != next.RecoveryLabel
+		prev.RecoveryLabel != next.RecoveryLabel ||
+		agentContextChanged(prev.Agents, next.Agents)
+}
+
+func agentContextChanged(prev, next []host.AgentSnapshot) bool {
+	if len(prev) != len(next) {
+		return true
+	}
+	for i := range next {
+		pc, nc := prev[i].Context, next[i].Context
+		if prev[i].Name != next[i].Name ||
+			prev[i].State != next[i].State ||
+			prev[i].Tool != next[i].Tool ||
+			pc.Tokens != nc.Tokens ||
+			int(pc.Percent) != int(nc.Percent) ||
+			pc.Strategy != nc.Strategy ||
+			pc.Scope != nc.Scope ||
+			pc.LastChanged != nc.LastChanged {
+			return true
+		}
+	}
+	return false
 }
 
 func snapshotDetailChanged(prev, next host.UISnapshot) bool {
-	if prev.CurrentVolumeArc != next.CurrentVolumeArc || len(prev.Outline) != len(next.Outline) {
+	if prev.CurrentVolumeArc != next.CurrentVolumeArc ||
+		prev.InProgressChapter != next.InProgressChapter ||
+		prev.CompletedCount != next.CompletedCount ||
+		prev.OutlinePlanned != next.OutlinePlanned ||
+		len(prev.Outline) != len(next.Outline) {
 		return true
 	}
 	if len(next.Outline) == 0 {
 		return false
 	}
-	a := prev.Outline[len(prev.Outline)-1]
-	b := next.Outline[len(next.Outline)-1]
-	return a.Chapter != b.Chapter || a.Title != b.Title
+	a := prev.Outline[0]
+	b := next.Outline[0]
+	if a.Chapter != b.Chapter || a.Title != b.Title {
+		return true
+	}
+	pa := prev.Outline[len(prev.Outline)-1]
+	pb := next.Outline[len(next.Outline)-1]
+	return pa.Chapter != pb.Chapter || pa.Title != pb.Title
 }
 
 func (m Model) handleTextareaMsg(msg tea.Msg) (tea.Model, tea.Cmd) {

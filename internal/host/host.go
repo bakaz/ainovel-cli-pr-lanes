@@ -2020,26 +2020,27 @@ func (h *Host) fillDetails(snap *UISnapshot, progress *domain.Progress) {
 	if premise, _ := h.store.Outline.LoadPremise(); premise != "" {
 		snap.Premise = truncate(premise, 80)
 	}
-	if outline, _ := h.store.Outline.LoadOutline(); len(outline) > 0 {
-		for _, e := range outline {
-			snap.Outline = append(snap.Outline, OutlineSnapshot{
-				Chapter: e.Chapter, Title: e.Title, CoreEvent: e.CoreEvent,
-			})
-		}
-	}
+	var volumes []domain.VolumeOutline
 	if progress != nil && progress.Layered {
+		volumes, _ = h.store.Outline.LoadLayeredOutline()
 		if compass, _ := h.store.Outline.LoadCompass(); compass != nil {
 			snap.CompassDirection = compass.Long.EndingDirection
 			snap.CompassScale = compass.Long.EstimatedScale
 		}
-		if volumes, _ := h.store.Outline.LoadLayeredOutline(); len(volumes) > 0 {
-			for _, v := range volumes {
-				if v.Index > progress.CurrentVolume {
-					snap.NextVolumeTitle = v.Title
-					break
-				}
+		for _, v := range volumes {
+			if v.Index > progress.CurrentVolume {
+				snap.NextVolumeTitle = v.Title
+				break
 			}
 		}
+	}
+	outline, _ := h.store.Outline.LoadOutline()
+	if len(outline) == 0 && len(volumes) > 0 {
+		outline = domain.FlattenOutline(volumes)
+	}
+	if len(outline) > 0 {
+		snap.OutlinePlanned = len(outline)
+		snap.Outline = selectOutlineForSnapshot(outline, progress, volumes)
 	}
 	if chars, _ := h.store.Characters.Load(); len(chars) > 0 {
 		for _, c := range chars {
