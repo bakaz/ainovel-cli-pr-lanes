@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -129,6 +130,7 @@ func TestCharacterState_Validation(t *testing.T) {
 		{"partial prefix not matched", csUpdate("林墨", "device.left_hand", "x")},
 		{"value too long", csUpdate("林墨", "status.realm", longValue)},
 		{"evidence too long", domain.CharacterStateUpdate{Entity: "林墨", Field: "status.realm", Value: "x", Evidence: longEvidence}},
+		{"empty value without reason", domain.CharacterStateUpdate{Entity: "林墨", Field: "status.realm", Value: ""}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -240,5 +242,61 @@ func TestCharacterState_CrossStorePersistence(t *testing.T) {
 	entries, err := s2.World.LoadCharacterState()
 	if err != nil || len(entries) != 1 || entries[0].Entity != "林墨" {
 		t.Fatalf("cross-store load: %+v, %v", entries, err)
+	}
+}
+
+func TestCharacterState_ClearRemovesKey(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.World.UpsertCharacterState(1, []domain.CharacterStateUpdate{
+		csUpdate("林墨", "status.realm", "练气期"),
+		csUpdate("林墨", "body_device.ring", "在"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.World.UpsertCharacterState(2, []domain.CharacterStateUpdate{
+		{Entity: "林墨", Field: "status.realm", Value: "", Reason: "不再约束"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.World.LoadCharacterState()
+	if err != nil || len(entries) != 1 || entries[0].Field != "body_device.ring" {
+		t.Fatalf("after clear want only ring, got %+v err=%v", entries, err)
+	}
+	changes, _ := s.World.LoadStateChanges()
+	var found bool
+	for _, c := range changes {
+		if c.Field == "status.realm" && c.NewValue == "" && c.OldValue == "练气期" && c.Reason == "不再约束" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing clear state_change: %+v", changes)
+	}
+	if err := s.World.UpsertCharacterState(3, []domain.CharacterStateUpdate{
+		{Entity: "林墨", Field: "status.gone", Value: "", Reason: "幂等"},
+	}); err != nil {
+		t.Fatalf("clear missing key should be idempotent: %v", err)
+	}
+}
+
+func TestCharacterState_ClearFreesSlotForNewField(t *testing.T) {
+	s := newTestStore(t)
+	var updates []domain.CharacterStateUpdate
+	for i := 0; i < domain.MaxFieldsPerEntity; i++ {
+		updates = append(updates, csUpdate("林墨", fmt.Sprintf("status.item_%d", i), "值"))
+	}
+	if err := s.World.UpsertCharacterState(1, updates); err != nil {
+		t.Fatal(err)
+	}
+	err := s.World.UpsertCharacterState(2, []domain.CharacterStateUpdate{
+		{Entity: "林墨", Field: "status.item_0", Value: "", Reason: "结束"},
+		csUpdate("林墨", "body_device.new", "新"),
+	})
+	if err != nil {
+		t.Fatalf("clear then add in same batch: %v", err)
+	}
+	entries, _ := s.World.LoadCharacterState()
+	if len(entries) != domain.MaxFieldsPerEntity {
+		t.Fatalf("want %d entries, got %d", domain.MaxFieldsPerEntity, len(entries))
 	}
 }

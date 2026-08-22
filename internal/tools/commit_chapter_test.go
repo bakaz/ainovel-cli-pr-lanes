@@ -1676,3 +1676,62 @@ func TestCommitChapterRewritePreserveSkipsCharacterState(t *testing.T) {
 		t.Fatalf("preserve 后不得派生 state_changes，got %+v", changes)
 	}
 }
+
+func TestCommitChapterCharacterStateClearRemovesKey(t *testing.T) {
+	s := preflightStore(t)
+	if err := s.World.SaveCharacterState([]domain.CharacterStateEntry{
+		{Entity: "林墨", Field: "status.realm", Value: "练气期"},
+		{Entity: "林墨", Field: "body_device.ring", Value: "在"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewCommitChapterTool(s)
+	if _, err := tool.Execute(context.Background(), preflightCommitArgsJSON(map[string]any{
+		"character_state_updates": []domain.CharacterStateUpdate{
+			{Entity: "林墨", Field: "status.realm", Value: "", Reason: "不再约束", Evidence: "黑影一闪而过"},
+		},
+	})); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	entries, err := s.World.LoadCharacterState()
+	if err != nil || len(entries) != 1 || entries[0].Field != "body_device.ring" {
+		t.Fatalf("after clear want only ring, got %+v err=%v", entries, err)
+	}
+}
+
+func TestCommitChapterRejectsTooManyNewStatusFields(t *testing.T) {
+	s := preflightStore(t)
+	tool := NewCommitChapterTool(s)
+	_, err := tool.Execute(context.Background(), preflightCommitArgsJSON(map[string]any{
+		"character_state_updates": []domain.CharacterStateUpdate{
+			{Entity: "林墨", Field: "status.a", Value: "1"},
+			{Entity: "林墨", Field: "status.b", Value: "2"},
+			{Entity: "林墨", Field: "status.c", Value: "3"},
+		},
+	}))
+	if err == nil || !strings.Contains(err.Error(), "新增 status.*") {
+		t.Fatalf("want status new-key cap error, got %v", err)
+	}
+}
+
+func TestCommitChapterClearThenAddUnderCap(t *testing.T) {
+	s := preflightStore(t)
+	entries := make([]domain.CharacterStateEntry, 0, domain.MaxFieldsPerEntity)
+	for i := 0; i < domain.MaxFieldsPerEntity; i++ {
+		entries = append(entries, domain.CharacterStateEntry{
+			Entity: "林墨", Field: fmt.Sprintf("status.f%02d", i), Value: "v",
+		})
+	}
+	if err := s.World.SaveCharacterState(entries); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewCommitChapterTool(s)
+	if _, err := tool.Execute(context.Background(), preflightCommitArgsJSON(map[string]any{
+		"character_state_updates": []domain.CharacterStateUpdate{
+			{Entity: "林墨", Field: "status.f00", Value: "", Reason: "结束", Evidence: "黑影一闪而过"},
+			{Entity: "林墨", Field: "body_device.new", Value: "新"},
+		},
+	})); err != nil {
+		t.Fatalf("clear then add should pass cap: %v", err)
+	}
+}

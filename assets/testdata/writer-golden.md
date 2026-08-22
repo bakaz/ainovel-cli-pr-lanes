@@ -175,7 +175,7 @@
 **规划、写作和提交时**判断本章产生的事实变化属于哪层，通过对应通道声明（**一次事件可同时更新多个层**，如装置拆除 = timeline 事件 + 角色状态 + 伏笔 resolve）：
 
 1. **世界规则**（规则如何运作/变化）：不直接改 world_rules——通过 `feedback` 以 `[world_rule]` 前缀提交建议，由 Architect 确认后落库
-2. **角色状态**（身上装着什么/处于什么状态）：`character_state_updates`（upsert 当前值，非 diff）
+2. **角色状态**（身上装着什么/处于什么状态）：`character_state_updates`（当前值投影，不是章节进度日志）
 3. **剧情事件**（已发生的事）：`timeline_events`
 4. **伏笔**（未来必须兑现的承诺）：`foreshadow_updates`，仅限**长线承诺**（跨弧/跨卷或兑现位置不确定）
 
@@ -207,7 +207,7 @@
 - `timeline_events`：时间线事件；有则必须报，无则省略或空数组，缺失不重试
 - `foreshadow_updates`：伏笔操作，`plant` / `advance` / `resolve` / `retire`（语义见"世界状态分流"节）；`plant` 必填 `horizon`，`advance`/`resolve` 必填 `evidence`（正文精确短引文），`retire` 必填 `reason`；有则必须报，无则省略或空数组，缺失不重试
 - `relationship_changes`：人物关系变化；有则必须报，无则省略或空数组，缺失不重试
-- `character_state_updates`：角色/实体状态的**当前值**（upsert，非 diff），每条 `{entity, field, value, reason?, evidence?}`；field 用受控命名空间（body_device./health./location./capability./resource./inventory./status./knowledge.）；同一状态不要与 `state_changes` 重复声明（同 entity/field 双写会被拒绝）；有则必须报，无则省略或空数组
+- `character_state_updates`：只报**开下一章仍成立**的约束，每条 `{entity, field, value, reason?, evidence?}`。`value` 非空 = upsert 当前值；`value` 为空字符串且必须带 `reason` = 从当前账本**删除该 field**（腾出名额）。有余伤的解除：改原 field 的 value（如「已解除，仍红肿」），不要新开 `status.xxx完成`。`status.*` 禁止记录「本章完成了什么」（那是 `timeline_events`）；单次提交新增 `status.*` 不得超过 2 条。field 用受控命名空间（body_device./health./location./capability./resource./inventory./status./knowledge.）；同一状态不要与 `state_changes` 重复声明（同 entity/field 双写会被拒绝）；有则必须报，无则省略或空数组
 - `state_changes`：角色或实体状态变化的兼容通道（新流程优先用 `character_state_updates`，由系统自动派生流水）；有则必须报，无则省略或空数组，缺失不重试
 - `cast_intros`：本章首次引入的次要角色简介数组，每个 `{name, brief_role}`。可选——没有新引入就省略，缺失不阻断提交。详见上方"配角连续性"段。
 - `hook_type`：`crisis` / `mystery` / `desire` / `emotion` / `choice`；有则必须报，缺失不重试

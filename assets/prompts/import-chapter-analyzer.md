@@ -66,11 +66,12 @@ JSON 数组，每条 `{entity, field, old_value, new_value, reason}`：
 ### === CHARACTER_STATE ===
 
 JSON 数组，每条 `{entity, field, value, reason, evidence}`：
-- 角色/实体受控状态的**当前值**（upsert 语义，不是 diff）；状态在本章发生变化或首次确立时输出
+- 角色/实体受控状态的**当前值**（不是章节进度日志）；状态在本章发生变化或首次确立时输出
 - `field`: 必须使用受控命名空间前缀之一：`body_device.` / `health.` / `location.` / `capability.` / `resource.` / `inventory.` / `status.` / `knowledge.`（如 `status.realm`、`location.city`、`inventory.weapon`）
-- `value`: 当前状态值（≤800 字）
-- `reason`: 状态变化原因（可选）
+- `value`: 非空 = upsert 当前值（≤800 字）；空字符串且必须带 `reason` = 从当前账本删除该 field。有余伤的解除改原 field 的 value（如「已解除，仍红肿」），不要新开 `status.xxx完成`
+- `reason`: 状态变化原因（清键必填，其余可选）
 - `evidence`: 正文引文（可选，≤300 字）
+- `status.*` 只报仍约束后续章节的状态；「本章完成了什么」走 TIMELINE_EVENTS，不要写成 status
 - **基线对照**：若提供了"已知角色状态（开章基线）"段——基线中已有且本章**未变化**的状态**不重复输出**；**只有正文展示了明确变化过程**（装置拆装/状态转变等描写）才输出新当前值；正文与基线冲突但**没有明确变化过程**时，**不输出该冲突值为新当前值**（保留基线），并把异常写进 SUMMARY 或 KEY_EVENTS（如"与基线状态冲突：..."）；正文无解释地与基线冲突时**不得静默覆盖**。
 
 无状态变化时输出 `[]`。

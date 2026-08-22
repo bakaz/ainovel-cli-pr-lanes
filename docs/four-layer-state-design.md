@@ -59,12 +59,12 @@
 ```
 
 约束（新增能力，实施固化）：
-- `(entity, field)` 唯一键；同键新提交**覆盖**旧值（upsert 语义）
+- `(entity, field)` 唯一键；`value` 非空 = upsert 覆盖旧值
 - entity/field 非空；field 受控命名空间，初始清单：
   `body_device.*`（身体装置）/ `health.*` / `location.*` / `capability.*` / `resource.*` / `inventory.*` / `status.*` / `knowledge.<fact-id>`（信息差：value ∈ unknown|suspects|knows|believes:<内容>）
 - 近义字段不得新增 key（迁移时归并，如"身体状态/双乳状态/右乳状态"→ `body_device.*`）
-- 单 value ≤800 字、单 evidence ≤300 字、单实体字段数 ≤100（可测试常量）
-- 允许删除：显式 `value=""` + reason 或 delete action（二选一，定稿：`value="已移除"` 语义 + reason，不新增 delete action）
+- 单 value ≤800 字、单 evidence ≤300 字、单实体字段数 ≤100（可测试常量）；单次提交新增 `status.*` ≤ 2
+- 物理删除：`value=""` 且必须带 `reason`，从当前投影移除该键；历史保留在 `state_changes.json`（`new_value=""`）。余伤/后果改原 field 的 value（如「已解除，仍红肿」），不要新开 `status.xxx完成` 或把章节进度写进 `status.*`
 - 权威顺序：`character_state 当前值 > 最新 snapshot > characters 基础设定`
 
 ### 3.2 foreshadow_ledger.json（迁移后只留长线承诺）
@@ -107,7 +107,7 @@
 | writer（commit） | `timeline_events`（已有） | timeline.json | |
 | | `foreshadow_updates`（已有 + evidence/horizon/reason） | foreshadow_ledger.json | |
 | | `relationship_changes`（已有） | relationship_state.json | |
-| | `character_state_updates`（**新增，唯一新增正式通道**） | character_state.json（upsert）+ **自动派生** append state_changes.json | 派生复用现有 `stateChangeKey` 幂等去重（world.go:572-574），key 按 `chapter\|entity\|field\|old\|new` 对齐 |
+| | `character_state_updates`（**新增，唯一新增正式通道**） | character_state.json（value 非空 upsert；value="" + reason 则从投影删除）+ **自动派生** append state_changes.json | 派生复用现有 `stateChangeKey` 幂等去重（world.go:572-574），key 按 `chapter\|entity\|field\|old\|new` 对齐；清键的 `new_value` 为空 |
 | | `state_changes`（旧通道降为兼容入口） | state_changes.json | 与 character_state_updates **同 (entity,field) 双写 → 拒绝**（冲突校验） |
 | | `feedback`（复用现有通道，**不新增 world_rule_proposal schema**） | OutlineFeedback 池（commit_chapter.go:116,406-413 → architect foundation writer_feedback） | 规则变更建议按固定格式写入 feedback.suggestion（如 `[world_rule] 奶税转型：…`），architect 消费后 save_foundation 落库 |
 | architect | `save_foundation(type=world_rules)`（权威修订，全量保存） | world_rules.json | **保存前校验**（新增）：条数 >30 warning；总字节 >24576 拒绝 |

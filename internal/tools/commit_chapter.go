@@ -104,7 +104,7 @@ func (t *CommitChapterTool) Schema() map[string]any {
 	characterStateSchema := schema.Object(
 		schema.Property("entity", schema.String("角色名或实体名")).Required(),
 		schema.Property("field", schema.String("受控命名空间：body_device./health./location./capability./resource./inventory./status./knowledge.")).Required(),
-		schema.Property("value", schema.String("当前状态值（≤800 字，upsert 语义）")).Required(),
+		schema.Property("value", schema.String("当前状态值（≤800 字）。空字符串且提供 reason = 从当前账本移除该 field")).Required(),
 		schema.Property("reason", schema.String("状态变化原因")),
 		schema.Property("evidence", schema.String("正文引文（≤300 字）")),
 	)
@@ -135,7 +135,7 @@ func (t *CommitChapterTool) Schema() map[string]any {
 		schema.Property("foreshadow_updates", schema.Array("伏笔操作", foreshadowSchema)),
 		schema.Property("relationship_changes", schema.Array("关系变化", relationshipSchema)),
 		schema.Property("state_changes", schema.Array("角色/实体状态变化", stateChangeSchema)),
-		schema.Property("character_state_updates", schema.Array("角色/实体受控状态更新（upsert 当前值；与 state_changes 二选一，勿对同一 (entity,field) 双写）", characterStateSchema)),
+		schema.Property("character_state_updates", schema.Array("角色/实体受控状态：value 非空为 upsert 当前值；value 空字符串且带 reason = 从当前账本移除该 field。与 state_changes 勿对同一 (entity,field) 双写", characterStateSchema)),
 		schema.Property("cast_intros", schema.Array("本章首次引入且后续可能再出现的次要角色简介（不含主角及 characters.json 已有角色）", schema.Object(
 			schema.Property("name", schema.String("角色名")).Required(),
 			schema.Property("brief_role", schema.String("一句话定位（如：客栈老板/赌坊打手）")).Required(),
@@ -610,18 +610,44 @@ func (t *CommitChapterTool) preflightCommitArgs(
 		key := u.Entity + "\x00" + u.Field
 		if prev, dup := seenCharKey[key]; dup {
 			if prev != u.Value {
-				return fmt.Errorf("character_state_updates: %s.%s 在同一提交内重复且 value 不同（%q 与 %q），请合并为一条 upsert: %w",
+				return fmt.Errorf("character_state_updates: %s.%s 在同一提交内重复且 value 不同（%q 与 %q），请合并为一条: %w",
 					u.Entity, u.Field, prev, u.Value, errs.ErrToolArgs)
 			}
-			continue // 同值重复：幂等，允许
+			continue
 		}
 		seenCharKey[key] = u.Value
-		if _, exists := existingKeys[key]; !exists {
-			if fieldCount[u.Entity] >= domain.MaxFieldsPerEntity {
-				return fmt.Errorf("character_state_updates[%d]: %s 字段数已达上限 %d，拒绝新增 %s: %w",
-					i, u.Entity, domain.MaxFieldsPerEntity, u.Field, errs.ErrToolArgs)
+	}
+	for _, u := range charStates {
+		if !u.Clears() {
+			continue
+		}
+		key := u.Entity + "\x00" + u.Field
+		if _, exists := existingKeys[key]; exists {
+			fieldCount[u.Entity]--
+			delete(existingKeys, key)
+		}
+	}
+	newStatus := 0
+	for i, u := range charStates {
+		if u.Clears() {
+			continue
+		}
+		key := u.Entity + "\x00" + u.Field
+		if _, exists := existingKeys[key]; exists {
+			continue
+		}
+		if fieldCount[u.Entity] >= domain.MaxFieldsPerEntity {
+			return fmt.Errorf("character_state_updates[%d]: %s 字段数已达上限 %d，拒绝新增 %s: %w",
+				i, u.Entity, domain.MaxFieldsPerEntity, u.Field, errs.ErrToolArgs)
+		}
+		fieldCount[u.Entity]++
+		existingKeys[key] = struct{}{}
+		if strings.HasPrefix(u.Field, "status.") {
+			newStatus++
+			if newStatus > domain.MaxNewStatusFieldsPerCommit {
+				return fmt.Errorf("character_state_updates[%d]: 单次提交新增 status.* 不得超过 %d 条（status 只报仍约束下一章的状态，章节进度请用 timeline_events）: %w",
+					i, domain.MaxNewStatusFieldsPerCommit, errs.ErrToolArgs)
 			}
-			fieldCount[u.Entity]++
 		}
 	}
 	// 双写冲突：(entity,field) 同时出现在 character_state_updates 与 state_changes

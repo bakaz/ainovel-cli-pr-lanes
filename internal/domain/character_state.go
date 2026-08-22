@@ -16,13 +16,18 @@ type CharacterStateEntry struct {
 	Evidence       string `json:"evidence,omitempty"`
 }
 
-// CharacterStateUpdate 角色状态更新操作（upsert 语义）。
+// CharacterStateUpdate 角色状态更新操作（upsert；value 为空且带 reason 时清键）。
 type CharacterStateUpdate struct {
 	Entity   string `json:"entity"`
 	Field    string `json:"field"`
 	Value    string `json:"value"`
-	Reason   string `json:"reason,omitempty"`   // 状态变化原因（派生到 state_changes）
+	Reason   string `json:"reason,omitempty"`   // 状态变化原因（派生到 state_changes）；清键必填
 	Evidence string `json:"evidence,omitempty"` // 正文引文，最长 MaxCharacterEvidenceRunes
+}
+
+// Clears reports whether this update removes the (entity, field) from current state.
+func (u CharacterStateUpdate) Clears() bool {
+	return strings.TrimSpace(u.Value) == ""
 }
 
 const (
@@ -32,6 +37,9 @@ const (
 	MaxCharacterEvidenceRunes = 300
 	// MaxFieldsPerEntity 单个实体允许的字段数上限。
 	MaxFieldsPerEntity = 100
+	// MaxNewStatusFieldsPerCommit 单次提交允许新增的 status.* 字段数。
+	// 覆盖已有 status 不计入；防止把章节进度写成角色状态。
+	MaxNewStatusFieldsPerCommit = 2
 )
 
 // CharacterStateFieldPrefixes field 命名空间前缀白名单。
@@ -62,7 +70,11 @@ func ValidateCharacterStateUpdate(u CharacterStateUpdate) error {
 	if !ValidCharacterStateField(u.Field) {
 		return fmt.Errorf("character state: field %q 不在受控命名空间内（允许前缀：%v）", u.Field, CharacterStateFieldPrefixes)
 	}
-	if runes := utf8.RuneCountInString(u.Value); runes > MaxCharacterValueRunes {
+	if u.Clears() {
+		if strings.TrimSpace(u.Reason) == "" {
+			return fmt.Errorf("character state: 清空 %s.%s 必须提供 reason", u.Entity, u.Field)
+		}
+	} else if runes := utf8.RuneCountInString(u.Value); runes > MaxCharacterValueRunes {
 		return fmt.Errorf("character state: %s.%s 值长度 %d 超过上限 %d 个字符", u.Entity, u.Field, runes, MaxCharacterValueRunes)
 	}
 	if runes := utf8.RuneCountInString(u.Evidence); runes > MaxCharacterEvidenceRunes {
