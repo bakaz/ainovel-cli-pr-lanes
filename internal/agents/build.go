@@ -426,6 +426,7 @@ func BuildWorkers(
 		return guard.NewArchitectStopGuard(store, onGuardBlock)
 	}
 	architectThinking, _ := ResolveThinkingForModel(architectModel, roleThinking(cfg, "architect"))
+	architectGate := tools.NewResultViewGate(store)
 	architectShort := subagent.Config{
 		Name:             "architect_short",
 		Description:      "短篇规划师：为单卷、单冲突、高密度故事生成紧凑设定与扁平大纲",
@@ -438,6 +439,7 @@ func BuildWorkers(
 		OnMessage:        onMsg,
 		CacheLastMessage: "ephemeral",
 		PromptCacheKey:   cacheBase + "-architect_short",
+		Middlewares:      []agentcore.ToolMiddleware{architectGate.Middleware()},
 		StopAfterToolResult: func(toolName string, result json.RawMessage) bool {
 			r := decodeSaveFoundationResult(toolName, result)
 			return r.Type == "outline" && r.FoundationReady
@@ -456,6 +458,7 @@ func BuildWorkers(
 		OnMessage:           onMsg,
 		CacheLastMessage:    "ephemeral",
 		PromptCacheKey:      cacheBase + "-architect_long",
+		Middlewares:         []agentcore.ToolMiddleware{architectGate.Middleware()},
 		StopAfterToolResult: architectLongShouldStopAfterToolResult,
 		StopGuardFactory:    architectStopGuardFactory,
 	}
@@ -468,6 +471,7 @@ func BuildWorkers(
 	restore := &ctxpack.WriterRestorePack{}
 	restore.Refresh(store)
 
+	writerGate := tools.NewResultViewGate(store)
 	writer := subagent.Config{
 		Name:             "writer",
 		Description:      "创作者：自主完成一章的构思、写作、自审和提交",
@@ -484,11 +488,13 @@ func BuildWorkers(
 		StopGuardFactory: func(_, _ string) agentcore.StopGuard {
 			return guard.NewWriterStopGuard(store, onGuardBlock)
 		},
+		Middlewares: []agentcore.ToolMiddleware{writerGate.Middleware()},
 		ContextManagerFactory: func(model agentcore.ChatModel) agentcore.ContextManager {
 			// 每次 subagent(writer) 调用都会重建，从当前 runModel 读取最新模型名。
 			// /model 切换 writer 后下一章自动用新窗口。
 			window, _ := cfg.ResolveContextWindow(bootstrap.ModelName(model))
-			return newContextManager(contextManagerConfig{
+			reserve := bootstrap.CompactReserveTokens(window)
+			cm := newContextManager(contextManagerConfig{
 				Model:            model,
 				ContextWindow:    window,
 				ReserveTokens:    bootstrap.CompactReserveTokens(window),
@@ -500,6 +506,7 @@ func BuildWorkers(
 				CommitOnProject: true,
 				ToolMicrocompact: &corecontext.ToolResultMicrocompactConfig{
 					IdleThreshold: 5 * time.Minute,
+					BudgetFill:    true,
 				},
 				ExtraStrategies: []corecontext.Strategy{
 					ctxpack.NewStoreSummaryCompact(ctxpack.StoreSummaryCompactConfig{
@@ -515,9 +522,12 @@ func BuildWorkers(
 					TurnPrefixPrompt:    ctxpack.WriterTurnPrefixPrompt,
 				},
 			})
+			writerGate.Bind(cm, window, reserve)
+			return cm
 		},
 	}
 
+	editorGate := tools.NewResultViewGate(store)
 	editor := subagent.Config{
 		Name:             "editor",
 		Description:      "审阅者：阅读原文，从结构和审美两个层面发现问题",
@@ -530,6 +540,7 @@ func BuildWorkers(
 		OnMessage:        onMsg,
 		CacheLastMessage: "ephemeral",
 		PromptCacheKey:   cacheBase + "-editor",
+		Middlewares:      []agentcore.ToolMiddleware{editorGate.Middleware()},
 		// 终态产物命中即停。终态退出仍会咨询 StopGuard（契约测试 TestContract_
 		// TerminalToolExitConsultsStopGuard），任务感知的 NewEditorStopGuard 负责
 		// 否决"被派生成摘要却只做了复核"的提前退出，所以 save_review 可以安全硬停。
@@ -606,6 +617,7 @@ func BuildWorkers(
 				CommitOnProject:  true,
 				ToolMicrocompact: &corecontext.ToolResultMicrocompactConfig{
 					IdleThreshold: 5 * time.Minute,
+					BudgetFill:    true,
 				},
 				ExtraStrategies: []corecontext.Strategy{
 					ctxpack.NewStoreSummaryCompact(ctxpack.StoreSummaryCompactConfig{

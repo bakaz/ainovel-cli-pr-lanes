@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/voocel/ainovel-cli/internal/host"
@@ -670,7 +671,8 @@ func agentContextLine(agent host.AgentSnapshot) string {
 	if scope := contextScopeLabel(ctx.Scope); scope != "" {
 		parts = append(parts, scope)
 	}
-	if strategy := contextStrategyLabel(ctx.Strategy); strategy != "" {
+	if strategy := contextStrategyLabel(ctx.Strategy); strategy != "" &&
+		(ctx.LastChanged || (!ctx.StrategyAt.IsZero() && time.Since(ctx.StrategyAt) < 15*time.Second)) {
 		parts = append(parts, strategy)
 	}
 	return strings.Join(parts, " · ")

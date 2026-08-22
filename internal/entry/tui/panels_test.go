@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/voocel/ainovel-cli/internal/host"
@@ -84,5 +85,33 @@ func TestRenderDetailContentWrapsCJK(t *testing.T) {
 	joined := strings.ReplaceAll(strings.ReplaceAll(out, "\n", ""), " ", "")
 	if !strings.Contains(joined, "坚持程序正义") {
 		t.Errorf("折行后应保留完整描述，实际输出:\n%s", out)
+	}
+}
+
+func TestAgentContextLineHidesStaleStrategy(t *testing.T) {
+	line := agentContextLine(host.AgentSnapshot{
+		Context: host.AgentContextSnapshot{
+			Tokens:        80000,
+			ContextWindow: 200000,
+			Percent:       40,
+			Strategy:      "tool_result_microcompact",
+			StrategyAt:    time.Now().Add(-time.Minute),
+		},
+	})
+	if strings.Contains(line, "微压缩") {
+		t.Fatalf("stale strategy should be hidden: %q", line)
+	}
+	fresh := agentContextLine(host.AgentSnapshot{
+		Context: host.AgentContextSnapshot{
+			Tokens:        80000,
+			ContextWindow: 200000,
+			Percent:       40,
+			Strategy:      "tool_result_microcompact",
+			LastChanged:   true,
+			StrategyAt:    time.Now(),
+		},
+	})
+	if !strings.Contains(fresh, "微压缩") {
+		t.Fatalf("fresh compact should show strategy: %q", fresh)
 	}
 }

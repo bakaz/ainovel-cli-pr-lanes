@@ -7,8 +7,9 @@ import (
 	"time"
 
 	"encoding/json"
-	"github.com/voocel/agentcore"
 	"log/slog"
+
+	"github.com/voocel/agentcore"
 )
 
 func retryPrefix(attempt, maxRetries int, delay time.Duration, explicitZero bool) string {
@@ -73,6 +74,7 @@ func (o *observer) handleContextProgress(ev agentcore.Event) {
 		Percent       float64 `json:"percent"`
 		Scope         string  `json:"scope"`
 		Strategy      string  `json:"strategy"`
+		LastChanged   bool    `json:"last_changed"`
 	}
 	if json.Unmarshal(ev.Progress.Meta, &payload) != nil {
 		return
@@ -84,14 +86,27 @@ func (o *observer) handleContextProgress(ev agentcore.Event) {
 	}
 
 	// 更新 agent 快照（TUI 侧边栏始终可见）
+	var prevPercent float64
 	o.updateAgent(agent, func(a *agentState) {
-		a.context = AgentContextSnapshot{
-			Tokens:        payload.Tokens,
-			ContextWindow: payload.ContextWindow,
-			Percent:       payload.Percent,
-			Scope:         payload.Scope,
-			Strategy:      payload.Strategy,
+		prevPercent = a.lastLogPercent
+		snap := AgentContextSnapshot{
+			Tokens:         payload.Tokens,
+			ContextWindow:  payload.ContextWindow,
+			Percent:        payload.Percent,
+			Scope:          payload.Scope,
+			Strategy:       payload.Strategy,
+			LastChanged:    payload.LastChanged,
+			ActiveMessages: a.context.ActiveMessages,
 		}
+		if payload.LastChanged {
+			snap.StrategyAt = time.Now()
+		} else {
+			snap.StrategyAt = a.context.StrategyAt
+			if snap.Strategy == "" {
+				snap.Strategy = a.context.Strategy
+			}
+		}
+		a.context = snap
 	})
 
 	level := "info"
@@ -100,17 +115,39 @@ func (o *observer) handleContextProgress(ev agentcore.Event) {
 	}
 	summary := fmt.Sprintf("%s 上下文 %.0f%% (%d/%d) 策略: %s", agent, payload.Percent, payload.Tokens, payload.ContextWindow, payload.Strategy)
 
-	if payload.Strategy != "" {
-		// 触发了压缩 → 事件流 + 日志
+	if payload.LastChanged && payload.Strategy != "" {
 		ctxEv := Event{Time: time.Now(), Category: "SYSTEM", Agent: agent, Summary: summary, Level: level, Depth: 1}
 		o.emitEv(ctxEv)
 		o.persistEvent(ctxEv)
-	} else {
-		// 普通使用率报告 → 仅日志
-		slogLevel := slog.LevelInfo
-		if level == "warn" {
-			slogLevel = slog.LevelWarn
-		}
-		slog.Log(context.Background(), slogLevel, summary, "module", "context", "agent", agent)
+		o.updateAgent(agent, func(a *agentState) { a.lastLogPercent = payload.Percent })
+		return
 	}
+
+	crossed := contextPercentCrossed(prevPercent, payload.Percent)
+	jumped := absFloat(payload.Percent-prevPercent) >= 5
+	if !crossed && !jumped {
+		return
+	}
+	o.updateAgent(agent, func(a *agentState) { a.lastLogPercent = payload.Percent })
+	slogLevel := slog.LevelInfo
+	if level == "warn" {
+		slogLevel = slog.LevelWarn
+	}
+	slog.Log(context.Background(), slogLevel, summary, "module", "context", "agent", agent)
+}
+
+func contextPercentCrossed(prev, next float64) bool {
+	for _, line := range []float64{70, 85} {
+		if (prev < line && next >= line) || (prev >= line && next < line) {
+			return true
+		}
+	}
+	return false
+}
+
+func absFloat(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }

@@ -187,6 +187,8 @@ type AgentContextSnapshot struct {
 	Percent         float64
 	Scope           string
 	Strategy        string
+	LastChanged     bool
+	StrategyAt      time.Time
 	ActiveMessages  int
 	SummaryMessages int
 	CompactedCount  int

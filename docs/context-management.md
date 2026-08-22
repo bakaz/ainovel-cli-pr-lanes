@@ -164,14 +164,17 @@ Writer 走 `newContextManager`（每次 spawn 由工厂按当前模型窗口重�
 
 | 参数 | Writer | Coordinator（已退役，历史对照） |
 |------|--------|-------------|
-| ReserveTokens | 16,384 | 32,000 |
+| ReserveTokens | CompactReserveTokens(window)，下限 8k | 32,000 |
 | KeepRecentTokens | 20,000 | 30,000 |
-| CommitOnProject | false | true |
+| CommitOnProject | true | true |
 | IdleThreshold | 5min | 无 |
+| ToolMicrocompact | BudgetFill（按剩余窗口留全文，不固定条数） | 无 |
 | ExtraStrategies | StoreSummaryCompact | 无 |
 | 自定义 Summary Prompt | 小说叙事版 | 默认(代码助手版) |
 
-压缩触发阈值 = `ContextWindow - ReserveTokens`。例如窗口 128K 时，Writer 在 ~112K 触发。
+压缩触发阈值 = `ContextWindow - ReserveTokens`（约窗口的 85%）。例如窗口 200K 时，Writer 在 ~170K 触发。未到阈值不改写已提交前缀（保 prompt cache）。
+
+工具结果双套：全文写入 `meta/sessions/tool-results/`；给模型的那份在**入口**按剩余窗口选择全文或摘要。85% 微压缩同样从旧到新把放不下的全文换成摘要，磁盘全文保留。
 
 当前 Writer 的策略管线顺序是：
 

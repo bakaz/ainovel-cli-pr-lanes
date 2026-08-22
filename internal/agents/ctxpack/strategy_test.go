@@ -20,10 +20,10 @@ func TestStoreSummaryCompactApplyUsesPersistentStoreData(t *testing.T) {
 	})
 
 	msgs := []agentcore.AgentMessage{
-		agentcore.UserMsg(strings.Repeat("旧上下文", 80)),
+		agentcore.UserMsg(strings.Repeat("旧上下文", 800)),
 		agentcore.Message{
 			Role:    agentcore.RoleAssistant,
-			Content: []agentcore.ContentBlock{agentcore.TextBlock(strings.Repeat("旧回复", 80))},
+			Content: []agentcore.ContentBlock{agentcore.TextBlock(strings.Repeat("旧回复", 800))},
 		},
 		agentcore.UserMsg("继续写第三章，注意承接第二章结尾。"),
 		agentcore.Message{
