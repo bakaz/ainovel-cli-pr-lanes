@@ -5,7 +5,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/voocel/ainovel-cli/internal/host"
@@ -671,14 +670,14 @@ func agentContextLine(agent host.AgentSnapshot) string {
 	percentColor := contextPercentColor(ctx.Percent)
 	percentStr := lipgloss.NewStyle().Foreground(percentColor).Render(fmt.Sprintf("ctx %.0f%%", ctx.Percent))
 	parts := []string{percentStr}
-	if scope := contextScopeLabel(ctx.Scope); scope != "" &&
-		(ctx.Scope == "committed" || ctx.Scope == "recovered") &&
-		(ctx.LastChanged || (!ctx.StrategyAt.IsZero() && time.Since(ctx.StrategyAt) < 15*time.Second)) {
-		parts = append(parts, scope)
-	}
-	if strategy := contextStrategyLabel(ctx.Strategy); strategy != "" &&
-		(ctx.LastChanged || (!ctx.StrategyAt.IsZero() && time.Since(ctx.StrategyAt) < 15*time.Second)) {
-		parts = append(parts, strategy)
+	if ctx.LastChanged {
+		if scope := contextScopeLabel(ctx.Scope); scope != "" &&
+			(ctx.Scope == "committed" || ctx.Scope == "recovered") {
+			parts = append(parts, scope)
+		}
+		if strategy := contextStrategyLabel(ctx.Strategy); strategy != "" {
+			parts = append(parts, strategy)
+		}
 	}
 	return strings.Join(parts, " · ")
 }

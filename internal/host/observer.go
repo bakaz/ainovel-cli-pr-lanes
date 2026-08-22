@@ -344,6 +344,8 @@ func (o *observer) agentSnapshots() []AgentSnapshot {
 			Context:   a.context,
 			UpdatedAt: a.updated,
 		})
+		// LastChanged 只亮一帧：TUI 读走后清掉，避免压缩策略一直挂在侧栏。
+		a.context.LastChanged = false
 	}
 	return snaps
 }

@@ -95,11 +95,11 @@ func TestAgentContextLineHidesStaleStrategy(t *testing.T) {
 			ContextWindow: 200000,
 			Percent:       40,
 			Strategy:      "tool_result_microcompact",
-			StrategyAt:    time.Now().Add(-time.Minute),
+			StrategyAt:    time.Now(),
 		},
 	})
 	if strings.Contains(line, "微压缩") {
-		t.Fatalf("stale strategy should be hidden: %q", line)
+		t.Fatalf("strategy without LastChanged should stay hidden: %q", line)
 	}
 	fresh := agentContextLine(host.AgentSnapshot{
 		Context: host.AgentContextSnapshot{
@@ -120,6 +120,7 @@ func TestAgentContextLineHidesStaleStrategy(t *testing.T) {
 			ContextWindow: 200000,
 			Percent:       40,
 			Scope:         "projected",
+			LastChanged:   true,
 		},
 	})
 	if strings.Contains(projected, "投影") {

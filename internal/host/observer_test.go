@@ -1339,3 +1339,67 @@ func TestObserverToolErrorReviewCheckCategories(t *testing.T) {
 		})
 	}
 }
+
+func TestAgentSnapshotsConsumesLastChanged(t *testing.T) {
+	var events []Event
+	o := testObserver(&events)
+	o.updateAgent("writer", func(a *agentState) {
+		a.context = AgentContextSnapshot{
+			Tokens: 80000, ContextWindow: 200000, Percent: 40,
+			Strategy:    "tool_result_microcompact",
+			LastChanged: true,
+		}
+	})
+	first := o.agentSnapshots()
+	if len(first) != 1 || !first[0].Context.LastChanged {
+		t.Fatalf("first snapshot should expose LastChanged, got %+v", first)
+	}
+	second := o.agentSnapshots()
+	if len(second) != 1 || second[0].Context.LastChanged {
+		t.Fatalf("LastChanged must be one-shot, got %+v", second)
+	}
+}
+
+func TestHandleContextProgressSkipsMicrocompactNotify(t *testing.T) {
+	var events []Event
+	o := testObserver(&events)
+	meta, err := json.Marshal(map[string]any{
+		"tokens": 80000, "context_window": 100000, "percent": 80,
+		"scope": "committed", "strategy": "tool_result_microcompact", "last_changed": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.handleContextProgress(agentcore.Event{
+		Progress: &agentcore.ProgressPayload{Agent: "writer", Meta: meta},
+	})
+	for _, ev := range events {
+		if ev.Category == "SYSTEM" {
+			t.Fatalf("microcompact should not emit a SYSTEM notification: %+v", ev)
+		}
+	}
+}
+
+func TestHandleContextProgressPersistsFullRewrite(t *testing.T) {
+	var events []Event
+	o := testObserver(&events)
+	meta, err := json.Marshal(map[string]any{
+		"tokens": 180000, "context_window": 200000, "percent": 90,
+		"scope": "committed", "strategy": "full_summary", "last_changed": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.handleContextProgress(agentcore.Event{
+		Progress: &agentcore.ProgressPayload{Agent: "writer", Meta: meta},
+	})
+	found := false
+	for _, ev := range events {
+		if ev.Category == "SYSTEM" && strings.Contains(ev.Summary, "full_summary") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("full rewrite should emit a SYSTEM notification, got %+v", events)
+	}
+}

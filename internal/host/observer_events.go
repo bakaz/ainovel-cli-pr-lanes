@@ -115,7 +115,7 @@ func (o *observer) handleContextProgress(ev agentcore.Event) {
 	}
 	summary := fmt.Sprintf("%s 上下文 %.0f%% (%d/%d) 策略: %s", agent, payload.Percent, payload.Tokens, payload.ContextWindow, payload.Strategy)
 
-	if payload.LastChanged && payload.Strategy != "" {
+	if payload.LastChanged && contextStrategyNotifiesTUI(payload.Strategy) {
 		ctxEv := Event{Time: time.Now(), Category: "SYSTEM", Agent: agent, Summary: summary, Level: level, Depth: 1}
 		o.emitEv(ctxEv)
 		o.persistEvent(ctxEv)
@@ -150,4 +150,15 @@ func absFloat(v float64) float64 {
 		return -v
 	}
 	return v
+}
+
+// contextStrategyNotifiesTUI 只有真正改写了上下文窗口的策略才进事件流。
+// 工具结果微压缩每轮都可能发生，侧栏用 LastChanged 亮一次即可，不能当 SYSTEM 通知刷屏。
+func contextStrategyNotifiesTUI(strategy string) bool {
+	switch strategy {
+	case "", "tool_result_microcompact":
+		return false
+	default:
+		return true
+	}
 }
