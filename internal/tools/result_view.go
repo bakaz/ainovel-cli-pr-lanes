@@ -58,15 +58,15 @@ func (g *ResultViewGate) Select(toolName string, full json.RawMessage) json.RawM
 	if g == nil || len(full) == 0 {
 		return full
 	}
+	need := corecontext.EstimateTokens(agentcore.UserMsg(string(full)))
+	if need <= g.remaining() {
+		return full
+	}
 	id := newToolResultID()
 	if len(full) >= toolResultPersistMinBytes && g.store != nil && g.store.Sessions != nil {
 		if err := g.store.Sessions.SaveToolResult(id, toolName, full); err != nil {
 			slog.Warn("save tool result sidecar", "tool", toolName, "err", err)
 		}
-	}
-	need := corecontext.EstimateTokens(agentcore.UserMsg(string(full)))
-	if need <= g.remaining() {
-		return full
 	}
 	return summarizeToolResult(toolName, id, full)
 }

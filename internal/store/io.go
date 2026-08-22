@@ -88,6 +88,18 @@ func (io *IO) ReadFileUnlocked(rel string) ([]byte, error) {
 }
 
 func (io *IO) WriteFileUnlocked(rel string, data []byte) error {
+	return io.writeFileUnlocked(rel, data, true)
+}
+
+// WriteFileBuffered 原子写入但不 fsync。给可重建的旁路文件用，避免每个大
+// 工具结果都卡在磁盘刷新上。
+func (io *IO) WriteFileBuffered(rel string, data []byte) error {
+	io.mu.Lock()
+	defer io.mu.Unlock()
+	return io.writeFileUnlocked(rel, data, false)
+}
+
+func (io *IO) writeFileUnlocked(rel string, data []byte, sync bool) error {
 	// 写生命周期 lease：完整 OS 修改期间持读 lease（Close 等待在途写）。
 	endWrite, err := io.beginWrite()
 	if err != nil {
@@ -113,9 +125,11 @@ func (io *IO) WriteFileUnlocked(rel string, data []byte) error {
 		_ = tmp.Close()
 		return err
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
+	if sync {
+		if err := tmp.Sync(); err != nil {
+			_ = tmp.Close()
+			return err
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return err

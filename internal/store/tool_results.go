@@ -18,7 +18,11 @@ func (s *SessionStore) SaveToolResult(id, tool string, content json.RawMessage) 
 		return fmt.Errorf("save tool result: missing session store or id")
 	}
 	rec := storedToolResult{Tool: tool, Content: content}
-	return s.io.WriteJSON(toolResultDir+"/"+id+".json", rec)
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("marshal tool result: %w", err)
+	}
+	return s.io.WriteFileBuffered(toolResultDir+"/"+id+".json", data)
 }
 
 // LoadToolResult 读取旁路全文。
