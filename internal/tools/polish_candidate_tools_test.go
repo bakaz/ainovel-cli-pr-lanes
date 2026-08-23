@@ -56,6 +56,29 @@ func wantErr(t *testing.T, r testResult, code string) {
 	}
 }
 
+// ── 构造辅助（包 4 适配：无参构造 + SetAccumulator 运行时注入） ─────────────
+// 三个候选工具在构建时以 nil accumulator 注册，运行时经 SetAccumulator 注入
+//（包 4 holder / 包 6 polish_draft 每次 run 接线）。测试统一走
+// "构造 → SetAccumulator → Execute" 路径。
+
+func planToolFor(acc *PolishAccumulator) *SubmitPolishPlanTool {
+	tool := NewSubmitPolishPlanTool()
+	tool.SetAccumulator(acc)
+	return tool
+}
+
+func batchToolFor(acc *PolishAccumulator) *SubmitEditBatchTool {
+	tool := NewSubmitEditBatchTool()
+	tool.SetAccumulator(acc)
+	return tool
+}
+
+func finishToolFor(acc *PolishAccumulator) *FinishPolishTool {
+	tool := NewFinishPolishTool()
+	tool.SetAccumulator(acc)
+	return tool
+}
+
 // ── 请求构造 ───────────────────────────────────────────────────────────
 
 func polishPlanArgs(t *testing.T, op, digest string, issues []map[string]any) json.RawMessage {
@@ -120,7 +143,7 @@ func polishFinishArgs(t *testing.T, op, digest, status string, count int, covere
 // submitPlan 提交一个含给定 issues 的 plan，断言成功。
 func submitPlan(t *testing.T, acc *PolishAccumulator, issues []map[string]any) {
 	t.Helper()
-	tool := NewSubmitPolishPlanTool(acc)
+	tool := planToolFor(acc)
 	raw, err := tool.Execute(t.Context(), polishPlanArgs(t, testOpID, testBaselineDigest, issues))
 	if err != nil {
 		t.Fatalf("plan execute: %v", err)
@@ -135,8 +158,8 @@ func submitPlan(t *testing.T, acc *PolishAccumulator, issues []map[string]any) {
 
 func TestPolishCandidateTools_HappyPath(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
-	finishTool := NewFinishPolishTool(acc)
+	batchTool := batchToolFor(acc)
+	finishTool := finishToolFor(acc)
 
 	issues := []map[string]any{
 		polishPlanIssue("p-001", "edit"),
@@ -218,8 +241,8 @@ func TestPolishCandidateTools_HappyPath(t *testing.T) {
 func TestPolishCandidateTools_OrderViolations(t *testing.T) {
 	// batch/finish 先于 plan → not_planned。
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
-	finishTool := NewFinishPolishTool(acc)
+	batchTool := batchToolFor(acc)
+	finishTool := finishToolFor(acc)
 
 	raw, _ := batchTool.Execute(t.Context(), polishBatchArgs(t, testOpID, testBaselineDigest, 1, []map[string]any{
 		polishBatchEdit("p-001", "她站在窗前", "她倚窗而立"),
@@ -231,7 +254,7 @@ func TestPolishCandidateTools_OrderViolations(t *testing.T) {
 	wantErr(t, parseResult(t, raw), PolishErrNotPlanned)
 
 	// 重复 plan → plan_exists。
-	planTool := NewSubmitPolishPlanTool(acc)
+	planTool := planToolFor(acc)
 	submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 	raw, _ = planTool.Execute(t.Context(), polishPlanArgs(t, testOpID, testBaselineDigest, []map[string]any{
 		polishPlanIssue("p-002", "edit"),
@@ -259,7 +282,7 @@ func TestPolishCandidateTools_OrderViolations(t *testing.T) {
 
 func TestPolishCandidateTools_OpBaselineMismatch(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	planTool := NewSubmitPolishPlanTool(acc)
+	planTool := planToolFor(acc)
 
 	raw, _ := planTool.Execute(t.Context(), polishPlanArgs(t, "pol-wrong-1", testBaselineDigest, nil))
 	wantErr(t, parseResult(t, raw), PolishErrOpMismatch)
@@ -268,7 +291,7 @@ func TestPolishCandidateTools_OpBaselineMismatch(t *testing.T) {
 	wantErr(t, parseResult(t, raw), PolishErrBaselineMismatch)
 
 	// batch 同样整批拒绝。
-	batchTool := NewSubmitEditBatchTool(acc)
+	batchTool := batchToolFor(acc)
 	raw, _ = batchTool.Execute(t.Context(), polishBatchArgs(t, "pol-wrong-1", testBaselineDigest, 1, []map[string]any{
 		polishBatchEdit("p-001", "她站在窗前", "她倚窗而立"),
 	}))
@@ -279,7 +302,7 @@ func TestPolishCandidateTools_OpBaselineMismatch(t *testing.T) {
 
 func TestPolishCandidateTools_BadBatchIndex(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
+	batchTool := batchToolFor(acc)
 	submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 
 	// 首批就跳号（期望 1，提交 2）。
@@ -307,7 +330,7 @@ func TestPolishCandidateTools_BadBatchIndex(t *testing.T) {
 
 func TestPolishCandidateTools_BatchLimit(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
+	batchTool := batchToolFor(acc)
 	submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 
 	edits := make([]map[string]any, 0, 9)
@@ -323,7 +346,7 @@ func TestPolishCandidateTools_BatchLimit(t *testing.T) {
 
 func TestPolishCandidateTools_TotalLimit(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
+	batchTool := batchToolFor(acc)
 
 	// 8 个 edit issue，每批 8 条全部 anchor 失准被拒（rejected 计入 32 上限）。
 	issues := make([]map[string]any, 0, 8)
@@ -360,7 +383,7 @@ func TestPolishCandidateTools_TotalLimit(t *testing.T) {
 // 预算被 rejected 消耗后，合法 edit 也整批拒绝（§5.3 步骤 5 注：rejected 计入 32 上限）。
 func TestPolishCandidateTools_TotalLimitLegalEditRejected(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
+	batchTool := batchToolFor(acc)
 
 	issues := make([]map[string]any, 0, 8)
 	for i := 1; i <= 8; i++ {
@@ -429,7 +452,7 @@ func itoa(i int) string {
 
 func TestPolishCandidateTools_IssueReused(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
+	batchTool := batchToolFor(acc)
 	submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 
 	raw, _ := batchTool.Execute(t.Context(), polishBatchArgs(t, testOpID, testBaselineDigest, 1, []map[string]any{
@@ -470,7 +493,7 @@ func TestPolishCandidateTools_AnchorChecks(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			acc := newPolishTestAcc(t)
-			batchTool := NewSubmitEditBatchTool(acc)
+			batchTool := batchToolFor(acc)
 			submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 			raw, _ := batchTool.Execute(t.Context(), polishBatchArgs(t, testOpID, testBaselineDigest, 1, []map[string]any{
 				polishBatchEdit("p-001", tc.old, tc.new),
@@ -486,7 +509,7 @@ func TestPolishCandidateTools_AnchorChecks(t *testing.T) {
 func TestPolishCandidateTools_AnchorOverlap(t *testing.T) {
 	// 批内互相检查重叠：第二条与第一条的 byte range 重叠。
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
+	batchTool := batchToolFor(acc)
 	submitPlan(t, acc, []map[string]any{
 		polishPlanIssue("p-001", "edit"),
 		polishPlanIssue("p-002", "edit"),
@@ -530,7 +553,7 @@ func TestPolishCandidateTools_DigitPreservation(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			acc := newPolishTestAcc(t)
-			batchTool := NewSubmitEditBatchTool(acc)
+			batchTool := batchToolFor(acc)
 			submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 			raw, _ := batchTool.Execute(t.Context(), polishBatchArgs(t, testOpID, testBaselineDigest, 1, []map[string]any{
 				polishBatchEdit("p-001", tc.old, tc.new),
@@ -574,7 +597,7 @@ func TestPolishDigitRuns(t *testing.T) {
 
 func TestPolishCandidateTools_FactCheckInvalid(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
+	batchTool := batchToolFor(acc)
 	submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 
 	edit := polishBatchEdit("p-001", "她站在窗前，看着窗外的梧桐树", "她倚窗而立，望着窗外的梧桐树")
@@ -590,7 +613,7 @@ func TestPolishCandidateTools_FactCheckInvalid(t *testing.T) {
 
 func TestPolishCandidateTools_FactRiskEditConflict(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	planTool := NewSubmitPolishPlanTool(acc)
+	planTool := planToolFor(acc)
 
 	iss := polishPlanIssue("p-001", "edit")
 	iss["fact_risk"] = "high"
@@ -614,7 +637,7 @@ func TestPolishCandidateTools_FactRiskEditConflict(t *testing.T) {
 func TestPolishCandidateTools_FinishConsistency(t *testing.T) {
 	t.Run("no_op_with_count", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		finishTool := NewFinishPolishTool(acc)
+		finishTool := finishToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		raw, _ := finishTool.Execute(t.Context(), polishFinishArgs(t, testOpID, testBaselineDigest,
 			"no_op", 2, []string{}, nil, "无需修改"))
@@ -623,8 +646,8 @@ func TestPolishCandidateTools_FinishConsistency(t *testing.T) {
 
 	t.Run("complete_with_unresolved_edited", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		batchTool := NewSubmitEditBatchTool(acc)
-		finishTool := NewFinishPolishTool(acc)
+		batchTool := batchToolFor(acc)
+		finishTool := finishToolFor(acc)
 		submitPlan(t, acc, []map[string]any{
 			polishPlanIssue("p-001", "edit"),
 			polishPlanIssue("p-002", "edit"),
@@ -644,7 +667,7 @@ func TestPolishCandidateTools_FinishConsistency(t *testing.T) {
 
 	t.Run("escalate_empty_unresolved", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		finishTool := NewFinishPolishTool(acc)
+		finishTool := finishToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		raw, _ := finishTool.Execute(t.Context(), polishFinishArgs(t, testOpID, testBaselineDigest,
 			"escalate", 0, []string{}, nil, "升级"))
@@ -653,8 +676,8 @@ func TestPolishCandidateTools_FinishConsistency(t *testing.T) {
 
 	t.Run("covered_lie", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		batchTool := NewSubmitEditBatchTool(acc)
-		finishTool := NewFinishPolishTool(acc)
+		batchTool := batchToolFor(acc)
+		finishTool := finishToolFor(acc)
 		submitPlan(t, acc, []map[string]any{
 			polishPlanIssue("p-001", "edit"),
 			polishPlanIssue("p-002", "edit"),
@@ -673,8 +696,8 @@ func TestPolishCandidateTools_FinishConsistency(t *testing.T) {
 
 	t.Run("count_mismatch", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		batchTool := NewSubmitEditBatchTool(acc)
-		finishTool := NewFinishPolishTool(acc)
+		batchTool := batchToolFor(acc)
+		finishTool := finishToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		raw, _ := batchTool.Execute(t.Context(), polishBatchArgs(t, testOpID, testBaselineDigest, 1, []map[string]any{
 			polishBatchEdit("p-001", "她站在窗前，看着窗外的梧桐树", "她倚窗而立，望着窗外的梧桐树"),
@@ -690,7 +713,7 @@ func TestPolishCandidateTools_FinishConsistency(t *testing.T) {
 	t.Run("no_op_legit", func(t *testing.T) {
 		// no_op 合法终态：0 计数、空 covered、空 unresolved。
 		acc := newPolishTestAcc(t)
-		finishTool := NewFinishPolishTool(acc)
+		finishTool := finishToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "no_op")})
 		raw, _ := finishTool.Execute(t.Context(), polishFinishArgs(t, testOpID, testBaselineDigest,
 			"no_op", 0, []string{}, nil, "完整审阅后无需修改"))
@@ -707,7 +730,7 @@ func TestPolishCandidateTools_JSONTolerance(t *testing.T) {
 
 	t.Run("bom_prefix", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		planTool := NewSubmitPolishPlanTool(acc)
+		planTool := planToolFor(acc)
 		raw, _ := planTool.Execute(t.Context(), json.RawMessage("\uFEFF"+base))
 		if r := parseResult(t, raw); r.Accepted != 1 {
 			t.Fatalf("BOM plan = %+v, want accepted=1", r)
@@ -716,7 +739,7 @@ func TestPolishCandidateTools_JSONTolerance(t *testing.T) {
 
 	t.Run("single_fence", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		planTool := NewSubmitPolishPlanTool(acc)
+		planTool := planToolFor(acc)
 		raw, _ := planTool.Execute(t.Context(), json.RawMessage("```json\n"+base+"\n```"))
 		if r := parseResult(t, raw); r.Accepted != 1 {
 			t.Fatalf("fenced plan = %+v, want accepted=1", r)
@@ -725,7 +748,7 @@ func TestPolishCandidateTools_JSONTolerance(t *testing.T) {
 
 	t.Run("unknown_field", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		planTool := NewSubmitPolishPlanTool(acc)
+		planTool := planToolFor(acc)
 		var m map[string]any
 		_ = json.Unmarshal([]byte(base), &m)
 		m["extra"] = 1
@@ -735,14 +758,14 @@ func TestPolishCandidateTools_JSONTolerance(t *testing.T) {
 
 	t.Run("trailing_content", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		planTool := NewSubmitPolishPlanTool(acc)
+		planTool := planToolFor(acc)
 		raw, _ := planTool.Execute(t.Context(), json.RawMessage(base+" 已完成"))
 		wantErr(t, parseResult(t, raw), PolishErrMalformedJSON)
 	})
 
 	t.Run("nested_unknown_field", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		batchTool := NewSubmitEditBatchTool(acc)
+		batchTool := batchToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		edit := polishBatchEdit("p-001", "她站在窗前，看着窗外的梧桐树", "她倚窗而立，望着窗外的梧桐树")
 		edit["bogus"] = true
@@ -756,7 +779,7 @@ func TestPolishCandidateTools_JSONTolerance(t *testing.T) {
 func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 	t.Run("plan_bad_enum", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		planTool := NewSubmitPolishPlanTool(acc)
+		planTool := planToolFor(acc)
 		iss := polishPlanIssue("p-001", "edit")
 		iss["origin"] = "bogus"
 		raw, _ := planTool.Execute(t.Context(), polishPlanArgs(t, testOpID, testBaselineDigest, []map[string]any{iss}))
@@ -765,7 +788,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("plan_field_required", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		planTool := NewSubmitPolishPlanTool(acc)
+		planTool := planToolFor(acc)
 		m := map[string]any{
 			"operation_id":       testOpID,
 			"baseline_digest":    testBaselineDigest,
@@ -778,7 +801,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("plan_value_out_of_range", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		planTool := NewSubmitPolishPlanTool(acc)
+		planTool := planToolFor(acc)
 		m := map[string]any{
 			"operation_id":       testOpID,
 			"baseline_digest":    testBaselineDigest,
@@ -792,7 +815,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("plan_limit", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		planTool := NewSubmitPolishPlanTool(acc)
+		planTool := planToolFor(acc)
 		issues := make([]map[string]any, 0, 33)
 		for i := 1; i <= 33; i++ {
 			issues = append(issues, polishPlanIssue(sprintfP(i), "edit"))
@@ -811,7 +834,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("plan_issue_id_invalid", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		planTool := NewSubmitPolishPlanTool(acc)
+		planTool := planToolFor(acc)
 		iss := polishPlanIssue("x-001", "edit")
 		raw, _ := planTool.Execute(t.Context(), polishPlanArgs(t, testOpID, testBaselineDigest, []map[string]any{iss}))
 		wantErr(t, parseResult(t, raw), PolishErrIssueIDInvalid)
@@ -819,7 +842,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("plan_issue_id_duplicate", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		planTool := NewSubmitPolishPlanTool(acc)
+		planTool := planToolFor(acc)
 		raw, _ := planTool.Execute(t.Context(), polishPlanArgs(t, testOpID, testBaselineDigest, []map[string]any{
 			polishPlanIssue("p-001", "edit"),
 			polishPlanIssue("p-001", "edit"),
@@ -829,7 +852,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("batch_bad_enum", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		batchTool := NewSubmitEditBatchTool(acc)
+		batchTool := batchToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		edit := polishBatchEdit("p-001", "她站在窗前，看着窗外的梧桐树", "她倚窗而立，望着窗外的梧桐树")
 		edit["category"] = "bogus"
@@ -839,7 +862,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("batch_field_required", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		batchTool := NewSubmitEditBatchTool(acc)
+		batchTool := batchToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		edit := polishBatchEdit("p-001", "她站在窗前，看着窗外的梧桐树", "她倚窗而立，望着窗外的梧桐树")
 		delete(edit, "issue_id")
@@ -849,7 +872,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("batch_reason_too_long", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		batchTool := NewSubmitEditBatchTool(acc)
+		batchTool := batchToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		edit := polishBatchEdit("p-001", "她站在窗前，看着窗外的梧桐树", "她倚窗而立，望着窗外的梧桐树")
 		edit["reason"] = strings.Repeat("理", 501)
@@ -859,7 +882,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("finish_status_invalid", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		finishTool := NewFinishPolishTool(acc)
+		finishTool := finishToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		raw, _ := finishTool.Execute(t.Context(), polishFinishArgs(t, testOpID, testBaselineDigest,
 			"bogus", 0, []string{}, nil, "摘要"))
@@ -868,7 +891,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("finish_owner_invalid", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		finishTool := NewFinishPolishTool(acc)
+		finishTool := finishToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		raw, _ := finishTool.Execute(t.Context(), polishFinishArgs(t, testOpID, testBaselineDigest,
 			"escalate", 0, []string{}, []map[string]any{
@@ -879,7 +902,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("finish_summary_required", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		finishTool := NewFinishPolishTool(acc)
+		finishTool := finishToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		raw, _ := finishTool.Execute(t.Context(), polishFinishArgs(t, testOpID, testBaselineDigest,
 			"complete", 0, []string{}, nil, ""))
@@ -888,7 +911,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("finish_covered_unknown", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		finishTool := NewFinishPolishTool(acc)
+		finishTool := finishToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		raw, _ := finishTool.Execute(t.Context(), polishFinishArgs(t, testOpID, testBaselineDigest,
 			"complete", 0, []string{"p-999"}, nil, "摘要"))
@@ -897,7 +920,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 	t.Run("finish_unresolved_unknown", func(t *testing.T) {
 		acc := newPolishTestAcc(t)
-		finishTool := NewFinishPolishTool(acc)
+		finishTool := finishToolFor(acc)
 		submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 		raw, _ := finishTool.Execute(t.Context(), polishFinishArgs(t, testOpID, testBaselineDigest,
 			"escalate", 0, []string{}, []map[string]any{
@@ -911,7 +934,7 @@ func TestPolishCandidateTools_EnumFieldLength(t *testing.T) {
 
 func TestPolishCandidateTools_NoEcho(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
+	batchTool := batchToolFor(acc)
 	submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 
 	oldS := "她站在窗前，看着窗外的梧桐树"
@@ -938,7 +961,7 @@ func TestPolishCandidateTools_NoEcho(t *testing.T) {
 
 func TestPolishCandidateTools_NormalizedMatch(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
+	batchTool := batchToolFor(acc)
 	submitPlan(t, acc, []map[string]any{polishPlanIssue("p-001", "edit")})
 
 	// 半角逗号 → 归一化后唯一命中 baseline 的全角逗号。
@@ -976,7 +999,7 @@ func TestPolishCandidateTools_PlanDigestDeterministic(t *testing.T) {
 
 func TestPolishCandidateTools_IssueUnknownNotEditable(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	batchTool := NewSubmitEditBatchTool(acc)
+	batchTool := batchToolFor(acc)
 	submitPlan(t, acc, []map[string]any{
 		polishPlanIssue("p-001", "edit"),
 		polishPlanIssue("p-002", "defer_to_writer"),
@@ -1003,9 +1026,9 @@ func TestPolishCandidateTools_IssueUnknownNotEditable(t *testing.T) {
 
 func TestPolishCandidateTools_Metadata(t *testing.T) {
 	acc := newPolishTestAcc(t)
-	planTool := NewSubmitPolishPlanTool(acc)
-	batchTool := NewSubmitEditBatchTool(acc)
-	finishTool := NewFinishPolishTool(acc)
+	planTool := planToolFor(acc)
+	batchTool := batchToolFor(acc)
+	finishTool := finishToolFor(acc)
 
 	if planTool.Name() != "submit_polish_plan" || batchTool.Name() != "submit_edit_batch" || finishTool.Name() != "finish_polish" {
 		t.Fatal("tool names mismatch")
@@ -1024,5 +1047,52 @@ func TestPolishCandidateTools_Metadata(t *testing.T) {
 		if tool.Schema() == nil {
 			t.Fatal("schema must be non-nil")
 		}
+	}
+}
+
+// ── 19. 未注入 accumulator 时 Execute 返回明确错误（包 4 适配） ─────────────
+// 工具在构建时以 nil accumulator 注册（包 4 holder 接线），运行时才注入；
+// 未注入时 Execute 必须返回明确错误，不能静默空转或 panic。
+
+func TestPolishCandidateTools_AccumulatorNotInitialized(t *testing.T) {
+	planTool := NewSubmitPolishPlanTool()
+	batchTool := NewSubmitEditBatchTool()
+	finishTool := NewFinishPolishTool()
+
+	raw, err := planTool.Execute(t.Context(), polishPlanArgs(t, testOpID, testBaselineDigest, nil))
+	if err == nil || !strings.Contains(err.Error(), "polish accumulator not initialized") {
+		t.Fatalf("plan Execute without accumulator: err = %v, want 'polish accumulator not initialized'", err)
+	}
+	if raw != nil {
+		t.Fatalf("plan Execute without accumulator must return nil result, got %s", raw)
+	}
+
+	raw, err = batchTool.Execute(t.Context(), polishBatchArgs(t, testOpID, testBaselineDigest, 1, nil))
+	if err == nil || !strings.Contains(err.Error(), "polish accumulator not initialized") {
+		t.Fatalf("batch Execute without accumulator: err = %v, want 'polish accumulator not initialized'", err)
+	}
+	if raw != nil {
+		t.Fatalf("batch Execute without accumulator must return nil result, got %s", raw)
+	}
+
+	raw, err = finishTool.Execute(t.Context(), polishFinishArgs(t, testOpID, testBaselineDigest,
+		"complete", 0, nil, nil, "摘要"))
+	if err == nil || !strings.Contains(err.Error(), "polish accumulator not initialized") {
+		t.Fatalf("finish Execute without accumulator: err = %v, want 'polish accumulator not initialized'", err)
+	}
+	if raw != nil {
+		t.Fatalf("finish Execute without accumulator must return nil result, got %s", raw)
+	}
+
+	// 注入后恢复正常协议行为（运行时替换指针生效）。
+	acc := newPolishTestAcc(t)
+	planTool.SetAccumulator(acc)
+	raw, err = planTool.Execute(t.Context(), polishPlanArgs(t, testOpID, testBaselineDigest,
+		[]map[string]any{polishPlanIssue("p-001", "edit")}))
+	if err != nil {
+		t.Fatalf("plan Execute after SetAccumulator: %v", err)
+	}
+	if r := parseResult(t, raw); r.Accepted != 1 || len(r.Errors) != 0 {
+		t.Fatalf("plan result after SetAccumulator = %+v, want accepted=1", r)
 	}
 }

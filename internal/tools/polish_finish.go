@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/voocel/agentcore/schema"
@@ -16,13 +18,31 @@ import (
 // 不直接保存正文（包 6 最终应用）。
 
 // FinishPolishTool 是 finish_polish 工具。非 ReadOnly，非 ConcurrencySafe。
+// accumulator 为可替换指针：工具在构建时注册（nil），运行时经 SetAccumulator
+// 注入（包 4 holder / 包 6 polish_draft 每次 run 接线）；Execute 在未注入时
+// 返回明确错误，不会静默空转。
 type FinishPolishTool struct {
+	mu  sync.Mutex
 	acc *PolishAccumulator
 }
 
-// NewFinishPolishTool 构造 finish 工具（共享外部注入的 accumulator）。
-func NewFinishPolishTool(acc *PolishAccumulator) *FinishPolishTool {
-	return &FinishPolishTool{acc: acc}
+// NewFinishPolishTool 构造 finish 工具（无参；accumulator 由 SetAccumulator 注入）。
+func NewFinishPolishTool() *FinishPolishTool {
+	return &FinishPolishTool{}
+}
+
+// SetAccumulator 注入/替换当前 run 的 accumulator（线程安全，运行时调用）。
+func (t *FinishPolishTool) SetAccumulator(acc *PolishAccumulator) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.acc = acc
+}
+
+// currentAccumulator 返回当前注入的 accumulator（未注入时为 nil）。
+func (t *FinishPolishTool) currentAccumulator() *PolishAccumulator {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.acc
 }
 
 func (t *FinishPolishTool) Name() string { return "finish_polish" }
@@ -66,8 +86,12 @@ type polishFinishRequest struct {
 }
 
 func (t *FinishPolishTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
-	t.acc.mu.Lock()
-	defer t.acc.mu.Unlock()
+	acc := t.currentAccumulator()
+	if acc == nil {
+		return nil, fmt.Errorf("polish accumulator not initialized")
+	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
 
 	reject := func(code string) (json.RawMessage, error) {
 		return json.Marshal(polishPlanResult{Accepted: 0, Rejected: 1,
@@ -80,15 +104,15 @@ func (t *FinishPolishTool) Execute(_ context.Context, args json.RawMessage) (jso
 	}
 
 	// §3.1：operation_id / baseline_digest 一致。
-	if req.OperationID == nil || *req.OperationID != t.acc.operationID {
+	if req.OperationID == nil || *req.OperationID != acc.operationID {
 		return reject(PolishErrOpMismatch)
 	}
-	if req.BaselineDigest == nil || *req.BaselineDigest != t.acc.baselineDigest {
+	if req.BaselineDigest == nil || *req.BaselineDigest != acc.baselineDigest {
 		return reject(PolishErrBaselineMismatch)
 	}
 
 	// §3.2 状态机：planned → finished；未 plan → not_planned；已 finish → already_finished。
-	switch t.acc.state {
+	switch acc.state {
 	case polishAccEmpty:
 		return reject(PolishErrNotPlanned)
 	case polishAccFinished:
@@ -115,7 +139,7 @@ func (t *FinishPolishTool) Execute(_ context.Context, args json.RawMessage) (jso
 		if !polishIssueIDRe.MatchString(id) {
 			return reject(PolishErrIssueIDInvalid)
 		}
-		if t.acc.findPlanIssue(id) == nil {
+		if acc.findPlanIssue(id) == nil {
 			return reject(PolishErrIssueUnknown)
 		}
 	}
@@ -131,7 +155,7 @@ func (t *FinishPolishTool) Execute(_ context.Context, args json.RawMessage) (jso
 			if !polishIssueIDRe.MatchString(*u.IssueID) {
 				return reject(PolishErrIssueIDInvalid)
 			}
-			if t.acc.findPlanIssue(*u.IssueID) == nil {
+			if acc.findPlanIssue(*u.IssueID) == nil {
 				return reject(PolishErrIssueUnknown)
 			}
 			if u.Reason == nil {
@@ -172,7 +196,7 @@ func (t *FinishPolishTool) Execute(_ context.Context, args json.RawMessage) (jso
 	// - status=complete ⇒ unresolved 不得含 plan 中 action=edit 的 issue。
 	if *req.Status == "complete" {
 		for _, u := range unresolved {
-			if iss := t.acc.findPlanIssue(u.IssueID); iss != nil && iss.Action == "edit" {
+			if iss := acc.findPlanIssue(u.IssueID); iss != nil && iss.Action == "edit" {
 				return reject(PolishErrUnresolvedEdited)
 			}
 		}
@@ -183,26 +207,26 @@ func (t *FinishPolishTool) Execute(_ context.Context, args json.RawMessage) (jso
 	}
 	// - covered_issue_ids 每个 issue 必须满足可覆盖条件：(a) 已提交过 edit，或 (b) action=no_op。
 	for _, id := range *req.CoveredIssueIDs {
-		if !t.acc.issueHasAcceptedEdit(id) {
-			if iss := t.acc.findPlanIssue(id); iss == nil || iss.Action != "no_op" {
+		if !acc.issueHasAcceptedEdit(id) {
+			if iss := acc.findPlanIssue(id); iss == nil || iss.Action != "no_op" {
 				return reject(PolishErrCoverageNotEditable)
 			}
 		}
 	}
 	// - submitted_edit_count 必须等于已接受总数。
-	if *req.SubmittedEditCount != len(t.acc.accepted) {
+	if *req.SubmittedEditCount != len(acc.accepted) {
 		return reject(PolishErrCountMismatch)
 	}
 
 	// 通过：存 finish，状态 → finished。
-	t.acc.finish = &PolishFinishRecord{
+	acc.finish = &PolishFinishRecord{
 		Status:             *req.Status,
 		SubmittedEditCount: *req.SubmittedEditCount,
 		CoveredIssueIDs:    *req.CoveredIssueIDs,
 		Unresolved:         unresolved,
 		Summary:            *req.Summary,
 	}
-	t.acc.state = polishAccFinished
+	acc.state = polishAccFinished
 
 	return json.Marshal(polishPlanResult{Accepted: 1, Rejected: 0, Errors: []polishToolError{}})
 }

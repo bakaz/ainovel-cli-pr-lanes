@@ -251,9 +251,15 @@ func buildWorkerToolsetsWithApproval(store *store.Store, bundle assets.Bundle, s
 			tools.NewSaveArcSummaryTool(store),
 			tools.NewSaveVolumeSummaryTool(store),
 		},
-		// Polisher 无工具：纯文本转换的嵌套模型，全部上下文（草稿全文 + 精修依据 +
-		// 既有 findings + rewrite brief）已由 polish_draft 的 buildPolishTask 塞进任务文本。
-		Polisher:   []agentcore.Tool{},
+		// Polisher 工具集 = 三个候选提交工具（schema docs/polisher-candidate-tools-schema.md §2）：
+		// submit_polish_plan / submit_edit_batch / finish_polish。accumulator 是 per-run 的
+		//（polish_draft 每次 run 创建，包 6 接线），工具在构建时以 nil accumulator 注册，
+		// 运行时经 SetAccumulator 注入（见 BuildWorkers 的 holder 接线）。
+		Polisher: []agentcore.Tool{
+			tools.NewSubmitPolishPlanTool(),
+			tools.NewSubmitEditBatchTool(),
+			tools.NewFinishPolishTool(),
+		},
 		commitTool: commitTool,
 	}
 }
@@ -308,6 +314,16 @@ func BuildWorkers(
 	writerTools := ts.Writer
 	editorTools := ts.Editor
 	polisherTools := ts.Polisher
+
+	// 候选工具运行时注入：accumulator 由 polish_draft 每次 run 创建（包 6 接线），
+	// 经 PolishAccumulatorHolder 注入三个候选工具。构建时 holder.Get()==nil——
+	// 工具 Execute 在未注入 accumulator 时返回明确错误，不会静默空转。
+	polisherAccHolder := NewPolishAccumulatorHolder()
+	for _, tl := range polisherTools {
+		if injectable, ok := tl.(interface{ SetAccumulator(*tools.PolishAccumulator) }); ok {
+			injectable.SetAccumulator(polisherAccHolder.Get())
+		}
+	}
 
 	// 精修流水线开关（chapter_pipeline="ds_mimo_critic" 或 roles.polisher 显式配置）：
 	// 开启时注入 polish_draft 强制（工具 enabled + writer 协议）与 commit gate 校验
@@ -394,6 +410,7 @@ func BuildWorkers(
 		MaxTurns:       1,
 		MaxRetries:     subagentMaxRetries,
 		ThinkingLevel:  resolvedRoleThinking(criticModel, cfg, "critic"),
+		MaxTokens:      roleMaxOutput("style_critic"), // 预算表 §6：16,384
 		OnMessage:      onMsg,
 		PromptCacheKey: cacheBase + "-style_critic",
 	}
@@ -435,6 +452,7 @@ func BuildWorkers(
 		MaxTurns:         15,
 		MaxRetries:       subagentMaxRetries,
 		ThinkingLevel:    architectThinking,
+		MaxTokens:        roleMaxOutput("architect_short"), // 预算表 §6：32,768
 		OnMessage:        onMsg,
 		CacheLastMessage: "ephemeral",
 		PromptCacheKey:   cacheBase + "-architect_short",
@@ -527,6 +545,7 @@ func BuildWorkers(
 		MaxTurns:         20,
 		MaxRetries:       subagentMaxRetries,
 		ThinkingLevel:    resolvedRoleThinking(editorModel, cfg, "editor"),
+		MaxTokens:        roleMaxOutput("editor"), // 预算表 §6：32,768
 		OnMessage:        onMsg,
 		CacheLastMessage: "ephemeral",
 		PromptCacheKey:   cacheBase + "-editor",
@@ -541,25 +560,22 @@ func BuildWorkers(
 		},
 	}
 
-	// ── 文风精修师子代理（无工具、纯文本转换的嵌套模型：独立 Runner / system prompt /
-	// ContextManager / cache key / provenance）。由 polish_draft 工具在 Writer 单次 Run 内
-	// 嵌套调用——模式与 review_style 内部启动 critic runner 一致；不 Swap 同一 Writer 会话。
+	// ── 文风精修师子代理（候选工具协议：独立 Runner / system prompt / ContextManager /
+	// cache key / provenance）。由 polish_draft 工具在 Writer 单次 Run 内嵌套调用——
+	// 模式与 review_style 内部启动 critic runner 一致；不 Swap 同一 Writer 会话。
 	// 全部上下文（草稿全文 + 精修依据 + 既有 findings + rewrite brief）由 buildPolishTask
-	// 塞进任务文本，模型输出结构化 edit 列表 JSON 作为最终响应（ora-1 形态 2）。
-	// MaxTurns=3（1 初始 + 最多 2 次 length recovery）：polisher 模型 thinking 极长，
-	// 实测频繁被 max_tokens 截断（StopReason=length）。agentcore 对 length 截断自动注入
-	// recovery prompt 继续下一轮，但循环在每轮顶部按 turnCount(>=MaxTurns) fail-closed；
-	// MaxTurns=1 会让首次 recovery 立即撞 MaxTurnsError（生产 55 章 rewrite 卡死根因）。
-	// MaxTurns=3 允许连续 2 次 recovery；连续 3 次 length 时第 4 次调用前报 MaxTurnsError
-	// fail-closed（比 agentcore 内部 recovery 预算放行截断结果更保守，见 defaultMaxLengthRecoveries）。
-	// LengthRecoveryPrompt 要求从头重新输出完整 edit 列表 JSON：默认 recovery prompt 是
-	// "从截断处续写"，若第一轮已输出部分 JSON、第二轮只续写尾段，RunResult 只返回尾段，
-	// 解析必然失败且内容残缺——故必须显式覆盖为整表重输出。
-	// MaxTokens=131072：mimo-v2.5（小米 MiMo-V2.5）真实输出上限 131072 tokens
-	//（OpenRouter top_provider.max_completion_tokens 四方一致）；agentcore 默认
-	// GenerationConfig.MaxTokens=65536 会把 75-97K 字符的 thinking 截断（thinking 与
-	// 最终回答共用 max_tokens 预算），与 MaxTurns 卡死同源——显式放宽为模型真实上限，
-	// 为 thinking+正文留足余量且不超过模型上限。其他 agent 不设置（保持默认 65536）。
+	// 塞进任务文本；模型通过三个候选工具（submit_polish_plan / submit_edit_batch /
+	// finish_polish）提交 plan/batch/finish（schema docs/polisher-candidate-tools-schema.md
+	// §2），产物由 polish_draft 统一验证并一次性落盘。
+	// MaxTurns=6（初始 + plan + 最多 4 批 + finish，schema §11）；finish_polish 是
+	// 停止工具（StopAfterTools），调用成功后 runner 结束。StopGuard 仍用
+	// NewPolisherStopGuard：agentcore 在 StopAfterTools 命中后同样咨询 StopGuard，
+	// 该 guard 恒放行 end_turn（仅 provider 拒答升级），与停止工具不冲突。
+	// MaxTokens=预算表默认 65,536（计划 §6）；131,072 仅作为经过验证的精确模型
+	// override（polisherHighOutputModels，见 budgets.go），不能全局提升。
+	// LengthRecoveryPrompt 要求从头重新输出完整内容：默认 recovery prompt 是
+	// "从截断处续写"，若第一轮已输出部分 JSON、第二轮只续写尾段，RunResult 只返回
+	// 尾段，解析必然失败且内容残缺——故必须显式覆盖为整表重输出。
 	polisherModel := WithTrailingAntiRefusal(models.ForRoleWithFailover("polisher", reportFailover), store)
 	_, polisherModelName, _ := models.CurrentSelection("polisher")
 	polisherContextWindow, polisherSource := cfg.ResolveContextWindow(polisherModelName)
@@ -575,7 +591,7 @@ func BuildWorkers(
 		Model:            polisherModel,
 		SystemPrompt:     bundle.Prompts.Polisher,
 		Tools:            polisherTools,
-		MaxTurns:         3,
+		MaxTurns:         6,
 		MaxRetries:       subagentMaxRetries,
 		ThinkingLevel:    resolvedRoleThinking(polisherModel, cfg, "polisher"),
 		OnMessage:        onMsg,
@@ -584,8 +600,11 @@ func BuildWorkers(
 		// 覆盖 agentcore 默认的"从截断处续写"recovery prompt：length 截断后要求模型
 		// 从头完整重输出 edit 列表 JSON，避免仅返回尾段导致 JSON 残缺（见上方注释）。
 		LengthRecoveryPrompt: "上一次输出被截断。不要从中间续写；请从第一条 edit 开始，重新输出完整的精修 edit 列表 JSON（{\"version\":1,\"edits\":[{\"old_string\":\"原文片段\",\"new_string\":\"精修后片段\"}]}）。只输出该 JSON，不要附加任何其他内容。",
-		// mimo-v2.5 真实 max output = 131072（见上方注释），显式覆盖默认 65536。
-		MaxTokens: 131072,
+		// 预算表默认 65,536（计划 §6）；131,072 仅对 polisherHighOutputModels 中
+		// 经过验证的模型生效（见 budgets.go），并按 min(上限, registry 上限,
+		// contextWindow-8k 安全余量) 收敛。
+		MaxTokens:      PolisherMaxOutputTokens(polisherModelName, polisherContextWindow),
+		StopAfterTools: []string{"finish_polish"},
 		StopGuardFactory: func(_, _ string) agentcore.StopGuard {
 			// polisher 正常路径以最终 edit 列表 JSON 响应结束（产物由 polish_draft
 			// 工具校验并落盘），不能用 writer 同款 guard：polisher 协议禁止自行

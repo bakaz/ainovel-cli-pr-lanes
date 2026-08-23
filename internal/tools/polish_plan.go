@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/voocel/agentcore/schema"
@@ -61,13 +62,31 @@ const (
 )
 
 // SubmitPolishPlanTool 是 submit_polish_plan 工具。非 ReadOnly，非 ConcurrencySafe。
+// accumulator 为可替换指针：工具在构建时注册（nil），运行时经 SetAccumulator
+// 注入（包 4 holder / 包 6 polish_draft 每次 run 接线）；Execute 在未注入时
+// 返回明确错误，不会静默空转。
 type SubmitPolishPlanTool struct {
+	mu  sync.Mutex
 	acc *PolishAccumulator
 }
 
-// NewSubmitPolishPlanTool 构造 plan 工具（共享外部注入的 accumulator）。
-func NewSubmitPolishPlanTool(acc *PolishAccumulator) *SubmitPolishPlanTool {
-	return &SubmitPolishPlanTool{acc: acc}
+// NewSubmitPolishPlanTool 构造 plan 工具（无参；accumulator 由 SetAccumulator 注入）。
+func NewSubmitPolishPlanTool() *SubmitPolishPlanTool {
+	return &SubmitPolishPlanTool{}
+}
+
+// SetAccumulator 注入/替换当前 run 的 accumulator（线程安全，运行时调用）。
+func (t *SubmitPolishPlanTool) SetAccumulator(acc *PolishAccumulator) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.acc = acc
+}
+
+// currentAccumulator 返回当前注入的 accumulator（未注入时为 nil）。
+func (t *SubmitPolishPlanTool) currentAccumulator() *PolishAccumulator {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.acc
 }
 
 func (t *SubmitPolishPlanTool) Name() string { return "submit_polish_plan" }
@@ -121,8 +140,12 @@ type polishPlanRequest struct {
 }
 
 func (t *SubmitPolishPlanTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
-	t.acc.mu.Lock()
-	defer t.acc.mu.Unlock()
+	acc := t.currentAccumulator()
+	if acc == nil {
+		return nil, fmt.Errorf("polish accumulator not initialized")
+	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
 
 	reject := func(code string) (json.RawMessage, error) {
 		return json.Marshal(polishPlanResult{Accepted: 0, Rejected: 1,
@@ -135,15 +158,15 @@ func (t *SubmitPolishPlanTool) Execute(_ context.Context, args json.RawMessage) 
 	}
 
 	// §3.1：operation_id / baseline_digest 必须与 accumulator 一致（整批拒绝，不进入预检）。
-	if req.OperationID == nil || *req.OperationID != t.acc.operationID {
+	if req.OperationID == nil || *req.OperationID != acc.operationID {
 		return reject(PolishErrOpMismatch)
 	}
-	if req.BaselineDigest == nil || *req.BaselineDigest != t.acc.baselineDigest {
+	if req.BaselineDigest == nil || *req.BaselineDigest != acc.baselineDigest {
 		return reject(PolishErrBaselineMismatch)
 	}
 
 	// §3.2 状态机：empty → planned；重复 plan → plan_exists；finish 后 → already_finished。
-	switch t.acc.state {
+	switch acc.state {
 	case polishAccPlanned:
 		return reject(PolishErrPlanExists)
 	case polishAccFinished:
@@ -250,10 +273,10 @@ func (t *SubmitPolishPlanTool) Execute(_ context.Context, args json.RawMessage) 
 		PlannedEditCount:  *req.PlannedEditCount,
 		Issues:            issues,
 	}
-	plan.Digest = polishPlanDigest(t.acc.operationID, t.acc.baselineDigest, plan)
-	t.acc.plan = plan
-	t.acc.state = polishAccPlanned
-	t.acc.nextBatch = 1
+	plan.Digest = polishPlanDigest(acc.operationID, acc.baselineDigest, plan)
+	acc.plan = plan
+	acc.state = polishAccPlanned
+	acc.nextBatch = 1
 
 	return json.Marshal(polishPlanResult{Accepted: 1, Rejected: 0, Errors: []polishToolError{}})
 }

@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/voocel/agentcore/schema"
@@ -15,13 +17,31 @@ import (
 // 逐条检查（6–14）只拒绝该条（index=批内下标）。
 
 // SubmitEditBatchTool 是 submit_edit_batch 工具。非 ReadOnly，非 ConcurrencySafe。
+// accumulator 为可替换指针：工具在构建时注册（nil），运行时经 SetAccumulator
+// 注入（包 4 holder / 包 6 polish_draft 每次 run 接线）；Execute 在未注入时
+// 返回明确错误，不会静默空转。
 type SubmitEditBatchTool struct {
+	mu  sync.Mutex
 	acc *PolishAccumulator
 }
 
-// NewSubmitEditBatchTool 构造 batch 工具（共享外部注入的 accumulator）。
-func NewSubmitEditBatchTool(acc *PolishAccumulator) *SubmitEditBatchTool {
-	return &SubmitEditBatchTool{acc: acc}
+// NewSubmitEditBatchTool 构造 batch 工具（无参；accumulator 由 SetAccumulator 注入）。
+func NewSubmitEditBatchTool() *SubmitEditBatchTool {
+	return &SubmitEditBatchTool{}
+}
+
+// SetAccumulator 注入/替换当前 run 的 accumulator（线程安全，运行时调用）。
+func (t *SubmitEditBatchTool) SetAccumulator(acc *PolishAccumulator) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.acc = acc
+}
+
+// currentAccumulator 返回当前注入的 accumulator（未注入时为 nil）。
+func (t *SubmitEditBatchTool) currentAccumulator() *PolishAccumulator {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.acc
 }
 
 func (t *SubmitEditBatchTool) Name() string { return "submit_edit_batch" }
@@ -65,11 +85,15 @@ type polishEditRequest struct {
 }
 
 func (t *SubmitEditBatchTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
-	t.acc.mu.Lock()
-	defer t.acc.mu.Unlock()
+	acc := t.currentAccumulator()
+	if acc == nil {
+		return nil, fmt.Errorf("polish accumulator not initialized")
+	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
 
 	rejectBatch := func(code string) (json.RawMessage, error) {
-		return json.Marshal(polishBatchResult{Accepted: 0, Rejected: 0, AcceptedTotal: len(t.acc.accepted),
+		return json.Marshal(polishBatchResult{Accepted: 0, Rejected: 0, AcceptedTotal: len(acc.accepted),
 			Errors: []polishToolError{{Index: -1, Code: code}}})
 	}
 
@@ -79,15 +103,15 @@ func (t *SubmitEditBatchTool) Execute(_ context.Context, args json.RawMessage) (
 	}
 
 	// §5.3 步骤 1：operation/baseline 一致（整批拒绝，不进入任何预检）。
-	if req.OperationID == nil || *req.OperationID != t.acc.operationID {
+	if req.OperationID == nil || *req.OperationID != acc.operationID {
 		return rejectBatch(PolishErrOpMismatch)
 	}
-	if req.BaselineDigest == nil || *req.BaselineDigest != t.acc.baselineDigest {
+	if req.BaselineDigest == nil || *req.BaselineDigest != acc.baselineDigest {
 		return rejectBatch(PolishErrBaselineMismatch)
 	}
 
 	// §5.3 步骤 2：状态必须为 planned。
-	switch t.acc.state {
+	switch acc.state {
 	case polishAccEmpty:
 		return rejectBatch(PolishErrNotPlanned)
 	case polishAccFinished:
@@ -98,7 +122,7 @@ func (t *SubmitEditBatchTool) Execute(_ context.Context, args json.RawMessage) (
 	if req.BatchIndex == nil {
 		return rejectBatch(PolishErrFieldRequired)
 	}
-	if *req.BatchIndex < 1 || *req.BatchIndex > 4 || *req.BatchIndex != t.acc.nextBatch {
+	if *req.BatchIndex < 1 || *req.BatchIndex > 4 || *req.BatchIndex != acc.nextBatch {
 		return rejectBatch(PolishErrBadBatchIndex)
 	}
 
@@ -111,12 +135,12 @@ func (t *SubmitEditBatchTool) Execute(_ context.Context, args json.RawMessage) (
 	}
 
 	// §5.3 步骤 5：累计 accepted+rejected ≤ 32（rejected 计入上限是有意设计）。
-	if len(t.acc.accepted)+len(t.acc.rejected)+len(*req.Edits) > maxPolishEdits {
+	if len(acc.accepted)+len(acc.rejected)+len(*req.Edits) > maxPolishEdits {
 		return rejectBatch(PolishErrTotalLimit)
 	}
 
 	// 逐条预检（§5.3 步骤 6–14，按序短路；同批内多条互相检查重叠）。
-	normInput := normalizePolishAnchorMapped(t.acc.baselineContent)
+	normInput := normalizePolishAnchorMapped(acc.baselineContent)
 	accepted := 0
 	rejected := 0
 	errors := []polishToolError{}
@@ -127,7 +151,7 @@ func (t *SubmitEditBatchTool) Execute(_ context.Context, args json.RawMessage) (
 			rejected++
 			errors = append(errors, polishToolError{Index: i, Code: code})
 			if raw.IssueID != nil {
-				t.acc.rejected = append(t.acc.rejected, PolishRejectedEdit{IssueID: *raw.IssueID, Code: code, Index: i})
+				acc.rejected = append(acc.rejected, PolishRejectedEdit{IssueID: *raw.IssueID, Code: code, Index: i})
 			}
 		}
 
@@ -140,7 +164,7 @@ func (t *SubmitEditBatchTool) Execute(_ context.Context, args json.RawMessage) (
 			rejectEdit(PolishErrIssueIDInvalid)
 			continue
 		}
-		issue := t.acc.findPlanIssue(*raw.IssueID)
+		issue := acc.findPlanIssue(*raw.IssueID)
 		if issue == nil {
 			rejectEdit(PolishErrIssueUnknown)
 			continue
@@ -149,7 +173,7 @@ func (t *SubmitEditBatchTool) Execute(_ context.Context, args json.RawMessage) (
 			rejectEdit(PolishErrIssueNotEditable)
 			continue
 		}
-		if t.acc.usedIssueIDs[*raw.IssueID] {
+		if acc.usedIssueIDs[*raw.IssueID] {
 			rejectEdit(PolishErrIssueReused)
 			continue
 		}
@@ -189,7 +213,7 @@ func (t *SubmitEditBatchTool) Execute(_ context.Context, args json.RawMessage) (
 		}
 
 		// 步骤 10：old_string 唯一命中 baseline（exact → normalized 两级，复用 locatePolishEdit）。
-		loc, reason, ok := locatePolishEdit(t.acc.baselineContent, &normInput,
+		loc, reason, ok := locatePolishEdit(acc.baselineContent, &normInput,
 			PolishEditItem{OldString: *raw.OldString, NewString: *raw.NewString}, i)
 		if !ok {
 			if reason == PolishEditDropAnchorAmbiguous {
@@ -201,7 +225,7 @@ func (t *SubmitEditBatchTool) Execute(_ context.Context, args json.RawMessage) (
 		}
 
 		// 步骤 11：与已接受候选不重叠（byte range 判定；含本批已接受的）。
-		if polishAcceptedOverlaps(loc.Start, loc.End, t.acc.accepted) ||
+		if polishAcceptedOverlaps(loc.Start, loc.End, acc.accepted) ||
 			polishAcceptedOverlaps(loc.Start, loc.End, batchAccepted) {
 			rejectEdit(PolishErrAnchorOverlap)
 			continue
