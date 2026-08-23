@@ -131,7 +131,7 @@ func renderEventLineClocks(ev host.Event, width, spinnerFrame int, clocks eventC
 			first += "\n" + pad + errStyle.Render(l)
 		}
 		if ev.Duration > 0 {
-			first += renderEventClocks(eventClocks{tool: ev.Duration})
+			first += renderEventClocks(eventClocks{work: ev.Duration})
 		}
 		return first
 
@@ -211,9 +211,10 @@ func eventAgentColor(agent string) lipgloss.AdaptiveColor {
 }
 
 type eventClocks struct {
-	started time.Duration
-	think   time.Duration
-	tool    time.Duration
+	total time.Duration // 派发墙钟
+	think time.Duration // 所有非工具时间（含首次思考与工具之间）
+	work  time.Duration // 派发行：所有工具之和；工具行：这一次
+	split bool          // 派发行显示 总=想+工
 }
 
 func eventElapsed(ev host.Event) time.Duration {
@@ -233,48 +234,18 @@ func clocksFor(events []host.Event, idx int) eventClocks {
 	ev := events[idx]
 	switch ev.Category {
 	case "DISPATCH", "DECISION":
-		c := eventClocks{started: eventElapsed(ev)}
-		if ev.Running() {
-			c.tool = runningToolElapsed(events, ev.Agent)
-			c.think = thinkElapsed(events, idx)
+		total := eventElapsed(ev)
+		work := dispatchToolTotal(events, idx)
+		think := total - work
+		if think < 0 {
+			think = 0
 		}
-		return c
+		return eventClocks{total: total, think: think, work: work, split: true}
 	case "TOOL", "REVIEW", "CHECK":
-		c := eventClocks{tool: eventElapsed(ev), think: thinkElapsed(events, idx)}
-		if start := parentDispatchTime(events, idx); !start.IsZero() {
-			if ev.Running() {
-				c.started = time.Since(start)
-			} else if !ev.FinishedAt.IsZero() {
-				c.started = ev.FinishedAt.Sub(start)
-			} else if ev.Duration > 0 {
-				c.started = ev.Time.Add(ev.Duration).Sub(start)
-			}
-			if c.started < 0 {
-				c.started = 0
-			}
-		}
-		return c
+		return eventClocks{work: eventElapsed(ev)}
 	default:
 		return eventClocks{}
 	}
-}
-
-func parentDispatchTime(events []host.Event, idx int) time.Time {
-	agent := events[idx].Agent
-	var fallback time.Time
-	for i := idx; i >= 0; i-- {
-		ev := events[i]
-		if ev.Category != "DISPATCH" || ev.Time.IsZero() {
-			continue
-		}
-		if agent == "" || ev.Agent == agent {
-			return ev.Time
-		}
-		if fallback.IsZero() {
-			fallback = ev.Time
-		}
-	}
-	return fallback
 }
 
 func isToolish(ev host.Event) bool {
@@ -286,119 +257,48 @@ func isToolish(ev host.Event) bool {
 	}
 }
 
-func toolFinishTime(ev host.Event) time.Time {
-	if !ev.FinishedAt.IsZero() {
-		return ev.FinishedAt
-	}
-	if ev.Duration > 0 && !ev.Time.IsZero() {
-		return ev.Time.Add(ev.Duration)
-	}
-	return time.Time{}
-}
-
-func lastFinishedToolBefore(events []host.Event, idx int, agent string) (host.Event, bool) {
-	start := idx - 1
-	if start >= len(events) {
-		start = len(events) - 1
-	}
-	for i := start; i >= 0; i-- {
+func dispatchToolTotal(events []host.Event, dispatchIdx int) time.Duration {
+	agent := events[dispatchIdx].Agent
+	var total time.Duration
+	for i := dispatchIdx + 1; i < len(events); i++ {
 		ev := events[i]
-		if ev.Category == "DISPATCH" && agent != "" && ev.Agent == agent {
-			return host.Event{}, false
+		if ev.Category == "DISPATCH" && (agent == "" || ev.Agent == agent) {
+			break
 		}
-		if !isToolish(ev) || ev.Running() {
+		if !isToolish(ev) {
 			continue
 		}
 		if agent != "" && ev.Agent != "" && ev.Agent != agent {
 			continue
 		}
-		if toolFinishTime(ev).IsZero() {
-			continue
-		}
-		return ev, true
+		total += eventElapsed(ev)
 	}
-	return host.Event{}, false
+	return total
 }
 
-func thinkElapsed(events []host.Event, idx int) time.Duration {
-	if idx < 0 || idx >= len(events) {
-		return 0
-	}
-	ev := events[idx]
-	agent := ev.Agent
-	switch ev.Category {
-	case "DISPATCH", "DECISION":
-		if !ev.Running() {
-			return 0
-		}
-		for i := len(events) - 1; i >= 0; i-- {
-			t := events[i]
-			if t.Running() && isToolish(t) && (agent == "" || t.Agent == agent) {
-				prev, ok := lastFinishedToolBefore(events, i, agent)
-				if !ok {
-					return 0
-				}
-				d := t.Time.Sub(toolFinishTime(prev))
-				if d < time.Second {
-					return 0
-				}
-				return d
-			}
-		}
-		prev, ok := lastFinishedToolBefore(events, len(events), agent)
-		if !ok {
-			return 0
-		}
-		d := time.Since(toolFinishTime(prev))
-		if d < time.Second {
-			return 0
-		}
-		return d
-	case "TOOL", "REVIEW", "CHECK":
-		prev, ok := lastFinishedToolBefore(events, idx, agent)
-		if !ok || ev.Time.IsZero() {
-			return 0
-		}
-		d := ev.Time.Sub(toolFinishTime(prev))
-		if d < time.Second {
-			return 0
-		}
-		return d
-	default:
-		return 0
-	}
-}
-
-func runningToolElapsed(events []host.Event, agent string) time.Duration {
-	for i := len(events) - 1; i >= 0; i-- {
-		ev := events[i]
-		if !ev.Running() {
-			continue
-		}
-		if isToolish(ev) && (agent == "" || ev.Agent == agent) {
-			return eventElapsed(ev)
-		}
-	}
-	return 0
-}
-
-// renderEventClocks：(started …) 派发起算；(think …) 两工具之间思考；(tool …) 本次 tool call。
+// renderEventClocks 派发行：(47m = 想 39m + 工 8m)；工具行只显示这一次 (4m)。
 func renderEventClocks(c eventClocks) string {
-	var parts []string
-	if c.started > 0 {
-		parts = append(parts, "started "+formatDuration(c.started))
+	if c.split {
+		if c.total <= 0 {
+			return ""
+		}
+		var parts []string
+		if c.think > 0 {
+			parts = append(parts, "想 "+formatDuration(c.think))
+		}
+		if c.work > 0 {
+			parts = append(parts, "工 "+formatDuration(c.work))
+		}
+		text := formatDuration(c.total)
+		if len(parts) > 0 {
+			text += " = " + strings.Join(parts, " + ")
+		}
+		return " " + lipgloss.NewStyle().Foreground(colorDim).Italic(true).Render("("+text+")")
 	}
-	if c.think > 0 {
-		parts = append(parts, "think "+formatDuration(c.think))
-	}
-	if c.tool > 0 {
-		parts = append(parts, "tool "+formatDuration(c.tool))
-	}
-	if len(parts) == 0 {
+	if c.work <= 0 {
 		return ""
 	}
-	text := "(" + strings.Join(parts, ") (") + ")"
-	return " " + lipgloss.NewStyle().Foreground(colorDim).Italic(true).Render(text)
+	return " " + lipgloss.NewStyle().Foreground(colorDim).Italic(true).Render("("+formatDuration(c.work)+")")
 }
 
 func formatDuration(d time.Duration) string {
