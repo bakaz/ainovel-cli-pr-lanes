@@ -139,6 +139,70 @@ func TestPolisherPrompt_LoadedAndOverlay(t *testing.T) {
 	}
 }
 
+// TestPolisherPrompt_FullContextProtocol 验证 polisher.md 描述完整阅读 + 三工具协议：
+// 先 plan → 最多 4 批 batch → finish；每批 ≤8、总 ≤32、软目标 20、全部 old_string
+// 基于同一 baseline；fact_risk=high 必须 defer_to_writer；既有 finding 与自主发现
+// 必须区分 origin。
+func TestPolisherPrompt_FullContextProtocol(t *testing.T) {
+	protocol := mustRead(promptsFS, "prompts/polisher.md")
+	required := []string{
+		"submit_polish_plan",
+		"submit_edit_batch",
+		"finish_polish",
+		"完整阅读全文",
+		"完整事实大纲",
+		"完整 findings",
+		"origin",
+		"existing_finding",
+		"polisher_discovered",
+		"fact_risk",
+		"defer_to_writer",
+		"每批最多 8",
+		"最多 4 批",
+		"最多 32",
+		"软目标",
+		"baseline",
+	}
+	for _, key := range required {
+		if !contains(t, protocol, key) {
+			t.Errorf("polisher.md 缺少协议关键词 %q", key)
+		}
+	}
+	// 软目标不是最低配额：问题少时允许 no-op，不得为凑数过度修改
+	if !contains(t, protocol, "no-op") {
+		t.Error("polisher.md 必须允许 no-op 终态")
+	}
+	if !contains(t, protocol, "凑数") {
+		t.Error("polisher.md 必须禁止为凑数制造无价值修改")
+	}
+	// 不做穷举式 checklist 审计的意图必须保留（与主动审查全文协调，不自相矛盾）
+	if !contains(t, protocol, "穷举") {
+		t.Error("polisher.md 必须保留'不做穷举式审计清单'的意图")
+	}
+	// 与 internal/agents 的既有契约：必须声明除候选提交工具外不提供任何工具
+	if !contains(t, protocol, "不提供任何工具") {
+		t.Error("polisher.md 必须声明除候选提交工具外不提供任何工具")
+	}
+}
+
+// TestStyleCriticPrompt_IndependentFinalReview 验证 style-critic.md 保持独立终审角色：
+// 只判断阻断性问题、不承担 Polisher 完整审稿职责、区分内容问题与技术/协议失败。
+func TestStyleCriticPrompt_IndependentFinalReview(t *testing.T) {
+	p := mustRead(promptsFS, "prompts/style-critic.md")
+	if !contains(t, p, "独立终审") {
+		t.Error("style-critic.md 必须声明独立终审角色")
+	}
+	if !contains(t, p, "阻断") {
+		t.Error("style-critic.md 必须限定只判断阻断性问题")
+	}
+	if !contains(t, p, "Polisher") {
+		t.Error("style-critic.md 必须声明不承担 Polisher 的完整审稿职责")
+	}
+	if !contains(t, p, "技术") || !contains(t, p, "协议") {
+		t.Error("style-critic.md 必须区分内容问题与技术/协议失败")
+	}
+}
+
 // TestStyleCriticPrompt_Loaded 验证 style-critic.md 嵌入并可通过 Load 正常访问。
 func TestStyleCriticPrompt_Loaded(t *testing.T) {
 	b := Load("default", LoadOptions{})
