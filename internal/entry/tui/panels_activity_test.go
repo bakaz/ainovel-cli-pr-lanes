@@ -80,47 +80,14 @@ func TestRenderEventLine_TOOL_DiscardedShowsOStroke(t *testing.T) {
 	if !strings.Contains(out, "5.0s") {
 		t.Errorf("discarded TOOL should show duration (5.0s): %q", out)
 	}
-	if !strings.Contains(out, "tool") {
-		t.Errorf("discarded TOOL should label tool duration: %q", out)
-	}
 }
 
-func TestRenderEventLine_DispatchAndToolUseSeparateClocks(t *testing.T) {
-	events := []host.Event{
-		{
-			ID:       "d1",
-			Time:     time.Now().Add(-20*time.Minute - 8*time.Second),
-			Category: "DISPATCH",
-			Agent:    "writer",
-			Summary:  "写第 845 章",
-		},
-		{
-			ID:       "t1",
-			Time:     time.Now().Add(-4*time.Minute - 2*time.Second),
-			Category: "TOOL",
-			Agent:    "writer",
-			Summary:  "plan_chapter",
-			Depth:    1,
-		},
-	}
-	out := renderEventContent(events, 120, 0)
-	if !strings.Contains(out, "started") || !strings.Contains(out, "tool") {
-		t.Fatalf("expected (started …) (tool …), got %q", out)
-	}
-	if !strings.Contains(out, "20m") {
-		t.Fatalf("started clock should count from dispatch: %q", out)
-	}
-	if !strings.Contains(out, "4m") {
-		t.Fatalf("tool clock should count from tool_call: %q", out)
-	}
-}
-
-func TestRenderEventContent_ThinkClockBetweenTools(t *testing.T) {
+func TestRenderEventContent_DispatchTotalsIncludeThinkAndTools(t *testing.T) {
 	now := time.Now()
 	events := []host.Event{
 		{
 			ID:       "d1",
-			Time:     now.Add(-10 * time.Minute),
+			Time:     now.Add(-20 * time.Minute),
 			Category: "DISPATCH",
 			Agent:    "writer",
 			Summary:  "写第 845 章",
@@ -137,19 +104,33 @@ func TestRenderEventContent_ThinkClockBetweenTools(t *testing.T) {
 		},
 		{
 			ID:       "t2",
-			Time:     now.Add(-2 * time.Minute),
+			Time:     now.Add(-4 * time.Minute),
 			Category: "TOOL",
 			Agent:    "writer",
 			Summary:  "draft_chapter",
 			Depth:    1,
 		},
 	}
-	out := renderEventContent(events, 140, 0)
-	if !strings.Contains(out, "think") {
-		t.Fatalf("gap between tools should show think clock: %q", out)
+	out := renderEventContent(events, 160, 0)
+	if !strings.Contains(out, "想") || !strings.Contains(out, "工") || !strings.Contains(out, "=") {
+		t.Fatalf("dispatch should show 总=想+工, got %q", out)
 	}
-	if !strings.Contains(out, "5m") {
-		t.Fatalf("think clock should be ~5m between tool finish and next tool_call: %q", out)
+	if !strings.Contains(out, "20m") {
+		t.Fatalf("dispatch total should be ~20m: %q", out)
+	}
+	// 工 = 完成的 1m + 进行中的 ~4m
+	if !strings.Contains(out, "工 5m") && !strings.Contains(out, "工 4m") {
+		t.Fatalf("dispatch 工 should include finished+running tools: %q", out)
+	}
+	lines := strings.Split(out, "\n")
+	if len(lines) < 3 {
+		t.Fatalf("expected dispatch + 2 tools, got %d lines: %q", len(lines), out)
+	}
+	if strings.Contains(lines[2], "想") || strings.Contains(lines[2], "started") {
+		t.Fatalf("tool line should only show this call, got %q", lines[2])
+	}
+	if !strings.Contains(lines[2], "4m") {
+		t.Fatalf("current tool line should show this call ~4m: %q", lines[2])
 	}
 }
 
