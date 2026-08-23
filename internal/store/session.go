@@ -62,7 +62,7 @@ func (s *SessionStore) LogCoCreate(entry any) error {
 		return fmt.Errorf("marshal cocreate session: %w", err)
 	}
 	data = append(data, '\n')
-	return s.io.AppendLine("meta/sessions/cocreate.jsonl", data)
+	return s.io.AppendLineBuffered("meta/sessions/cocreate.jsonl", data)
 }
 
 // Log 追加一条消息到指定路径，自动压缩大内容。
@@ -112,7 +112,7 @@ func (s *SessionStore) logEntry(rel string, msg agentcore.AgentMessage, meta *se
 		return fmt.Errorf("marshal session message: %w", err)
 	}
 	data = append(data, '\n')
-	return s.io.AppendLine(rel, data)
+	return s.io.AppendLineBuffered(rel, data)
 }
 
 func usageMeta(usage *agentcore.Usage) *sessionLogMeta {
@@ -164,20 +164,35 @@ func (s *SessionStore) subAgentPath(agentName, task string) string {
 		return fmt.Sprintf("meta/sessions/agents/%s-%s.jsonl", agentName, cached)
 	}
 	s.seq[agentName]++
-	suffix = fmt.Sprintf("%03d", s.seq[agentName])
+	suffix = fmt.Sprintf("seq%03d", s.seq[agentName])
 	s.taskKey[key] = suffix
 	s.mu.Unlock()
 	return fmt.Sprintf("meta/sessions/agents/%s-%s.jsonl", agentName, suffix)
 }
 
-var chapterRe = regexp.MustCompile(`第\s*(\d+)\s*章`)
+var (
+	chapterRe       = regexp.MustCompile(`第\s*(\d+)\s*章`)
+	chapterFieldRe  = regexp.MustCompile(`(?i)(?:chapter|"chapter")\s*[=:]?\s*"?(\d+)`)
+	chapterDraftIdx = "### 章节与草稿"
+)
 
 func extractChapter(task string) string {
-	m := chapterRe.FindStringSubmatch(task)
-	if len(m) < 2 {
-		return ""
+	if idx := strings.Index(task, chapterDraftIdx); idx >= 0 {
+		if m := chapterRe.FindStringSubmatch(task[idx:]); len(m) >= 2 {
+			return chapterSuffix(m[1])
+		}
 	}
-	n, _ := strconv.Atoi(m[1])
+	if all := chapterRe.FindAllStringSubmatch(task, -1); len(all) > 0 {
+		return chapterSuffix(all[len(all)-1][1])
+	}
+	if m := chapterFieldRe.FindStringSubmatch(task); len(m) >= 2 {
+		return chapterSuffix(m[1])
+	}
+	return ""
+}
+
+func chapterSuffix(raw string) string {
+	n, _ := strconv.Atoi(raw)
 	if n <= 0 {
 		return ""
 	}
@@ -220,6 +235,16 @@ func toolNameFromMeta(meta map[string]any) string {
 
 // compactText 压缩 tool result 的 text content。
 func compactText(role agentcore.Role, toolName, text string) string {
+	if (role == agentcore.RoleUser || role == agentcore.RoleAssistant) && len(text) > 8192 {
+		keep := text
+		if idx := strings.Index(text, chapterDraftIdx); idx >= 0 {
+			keep = text[idx:]
+		}
+		if len(keep) > 512 {
+			keep = keep[:512]
+		}
+		return fmt.Sprintf("[session_compact: %s %dB]\n%s", role, len(text), keep)
+	}
 	if role != agentcore.RoleTool || len(text) < 4096 {
 		return text
 	}

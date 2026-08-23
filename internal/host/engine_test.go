@@ -2489,20 +2489,25 @@ func exhaustedLedger(chapter int) *domain.StyleReviewLedger {
 func TestEngine_ExhaustedLedgerNoWriterDispatch(t *testing.T) {
 	const ch = 1
 	st := exhaustedTestStore(t, ch, exhaustedLedger(ch))
+	if err := st.RunMeta.Init("default", "test", "test"); err != nil {
+		t.Fatal(err)
+	}
 
 	var workerCalls int32
+	var notifyCalls int32
 	e := &engine{
-		store:           st,
-		workers:         subagent.NewRunner(),
-		notify:          func(_, _, _, _ string) {},
+		store:   st,
+		workers: subagent.NewRunner(),
+		notify: func(_, _, _, _ string) {
+			atomic.AddInt32(&notifyCalls, 1)
+		},
 		emitEvent:       func(Event) {},
 		onPause:         func(string) {},
 		onDone:          func() {},
 		beforeRunWorker: func() { atomic.AddInt32(&workerCalls, 1) },
 	}
 	e.gate = NewChapterAdvanceGate(st, func(string) {}, func(string, string) {})
-	// The writer will target ch via writerTargetChapter (NextChapter).
-	e.next = nil
+	e.next = &flow.Instruction{Agent: "writer", Task: "写第 1 章", Chapter: ch}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -2510,10 +2515,27 @@ func TestEngine_ExhaustedLedgerNoWriterDispatch(t *testing.T) {
 	e.running = true
 	e.cancel = cancel
 	go e.run(ctx)
-	<-done
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("engine did not stop after exhausted precheck")
+	}
 
 	if n := atomic.LoadInt32(&workerCalls); n != 0 {
 		t.Fatalf("runWorker called %d times, expected 0 (exhausted should block dispatch)", n)
+	}
+	if n := atomic.LoadInt32(&notifyCalls); n != 1 {
+		t.Fatalf("pause notify called %d times, want 1", n)
+	}
+}
+
+func TestTrackDeadlockEmptyAgentStops(t *testing.T) {
+	e := &engine{}
+	inst := &flow.Instruction{}
+	p := inst
+	if !e.trackDeadlock(context.Background(), &p) {
+		t.Fatal("empty agent must stop the engine loop, not continue")
 	}
 }
 

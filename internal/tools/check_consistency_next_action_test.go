@@ -72,6 +72,32 @@ func TestInteg_CriticOn_NoLedger_FieldPresent(t *testing.T) {
 	assertPresentAction(t, m, ActionReviewStyle)
 }
 
+func TestInteg_UnderMin_FieldSuggestsAppend(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	snap := rules.BuildSnapshot([]rules.Candidate{
+		rules.SystemDefaults(),
+		{Source: "test", Structured: rules.Structured{
+			ChapterWords: &rules.WordRange{Min: 3000, Max: 6000},
+		}},
+	})
+	must(t, st.UserRules.Save(&snap))
+	must(t, st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}))
+	must(t, st.Drafts.SaveDraft(1, "# 一\n她走到窗前，心里骂自己丢人，真不要脸。"))
+
+	m := mustUnmarshal(t, mustExecute(t, st, 1))
+	action, ok := m["required_next_action"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected append required_next_action, got %v", m)
+	}
+	if action["action"] != ActionDraftChapter || action["mode"] != "append" {
+		t.Fatalf("required_next_action = %v, want draft_chapter mode=append", action)
+	}
+	guidance, ok := m["word_count_guidance"].(map[string]any)
+	if !ok || guidance["status"] != "under_min" || guidance["recommended_mode"] != "append" {
+		t.Fatalf("word_count_guidance = %v, want under_min/append", m["word_count_guidance"])
+	}
+}
+
 func TestInteg_Terminal_DigestMatch_FieldPresent(t *testing.T) {
 	st := store.NewStore(t.TempDir())
 	savePermissiveUserRules(t, st)

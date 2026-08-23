@@ -17,14 +17,30 @@ import "github.com/charmbracelet/lipgloss"
 //   - 亮色终端 → 用 colorText 的 Light 档（深棕 #3d3529），保留品牌暖调；
 //     亮底默认黑色对比度太硬，原本调过的深棕在亮底视觉更柔和。
 //
-// AdaptiveColor 两端都必须给颜色值，没有"无色"档，所以这里启动时判一次背景，
-// 之后所有概览值/章节正文/命令描述等"中性正文"统一引用 bodyTextColor。
-var bodyTextColor lipgloss.TerminalColor = func() lipgloss.TerminalColor {
-	if lipgloss.HasDarkBackground() {
-		return lipgloss.NoColor{}
+// AdaptiveColor 两端都必须给颜色值，没有"无色"档。HasDarkBackground 在
+// package init 时查询会把错误结果锁进 sync.Once（lipgloss #1036），所以
+// 默认按暗底继承终端前景，等第一帧 WindowSizeMsg 再校正亮底深棕。
+var (
+	bodyTextColor       lipgloss.TerminalColor = lipgloss.NoColor{}
+	bodyTextThemeSynced bool
+	bodyTextIsDark      bool
+)
+
+func syncBodyTextTheme() {
+	dark := lipgloss.HasDarkBackground()
+	if bodyTextThemeSynced && bodyTextIsDark == dark {
+		return
 	}
-	return lipgloss.Color("#3d3529")
-}()
+	bodyTextThemeSynced = true
+	bodyTextIsDark = dark
+	if dark {
+		bodyTextColor = lipgloss.NoColor{}
+	} else {
+		bodyTextColor = lipgloss.Color("#3d3529")
+	}
+	fieldValueStyle = lipgloss.NewStyle().Foreground(bodyTextColor)
+	cardContentStyle = lipgloss.NewStyle().Foreground(bodyTextColor)
+}
 
 var (
 	colorText    = lipgloss.AdaptiveColor{Light: "#3d3529", Dark: "#e8e0d0"}

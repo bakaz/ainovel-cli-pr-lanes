@@ -33,6 +33,10 @@ func TestValidateCharacterStateUpdate(t *testing.T) {
 	if err := ValidateCharacterStateUpdate(ok); err != nil {
 		t.Fatalf("valid update rejected: %v", err)
 	}
+	clear := CharacterStateUpdate{Entity: "林墨", Field: "status.realm", Value: "", Reason: "不再约束"}
+	if err := ValidateCharacterStateUpdate(clear); err != nil {
+		t.Fatalf("clear with reason rejected: %v", err)
+	}
 	// 上限边界：恰好 Max 长度通过
 	boundary := CharacterStateUpdate{
 		Entity:   "林墨",
@@ -54,6 +58,8 @@ func TestValidateCharacterStateUpdate(t *testing.T) {
 		{"field outside namespace", CharacterStateUpdate{Entity: "林墨", Field: "freeform", Value: "x"}},
 		{"value over limit", CharacterStateUpdate{Entity: "林墨", Field: "status.realm", Value: strings.Repeat("值", MaxCharacterValueRunes+1)}},
 		{"evidence over limit", CharacterStateUpdate{Entity: "林墨", Field: "status.realm", Value: "x", Evidence: strings.Repeat("引", MaxCharacterEvidenceRunes+1)}},
+		{"empty value without reason", CharacterStateUpdate{Entity: "林墨", Field: "status.realm", Value: ""}},
+		{"whitespace value without reason", CharacterStateUpdate{Entity: "林墨", Field: "status.realm", Value: "  "}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

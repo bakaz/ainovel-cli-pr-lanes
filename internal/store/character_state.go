@@ -30,14 +30,13 @@ func (s *WorldStore) SaveCharacterState(entries []domain.CharacterStateEntry) er
 	return s.io.WriteJSON(characterStateFile, entries)
 }
 
-// UpsertCharacterState 批量 upsert 角色受控状态（原子写入）：
+// UpsertCharacterState 批量更新角色受控状态（原子写入）：
 //   - 每个 update 先经 domain.ValidateCharacterStateUpdate 校验；
-//   - (entity, field) 唯一键 upsert：新值覆盖旧值，updated_chapter=chapter，evidence 更新；
+//   - value 非空：(entity, field) upsert，updated_chapter=chapter；
+//   - value 为空且带 reason：从当前投影删除该键（不存在则幂等跳过）；
+//   - 同一批先处理清键再处理 upsert，清键腾出的名额可供本批新增使用；
 //   - 新增 (entity, field) 时单实体字段数不得超过 MaxFieldsPerEntity；
-//   - 对每个 upsert 派生 StateChange（old_value=旧值，new_value=新值，reason=update.Reason）
-//     追加到 meta/state_changes.json，复用 stateChangeKey 幂等去重——同章重复提交不重复 append；
-//   - 写入顺序：先追加派生 state_changes（幂等 key 保证重试不重复），再写
-//     character_state.json——任何单点失败后重试可收敛（见函数内注释）。
+//   - 对每个实际变化派生 StateChange，追加到 meta/state_changes.json。
 func (s *WorldStore) UpsertCharacterState(chapter int, updates []domain.CharacterStateUpdate) error {
 	return s.io.WithWriteLock(func() error {
 		var entries []domain.CharacterStateEntry
@@ -53,10 +52,50 @@ func (s *WorldStore) UpsertCharacterState(chapter int, updates []domain.Characte
 			fieldCount[e.Entity]++
 		}
 		var derived []domain.StateChange
+		var clears, sets []domain.CharacterStateUpdate
 		for _, u := range updates {
 			if err := domain.ValidateCharacterStateUpdate(u); err != nil {
 				return fmt.Errorf("%w: %v", errs.ErrToolArgs, err)
 			}
+			if u.Clears() {
+				clears = append(clears, u)
+			} else {
+				sets = append(sets, u)
+			}
+		}
+		deleted := make(map[string]bool, len(clears))
+		for _, u := range clears {
+			key := u.Entity + "\x00" + u.Field
+			i, ok := idx[key]
+			if !ok || deleted[key] {
+				continue
+			}
+			oldValue := entries[i].Value
+			deleted[key] = true
+			derived = append(derived, domain.StateChange{
+				Chapter:  chapter,
+				Entity:   u.Entity,
+				Field:    u.Field,
+				OldValue: oldValue,
+				NewValue: "",
+				Reason:   u.Reason,
+			})
+		}
+		if len(deleted) > 0 {
+			kept := make([]domain.CharacterStateEntry, 0, len(entries)-len(deleted))
+			idx = make(map[string]int, len(entries)-len(deleted))
+			fieldCount = make(map[string]int)
+			for _, e := range entries {
+				if deleted[e.Entity+"\x00"+e.Field] {
+					continue
+				}
+				idx[e.Entity+"\x00"+e.Field] = len(kept)
+				fieldCount[e.Entity]++
+				kept = append(kept, e)
+			}
+			entries = kept
+		}
+		for _, u := range sets {
 			key := u.Entity + "\x00" + u.Field
 			oldValue := ""
 			if i, ok := idx[key]; ok {

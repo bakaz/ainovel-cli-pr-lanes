@@ -21,7 +21,9 @@ func TestWindowResizeRebuildsCenterViewports(t *testing.T) {
 		Summary:  strings.Repeat("窗口调整后事件内容必须按新宽度重新换行。", 8),
 		Level:    "error",
 	}}
-	m.streamRounds = []string{strings.Repeat("窗口调整后流式内容必须按新宽度重新换行。", 12)}
+	var round streamRound
+	round.append(strings.Repeat("窗口调整后流式内容必须按新宽度重新换行。", 12))
+	m.streamRounds = []streamRound{round}
 	m.refreshEventViewport()
 	m.refreshStreamViewport()
 
@@ -47,8 +49,5 @@ func TestWindowResizeRebuildsCenterViewports(t *testing.T) {
 	}
 	if got.streamVP.View() != expectedStream.View() {
 		t.Fatal("stream viewport was not rebuilt for the new width")
-	}
-	if got.streamDirty {
-		t.Fatal("resize should clear stale stream dirty state")
 	}
 }

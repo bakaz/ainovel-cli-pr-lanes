@@ -552,7 +552,8 @@ output/{novel_name}/
 │   ├── progress.json   # 进度状态
 │   ├── timeline.json   # 时间线
 │   ├── foreshadow.json # 伏笔台账
-│   ├── state_changes.json # 角色状态变化记录
+│   ├── character_state.json # 角色受控状态当前投影（value="" + reason 可删键）
+│   ├── state_changes.json # 角色状态变化流水（含清键 tombstone）
 │   ├── style_rules.json# 写作风格规则（弧边界时提炼）
 │   ├── snapshots/      # 角色状态快照（长篇）
 │   ├── checkpoints.jsonl # Step 级 checkpoint（每个工具成功后追加）

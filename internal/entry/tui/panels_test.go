@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/voocel/ainovel-cli/internal/host"
@@ -84,5 +85,63 @@ func TestRenderDetailContentWrapsCJK(t *testing.T) {
 	joined := strings.ReplaceAll(strings.ReplaceAll(out, "\n", ""), " ", "")
 	if !strings.Contains(joined, "坚持程序正义") {
 		t.Errorf("折行后应保留完整描述，实际输出:\n%s", out)
+	}
+}
+
+func TestAgentContextLineHidesStaleStrategy(t *testing.T) {
+	line := agentContextLine(host.AgentSnapshot{
+		Context: host.AgentContextSnapshot{
+			Tokens:        80000,
+			ContextWindow: 200000,
+			Percent:       40,
+			Strategy:      "tool_result_microcompact",
+			StrategyAt:    time.Now(),
+		},
+	})
+	if strings.Contains(line, "微压缩") {
+		t.Fatalf("strategy without LastChanged should stay hidden: %q", line)
+	}
+	fresh := agentContextLine(host.AgentSnapshot{
+		Context: host.AgentContextSnapshot{
+			Tokens:        80000,
+			ContextWindow: 200000,
+			Percent:       40,
+			Strategy:      "tool_result_microcompact",
+			LastChanged:   true,
+			StrategyAt:    time.Now(),
+		},
+	})
+	if !strings.Contains(fresh, "微压缩") {
+		t.Fatalf("fresh compact should show strategy: %q", fresh)
+	}
+	projected := agentContextLine(host.AgentSnapshot{
+		Context: host.AgentContextSnapshot{
+			Tokens:        80000,
+			ContextWindow: 200000,
+			Percent:       40,
+			Scope:         "projected",
+			LastChanged:   true,
+		},
+	})
+	if strings.Contains(projected, "投影") {
+		t.Fatalf("projected scope should stay off the idle line: %q", projected)
+	}
+}
+
+func TestRenderStateContentUsesOutlinePlannedCount(t *testing.T) {
+	out := renderStateContent(host.UISnapshot{
+		Layered:        true,
+		CompletedCount: 30,
+		OutlinePlanned: 837,
+		Outline: []host.OutlineSnapshot{
+			{Chapter: 31, Title: "当前卷窗口"},
+			{Chapter: 32, Title: "下一章"},
+		},
+	}, 32)
+	if !strings.Contains(out, "837") {
+		t.Fatalf("sidebar should show full planned count, got %q", out)
+	}
+	if strings.Contains(out, "2 章") && !strings.Contains(out, "837") {
+		t.Fatalf("sidebar should not use window length as planned count: %q", out)
 	}
 }

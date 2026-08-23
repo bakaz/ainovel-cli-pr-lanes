@@ -110,6 +110,26 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 			})
 		}
 	}
+	// Once the initial draft is known to be short for the sole mechanical
+	// reason of the lower bound, reject another full overwrite before it can
+	// create a checkpoint. This leaves rewrite/review/error paths untouched.
+	if t.fsmConfig.Enabled && a.Mode == "write" {
+		if existing, loadErr := t.store.Drafts.LoadDraft(a.Chapter); loadErr == nil && existing != "" {
+			wordCount := utf8.RuneCountInString(existing)
+			if shouldForceAppendUnderMin(t.store, a.Chapter, existing, wordCount) {
+				rng := chapterWordRange(t.store)
+				deficit := 0
+				if rng != nil && rng.Min > wordCount {
+					deficit = rng.Min - wordCount
+				}
+				return nil, fmt.Errorf(
+					"draft_chapter: 第 %d 章当前草稿 %d 字，唯一 error 是低于最小字数（还差 %d 字）；请使用 mode=append 续写，不要再次 mode=write 整章覆盖: %w",
+					a.Chapter, wordCount, deficit, errs.ErrToolPrecondition,
+				)
+			}
+		}
+	}
+
 	if err := t.store.Progress.StartChapter(a.Chapter); err != nil {
 		return nil, fmt.Errorf("mark chapter in progress: %w", err)
 	}

@@ -119,14 +119,15 @@ type agentExtractor struct {
 }
 
 type agentState struct {
-	name     string
-	state    string
-	tool     string
-	summary  string
-	turn     int
-	taskKind string
-	context  AgentContextSnapshot
-	updated  time.Time
+	name           string
+	state          string
+	tool           string
+	summary        string
+	turn           int
+	taskKind       string
+	context        AgentContextSnapshot
+	updated        time.Time
+	lastLogPercent float64
 }
 
 func newObserver(s *storepkg.Store, emitEv func(Event), emitD func(string), emitC func()) *observer {
@@ -343,6 +344,8 @@ func (o *observer) agentSnapshots() []AgentSnapshot {
 			Context:   a.context,
 			UpdatedAt: a.updated,
 		})
+		// LastChanged 只亮一帧：TUI 读走后清掉，避免压缩策略一直挂在侧栏。
+		a.context.LastChanged = false
 	}
 	return snaps
 }

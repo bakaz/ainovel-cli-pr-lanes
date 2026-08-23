@@ -1285,3 +1285,33 @@ func TestComputeChapterStage_NeedsCommitArgsHint(t *testing.T) {
 		t.Fatalf("RequiredNextAction 必须携带 commit 参数提示，got %+v", na)
 	}
 }
+func TestComputeChapterStage_UnderMinSuggestsAppend(t *testing.T) {
+	d := dig("short-draft")
+	got := ComputeChapterStage(ChapterStageInput{
+		StyleReviewMode:     domain.StyleQualityCritic,
+		DraftExists:         true,
+		DraftDigest:         d,
+		HasMechanicalErrors: true,
+		OnlyUnderMinError:   true,
+		LatestConsistency:   consistencyCP(1, d),
+	})
+	if got.Stage != ChapterStageNeedsEdit {
+		t.Fatalf("stage = %s, want needs_edit", got.Stage)
+	}
+	next := got.RequiredNextAction()
+	if next == nil || next.Action != ActionDraftChapter || next.Mode != "append" {
+		t.Fatalf("required_next_action = %+v, want draft_chapter mode=append", next)
+	}
+	if !strings.Contains(next.Reason, "mode=append") {
+		t.Fatalf("append reason missing: %q", next.Reason)
+	}
+
+	rewrite := ComputeChapterStage(ChapterStageInput{
+		StyleReviewMode: domain.StyleQualityCritic, DraftExists: true, DraftDigest: d,
+		HasMechanicalErrors: true, OnlyUnderMinError: true, InRewriteQueue: true,
+		LatestConsistency: consistencyCP(1, d),
+	})
+	if next := rewrite.RequiredNextAction(); next != nil && next.Mode == "append" {
+		t.Fatalf("rewrite queue must not receive append-only mode: %+v", next)
+	}
+}

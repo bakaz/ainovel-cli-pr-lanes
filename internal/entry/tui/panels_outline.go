@@ -142,7 +142,7 @@ func truncateWidth(s string, maxW int) string {
 	var b strings.Builder
 	cur := 0
 	for _, r := range s {
-		rw := lipgloss.Width(string(r))
+		rw := runeDisplayWidth(r)
 		if cur+rw > maxW {
 			break
 		}

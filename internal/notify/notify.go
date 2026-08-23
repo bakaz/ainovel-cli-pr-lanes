@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,6 +34,8 @@ const (
 	KindPlanStart     = "plan_start"
 	KindDeadlock      = "deadlock"
 	KindWorkerFailure = "worker_failure"
+	KindEngine        = "engine"
+	KindBackup        = "backup"
 )
 
 // Kinds 返回当前版本可用于 notify.events 的全部事件名。
@@ -46,6 +49,8 @@ func Kinds() []string {
 		KindPlanStart,
 		KindDeadlock,
 		KindWorkerFailure,
+		KindEngine,
+		KindBackup,
 	}
 }
 
@@ -63,6 +68,8 @@ type Notifier struct {
 	command string          // 非空时替代 system 通道（手机推送走这里）
 	events  map[string]bool // nil = 全部 kind 放行
 	timeout time.Duration
+	mu      sync.Mutex
+	sent    map[string]struct{} // kind+title+body 只投递一次；失败也不补发
 }
 
 // New 创建 Notifier。command 为空走内置 system 通道（Windows 通知气泡 /
@@ -79,11 +86,36 @@ func New(command string, events []string) *Notifier {
 }
 
 // Send 异步发送一条通知。过滤、执行、失败处理全部不影响调用方。
+// 同一 kind+title+body 进程内只投递一次；发送失败也不再补发，避免暂停类告警刷屏。
 func (n *Notifier) Send(nt Notification) {
 	if !n.allows(nt.Kind) {
 		return
 	}
+	if !n.markSent(nt) {
+		return
+	}
 	go n.deliver(nt)
+}
+
+func notifyKey(nt Notification) string {
+	return nt.Kind + "\x00" + nt.Title + "\x00" + nt.Body
+}
+
+func (n *Notifier) markSent(nt Notification) bool {
+	if n == nil {
+		return false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.sent == nil {
+		n.sent = make(map[string]struct{})
+	}
+	key := notifyKey(nt)
+	if _, ok := n.sent[key]; ok {
+		return false
+	}
+	n.sent[key] = struct{}{}
+	return true
 }
 
 // allows 返回该 kind 是否放行（nil Notifier / 未列入 events 时拦截）。

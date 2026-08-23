@@ -56,17 +56,55 @@ func (s *RuntimeStore) LoadQueue() ([]domain.RuntimeQueueItem, error) {
 
 // LoadQueueAfter 返回指定序号之后的队列项。
 func (s *RuntimeStore) LoadQueueAfter(afterSeq int64) ([]domain.RuntimeQueueItem, error) {
-	items, err := s.LoadQueue()
-	if err != nil || afterSeq <= 0 {
-		return items, err
-	}
-	filtered := items[:0]
-	for _, item := range items {
-		if item.Seq > afterSeq {
-			filtered = append(filtered, item)
+	return s.LoadQueueKindsAfter(afterSeq)
+}
+
+// LoadQueueKindsAfter 扫描 queue.jsonl，只反序列化指定 kind（空 kinds = 全部）。
+// TUI 回放只需要 stream_*，避免把数万条 ui_event 的 Event payload 全部展开。
+func (s *RuntimeStore) LoadQueueKindsAfter(afterSeq int64, kinds ...domain.RuntimeQueueKind) ([]domain.RuntimeQueueItem, error) {
+	data, err := s.io.ReadFile(runtimeQueuePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
 		}
+		return nil, err
 	}
-	return append([]domain.RuntimeQueueItem(nil), filtered...), nil
+	want := map[domain.RuntimeQueueKind]bool{}
+	for _, k := range kinds {
+		want[k] = true
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 8*1024*1024)
+	var out []domain.RuntimeQueueItem
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var peek struct {
+			Seq  int64                   `json:"seq"`
+			Kind domain.RuntimeQueueKind `json:"kind"`
+		}
+		if err := json.Unmarshal([]byte(line), &peek); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", runtimeQueuePath, err)
+		}
+		if afterSeq > 0 && peek.Seq <= afterSeq {
+			continue
+		}
+		if len(want) > 0 && !want[peek.Kind] {
+			continue
+		}
+		var item domain.RuntimeQueueItem
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", runtimeQueuePath, err)
+		}
+		out = append(out, item)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // AppendTaskLog 追加某个任务的运行日志。
@@ -155,7 +193,7 @@ func (s *RuntimeStore) appendJSONLine(rel string, value any) error {
 		return err
 	}
 	data = append(data, '\n')
-	return s.io.AppendLine(rel, data)
+	return s.io.AppendLineBuffered(rel, data)
 }
 
 func loadJSONLines[T any](io *IO, rel string) ([]T, error) {

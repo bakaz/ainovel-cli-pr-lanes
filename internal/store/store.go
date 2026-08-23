@@ -314,7 +314,7 @@ func (s *Store) Init() error {
 		return err
 	}
 	return s.Progress.io.EnsureDirs([]string{
-		"chapters", "summaries", "drafts", "reviews", "meta", "meta/runtime", "meta/runtime/tasks", "meta/style_review", "meta/sessions", "meta/sessions/agents",
+		"chapters", "summaries", "drafts", "reviews", "meta", "meta/runtime", "meta/runtime/tasks", "meta/style_review", "meta/sessions", "meta/sessions/agents", "meta/sessions/tool-results",
 	})
 }
 

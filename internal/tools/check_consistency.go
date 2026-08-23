@@ -193,6 +193,11 @@ func (t *CheckConsistencyTool) Execute(_ context.Context, args json.RawMessage) 
 		result["pipeline_state_error"] = err.Error()
 	} else if next := decision.RequiredNextAction(); next != nil {
 		result["required_next_action"] = next
+		if decision.DraftMode == "append" {
+			if guidance, ok := underMinWordCountGuidance(t.store, wordCount); ok {
+				result["word_count_guidance"] = guidance
+			}
+		}
 	}
 
 	return json.Marshal(result)

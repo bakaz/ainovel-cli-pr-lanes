@@ -38,7 +38,31 @@ func Run(cfg bootstrap.Config, bundle assets.Bundle, version string) error {
 	// 不在启动时全局开启鼠标上报：欢迎页用不到鼠标，关闭上报可保留终端原生
 	// 拖拽选中复制。进入创作工作台（modeRunning）时再由 enterRunning 打开上报，
 	// 以支持点击切面板 / 滚轮 / 拖拽侧边栏。
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithFilter(dropUnchangedMouseMotion))
 	_, err = p.Run()
+	// Run 正常退出会 restore；Windows 下鼠标追踪偶发残留，再补一次。
+	_ = p.ReleaseTerminal()
 	return err
+}
+
+func dropUnchangedMouseMotion(model tea.Model, msg tea.Msg) tea.Msg {
+	mouse, ok := msg.(tea.MouseMsg)
+	if !ok {
+		return msg
+	}
+	if mouse.Action != tea.MouseActionMotion {
+		return msg
+	}
+	m, ok := model.(Model)
+	if !ok {
+		return msg
+	}
+	pane, in := m.paneAtMouse(mouse.X, mouse.Y)
+	if in && m.hoverActive && m.hoverPane == pane {
+		return nil
+	}
+	if !in && !m.hoverActive {
+		return nil
+	}
+	return msg
 }
