@@ -575,6 +575,14 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 	if ac.MaxTokens != 65536 {
 		t.Errorf("polisher MaxTokens = %d, want 65536 (budget table default)", ac.MaxTokens)
 	}
+	// 计划 §7：length 截断每个逻辑调用最多恢复 1 次；run 级实际 API 调用硬上限 8
+	// （与 MaxTurns=6 独立：MaxTurns 是模型 turn 上限，MaxActualCalls 是 API 调用上限）
+	if ac.MaxLengthRecoveries != 1 {
+		t.Errorf("polisher MaxLengthRecoveries = %d, want 1 (plan §7: at most 1 length recovery)", ac.MaxLengthRecoveries)
+	}
+	if ac.MaxActualCalls != 8 {
+		t.Errorf("polisher MaxActualCalls = %d, want 8 (plan §7: run-level API call hard cap)", ac.MaxActualCalls)
+	}
 	if len(ac.StopAfterTools) != 1 || ac.StopAfterTools[0] != "finish_polish" {
 		t.Errorf("polisher StopAfterTools = %v, want [finish_polish]", ac.StopAfterTools)
 	}
@@ -605,6 +613,13 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 	if writerAC.MaxTokens != 0 {
 		t.Errorf("writer MaxTokens = %d, want 0 (default behavior)", writerAC.MaxTokens)
 	}
+	// 其他 agent 不设置 recovery/调用预算：保持 agentcore 默认（计划 §7 仅 polisher 收紧）
+	if writerAC.MaxLengthRecoveries != 0 {
+		t.Errorf("writer MaxLengthRecoveries = %d, want 0 (default behavior)", writerAC.MaxLengthRecoveries)
+	}
+	if writerAC.MaxActualCalls != 0 {
+		t.Errorf("writer MaxActualCalls = %d, want 0 (default behavior)", writerAC.MaxActualCalls)
+	}
 	for _, name := range []string{"architect_short", "editor"} {
 		other, ok := runner.AgentConfig(name)
 		if !ok {
@@ -615,6 +630,12 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 		}
 		if other.MaxTokens != 32768 {
 			t.Errorf("%s MaxTokens = %d, want 32768 (budget table)", name, other.MaxTokens)
+		}
+		if other.MaxLengthRecoveries != 0 {
+			t.Errorf("%s MaxLengthRecoveries = %d, want 0 (default behavior)", name, other.MaxLengthRecoveries)
+		}
+		if other.MaxActualCalls != 0 {
+			t.Errorf("%s MaxActualCalls = %d, want 0 (default behavior)", name, other.MaxActualCalls)
 		}
 	}
 	// architect_long：预算表 65,536 = agentcore 默认，保持 0 不显式设置。
@@ -627,6 +648,12 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 	}
 	if archLong.MaxTokens != 0 {
 		t.Errorf("architect_long MaxTokens = %d, want 0 (agentcore default 65536 = budget table)", archLong.MaxTokens)
+	}
+	if archLong.MaxLengthRecoveries != 0 {
+		t.Errorf("architect_long MaxLengthRecoveries = %d, want 0 (default behavior)", archLong.MaxLengthRecoveries)
+	}
+	if archLong.MaxActualCalls != 0 {
+		t.Errorf("architect_long MaxActualCalls = %d, want 0 (default behavior)", archLong.MaxActualCalls)
 	}
 
 	// polisher 模型 = 配置的 roles.polisher

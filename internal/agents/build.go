@@ -624,6 +624,12 @@ func BuildWorkers(
 		// contextWindow-8k 安全余量) 收敛。灰度 flag legacy_polisher_high_output
 		// 开启时沿用旧硬编码 131,072（回滚开关，计划 §12）。
 		MaxTokens:      polisherMaxOutputFor(cfg, polisherModelName, polisherContextWindow),
+		// 计划 §7：length 截断每个逻辑调用最多恢复 1 次（默认 3 次会放大 API 调用
+		// 与失败窗口）；MaxActualCalls=8 是单次 run 的实际 API 调用硬上限（含
+		// recovery/重试），与 MaxTurns=6（模型 turn 上限）独立——8 ≥ 6+恢复 的
+		// 语义由预算表保证，超限即 ErrMaxActualCalls 终止。
+		MaxLengthRecoveries: 1,
+		MaxActualCalls:      8,
 		StopAfterTools: []string{"finish_polish"},
 		StopGuardFactory: func(_, _ string) agentcore.StopGuard {
 			// polisher 正常路径以最终 edit 列表 JSON 响应结束（产物由 polish_draft
