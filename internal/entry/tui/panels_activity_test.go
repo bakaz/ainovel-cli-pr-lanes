@@ -115,6 +115,44 @@ func TestRenderEventLine_DispatchAndToolUseSeparateClocks(t *testing.T) {
 	}
 }
 
+func TestRenderEventContent_ThinkClockBetweenTools(t *testing.T) {
+	now := time.Now()
+	events := []host.Event{
+		{
+			ID:       "d1",
+			Time:     now.Add(-10 * time.Minute),
+			Category: "DISPATCH",
+			Agent:    "writer",
+			Summary:  "写第 845 章",
+		},
+		{
+			ID:         "t1",
+			Time:       now.Add(-8 * time.Minute),
+			FinishedAt: now.Add(-7 * time.Minute),
+			Category:   "TOOL",
+			Agent:      "writer",
+			Summary:    "plan_chapter",
+			Depth:      1,
+			Duration:   time.Minute,
+		},
+		{
+			ID:       "t2",
+			Time:     now.Add(-2 * time.Minute),
+			Category: "TOOL",
+			Agent:    "writer",
+			Summary:  "draft_chapter",
+			Depth:    1,
+		},
+	}
+	out := renderEventContent(events, 140, 0)
+	if !strings.Contains(out, "think") {
+		t.Fatalf("gap between tools should show think clock: %q", out)
+	}
+	if !strings.Contains(out, "5m") {
+		t.Fatalf("think clock should be ~5m between tool finish and next tool_call: %q", out)
+	}
+}
+
 func TestRenderEventLine_TOOL_FailedShowsCross(t *testing.T) {
 	ev := host.Event{
 		ID:         "e1",
