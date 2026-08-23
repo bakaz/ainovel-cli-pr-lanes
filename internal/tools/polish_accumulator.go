@@ -44,6 +44,9 @@ type PolishAccumulator struct {
 	usedIssueIDs map[string]bool      // 已接受 edit 用过的 issue_id（防跨批复用）
 	nextBatch    int                  // 期望的下一个 batch_index（1 起）
 	finish       *PolishFinishRecord  // finish 校验通过后非 nil
+	// runRejectionCode 记录最近一次 run 级拒绝（整批/整 run，index=-1）的错误码
+	//（schema §9 RunRejectionCode 审计来源；per-edit 拒绝不进此字段）。
+	runRejectionCode string
 }
 
 // NewPolishAccumulator 构造 accumulator。operationID/baselineDigest 由 host 生成
@@ -130,6 +133,26 @@ func (a *PolishAccumulator) Finish() *PolishFinishRecord {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.finish
+}
+
+// RunRejectionCode 返回最近一次 run 级拒绝的错误码（无则空串；schema §9 审计用）。
+func (a *PolishAccumulator) RunRejectionCode() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.runRejectionCode
+}
+
+// recordRunRejectionLocked 记录 run 级拒绝错误码（调用方须已持有 mu；审计用）。
+// 由三个候选工具的整批/整 run 拒绝路径调用（index=-1 的拒绝）。
+func (a *PolishAccumulator) recordRunRejectionLocked(code string) {
+	a.runRejectionCode = code
+}
+
+// BatchCount 返回实际推进协议的批次数（nextBatch-1；全拒批次不推进，schema §9 审计用）。
+func (a *PolishAccumulator) BatchCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.nextBatch - 1
 }
 
 // ── 存储类型（schema §3.3） ────────────────────────────────────────────

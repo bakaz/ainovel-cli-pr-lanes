@@ -1013,3 +1013,121 @@ func TestBuildWorkers_RoleMaxTokens(t *testing.T) {
 		}
 	}
 }
+
+// polishDraftFromWriter 从 writer 工具集提取 polish_draft 实例（测试辅助）。
+func polishDraftFromWriter(t *testing.T, runner *subagent.Runner) *tools.PolishDraftTool {
+	t.Helper()
+	writerAC, ok := runner.AgentConfig("writer")
+	if !ok {
+		t.Fatal("writer agent missing")
+	}
+	for _, tl := range writerAC.Tools {
+		if pd, ok := tl.(*tools.PolishDraftTool); ok {
+			return pd
+		}
+	}
+	t.Fatal("writer toolset missing polish_draft")
+	return nil
+}
+
+// TestBuildWorkers_FullContextPolisherFlagWiring 验证灰度 flag
+// full_context_polisher_v3（计划 §12）经 BuildWorkers 注入 polish_draft：
+// flag=true → FullContextEnabled()=true；flag=false（默认）→ false（回滚开关）。
+func TestBuildWorkers_FullContextPolisherFlagWiring(t *testing.T) {
+	build := func(flag bool) *subagent.Runner {
+		t.Helper()
+		dir := t.TempDir()
+		st := store.NewStore(dir)
+		if err := st.Init(); err != nil {
+			t.Fatal(err)
+		}
+		bundle := assets.Load("default", assets.LoadOptions{})
+		cfg := bootstrap.Config{
+			Provider:  "ollama",
+			ModelName: "dummy-model",
+			Providers: map[string]bootstrap.ProviderConfig{
+				"ollama": {BaseURL: "http://0.0.0.0:0"},
+			},
+			Style:           "default",
+			ChapterPipeline: "ds_mimo_critic",
+			Roles: map[string]bootstrap.RoleConfig{
+				"polisher": {Provider: "ollama", Model: "mimo-polisher"},
+			},
+			Flags: bootstrap.Flags{FullContextPolisherV3: flag},
+		}
+		models, err := bootstrap.NewModelSet(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runner, _, _, _ := BuildWorkers(cfg, st, models, bundle, nil, nil, projectprofile.NewCore4Contract())
+		return runner
+	}
+
+	t.Run("flag_on", func(t *testing.T) {
+		pd := polishDraftFromWriter(t, build(true))
+		if !pd.FullContextEnabled() {
+			t.Error("full_context_polisher_v3=true must enable multi-turn path")
+		}
+	})
+	t.Run("flag_off_default", func(t *testing.T) {
+		pd := polishDraftFromWriter(t, build(false))
+		if pd.FullContextEnabled() {
+			t.Error("full_context_polisher_v3=false (default) must keep one-shot path")
+		}
+	})
+}
+
+// TestBuildWorkers_LegacyPolisherHighOutputFlag 验证灰度 flag
+// legacy_polisher_high_output（计划 §12）：开启时 polisher MaxTokens 沿用旧
+// 硬编码 131,072（回滚开关），关闭（默认）时走预算表 + 已验证模型 override。
+func TestBuildWorkers_LegacyPolisherHighOutputFlag(t *testing.T) {
+	build := func(flag bool) *subagent.Runner {
+		t.Helper()
+		dir := t.TempDir()
+		st := store.NewStore(dir)
+		if err := st.Init(); err != nil {
+			t.Fatal(err)
+		}
+		bundle := assets.Load("default", assets.LoadOptions{})
+		cfg := bootstrap.Config{
+			Provider:  "ollama",
+			ModelName: "dummy-model",
+			Providers: map[string]bootstrap.ProviderConfig{
+				"ollama": {BaseURL: "http://0.0.0.0:0"},
+			},
+			Style:           "default",
+			ChapterPipeline: "ds_mimo_critic",
+			Roles: map[string]bootstrap.RoleConfig{
+				"polisher": {Provider: "ollama", Model: "mimo-polisher"},
+			},
+			Flags: bootstrap.Flags{LegacyPolisherHighOutput: flag},
+		}
+		models, err := bootstrap.NewModelSet(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runner, _, _, _ := BuildWorkers(cfg, st, models, bundle, nil, nil, projectprofile.NewCore4Contract())
+		return runner
+	}
+
+	t.Run("flag_on_legacy_131072", func(t *testing.T) {
+		runner := build(true)
+		ac, ok := runner.AgentConfig("polisher")
+		if !ok {
+			t.Fatal("polisher agent missing")
+		}
+		if ac.MaxTokens != 131072 {
+			t.Errorf("polisher MaxTokens = %d, want 131072 (legacy high-output flag)", ac.MaxTokens)
+		}
+	})
+	t.Run("flag_off_budget_default", func(t *testing.T) {
+		runner := build(false)
+		ac, ok := runner.AgentConfig("polisher")
+		if !ok {
+			t.Fatal("polisher agent missing")
+		}
+		if ac.MaxTokens != 65536 {
+			t.Errorf("polisher MaxTokens = %d, want 65536 (budget table default)", ac.MaxTokens)
+		}
+	})
+}

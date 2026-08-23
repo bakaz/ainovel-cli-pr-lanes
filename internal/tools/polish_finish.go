@@ -94,6 +94,8 @@ func (t *FinishPolishTool) Execute(_ context.Context, args json.RawMessage) (jso
 	defer acc.mu.Unlock()
 
 	reject := func(code string) (json.RawMessage, error) {
+		// run 级拒绝（整批 index=-1）：记录错误码供审计（schema §9 RunRejectionCode）。
+		acc.recordRunRejectionLocked(code)
 		return json.Marshal(polishPlanResult{Accepted: 0, Rejected: 1,
 			Errors: []polishToolError{{Index: -1, Code: code}}})
 	}

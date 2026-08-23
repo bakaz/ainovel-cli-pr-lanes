@@ -93,6 +93,8 @@ func (t *SubmitEditBatchTool) Execute(_ context.Context, args json.RawMessage) (
 	defer acc.mu.Unlock()
 
 	rejectBatch := func(code string) (json.RawMessage, error) {
+		// run 级拒绝（整批 index=-1）：记录错误码供审计（schema §9 RunRejectionCode）。
+		acc.recordRunRejectionLocked(code)
 		return json.Marshal(polishBatchResult{Accepted: 0, Rejected: 0, AcceptedTotal: len(acc.accepted),
 			Errors: []polishToolError{{Index: -1, Code: code}}})
 	}

@@ -9,6 +9,47 @@ import (
 	"github.com/voocel/ainovel-cli/internal/notify"
 )
 
+// TestConfigFlagsAccessors 验证灰度 flags（计划 §12）的访问器：默认全关，
+// 开启后对应访问器为 true。
+func TestConfigFlagsAccessors(t *testing.T) {
+	cfg := Config{}
+	if cfg.FullContextPolisherV3Enabled() || cfg.PolisherCandidateToolsV3Enabled() ||
+		cfg.AgentOutputBudgetV2Enabled() || cfg.StyleContentBudgetV2Enabled() ||
+		cfg.LegacyPolisherHighOutputEnabled() {
+		t.Fatal("all grayscale flags must default to false (rollback-safe)")
+	}
+	cfg.Flags = Flags{
+		FullContextPolisherV3:   true,
+		PolisherCandidateToolsV3: true,
+		AgentOutputBudgetV2:      true,
+		StyleContentBudgetV2:     true,
+		LegacyPolisherHighOutput: true,
+	}
+	if !cfg.FullContextPolisherV3Enabled() || !cfg.PolisherCandidateToolsV3Enabled() ||
+		!cfg.AgentOutputBudgetV2Enabled() || !cfg.StyleContentBudgetV2Enabled() ||
+		!cfg.LegacyPolisherHighOutputEnabled() {
+		t.Error("enabled flags must report true via accessors")
+	}
+}
+
+// TestMergeConfigFlags 验证 flags 逐字段合并：任一配置层开启即开启（opt-in），
+// 低层配置不能关闭高层已开启的 flag。
+func TestMergeConfigFlags(t *testing.T) {
+	base := Config{Flags: Flags{FullContextPolisherV3: true}}
+	overlay := Config{Flags: Flags{LegacyPolisherHighOutput: true}}
+	merged := mergeConfig(base, overlay)
+	if !merged.FullContextPolisherV3Enabled() {
+		t.Error("base flag must survive overlay merge")
+	}
+	if !merged.LegacyPolisherHighOutputEnabled() {
+		t.Error("overlay flag must be merged in")
+	}
+	// 未开启的 flag 保持关闭
+	if merged.PolisherCandidateToolsV3Enabled() || merged.AgentOutputBudgetV2Enabled() {
+		t.Error("unset flags must remain false")
+	}
+}
+
 func TestConfigResolveReasoningEffort(t *testing.T) {
 	cfg := Config{
 		ReasoningEffort: "low", // 顶层默认

@@ -119,6 +119,16 @@ type Checkpoint struct {
 	Partial bool `json:"partial,omitempty"`
 	// MatchModes 是实际应用 edit 的匹配模式（"exact"/"normalized"，按应用序）。
 	MatchModes []string `json:"match_modes,omitempty"`
+	// 以下字段是候选工具协议（Method=candidate_tools）的审计字段
+	// （schema docs/polisher-candidate-tools-schema.md §9）：只含计数与 digest，
+	// 绝不含 edit 内容。仅审计用，不影响判定。omitempty 兼容旧数据。
+	OperationID      string `json:"operation_id,omitempty"`       // accumulator.operationID（host 生成）
+	RunRejectionCode string `json:"run_rejection_code,omitempty"` // 整 run/整批被拒时的错误码（§8 run 级码）；per-edit 全部通过时为空
+	PlanIssueCount   int    `json:"plan_issue_count,omitempty"`   // len(plan.Issues)
+	BatchCount       int    `json:"batch_count,omitempty"`        // 实际提交批次数
+	FinishStatus     string `json:"finish_status,omitempty"`      // finish.status（complete/partial/no_op/escalate）
+	UnresolvedCount  int    `json:"unresolved_count,omitempty"`   // len(finish.Unresolved)
+	PlanDigest       string `json:"plan_digest,omitempty"`        // plan.Digest（sha256 规范化 plan JSON）
 }
 
 // PolishCheckpointMeta 是 polish 步骤 checkpoint 的附加元数据。
@@ -139,4 +149,12 @@ type PolishCheckpointMeta struct {
 	NormalizedMatchCount int
 	Partial              bool
 	MatchModes           []string
+	// 候选工具协议审计字段（Method=candidate_tools，schema §9；旧路径为零值）。
+	OperationID      string
+	RunRejectionCode string
+	PlanIssueCount   int
+	BatchCount       int
+	FinishStatus     string
+	UnresolvedCount  int
+	PlanDigest       string
 }

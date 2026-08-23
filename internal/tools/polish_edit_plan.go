@@ -161,6 +161,7 @@ type PolishEditDropReason string
 const (
 	PolishEditDropAnchorMissing   PolishEditDropReason = "anchor_missing"
 	PolishEditDropAnchorAmbiguous PolishEditDropReason = "anchor_ambiguous"
+	PolishEditDropAnchorOverlap   PolishEditDropReason = "anchor_overlap"
 	PolishEditDropOverlapLower    PolishEditDropReason = "overlap_lower_priority"
 	PolishEditDropCoverageLimit   PolishEditDropReason = "coverage_limit"
 	PolishEditDropOutputTooShort  PolishEditDropReason = "output_too_short"

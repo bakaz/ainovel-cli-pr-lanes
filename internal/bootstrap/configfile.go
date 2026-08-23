@@ -209,6 +209,24 @@ func mergeConfig(base, overlay Config) Config {
 		base.Notify = overlay.Notify
 	}
 
+	// Flags：逐字段合并（灰度 flag 是 opt-in——任一配置层开启即开启；
+	// 不允许低层配置关闭高层已开启的 flag）。
+	if overlay.Flags.FullContextPolisherV3 {
+		base.Flags.FullContextPolisherV3 = true
+	}
+	if overlay.Flags.PolisherCandidateToolsV3 {
+		base.Flags.PolisherCandidateToolsV3 = true
+	}
+	if overlay.Flags.AgentOutputBudgetV2 {
+		base.Flags.AgentOutputBudgetV2 = true
+	}
+	if overlay.Flags.StyleContentBudgetV2 {
+		base.Flags.StyleContentBudgetV2 = true
+	}
+	if overlay.Flags.LegacyPolisherHighOutput {
+		base.Flags.LegacyPolisherHighOutput = true
+	}
+
 	return base
 }
 

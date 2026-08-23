@@ -318,8 +318,21 @@ func BuildWorkers(
 	// 候选工具运行时注入：accumulator 由 polish_draft 每次 run 创建（包 6 接线），
 	// 经 PolishAccumulatorHolder 注入三个候选工具。构建时 holder.Get()==nil——
 	// 工具 Execute 在未注入 accumulator 时返回明确错误，不会静默空转。
+	// 同时提取三个工具的具体实例，供 polish_draft 每次 run 直接 SetAccumulator
+	//（holder 是构建时注册与运行时注入之间的桥；polish_draft 同时持有两者）。
 	polisherAccHolder := NewPolishAccumulatorHolder()
+	var planTool *tools.SubmitPolishPlanTool
+	var batchTool *tools.SubmitEditBatchTool
+	var finishTool *tools.FinishPolishTool
 	for _, tl := range polisherTools {
+		switch tt := tl.(type) {
+		case *tools.SubmitPolishPlanTool:
+			planTool = tt
+		case *tools.SubmitEditBatchTool:
+			batchTool = tt
+		case *tools.FinishPolishTool:
+			finishTool = tt
+		}
 		if injectable, ok := tl.(interface{ SetAccumulator(*tools.PolishAccumulator) }); ok {
 			injectable.SetAccumulator(polisherAccHolder.Get())
 		}
@@ -426,6 +439,12 @@ func BuildWorkers(
 	// 返回 skipped）。必须在 writer subagent 配置之前完成，writer 配置捕获的是追加后的列表。
 	polishDraft := tools.NewPolishDraftTool(store, nil, "")
 	polishDraft.SetEnabled(pipelineEnabled)
+	// 多轮候选工具协议路径接线（灰度 flag full_context_polisher_v3，计划 §12）：
+	// holder + 三个候选工具实例 + flag 注入。flag=false（默认）时走现有 one-shot
+	// 路径（edit_list/full_text）——回滚开关。
+	polishDraft.SetAccumulatorHolder(polisherAccHolder)
+	polishDraft.SetCandidateTools(planTool, batchTool, finishTool)
+	polishDraft.SetFullContextEnabled(cfg.FullContextPolisherV3Enabled())
 	writerTools = append(writerTools, polishDraft)
 
 	// 统一注入章节流水线强制状态机配置（六工具：draft/edit/check/polish/review/commit）。
@@ -602,8 +621,9 @@ func BuildWorkers(
 		LengthRecoveryPrompt: "上一次输出被截断。不要从中间续写；请从第一条 edit 开始，重新输出完整的精修 edit 列表 JSON（{\"version\":1,\"edits\":[{\"old_string\":\"原文片段\",\"new_string\":\"精修后片段\"}]}）。只输出该 JSON，不要附加任何其他内容。",
 		// 预算表默认 65,536（计划 §6）；131,072 仅对 polisherHighOutputModels 中
 		// 经过验证的模型生效（见 budgets.go），并按 min(上限, registry 上限,
-		// contextWindow-8k 安全余量) 收敛。
-		MaxTokens:      PolisherMaxOutputTokens(polisherModelName, polisherContextWindow),
+		// contextWindow-8k 安全余量) 收敛。灰度 flag legacy_polisher_high_output
+		// 开启时沿用旧硬编码 131,072（回滚开关，计划 §12）。
+		MaxTokens:      polisherMaxOutputFor(cfg, polisherModelName, polisherContextWindow),
 		StopAfterTools: []string{"finish_polish"},
 		StopGuardFactory: func(_, _ string) agentcore.StopGuard {
 			// polisher 正常路径以最终 edit 列表 JSON 响应结束（产物由 polish_draft
@@ -685,6 +705,16 @@ func BuildWorkers(
 	}
 
 	return subagentRunner, askUser, restore, applyThinking
+}
+
+// polisherMaxOutputFor 按灰度 flag 解析 polisher 实际生效的 max output token
+//（计划 §12）：legacy_polisher_high_output=true 时沿用旧硬编码 131,072（回滚
+// 开关）；否则走预算表默认 65,536 + 已验证模型 override（budgets.go）。
+func polisherMaxOutputFor(cfg bootstrap.Config, modelName string, contextWindow int) int {
+	if cfg.LegacyPolisherHighOutputEnabled() {
+		return clampMaxOutput(polisherHighOutputOverrideTokens, modelName, contextWindow)
+	}
+	return PolisherMaxOutputTokens(modelName, contextWindow)
 }
 
 type saveFoundationResult struct {

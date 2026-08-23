@@ -152,6 +152,14 @@ func (cs *CheckpointStore) appendUnlocked(scope domain.Scope, step, artifact, di
 		cp.NormalizedMatchCount = polishMeta.NormalizedMatchCount
 		cp.Partial = polishMeta.Partial
 		cp.MatchModes = polishMeta.MatchModes
+		// 候选工具协议审计字段（schema §9；旧路径为零值，omitempty 不落盘）。
+		cp.OperationID = polishMeta.OperationID
+		cp.RunRejectionCode = polishMeta.RunRejectionCode
+		cp.PlanIssueCount = polishMeta.PlanIssueCount
+		cp.BatchCount = polishMeta.BatchCount
+		cp.FinishStatus = polishMeta.FinishStatus
+		cp.UnresolvedCount = polishMeta.UnresolvedCount
+		cp.PlanDigest = polishMeta.PlanDigest
 	}
 
 	data, err := json.Marshal(cp)
