@@ -17,7 +17,7 @@ import (
 func renderEventContent(events []host.Event, width, spinnerFrame int) string {
 	var b strings.Builder
 	for i, ev := range events {
-		b.WriteString(renderEventLine(ev, width, spinnerFrame))
+		b.WriteString(renderEventLineClocks(ev, width, spinnerFrame, clocksFor(events, i)))
 		if i < len(events)-1 {
 			b.WriteString("\n")
 		}
@@ -33,6 +33,10 @@ func runningSpinner(frame int) string {
 }
 
 func renderEventLine(ev host.Event, width, spinnerFrame int) string {
+	return renderEventLineClocks(ev, width, spinnerFrame, clocksFor([]host.Event{ev}, 0))
+}
+
+func renderEventLineClocks(ev host.Event, width, spinnerFrame int, clocks eventClocks) string {
 	tsStr := lipgloss.NewStyle().Foreground(colorDim).Render(ev.Time.Format("15:04:05"))
 	indent := ""
 	if ev.Depth > 0 {
@@ -41,7 +45,7 @@ func renderEventLine(ev host.Event, width, spinnerFrame int) string {
 	maxSumW := max(20, width-12-ev.Depth*2)
 
 	running := ev.Running()
-	durStr := renderEventDuration(ev.Duration)
+	durStr := renderEventClocks(clocks)
 
 	switch {
 	case ev.Category == "DECISION":
@@ -56,11 +60,7 @@ func renderEventLine(ev host.Event, width, spinnerFrame int) string {
 		}
 		name := lipgloss.NewStyle().Foreground(colorContext).Bold(true).Render("ARBITER")
 		label := lipgloss.NewStyle().Foreground(colorMuted).Render("（" + truncate(ev.Summary, maxSumW-9) + "）")
-		line := tsStr + " " + icon + " " + name + label
-		if !running {
-			line += durStr
-		}
-		return line
+		return tsStr + " " + icon + " " + name + label + durStr
 
 	case ev.Category == "DISPATCH":
 		// 三态：进行中（accent spinner + 加粗）/ 失败（红 ✕）/ 完成（绿 ✓）
@@ -78,11 +78,7 @@ func renderEventLine(ev host.Event, width, spinnerFrame int) string {
 			// 进行中保持原样但加粗
 			sum = lipgloss.NewStyle().Bold(true).Render(sum)
 		}
-		line := tsStr + " " + icon + " " + sum
-		if !running {
-			line += durStr
-		}
-		return line
+		return tsStr + " " + icon + " " + sum + durStr
 
 	case ev.Category == "TOOL":
 		// Worker 内部工具（Depth=1）
@@ -102,11 +98,7 @@ func renderEventLine(ev host.Event, width, spinnerFrame int) string {
 			icon = lipgloss.NewStyle().Foreground(colorDim).Render("├")
 			sum = lipgloss.NewStyle().Foreground(colorMuted).Render(truncate(ev.Summary, maxSumW))
 		}
-		line := tsStr + " " + indent + icon + " " + sum
-		if !running {
-			line += durStr
-		}
-		return line
+		return tsStr + " " + indent + icon + " " + sum + durStr
 
 	case ev.Category == "REVIEW" || ev.Category == "CHECK":
 		// save_review 完成事件 → REVIEW（金黄），check_consistency → CHECK（健康绿）。
@@ -127,11 +119,7 @@ func renderEventLine(ev host.Event, width, spinnerFrame int) string {
 			sumColor = colorSuccess
 		}
 		sum := lipgloss.NewStyle().Foreground(sumColor).Render(truncate(ev.Summary, maxSumW))
-		line := tsStr + " " + indent + icon + " " + sum
-		if !running {
-			line += durStr
-		}
-		return line
+		return tsStr + " " + indent + icon + " " + sum + durStr
 
 	case ev.Category == "ERROR":
 		icon := lipgloss.NewStyle().Foreground(colorError).Bold(true).Render("✕")
@@ -142,8 +130,8 @@ func renderEventLine(ev host.Event, width, spinnerFrame int) string {
 		for _, l := range lines[1:] {
 			first += "\n" + pad + errStyle.Render(l)
 		}
-		if durStr != "" {
-			first += durStr
+		if ev.Duration > 0 {
+			first += renderEventClocks(eventClocks{tool: ev.Duration})
 		}
 		return first
 
@@ -222,12 +210,101 @@ func eventAgentColor(agent string) lipgloss.AdaptiveColor {
 	}
 }
 
-// renderEventDuration 将 Duration 渲染为淡色括号标注，零值返回空。
-func renderEventDuration(d time.Duration) string {
-	if d <= 0 {
+type eventClocks struct {
+	started time.Duration
+	tool    time.Duration
+}
+
+func eventElapsed(ev host.Event) time.Duration {
+	if ev.Running() {
+		if ev.Time.IsZero() {
+			return 0
+		}
+		return time.Since(ev.Time)
+	}
+	return ev.Duration
+}
+
+func clocksFor(events []host.Event, idx int) eventClocks {
+	if idx < 0 || idx >= len(events) {
+		return eventClocks{}
+	}
+	ev := events[idx]
+	switch ev.Category {
+	case "DISPATCH", "DECISION":
+		c := eventClocks{started: eventElapsed(ev)}
+		if ev.Running() {
+			c.tool = runningToolElapsed(events, ev.Agent)
+		}
+		return c
+	case "TOOL", "REVIEW", "CHECK":
+		c := eventClocks{tool: eventElapsed(ev)}
+		if start := parentDispatchTime(events, idx); !start.IsZero() {
+			if ev.Running() {
+				c.started = time.Since(start)
+			} else if !ev.FinishedAt.IsZero() {
+				c.started = ev.FinishedAt.Sub(start)
+			} else if ev.Duration > 0 {
+				c.started = ev.Time.Add(ev.Duration).Sub(start)
+			}
+			if c.started < 0 {
+				c.started = 0
+			}
+		}
+		return c
+	default:
+		return eventClocks{}
+	}
+}
+
+func parentDispatchTime(events []host.Event, idx int) time.Time {
+	agent := events[idx].Agent
+	var fallback time.Time
+	for i := idx; i >= 0; i-- {
+		ev := events[i]
+		if ev.Category != "DISPATCH" || ev.Time.IsZero() {
+			continue
+		}
+		if agent == "" || ev.Agent == agent {
+			return ev.Time
+		}
+		if fallback.IsZero() {
+			fallback = ev.Time
+		}
+	}
+	return fallback
+}
+
+func runningToolElapsed(events []host.Event, agent string) time.Duration {
+	for i := len(events) - 1; i >= 0; i-- {
+		ev := events[i]
+		if !ev.Running() {
+			continue
+		}
+		switch ev.Category {
+		case "TOOL", "REVIEW", "CHECK":
+			if agent == "" || ev.Agent == agent {
+				return eventElapsed(ev)
+			}
+		}
+	}
+	return 0
+}
+
+// renderEventClocks 同一行两套钟：(started …) 从派发起算，(tool …) 从 tool call 起算。
+func renderEventClocks(c eventClocks) string {
+	var parts []string
+	if c.started > 0 {
+		parts = append(parts, "started "+formatDuration(c.started))
+	}
+	if c.tool > 0 {
+		parts = append(parts, "tool "+formatDuration(c.tool))
+	}
+	if len(parts) == 0 {
 		return ""
 	}
-	return " " + lipgloss.NewStyle().Foreground(colorDim).Italic(true).Render("("+formatDuration(d)+")")
+	text := "(" + strings.Join(parts, ") (") + ")"
+	return " " + lipgloss.NewStyle().Foreground(colorDim).Italic(true).Render(text)
 }
 
 func formatDuration(d time.Duration) string {
