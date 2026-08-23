@@ -524,3 +524,83 @@ func TestRunMetaStyleReviewMode_SetNormalizesEmpty(t *testing.T) {
 		t.Errorf("expected off, got %q", meta.StyleReviewMode)
 	}
 }
+
+// ── Style budget: event_kind 兼容与记录（计划 §9） ─────────────────────
+
+// TestStyleReviewStore_LegacyLedgerWithoutEventKindLoads 验证旧数据（无
+// event_kind 字段）读取不崩溃、按旧语义校验通过（legacy 兼容）。
+func TestStyleReviewStore_LegacyLedgerWithoutEventKindLoads(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+	p := filepath.Join(dir, "meta", "style_review", "01.json")
+	os.MkdirAll(filepath.Dir(p), 0o755)
+	// 旧格式 JSON：无 event_kind 字段。
+	data := `{"schema_version":1,"chapter":1,"mode":"critic","cycles":[{"cycle":1,"status":"initial_pending","created_at":"2026-07-25T10:00:00Z","attempt_id":"a1","request":{"prompt":"x","model":"gpt-4o"},"draft_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","basis_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}]}`
+	os.WriteFile(p, []byte(data), 0o644)
+	ledger, err := s.StyleReview.Load(1)
+	if err != nil {
+		t.Fatalf("legacy ledger without event_kind must load: %v", err)
+	}
+	if ledger == nil || ledger.Cycles[0].EventKind != "" {
+		t.Fatalf("legacy entry event_kind must be empty, got %+v", ledger)
+	}
+}
+
+// TestStyleReviewStore_EventKindRoundtrip 验证 event_kind 保存/读取往返一致。
+func TestStyleReviewStore_EventKindRoundtrip(t *testing.T) {
+	s := NewStore(t.TempDir())
+	l := initialPendingLedger()
+	appendRevisionOpen(&l)
+	l.Cycles[1].EventKind = domain.ReviewEventContentRevise
+	if err := s.StyleReview.Save(l); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := s.StyleReview.Load(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Cycles[1].EventKind != domain.ReviewEventContentRevise {
+		t.Fatalf("event_kind roundtrip failed: got %q", loaded.Cycles[1].EventKind)
+	}
+}
+
+// TestStyleReviewStore_StaleMarkerRecordsEventKindStale 验证 CAS stale 标记
+// （markReviewStale）单独记录：CommitReviewResult 检测到草稿变更 → 追加
+// degraded 周期且 EventKind=stale（不消耗内容预算）。
+func TestStyleReviewStore_StaleMarkerRecordsEventKindStale(t *testing.T) {
+	s := NewStore(t.TempDir())
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	// 预写入 initial_pending（绑定草稿 v1 digest）。
+	l := initialPendingLedger()
+	if err := s.StyleReview.Save(l); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Drafts.SaveDraft(1, "draft v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 草稿被并发修改为 v2 → CommitReviewResult 的 CAS 检测到 digest 漂移。
+	if err := s.Drafts.SaveDraft(1, "draft v2"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.CommitReviewResult(1, "a1", testDraft, 0, nil, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
+		return cur, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("expected ErrReviewStale, got %v", err)
+	}
+
+	loaded, err := s.StyleReview.Load(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := loaded.CurrentCycle()
+	if last.Status != domain.ReviewStatusDegraded {
+		t.Fatalf("expected degraded stale marker, got %s", last.Status)
+	}
+	if last.EventKind != domain.ReviewEventStale {
+		t.Fatalf("stale marker must record event_kind=stale, got %q", last.EventKind)
+	}
+}

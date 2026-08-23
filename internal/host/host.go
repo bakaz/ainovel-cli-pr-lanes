@@ -1435,6 +1435,8 @@ func (h *Host) StyleReviewOverride(chapter int, reason string) error {
 			DraftDigest: draftDigest,
 			BasisDigest: basisDigest,
 			Epoch:       cur.MaxEpoch(),
+			// user override 不消耗内容/技术预算（style budget，计划 §9）。
+			EventKind: domain.ReviewEventOverride,
 			// Override 记录用户干预的审计轨迹
 			Override: &domain.StyleReviewOverride{
 				Actor:        "user",

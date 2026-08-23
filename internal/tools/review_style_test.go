@@ -3652,6 +3652,22 @@ func TestReviewStyle_FinalRevisionCapExhausts(t *testing.T) {
 	if ledger.CurrentStatus() != domain.ReviewStatusExhausted {
 		t.Fatalf("Round 5: expected exhausted after 3 final revisions + 4th revise, got %s", ledger.CurrentStatus())
 	}
+	// 事件分类落盘（style budget，计划 §9）：revision_open/exhausted 周期均为
+	// content_revise（内容预算只由有效内容 revise 消耗）。
+	for i, c := range ledger.Cycles {
+		switch c.Status {
+		case domain.ReviewStatusRevisionOpen, domain.ReviewStatusExhausted:
+			if c.EventKind != domain.ReviewEventContentRevise {
+				t.Errorf("cycle[%d] %s event_kind = %q, want content_revise", i, c.Status, c.EventKind)
+			}
+		}
+	}
+	if got := domain.ContentRevisionCount(ledger); got != 3 {
+		t.Fatalf("ContentRevisionCount = %d, want 3", got)
+	}
+	if got := domain.TechnicalFailureCount(ledger); got != 0 {
+		t.Fatalf("TechnicalFailureCount = %d, want 0", got)
+	}
 
 	// exhausted 语义（与同签名停滞一致）：新评审被拒，必须先 /style-override
 	if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err == nil {
@@ -3860,6 +3876,10 @@ func TestReviewStyle_EmptyOutputExhaustedDegraded(t *testing.T) {
 	ledger, _ := st.StyleReview.Load(1)
 	if ledger.CurrentStatus() != domain.ReviewStatusDegraded {
 		t.Fatalf("expected degraded, got %s", ledger.CurrentStatus())
+	}
+	// 技术失败（空输出）记录为 technical（style budget，计划 §9）。
+	if last := ledger.CurrentCycle(); last.EventKind != domain.ReviewEventTechnical {
+		t.Fatalf("degraded event_kind = %q, want technical", last.EventKind)
 	}
 }
 
@@ -4472,6 +4492,10 @@ func TestReviewStyle_CandidateStaleDraftChanged(t *testing.T) {
 	if last.AttemptID == "" || last.Error == "" {
 		t.Errorf("stale marker must carry attempt + cause, got %+v", last)
 	}
+	// CAS stale 单独记录（style budget，计划 §9）：EventKind=stale。
+	if last.EventKind != domain.ReviewEventStale {
+		t.Errorf("stale marker event_kind = %q, want stale", last.EventKind)
+	}
 	// 草稿保持并发修改后的内容。
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != concurrent {
@@ -4557,5 +4581,166 @@ func TestReviewStyle_CandidateStaleMechanicalGateOrder(t *testing.T) {
 	saved, _, _ := st.Drafts.LoadChapterContent(1)
 	if saved != concurrent {
 		t.Errorf("draft = %q, want concurrent content %q", saved, concurrent)
+	}
+}
+
+// ── Style budget（计划 §9）：技术失败不触发 exhausted（核心修复目标） ────
+//
+// 同一评审 epoch 内：有效内容 revise（final_pending → revision_open）达到 3 次后，
+// 第 4 次内容 revise 才进入 exhausted。技术失败（空输出等调用故障）只增加技术
+// 计数，不消耗内容预算——即使内容预算已满、随后发生技术失败，状态仍是 degraded
+// 而非 exhausted。CAS stale 单独记录（EventKind=stale），不消耗任何预算。
+
+func TestReviewStyle_TechnicalFailuresDoNotTriggerExhausted(t *testing.T) {
+	oldMax, oldBase := criticEmptyRetryMax, criticEmptyRetryBase
+	criticEmptyRetryMax, criticEmptyRetryBase = 2, time.Millisecond
+	defer func() { criticEmptyRetryMax, criticEmptyRetryBase = oldMax, oldBase }()
+
+	st := setupCriticStore(t, 1, "正文。一些句子。")
+	draft, _, _ := st.Drafts.LoadChapterContent(1)
+
+	// 每次内容 revise 返回不同 finding（永不触发同签名停滞），收敛完全由内容
+	// 预算驱动；技术轮次返回空输出（重试耗尽 → degraded）。
+	reviseOutputs := []string{
+		`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"pacing","category":"style","severity":"warning","evidence":"末段","problem":"问题A","revision":"改法A"}]}`,
+		`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"hook","category":"plot","severity":"error","evidence":"首段","problem":"问题B","revision":"改法B"}]}`,
+		`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"continuity","category":"logic","severity":"warning","evidence":"中段","problem":"问题C","revision":"改法C"}]}`,
+		`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"aesthetic","category":"style","severity":"warning","evidence":"结尾","problem":"问题D","revision":"改法D"}]}`,
+		`{"verdict":"revise","strength":{"dimension":"hook","evidence":"好"},"findings":[{"dimension":"character","category":"tone","severity":"error","evidence":"对话","problem":"问题E","revision":"改法E"}]}`,
+	}
+	callCount := 0
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		callCount++
+		// 技术轮次（第 3/5/7 次 Execute）：空输出 ×2（重试耗尽 → degraded）。
+		switch i {
+		case 2, 3, 5, 6, 8, 9:
+			return &agentcore.LLMResponse{Message: criticText("")}, nil
+		}
+		// 内容轮次：按调用序取 revise 输出（0→A, 1→B, 4→C, 7→D, 10→E）。
+		idx := 0
+		switch {
+		case i >= 10:
+			idx = 4
+		case i >= 7:
+			idx = 3
+		case i >= 4:
+			idx = 2
+		case i >= 1:
+			idx = 1
+		}
+		return &agentcore.LLMResponse{Message: criticText(reviseOutputs[idx])}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+
+	round := func(n int, want domain.StyleReviewStatus) {
+		t.Helper()
+		newDraft := draft + fmt.Sprintf("\n修改%d。", n)
+		if err := st.Drafts.SaveDraft(1, newDraft); err != nil {
+			t.Fatal(err)
+		}
+		d := domain.DigestDraft(newDraft)
+		if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", fmt.Sprintf("a%d", n), d); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+			t.Fatalf("Round %d: %v", n, err)
+		}
+		ledger, _ := st.StyleReview.Load(1)
+		if ledger.CurrentStatus() != want {
+			t.Fatalf("Round %d: expected %s, got %s", n, want, ledger.CurrentStatus())
+		}
+	}
+
+	// Round 1: initial review → revise（不计入内容预算）
+	round(1, domain.ReviewStatusRevisionOpen)
+	// Round 2: final revise #1 → revision_open
+	round(2, domain.ReviewStatusRevisionOpen)
+	// Round 3: 技术失败（空输出）→ degraded（技术计数 +1，不触发 exhausted）
+	round(3, domain.ReviewStatusDegraded)
+	// Round 4: final revise #2 → revision_open
+	round(4, domain.ReviewStatusRevisionOpen)
+	// Round 5: 技术失败 → degraded（技术计数 +2）
+	round(5, domain.ReviewStatusDegraded)
+	// Round 6: final revise #3 → revision_open（内容预算 = 3/3）
+	round(6, domain.ReviewStatusRevisionOpen)
+	// Round 7: 技术失败 → degraded（技术计数 +3）——内容预算已满但技术失败
+	// 不得触发 exhausted（核心修复目标）。
+	round(7, domain.ReviewStatusDegraded)
+	// Round 8: 第 4 次内容 revise → 内容预算耗尽 → exhausted
+	round(8, domain.ReviewStatusExhausted)
+
+	ledger, _ := st.StyleReview.Load(1)
+	if got := domain.ContentRevisionCount(ledger); got != 3 {
+		t.Fatalf("ContentRevisionCount = %d, want 3", got)
+	}
+	if got := domain.TechnicalFailureCount(ledger); got != 3 {
+		t.Fatalf("TechnicalFailureCount = %d, want 3", got)
+	}
+	if got := domain.StaleCount(ledger); got != 0 {
+		t.Fatalf("StaleCount = %d, want 0", got)
+	}
+	// 事件分类落盘：degraded 周期全部为 technical；exhausted 周期为 content_revise
+	// （第 4 次内容 revise 触发耗尽，而非技术失败）。
+	for i, c := range ledger.Cycles {
+		switch c.Status {
+		case domain.ReviewStatusDegraded:
+			if c.EventKind != domain.ReviewEventTechnical {
+				t.Errorf("cycle[%d] degraded event_kind = %q, want technical", i, c.EventKind)
+			}
+		case domain.ReviewStatusRevisionOpen:
+			if c.EventKind != domain.ReviewEventContentRevise {
+				t.Errorf("cycle[%d] revision_open event_kind = %q, want content_revise", i, c.EventKind)
+			}
+		case domain.ReviewStatusExhausted:
+			if c.EventKind != domain.ReviewEventContentRevise {
+				t.Errorf("cycle[%d] exhausted event_kind = %q, want content_revise", i, c.EventKind)
+			}
+		}
+	}
+}
+
+// TestReviewStyle_StaleDoesNotConsumeContentBudget 验证 CAS stale 单独记录：
+// stale 事件不增加内容/技术计数，后续内容 revise 仍按正常预算计数。
+func TestReviewStyle_StaleDoesNotConsumeContentBudget(t *testing.T) {
+	st := setupCriticStore(t, 1, "第一章正文。这是一个测试草稿内容。")
+	concurrent := mechCleanDraft("第一章正文。并发修改后的内容。")
+	critic := newMockCritic(func(i int, msgs []agentcore.Message) (*agentcore.LLMResponse, error) {
+		// 模拟 critic 调用期间另一在途流程覆盖草稿 → CAS stale。
+		if err := st.Drafts.SaveDraft(1, concurrent); err != nil {
+			return nil, err
+		}
+		return &agentcore.LLMResponse{Message: criticText(productionReviseJSON())}, nil
+	})
+	tool := NewReviewStyleTool(st, critic, testCriticVersion)
+
+	out, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+	if err != nil {
+		t.Fatalf("Execute must return degraded output (not hard error): %v", err)
+	}
+	var output StyleReviewOutput
+	if err := json.Unmarshal(out, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Degraded || !strings.Contains(output.Error, "stale") {
+		t.Fatalf("expected degraded(stale) output, got %+v", output)
+	}
+
+	ledger, _ := st.StyleReview.Load(1)
+	last := ledger.CurrentCycle()
+	if last.EventKind != domain.ReviewEventStale {
+		t.Fatalf("stale marker must record event_kind=stale, got %q", last.EventKind)
+	}
+	// stale 不消耗内容预算也不消耗技术预算。
+	if got := domain.ContentRevisionCount(ledger); got != 0 {
+		t.Fatalf("ContentRevisionCount = %d, want 0（stale 不消耗内容预算）", got)
+	}
+	if got := domain.TechnicalFailureCount(ledger); got != 0 {
+		t.Fatalf("TechnicalFailureCount = %d, want 0（stale 单独记录，不计入技术计数）", got)
+	}
+	if got := domain.StaleCount(ledger); got != 1 {
+		t.Fatalf("StaleCount = %d, want 1", got)
+	}
+	if domain.ContentBudgetExhausted(ledger) {
+		t.Fatal("stale must not exhaust the content budget")
 	}
 }

@@ -165,6 +165,45 @@ func (v StyleReviewVerdict) Valid() bool {
 	return v == ReviewVerdictPass || v == ReviewVerdictRevise
 }
 
+// ── StyleReviewEventKind（style budget 账本，计划 §9）──────────────────
+//
+// 分类"产生该周期的评审事件"类型，用于区分内容计数（有效内容 revise，可触发
+// exhausted）与技术计数（调用故障，不可触发 exhausted）。空值 = legacy（旧数据
+// 无分类，按旧语义解释：degraded 视为技术失败，revision_open 视为内容 revise）。
+// 仅审计/预算计数用，不影响状态机流转。
+
+type StyleReviewEventKind string
+
+const (
+	// ReviewEventContentRevise 是有效内容 revise：style critic 对当前有效候选
+	// 返回内容性 revise。内容计数 +1，可触发 exhausted。
+	ReviewEventContentRevise StyleReviewEventKind = "content_revise"
+	// ReviewEventPass 是 pass 判定。不消耗任何预算。
+	ReviewEventPass StyleReviewEventKind = "pass"
+	// ReviewEventTechnical 是技术失败：length/empty/EOF/network/timeout/
+	// malformed JSON/audit 超限等调用故障。技术计数 +1，不可触发 exhausted。
+	ReviewEventTechnical StyleReviewEventKind = "technical"
+	// ReviewEventStale 是 CAS stale：评审候选过期（草稿/账本/polish checkpoint
+	// 在 critic 调用期间被并发修改）。单独记录，不消耗内容预算也不消耗技术预算。
+	ReviewEventStale StyleReviewEventKind = "stale"
+	// ReviewEventCandidateOutOfBounds 是 Polisher 候选越界（包 6 polish 流水线
+	// 记录，本包仅定义分类）。不消耗任何预算。
+	ReviewEventCandidateOutOfBounds StyleReviewEventKind = "candidate_out_of_bounds"
+	// ReviewEventOverride 是 user override（/style-override）。不消耗任何预算。
+	ReviewEventOverride StyleReviewEventKind = "override"
+)
+
+// Valid 报告事件分类是否合法（空值 = legacy，由调用方按旧语义解释）。
+func (k StyleReviewEventKind) Valid() bool {
+	switch k {
+	case ReviewEventContentRevise, ReviewEventPass, ReviewEventTechnical,
+		ReviewEventStale, ReviewEventCandidateOutOfBounds, ReviewEventOverride:
+		return true
+	default:
+		return false
+	}
+}
+
 // ── Finding enums ───────────────────────────────────────────────────
 
 const (
@@ -402,10 +441,18 @@ func DetectFinalReviewStagnation(ledger *StyleReviewLedger, currentResult *Style
 	return false
 }
 
-// FinalRevisionCount 统计当前评审 epoch 内的 final revision 轮次：即由
-// final_pending → revision_open 严格相邻转换产生的 revision_open 周期数
-// （"进入过 revision_open 后再次 final review 返回 revise"的次数）。
-// initial 评审的 revision_open（initial_pending → revision_open）不计入。
+// MaxContentRevisionsPerEpoch 是同一评审 epoch 内有效内容 revise 上限（计划 §9）：
+// 只有 style critic 对当前有效候选返回内容性 revise 才消耗内容预算；技术失败
+// （length/empty/EOF/network/timeout/malformed JSON/audit 超限）、CAS stale、
+// Polisher 候选越界与 user override 均不消耗内容预算，不得触发 exhausted。
+const MaxContentRevisionsPerEpoch = 3
+
+// ContentRevisionCount 统计当前评审 epoch 内的有效内容 revise 次数（内容预算，
+// 计划 §9）。语义与既有 final-revision 计数对齐：只统计由 final_pending →
+// revision_open 严格相邻转换产生的 revision_open 周期（"进入过 revision_open 后
+// 再次 final review 返回 revise"的次数）。initial 评审的 revision_open
+// （initial_pending → revision_open）不计入；degraded（技术失败/CAS stale）周期
+// 不计入——技术失败不得消耗内容预算（核心修复目标）。
 //
 // 计数绑定当前 epoch（MaxEpoch，与即将追加的新周期同代）：返工队列章节开启
 // 新 epoch 后从 0 重新计数（P1-7：每个评审 epoch 的 final revision 总数上限）。
@@ -413,7 +460,7 @@ func DetectFinalReviewStagnation(ledger *StyleReviewLedger, currentResult *Style
 // 与 DetectFinalReviewStagnation 叠加使用：同签名停滞立即 exhausted；不同
 // finding 的振荡（critic 反复换问题要求修订）在轮次达到上限后同样 exhausted，
 // 防止无限消耗 writer 轮次。
-func FinalRevisionCount(ledger *StyleReviewLedger) int {
+func ContentRevisionCount(ledger *StyleReviewLedger) int {
 	if ledger == nil || ledger.IsEmpty() {
 		return 0
 	}
@@ -428,6 +475,57 @@ func FinalRevisionCount(ledger *StyleReviewLedger) int {
 		}
 	}
 	return count
+}
+
+// TechnicalFailureCount 统计当前评审 epoch 内的技术失败次数（技术预算，计划 §9）：
+// length/empty/EOF/network/timeout/malformed JSON/audit 超限等调用故障。实现上
+// 统计 degraded 周期中 EventKind 为 technical 或 legacy（空——旧数据无分类，按
+// 旧语义视为技术失败）的条目。CAS stale（EventKind=stale）单独记录，不计入
+// 技术计数。技术计数不触发 exhausted。
+func TechnicalFailureCount(ledger *StyleReviewLedger) int {
+	if ledger == nil || ledger.IsEmpty() {
+		return 0
+	}
+	epoch := ledger.MaxEpoch()
+	count := 0
+	for i := range ledger.Cycles {
+		c := ledger.Cycles[i]
+		if c.EpochValue() != epoch || c.Status != ReviewStatusDegraded {
+			continue
+		}
+		if c.EventKind == ReviewEventStale {
+			continue
+		}
+		count++ // technical 或 legacy（空）
+	}
+	return count
+}
+
+// StaleCount 统计当前评审 epoch 内的 CAS stale 次数（单独记录，计划 §9）：
+// degraded 周期中 EventKind=stale 的条目。stale 不消耗内容预算也不消耗技术预算。
+func StaleCount(ledger *StyleReviewLedger) int {
+	if ledger == nil || ledger.IsEmpty() {
+		return 0
+	}
+	epoch := ledger.MaxEpoch()
+	count := 0
+	for i := range ledger.Cycles {
+		c := ledger.Cycles[i]
+		if c.EpochValue() != epoch || c.Status != ReviewStatusDegraded {
+			continue
+		}
+		if c.EventKind == ReviewEventStale {
+			count++
+		}
+	}
+	return count
+}
+
+// ContentBudgetExhausted 报告当前评审 epoch 的内容预算是否耗尽：有效内容 revise
+// 达到 MaxContentRevisionsPerEpoch 后，critic 再返回 revise 即进入 exhausted。
+// 技术失败/CAS stale/override 均不影响本判定（技术失败不得错误触发 exhausted）。
+func ContentBudgetExhausted(ledger *StyleReviewLedger) bool {
+	return ContentRevisionCount(ledger) >= MaxContentRevisionsPerEpoch
 }
 
 // ── StyleReviewOverride ─────────────────────────────────────────────
@@ -458,6 +556,11 @@ type StyleReviewEntry struct {
 	// 覆盖为 overridden）开启新 epoch（Epoch = 旧 max + 1）重新评审。
 	// 0 = legacy（读取时归一化为 1，见 StyleReviewStore.loadUnlocked）。
 	Epoch int `json:"epoch,omitempty"`
+	// EventKind 分类产生该周期的评审事件（style budget 账本，计划 §9）：
+	// content_revise/pass/technical/stale/candidate_out_of_bounds/override。
+	// 空 = legacy（旧数据无分类，按旧语义解释）。仅审计/预算计数用，不影响状态机
+	// 流转；序列化 omitempty 保证旧数据读取兼容。
+	EventKind StyleReviewEventKind `json:"event_kind,omitempty"`
 }
 
 // EpochValue 返回归一化后的 epoch：仅 0（legacy 数据/未设置）视为 1；
@@ -727,7 +830,8 @@ func overrideEqual(a, b StyleReviewOverride) bool {
 func EntriesEqual(a, b StyleReviewEntry) bool {
 	if a.Cycle != b.Cycle || a.Status != b.Status || a.AttemptID != b.AttemptID ||
 		a.DraftDigest != b.DraftDigest || a.BasisDigest != b.BasisDigest ||
-		a.Error != b.Error || a.CreatedAt != b.CreatedAt || a.Epoch != b.Epoch {
+		a.Error != b.Error || a.CreatedAt != b.CreatedAt || a.Epoch != b.Epoch ||
+		a.EventKind != b.EventKind {
 		return false
 	}
 	if (a.Request == nil) != (b.Request == nil) {
@@ -795,6 +899,37 @@ func validateCycleRules(l *StyleReviewLedger) error {
 		// C1-H3：epoch 负数非法（只有 0 允许被读取层归一化为 1）。
 		if cycle.Epoch < 0 {
 			return fmt.Errorf("ledger: cycle[%d] epoch must not be negative, got %d", i, cycle.Epoch)
+		}
+		// style budget（计划 §9）：event_kind 空 = legacy（旧数据无分类，允许）；
+		// 非空必须是合法枚举，且与状态语义一致（fail-closed，防误分类导致
+		// 技术失败被计入内容预算）。
+		if cycle.EventKind != "" && !cycle.EventKind.Valid() {
+			return fmt.Errorf("ledger: cycle[%d] invalid event_kind %q", i, cycle.EventKind)
+		}
+		switch cycle.Status {
+		case ReviewStatusInitialPending, ReviewStatusFinalPending:
+			// pending 周期不产生评审事件，不得携带 event_kind。
+			if cycle.EventKind != "" {
+				return fmt.Errorf("ledger: cycle[%d] %s must not have event_kind, got %q", i, cycle.Status, cycle.EventKind)
+			}
+		case ReviewStatusRevisionOpen, ReviewStatusExhausted:
+			// revise 结果（含触发 exhausted 的第 4 次 revise）只可能是内容事件。
+			if cycle.EventKind != "" && cycle.EventKind != ReviewEventContentRevise {
+				return fmt.Errorf("ledger: cycle[%d] %s requires event_kind content_revise or empty, got %q", i, cycle.Status, cycle.EventKind)
+			}
+		case ReviewStatusAcceptedInitial, ReviewStatusAcceptedRev:
+			if cycle.EventKind != "" && cycle.EventKind != ReviewEventPass {
+				return fmt.Errorf("ledger: cycle[%d] %s requires event_kind pass or empty, got %q", i, cycle.Status, cycle.EventKind)
+			}
+		case ReviewStatusDegraded:
+			// degraded 只可能是技术失败或 CAS stale（legacy 空值按技术失败解释）。
+			if cycle.EventKind != "" && cycle.EventKind != ReviewEventTechnical && cycle.EventKind != ReviewEventStale {
+				return fmt.Errorf("ledger: cycle[%d] degraded requires event_kind technical/stale or empty, got %q", i, cycle.EventKind)
+			}
+		case ReviewStatusOverridden:
+			if cycle.EventKind != "" && cycle.EventKind != ReviewEventOverride {
+				return fmt.Errorf("ledger: cycle[%d] overridden requires event_kind override or empty, got %q", i, cycle.EventKind)
+			}
 		}
 		if !isValidRFC3339(cycle.CreatedAt) {
 			return fmt.Errorf("ledger: cycle[%d] created_at not RFC3339: %q", i, cycle.CreatedAt)
