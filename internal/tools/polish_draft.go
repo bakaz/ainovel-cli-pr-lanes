@@ -192,10 +192,23 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 
 	// ── 4. 构建任务 payload（草稿 + 评审依据 + 已给意见 + 重写 brief）并调用 polisher ──
 	taskText := t.buildPolishTask(a.Chapter, content, wordCount, "")
-	outputText, err := t.runPolisherWithEmptyRetry(ctx, a.Chapter, taskText)
+
+	// 基线观测（§14 第 2 步）：polisher 调用前后记录耗时与进程 CPU 时间差。
+	// 观测只写 slog 日志，失败绝不影响主流程（见 logPolisherRunObs）。
+	obs := &polisherRunObs{}
+	obsStart := time.Now()
+	cpuStart, cpuOK := processCPUTime()
+	outputText, err := t.runPolisherWithEmptyRetry(ctx, a.Chapter, taskText, obs)
+	obs.elapsed = time.Since(obsStart)
+	if cpuOK {
+		if cpuEnd, ok := processCPUTime(); ok {
+			obs.cpuDelta, obs.cpuOK = cpuEnd-cpuStart, true
+		}
+	}
 	if err != nil {
 		// 可降级错误（stream idle / provider timeout / network 类 / MaxTurns）→
 		// 写 degraded polish checkpoint 后返回成功摘要；不可降级原样返回。
+		logPolisherRunObs(a.Chapter, wordCount, obs, nil, err)
 		return t.handlePolisherFailure(a.Chapter, inputDigest, wordCount, baseline, err)
 	}
 
@@ -210,11 +223,16 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 	plan, fallback, parseErr := ParsePolishEditPlan(outputText)
 	if parseErr != nil {
 		if !fallback {
+			logPolisherRunObs(a.Chapter, wordCount, obs, nil, parseErr)
 			return nil, fmt.Errorf("polisher 输出 edit plan 契约错误：%v: %w", parseErr, errs.ErrToolPrecondition)
 		}
-		return t.applyFullTextPolish(a.Chapter, content, wordCount, inputDigest, outputText, baseline)
+		summary, sErr := t.applyFullTextPolish(a.Chapter, content, wordCount, inputDigest, outputText, baseline)
+		logPolisherRunObs(a.Chapter, wordCount, obs, summary, sErr)
+		return summary, sErr
 	}
-	return t.applyEditPlan(a.Chapter, content, wordCount, inputDigest, plan, baseline)
+	summary, sErr := t.applyEditPlan(a.Chapter, content, wordCount, inputDigest, plan, baseline)
+	logPolisherRunObs(a.Chapter, wordCount, obs, summary, sErr)
+	return summary, sErr
 }
 
 // applyFullTextPolish 是整章重输出回退路径（旧协议）：polisher 输出无法解析为
@@ -678,7 +696,9 @@ func (t *PolishDraftTool) buildPolishTask(chapter int, content string, wordCount
 // 自动重试，指数退避（2s/4s/8s），最多 polisherEmptyRetryMax 次。
 // 只对"空输出"这种瞬态故障重试：runner 错误与非空输出（即使校验失败）立即返回。
 // 返回合并后的输出文本（Output 优先，空时回退 TerminalResult）。
-func (t *PolishDraftTool) runPolisherWithEmptyRetry(ctx context.Context, chapter int, taskText string) (string, error) {
+// obs 是基线观测累加器（§14 第 2 步）：每次尝试的 usage/空输出标记逐次累加，
+// 并输出单次尝试观测日志；观测失败绝不影响主流程。
+func (t *PolishDraftTool) runPolisherWithEmptyRetry(ctx context.Context, chapter int, taskText string, obs *polisherRunObs) (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= polisherEmptyRetryMax; attempt++ {
 		if attempt > 1 {
@@ -692,6 +712,10 @@ func (t *PolishDraftTool) runPolisherWithEmptyRetry(ctx context.Context, chapter
 
 		runResult, err := t.polisherRunner.Run(ctx, "polisher", taskText)
 		if err != nil {
+			// 基线观测：失败尝试同样消耗了 token（RunResult 在失败路径仍携带
+			// 已消耗 usage），记录后原样返回，错误处理不变。
+			obs.recordAttempt(runResult, false)
+			logPolisherAttempt(chapter, attempt, runResult, false, err)
 			return "", fmt.Errorf("polisher call failed: %w", err)
 		}
 
@@ -699,7 +723,10 @@ func (t *PolishDraftTool) runPolisherWithEmptyRetry(ctx context.Context, chapter
 		if outputText == "" && runResult.TerminalResult != nil {
 			outputText = string(runResult.TerminalResult)
 		}
-		if strings.TrimSpace(outputText) != "" {
+		empty := strings.TrimSpace(outputText) == ""
+		obs.recordAttempt(runResult, empty)
+		logPolisherAttempt(chapter, attempt, runResult, empty, nil)
+		if !empty {
 			return outputText, nil
 		}
 
@@ -709,6 +736,131 @@ func (t *PolishDraftTool) runPolisherWithEmptyRetry(ctx context.Context, chapter
 	}
 	return "", fmt.Errorf("%w；连续 %d 次空输出（瞬态故障），可稍后重新调用 polish_draft 重试",
 		lastErr, polisherEmptyRetryMax)
+}
+
+// ── Polisher 基线观测（§14 第 2 步）──────────────────────────────────
+//
+// 纯增量观测：为后续 one-shot → 多轮 polisher 改造提供基线数据（实际 API
+// 调用数 / token usage / 截断恢复 / edit 数 / 耗时与 CPU）。观测只写 slog
+// 日志，不改协议、不改落盘、不改错误处理、不改任何返回结构；观测代码自身
+// 错误只记日志，绝不影响主流程。
+
+// polisherRunObs 汇总一次 polish run 的观测数据：runPolisherWithEmptyRetry
+// 逐次尝试累加，Execute 主路径在 polisher 调用前后补计时，返回前输出汇总日志。
+type polisherRunObs struct {
+	attempts        int           // 实际 API 调用数（runPolisherWithEmptyRetry 尝试次数）
+	emptyOutputs    int           // 空输出次数（触发重试的瞬态故障数）
+	usageInput      int           // 全部尝试 input token 合计
+	usageOutput     int           // 全部尝试 output token 合计
+	usageCacheRead  int           // 全部尝试 cache_read token 合计
+	usageCacheWrite int           // 全部尝试 cache_write token 合计
+	usageCost       float64       // 全部尝试 cost 合计
+	usageTurns      int           // 全部尝试 turns 合计（含 length recovery 轮）
+	usageTools      int           // 全部尝试 tools 合计（polisher 无工具，恒 0）
+	elapsed         time.Duration // polisher 调用总耗时（Run 返回后由 Execute 补记）
+	cpuDelta        time.Duration // 进程 CPU 时间差（user+kernel）；不可得时为 0
+	cpuOK           bool          // 进程 CPU 时间是否可得
+}
+
+// recordAttempt 累加一次 Run 的观测数据（成功与失败尝试都消耗 token，
+// RunResult 在失败路径同样携带已消耗 usage）。
+func (o *polisherRunObs) recordAttempt(runResult subagent.RunResult, empty bool) {
+	o.attempts++
+	if empty {
+		o.emptyOutputs++
+	}
+	u := runResult.Usage
+	o.usageInput += u.Input
+	o.usageOutput += u.Output
+	o.usageCacheRead += u.CacheRead
+	o.usageCacheWrite += u.CacheWrite
+	o.usageCost += u.Cost
+	o.usageTurns += u.Turns
+	o.usageTools += u.Tools
+}
+
+// lengthRecoveryEst 估算本次 run 的 length recovery 次数。agentcore v1.7.13
+// 的 RunResult 不直接暴露 recovery 计数（loop 内 lengthRecoveryCount 不对外），
+// 但 polisher 无工具（ts.Polisher 恒为空）、无 steering/follow-up 注入，
+// AgentLoop 内每次 length 截断恢复恰好多消耗一轮模型调用（turns+1），故
+// turns - attempts ≈ recovery 次数。若未来 polisher 引入工具调用
+// （usageTools>0）该推导失效，返回 -1 表示不可得。
+func (o *polisherRunObs) lengthRecoveryEst() int {
+	if o.usageTools != 0 {
+		return -1
+	}
+	return o.usageTurns - o.attempts
+}
+
+// logPolisherAttempt 输出单次尝试的观测日志（runPolisherWithEmptyRetry 内部）。
+// finish_reason 恒为 "unavailable"：agentcore v1.7.13 RunResult 不暴露
+// finish reason（仅事件流 EventModelResponse.Message.StopReason 可见，而
+// Runner.SetEventObserver 是单槽位，已被 BuildWorkers 的 usage observer 占用，
+// 不得替换）。
+func logPolisherAttempt(chapter, attempt int, runResult subagent.RunResult, empty bool, err error) {
+	attrs := []any{
+		"module", "tools",
+		"chapter", chapter,
+		"attempt", attempt,
+		"max", polisherEmptyRetryMax,
+		"finish_reason", "unavailable",
+		"output_empty", empty,
+		"usage_input", runResult.Usage.Input,
+		"usage_output", runResult.Usage.Output,
+		"usage_cache_read", runResult.Usage.CacheRead,
+		"usage_cache_write", runResult.Usage.CacheWrite,
+		"usage_cost", runResult.Usage.Cost,
+		"usage_turns", runResult.Usage.Turns,
+		"usage_tools", runResult.Usage.Tools,
+	}
+	if err != nil {
+		attrs = append(attrs, "err", err)
+	}
+	slog.Info("polisher 调用观测（单次尝试）", attrs...)
+}
+
+// logPolisherRunObs 输出一次 polish run 的汇总观测日志（Execute 主路径，
+// polisher 调用完成后、返回前）。out 是各路径返回的 PolishDraftOutput JSON
+// （提取 edit 审计字段与 stage/model）；err 非 nil 表示本次 run 失败。
+// 观测失败（如 out 无法解析）只记日志，绝不影响主流程。
+func logPolisherRunObs(chapter, wordCount int, obs *polisherRunObs, out json.RawMessage, err error) {
+	var audit PolishDraftOutput
+	if len(out) > 0 {
+		_ = json.Unmarshal(out, &audit) // 观测失败不影响主流程
+	}
+	attrs := []any{
+		"module", "tools",
+		"chapter", chapter,
+		"word_count", wordCount,
+		"attempts", obs.attempts,
+		"empty_outputs", obs.emptyOutputs,
+		"length_recovery_est", obs.lengthRecoveryEst(),
+		"finish_reason", "unavailable",
+		"usage_input", obs.usageInput,
+		"usage_output", obs.usageOutput,
+		"usage_cache_read", obs.usageCacheRead,
+		"usage_cache_write", obs.usageCacheWrite,
+		"usage_cost", obs.usageCost,
+		"usage_turns", obs.usageTurns,
+		"usage_tools", obs.usageTools,
+		"proposed_edit_count", audit.ProposedEditCount,
+		"dropped_edit_count", audit.DroppedEditCount,
+		// applied = proposed - dropped：每条 edit 恰好落入 Applied 或 Dropped
+		// 一个桶（ApplyPolishEditPlanDetailed / DropApplied 保证）。
+		"applied_edit_count", audit.ProposedEditCount - audit.DroppedEditCount,
+		"partial", audit.Partial,
+		"normalized_match_count", audit.NormalizedMatchCount,
+		"match_modes", audit.MatchModes,
+		"stage", audit.Stage,
+		"polisher_model", audit.PolisherModel,
+		"elapsed_ms", obs.elapsed.Milliseconds(),
+		"cpu_ms", obs.cpuDelta.Milliseconds(),
+		"cpu_available", obs.cpuOK,
+	}
+	if err != nil {
+		attrs = append(attrs, "err", err)
+	}
+	slog.Info("polisher run 观测（汇总）", attrs...)
 }
 
 // polishStageForChapter 判定精修 stage：重写/打磨队列章节 → "rewrite"，其余 → "draft"。
