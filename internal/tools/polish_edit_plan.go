@@ -170,6 +170,16 @@ const (
 	PolishEditDropEmptyOldString  PolishEditDropReason = "empty_old_string"
 	PolishEditDropOldTooLong      PolishEditDropReason = "old_too_long"
 	PolishEditDropMechanical      PolishEditDropReason = "mechanical"
+	// ── 候选工具协议 per-edit 码（schema §9，包 2 扩展；只加常量，不改现有行为）──
+	PolishEditDropFactChanged      PolishEditDropReason = "fact_changed"
+	PolishEditDropFactCheckInvalid PolishEditDropReason = "fact_check_invalid"
+	PolishEditDropIssueUnknown     PolishEditDropReason = "issue_unknown"
+	PolishEditDropIssueNotEditable PolishEditDropReason = "issue_not_editable"
+	PolishEditDropIssueReused      PolishEditDropReason = "issue_reused"
+	PolishEditDropEmptyNewString   PolishEditDropReason = "empty_new"
+	PolishEditDropNewTooLong       PolishEditDropReason = "new_too_long"
+	PolishEditDropTotalLimit       PolishEditDropReason = "total_limit"
+	PolishEditDropBatchLimit       PolishEditDropReason = "batch_limit"
 )
 
 // minPolishEditNormalizedAnchorRunes 是 normalized 回退定位的锚点最短非空白 rune
