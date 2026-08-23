@@ -922,7 +922,10 @@ func (s *Store) markReviewStale(chapter int, attemptID, draftDigest string, pend
 		Request:     request,
 		DraftDigest: draftDigest,
 		BasisDigest: basisDigest,
-		Error:       cause,
+		// CAS stale 单独记录（style budget，计划 §9）：不消耗内容预算也不消耗
+		// 技术预算，不得触发 exhausted。
+		EventKind: domain.ReviewEventStale,
+		Error:     cause,
 	}
 	_ = s.StyleReview.updateUnlocked(chapter, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {
 		if cur == nil {

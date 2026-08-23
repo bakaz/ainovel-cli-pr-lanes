@@ -1404,12 +1404,12 @@ func TestDetectStagnation_CrossEpochNotDetected(t *testing.T) {
 	}
 }
 
-// ── FinalRevisionCount: final revision 轮次上限计数（P1-7） ─────────────
+// ── ContentRevisionCount: 有效内容 revise 计数（内容预算，P1-7） ────────
 
-// TestFinalRevisionCount_Basic 验证只统计 final_pending → revision_open 严格
+// TestContentRevisionCount_Basic 验证只统计 final_pending → revision_open 严格
 // 相邻转换产生的 revision_open（"进入过 revision_open 后再次 final review 返回
 // revise"），initial 评审的 revision_open 不计入。
-func TestFinalRevisionCount_Basic(t *testing.T) {
+func TestContentRevisionCount_Basic(t *testing.T) {
 	d := testDraft
 	b := testBasis
 	reqInit := &StyleReviewRequest{Prompt: "init", Model: "m"}
@@ -1429,26 +1429,26 @@ func TestFinalRevisionCount_Basic(t *testing.T) {
 			{Cycle: 6, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T15:00:00Z", AttemptID: "a3", Request: reqFinal, Result: revResult("问题二"), DraftDigest: d, BasisDigest: b},
 		},
 	}
-	if got := FinalRevisionCount(ledger); got != 2 {
-		t.Fatalf("FinalRevisionCount = %d, want 2", got)
+	if got := ContentRevisionCount(ledger); got != 2 {
+		t.Fatalf("ContentRevisionCount = %d, want 2", got)
 	}
 }
 
-// TestFinalRevisionCount_NilOrEmpty 验证 nil / 空账本计数为 0。
-func TestFinalRevisionCount_NilOrEmpty(t *testing.T) {
-	if got := FinalRevisionCount(nil); got != 0 {
+// TestContentRevisionCount_NilOrEmpty 验证 nil / 空账本计数为 0。
+func TestContentRevisionCount_NilOrEmpty(t *testing.T) {
+	if got := ContentRevisionCount(nil); got != 0 {
 		t.Fatalf("nil ledger count = %d, want 0", got)
 	}
 	empty := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic}
-	if got := FinalRevisionCount(empty); got != 0 {
+	if got := ContentRevisionCount(empty); got != 0 {
 		t.Fatalf("empty ledger count = %d, want 0", got)
 	}
 }
 
-// TestFinalRevisionCount_CrossEpochIsolated 验证计数绑定当前 epoch
+// TestContentRevisionCount_CrossEpochIsolated 验证计数绑定当前 epoch
 // （MaxEpoch）：旧 epoch 的 final revision 不计入，返工队列章节开启新 epoch
 // 后从 0 重新计数。
-func TestFinalRevisionCount_CrossEpochIsolated(t *testing.T) {
+func TestContentRevisionCount_CrossEpochIsolated(t *testing.T) {
 	d := testDraft
 	b := testBasis
 	reqInit := &StyleReviewRequest{Prompt: "init", Model: "m"}
@@ -1474,7 +1474,338 @@ func TestFinalRevisionCount_CrossEpochIsolated(t *testing.T) {
 		},
 	}
 	// 当前 epoch = 2：epoch 1 的 2 次 final revision 不计入 → 0
-	if got := FinalRevisionCount(ledger); got != 0 {
-		t.Fatalf("FinalRevisionCount = %d, want 0 (cross-epoch isolation)", got)
+	if got := ContentRevisionCount(ledger); got != 0 {
+		t.Fatalf("ContentRevisionCount = %d, want 0 (cross-epoch isolation)", got)
+	}
+}
+
+// ── StyleReviewEventKind（style budget 分类，计划 §9）──────────────────
+
+func TestEventKind_Valid(t *testing.T) {
+	for _, k := range []StyleReviewEventKind{
+		ReviewEventContentRevise, ReviewEventPass, ReviewEventTechnical,
+		ReviewEventStale, ReviewEventCandidateOutOfBounds, ReviewEventOverride,
+	} {
+		if !k.Valid() {
+			t.Errorf("event kind %q should be valid", k)
+		}
+	}
+	for _, k := range []StyleReviewEventKind{"", "bogus", "content"} {
+		if k.Valid() {
+			t.Errorf("event kind %q should be invalid", k)
+		}
+	}
+}
+
+// ── ValidateLedger: event_kind 校验 ───────────────────────────────────
+
+func TestValidateLedger_InvalidEventKind(t *testing.T) {
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusAcceptedInitial, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID:   "a1",
+		Request:     &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"},
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+		EventKind:   "bogus",
+	})
+	err := ValidateLedger(l)
+	if err == nil || !strings.Contains(err.Error(), "event_kind") {
+		t.Fatalf("expected invalid event_kind error, got %v", err)
+	}
+}
+
+func TestValidateLedger_EventKindStatusConsistency(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    StyleReviewStatus
+		eventKind StyleReviewEventKind
+		wantErr   string
+	}{
+		{"degraded with content_revise rejected", ReviewStatusDegraded, ReviewEventContentRevise, "degraded requires event_kind technical/stale"},
+		{"revision_open with technical rejected", ReviewStatusRevisionOpen, ReviewEventTechnical, "requires event_kind content_revise"},
+		{"accepted with technical rejected", ReviewStatusAcceptedInitial, ReviewEventTechnical, "requires event_kind pass"},
+		{"overridden with pass rejected", ReviewStatusOverridden, ReviewEventPass, "requires event_kind override"},
+		{"pending with event_kind rejected", ReviewStatusInitialPending, ReviewEventPass, "must not have event_kind"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+			entry := mkEntry(2, tc.status, ReviewVerdictPass)
+			entry.EventKind = tc.eventKind
+			l.Cycles = append(l.Cycles, entry)
+			err := ValidateLedger(l)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected %q error, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestValidateLedger_EventKindConsistentAccepted(t *testing.T) {
+	// 合法组合：revision_open+content_revise、degraded+technical、degraded+stale、
+	// accepted+pass 均通过校验（degraded 只允许跟在 final_pending 之后）。
+	l := validLedger(1, ReviewStatusInitialPending, ReviewVerdictPass)
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z",
+		AttemptID: "a1", Request: &StyleReviewRequest{Prompt: "initial review", Model: "gpt-4o"},
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "needs work", Findings: []StyleReviewFinding{testFind}},
+		DraftDigest: testDraft, BasisDigest: testBasis, EventKind: ReviewEventContentRevise,
+	})
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z",
+		AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 4, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T13:00:00Z",
+		AttemptID: "a2", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+		Error: "network failure", DraftDigest: testDraft, BasisDigest: testBasis, EventKind: ReviewEventTechnical,
+	})
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 5, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T14:00:00Z",
+		AttemptID: "a3", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 6, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T15:00:00Z",
+		AttemptID: "a3", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+		Error: "stale", DraftDigest: testDraft, BasisDigest: testBasis, EventKind: ReviewEventStale,
+	})
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 7, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T16:00:00Z",
+		AttemptID: "a4", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+		DraftDigest: testDraft, BasisDigest: testBasis,
+	})
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 8, Status: ReviewStatusAcceptedRev, CreatedAt: "2026-07-25T17:00:00Z",
+		AttemptID: "a4", Request: &StyleReviewRequest{Prompt: "final review", Model: "gpt-4o"},
+		Result:      &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok"},
+		DraftDigest: testDraft, BasisDigest: testBasis, EventKind: ReviewEventPass,
+	})
+	if err := ValidateLedger(l); err != nil {
+		t.Fatalf("consistent event_kind combinations should be valid: %v", err)
+	}
+}
+
+// ── EntriesEqual: event_kind 参与深度相等（append-only 前缀校验） ───────
+
+func TestEntriesEqual_EventKindDifference(t *testing.T) {
+	a := mkEntry(1, ReviewStatusAcceptedInitial, ReviewVerdictPass)
+	b := mkEntry(1, ReviewStatusAcceptedInitial, ReviewVerdictPass)
+	b.EventKind = ReviewEventPass
+	if EntriesEqual(a, b) {
+		t.Error("entries differing only in event_kind must not be equal")
+	}
+}
+
+// ── TechnicalFailureCount / StaleCount（技术预算与 stale 单独记录） ─────
+
+// mixedBudgetLedger 构造一个混合事件账本：initial revise（不计入内容预算）→
+// final revise #1 → 技术失败 → final revise #2 → CAS stale → final revise #3。
+// 当前 epoch 内容计数 = 3（final revise），技术计数 = 1，stale 计数 = 1。
+func mixedBudgetLedger() *StyleReviewLedger {
+	d := testDraft
+	b := testBasis
+	reqInit := &StyleReviewRequest{Prompt: "init", Model: "m"}
+	reqFinal := &StyleReviewRequest{Prompt: "final review", Model: "m"}
+	revResult := func(problem string) *StyleReviewResult {
+		return &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "e",
+			Findings: []StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Problem: problem, Suggestion: "改"}}}
+	}
+	return &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: reqInit, DraftDigest: d, BasisDigest: b, EventKind: ""},
+			{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z", AttemptID: "a1", Request: reqInit, Result: revResult("初始问题"), DraftDigest: d, BasisDigest: b, EventKind: ReviewEventContentRevise},
+			{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z", AttemptID: "a2", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 4, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T13:00:00Z", AttemptID: "a2", Request: reqFinal, Result: revResult("问题一"), DraftDigest: d, BasisDigest: b, EventKind: ReviewEventContentRevise},
+			{Cycle: 5, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T14:00:00Z", AttemptID: "a3", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 6, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T15:00:00Z", AttemptID: "a3", Request: reqFinal, Error: "critic returned empty output", DraftDigest: d, BasisDigest: b, EventKind: ReviewEventTechnical},
+			{Cycle: 7, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T16:00:00Z", AttemptID: "a4", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 8, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T17:00:00Z", AttemptID: "a4", Request: reqFinal, Result: revResult("问题二"), DraftDigest: d, BasisDigest: b, EventKind: ReviewEventContentRevise},
+			{Cycle: 9, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T18:00:00Z", AttemptID: "a5", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 10, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T19:00:00Z", AttemptID: "a5", Request: reqFinal, Error: "review candidate stale", DraftDigest: d, BasisDigest: b, EventKind: ReviewEventStale},
+			{Cycle: 11, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T20:00:00Z", AttemptID: "a6", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 12, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T21:00:00Z", AttemptID: "a6", Request: reqFinal, Result: revResult("问题三"), DraftDigest: d, BasisDigest: b, EventKind: ReviewEventContentRevise},
+		},
+	}
+}
+
+func TestTechnicalFailureCount_Basic(t *testing.T) {
+	l := mixedBudgetLedger()
+	if got := TechnicalFailureCount(l); got != 1 {
+		t.Fatalf("TechnicalFailureCount = %d, want 1（stale 单独记录，不计入技术计数）", got)
+	}
+}
+
+func TestTechnicalFailureCount_LegacyDegradedCountsAsTechnical(t *testing.T) {
+	// legacy（无 event_kind）degraded 按旧语义视为技术失败。
+	l := mixedBudgetLedger()
+	l.Cycles[5].EventKind = "" // 去掉 technical 分类 → legacy
+	if got := TechnicalFailureCount(l); got != 1 {
+		t.Fatalf("TechnicalFailureCount = %d, want 1（legacy degraded 视为技术失败）", got)
+	}
+}
+
+func TestTechnicalFailureCount_NilOrEmpty(t *testing.T) {
+	if got := TechnicalFailureCount(nil); got != 0 {
+		t.Fatalf("nil ledger count = %d, want 0", got)
+	}
+	empty := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic}
+	if got := TechnicalFailureCount(empty); got != 0 {
+		t.Fatalf("empty ledger count = %d, want 0", got)
+	}
+}
+
+func TestStaleCount_Basic(t *testing.T) {
+	l := mixedBudgetLedger()
+	if got := StaleCount(l); got != 1 {
+		t.Fatalf("StaleCount = %d, want 1", got)
+	}
+}
+
+func TestStaleCount_NilOrEmpty(t *testing.T) {
+	if got := StaleCount(nil); got != 0 {
+		t.Fatalf("nil ledger count = %d, want 0", got)
+	}
+	empty := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic}
+	if got := StaleCount(empty); got != 0 {
+		t.Fatalf("empty ledger count = %d, want 0", got)
+	}
+}
+
+// ── ContentBudgetExhausted（内容预算耗尽判定） ─────────────────────────
+
+func TestContentBudgetExhausted(t *testing.T) {
+	// 3 次有效内容 revise → 预算耗尽。
+	l := mixedBudgetLedger()
+	if !ContentBudgetExhausted(l) {
+		t.Fatal("3 content revises must exhaust the content budget")
+	}
+	// 内容计数与内容预算一致。
+	if got := ContentRevisionCount(l); got != MaxContentRevisionsPerEpoch {
+		t.Fatalf("ContentRevisionCount = %d, want %d", got, MaxContentRevisionsPerEpoch)
+	}
+
+	// 2 次有效内容 revise → 未耗尽。
+	l2 := mixedBudgetLedger()
+	l2.Cycles = l2.Cycles[:8] // 去掉 stale + 第 3 次 final revise
+	if ContentBudgetExhausted(l2) {
+		t.Fatal("2 content revises must not exhaust the content budget")
+	}
+
+	// nil / 空账本 → 未耗尽。
+	if ContentBudgetExhausted(nil) {
+		t.Fatal("nil ledger must not be exhausted")
+	}
+	empty := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic}
+	if ContentBudgetExhausted(empty) {
+		t.Fatal("empty ledger must not be exhausted")
+	}
+}
+
+// ── 事件→计数映射（计划 §9 表格） ──────────────────────────────────────
+//
+// 验证：只有有效内容 revise 增加内容计数并可触发 exhausted；pass/技术失败/
+// CAS stale/override 均不消耗内容预算。技术失败只增加技术计数；CAS stale 单独
+// 记录（不计入技术计数）。
+
+func TestEventClassificationMapping(t *testing.T) {
+	d := testDraft
+	b := testBasis
+	reqInit := &StyleReviewRequest{Prompt: "init", Model: "m"}
+	reqFinal := &StyleReviewRequest{Prompt: "final review", Model: "m"}
+	revResult := func(problem string) *StyleReviewResult {
+		return &StyleReviewResult{Verdict: ReviewVerdictRevise, Evidence: "e",
+			Findings: []StyleReviewFinding{{Dimension: "pacing", Category: "style", Severity: "warning", Problem: problem, Suggestion: "改"}}}
+	}
+	passResult := &StyleReviewResult{Verdict: ReviewVerdictPass, Evidence: "ok"}
+
+	// 完整生命周期：initial revise → final revise → 技术失败 → final revise →
+	// CAS stale → final revise → pass（accepted_revised）。
+	ledger := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: reqInit, DraftDigest: d, BasisDigest: b},
+			{Cycle: 2, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T11:00:00Z", AttemptID: "a1", Request: reqInit, Result: revResult("初始问题"), DraftDigest: d, BasisDigest: b, EventKind: ReviewEventContentRevise},
+			{Cycle: 3, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T12:00:00Z", AttemptID: "a2", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 4, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T13:00:00Z", AttemptID: "a2", Request: reqFinal, Result: revResult("问题一"), DraftDigest: d, BasisDigest: b, EventKind: ReviewEventContentRevise},
+			{Cycle: 5, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T14:00:00Z", AttemptID: "a3", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 6, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T15:00:00Z", AttemptID: "a3", Request: reqFinal, Error: "length exceeded", DraftDigest: d, BasisDigest: b, EventKind: ReviewEventTechnical},
+			{Cycle: 7, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T16:00:00Z", AttemptID: "a4", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 8, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T17:00:00Z", AttemptID: "a4", Request: reqFinal, Result: revResult("问题二"), DraftDigest: d, BasisDigest: b, EventKind: ReviewEventContentRevise},
+			{Cycle: 9, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T18:00:00Z", AttemptID: "a5", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 10, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T19:00:00Z", AttemptID: "a5", Request: reqFinal, Error: "review candidate stale", DraftDigest: d, BasisDigest: b, EventKind: ReviewEventStale},
+			{Cycle: 11, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T20:00:00Z", AttemptID: "a6", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 12, Status: ReviewStatusRevisionOpen, CreatedAt: "2026-07-25T21:00:00Z", AttemptID: "a6", Request: reqFinal, Result: revResult("问题三"), DraftDigest: d, BasisDigest: b, EventKind: ReviewEventContentRevise},
+			{Cycle: 13, Status: ReviewStatusFinalPending, CreatedAt: "2026-07-25T22:00:00Z", AttemptID: "a7", Request: reqFinal, DraftDigest: d, BasisDigest: b},
+			{Cycle: 14, Status: ReviewStatusAcceptedRev, CreatedAt: "2026-07-25T23:00:00Z", AttemptID: "a7", Request: reqFinal, Result: passResult, DraftDigest: d, BasisDigest: b, EventKind: ReviewEventPass},
+		},
+	}
+
+	// 内容计数 = 3 次 final 内容 revise（initial revise 不计入）。
+	if got := ContentRevisionCount(ledger); got != 3 {
+		t.Fatalf("ContentRevisionCount = %d, want 3", got)
+	}
+	// 技术计数 = 1（length 失败）；CAS stale 单独记录不计入技术计数。
+	if got := TechnicalFailureCount(ledger); got != 1 {
+		t.Fatalf("TechnicalFailureCount = %d, want 1", got)
+	}
+	// stale 单独记录 = 1。
+	if got := StaleCount(ledger); got != 1 {
+		t.Fatalf("StaleCount = %d, want 1", got)
+	}
+	// pass 不消耗任何预算：内容计数仍为 3（pass 周期本身不增加计数）。
+	if got := ContentRevisionCount(ledger); got != 3 {
+		t.Fatalf("pass must not consume content budget: ContentRevisionCount = %d, want 3", got)
+	}
+
+	// 技术失败 + stale 不触发 exhausted：即使技术失败很多，内容计数不变。
+	techHeavy := &StyleReviewLedger{SchemaVersion: 1, Chapter: 1, Mode: StyleQualityCritic,
+		Cycles: []StyleReviewEntry{
+			{Cycle: 1, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T10:00:00Z", AttemptID: "a1", Request: reqInit, DraftDigest: d, BasisDigest: b},
+			{Cycle: 2, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T11:00:00Z", AttemptID: "a1", Request: reqInit, Error: "empty output", DraftDigest: d, BasisDigest: b, EventKind: ReviewEventTechnical},
+			{Cycle: 3, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T12:00:00Z", AttemptID: "a2", Request: reqInit, DraftDigest: d, BasisDigest: b},
+			{Cycle: 4, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T13:00:00Z", AttemptID: "a2", Request: reqInit, Error: "EOF", DraftDigest: d, BasisDigest: b, EventKind: ReviewEventTechnical},
+			{Cycle: 5, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T14:00:00Z", AttemptID: "a3", Request: reqInit, DraftDigest: d, BasisDigest: b},
+			{Cycle: 6, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T15:00:00Z", AttemptID: "a3", Request: reqInit, Error: "timeout", DraftDigest: d, BasisDigest: b, EventKind: ReviewEventTechnical},
+			{Cycle: 7, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T16:00:00Z", AttemptID: "a4", Request: reqInit, DraftDigest: d, BasisDigest: b},
+			{Cycle: 8, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T17:00:00Z", AttemptID: "a4", Request: reqInit, Error: "malformed JSON", DraftDigest: d, BasisDigest: b, EventKind: ReviewEventTechnical},
+			{Cycle: 9, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T18:00:00Z", AttemptID: "a5", Request: reqInit, DraftDigest: d, BasisDigest: b},
+			{Cycle: 10, Status: ReviewStatusDegraded, CreatedAt: "2026-07-25T19:00:00Z", AttemptID: "a5", Request: reqInit, Error: "stale", DraftDigest: d, BasisDigest: b, EventKind: ReviewEventStale},
+		},
+	}
+	if got := TechnicalFailureCount(techHeavy); got != 4 {
+		t.Fatalf("TechnicalFailureCount = %d, want 4", got)
+	}
+	if got := StaleCount(techHeavy); got != 1 {
+		t.Fatalf("StaleCount = %d, want 1", got)
+	}
+	if ContentBudgetExhausted(techHeavy) {
+		t.Fatal("technical failures must never exhaust the content budget")
+	}
+	if got := ContentRevisionCount(techHeavy); got != 0 {
+		t.Fatalf("ContentRevisionCount = %d, want 0（技术失败不得消耗内容预算）", got)
+	}
+}
+
+// ── 技术计数 epoch 隔离 ───────────────────────────────────────────────
+
+func TestTechnicalFailureCount_CrossEpochIsolated(t *testing.T) {
+	l := mixedBudgetLedger()
+	// 追加 epoch 2 的 initial_pending（返工队列新 epoch）。
+	l.Cycles = append(l.Cycles, StyleReviewEntry{
+		Cycle: 13, Status: ReviewStatusInitialPending, CreatedAt: "2026-07-25T22:00:00Z",
+		AttemptID: "b1", Request: &StyleReviewRequest{Prompt: "init", Model: "m"},
+		DraftDigest: testDraft, BasisDigest: testBasis, Epoch: 2,
+	})
+	// 当前 epoch = 2：epoch 1 的技术失败/stale 不计入。
+	if got := TechnicalFailureCount(l); got != 0 {
+		t.Fatalf("TechnicalFailureCount = %d, want 0 (cross-epoch isolation)", got)
+	}
+	if got := StaleCount(l); got != 0 {
+		t.Fatalf("StaleCount = %d, want 0 (cross-epoch isolation)", got)
+	}
+	if got := ContentRevisionCount(l); got != 0 {
+		t.Fatalf("ContentRevisionCount = %d, want 0 (cross-epoch isolation)", got)
 	}
 }

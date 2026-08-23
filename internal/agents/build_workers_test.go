@@ -56,10 +56,12 @@ func TestBuildWorkers_ToolComposition(t *testing.T) {
 		"edit_chapter", "check_consistency", "commit_chapter",
 	})
 
-	// ── polisher 工具集：空（纯文本转换的嵌套模型，任务文本已含全部上下文，
-	// 无任何读取/落盘/检查/提交工具） ──
-	if len(ts.Polisher) != 0 {
-		t.Errorf("polisher toolset must be empty, got %v", toolNames(ts.Polisher))
+	// ── polisher 工具集：三个候选提交工具（schema docs/polisher-candidate-tools-schema.md §2）──
+	expectTools(t, "polisher", ts.Polisher, []string{
+		"submit_polish_plan", "submit_edit_batch", "finish_polish",
+	})
+	if len(ts.Polisher) != 3 {
+		t.Errorf("polisher toolset must have exactly 3 candidate tools, got %v", toolNames(ts.Polisher))
 	}
 
 	// ── editor 工具 ──
@@ -559,8 +561,8 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 	if ac.PromptCacheKey == "" || ac.PromptCacheKey == runnerAgentCacheKey(t, runner, "writer") {
 		t.Error("polisher cache key must be independent from writer")
 	}
-	if ac.MaxTurns != 3 {
-		t.Errorf("polisher MaxTurns = %d, want 3 (1 initial + up to 2 length recoveries)", ac.MaxTurns)
+	if ac.MaxTurns != 6 {
+		t.Errorf("polisher MaxTurns = %d, want 6 (initial + plan + up to 4 batches + finish, schema §11)", ac.MaxTurns)
 	}
 	// length 截断 recovery 必须要求整表重输出 edit 列表 JSON（默认续写提示会让
 	// JSON 尾段残缺，解析失败）
@@ -569,16 +571,27 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 	} else if !strings.Contains(ac.LengthRecoveryPrompt, "重新输出完整的精修 edit 列表 JSON") {
 		t.Errorf("polisher LengthRecoveryPrompt should require a full edit-list re-output, got %q", ac.LengthRecoveryPrompt)
 	}
-	// mimo-v2.5 真实 max output = 131072：显式覆盖默认 65536，避免 thinking 截断
-	if ac.MaxTokens != 131072 {
-		t.Errorf("polisher MaxTokens = %d, want 131072 (mimo-v2.5 real max output)", ac.MaxTokens)
+	// 预算表默认 65,536（计划 §6）；131,072 仅作为经过验证的模型 override（budgets.go）
+	if ac.MaxTokens != 65536 {
+		t.Errorf("polisher MaxTokens = %d, want 65536 (budget table default)", ac.MaxTokens)
 	}
-	if len(ac.StopAfterTools) != 0 {
-		t.Errorf("polisher StopAfterTools = %v, want empty (no tools)", ac.StopAfterTools)
+	// 计划 §7：length 截断每个逻辑调用最多恢复 1 次；run 级实际 API 调用硬上限 8
+	// （与 MaxTurns=6 独立：MaxTurns 是模型 turn 上限，MaxActualCalls 是 API 调用上限）
+	if ac.MaxLengthRecoveries != 1 {
+		t.Errorf("polisher MaxLengthRecoveries = %d, want 1 (plan §7: at most 1 length recovery)", ac.MaxLengthRecoveries)
 	}
-	// 工具集为空：纯文本转换的嵌套模型，无 review_style / commit_chapter 等任何工具
-	if len(ac.Tools) != 0 {
-		t.Errorf("polisher toolset must be empty, got %v", toolNames(ac.Tools))
+	if ac.MaxActualCalls != 8 {
+		t.Errorf("polisher MaxActualCalls = %d, want 8 (plan §7: run-level API call hard cap)", ac.MaxActualCalls)
+	}
+	if len(ac.StopAfterTools) != 1 || ac.StopAfterTools[0] != "finish_polish" {
+		t.Errorf("polisher StopAfterTools = %v, want [finish_polish]", ac.StopAfterTools)
+	}
+	// 工具集 = 三个候选提交工具（schema §2）
+	expectTools(t, "polisher", ac.Tools, []string{
+		"submit_polish_plan", "submit_edit_batch", "finish_polish",
+	})
+	if len(ac.Tools) != 3 {
+		t.Errorf("polisher toolset must have exactly 3 candidate tools, got %v", toolNames(ac.Tools))
 	}
 	if toolInList(ac.Tools, "review_style") || toolInList(ac.Tools, "commit_chapter") {
 		t.Error("polisher must not have review_style/commit_chapter")
@@ -600,7 +613,14 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 	if writerAC.MaxTokens != 0 {
 		t.Errorf("writer MaxTokens = %d, want 0 (default behavior)", writerAC.MaxTokens)
 	}
-	for _, name := range []string{"architect_short", "architect_long", "editor"} {
+	// 其他 agent 不设置 recovery/调用预算：保持 agentcore 默认（计划 §7 仅 polisher 收紧）
+	if writerAC.MaxLengthRecoveries != 0 {
+		t.Errorf("writer MaxLengthRecoveries = %d, want 0 (default behavior)", writerAC.MaxLengthRecoveries)
+	}
+	if writerAC.MaxActualCalls != 0 {
+		t.Errorf("writer MaxActualCalls = %d, want 0 (default behavior)", writerAC.MaxActualCalls)
+	}
+	for _, name := range []string{"architect_short", "editor"} {
 		other, ok := runner.AgentConfig(name)
 		if !ok {
 			t.Fatalf("agent %s missing", name)
@@ -608,9 +628,32 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 		if other.LengthRecoveryPrompt != "" {
 			t.Errorf("%s LengthRecoveryPrompt = %q, want empty (default behavior)", name, other.LengthRecoveryPrompt)
 		}
-		if other.MaxTokens != 0 {
-			t.Errorf("%s MaxTokens = %d, want 0 (default behavior)", name, other.MaxTokens)
+		if other.MaxTokens != 32768 {
+			t.Errorf("%s MaxTokens = %d, want 32768 (budget table)", name, other.MaxTokens)
 		}
+		if other.MaxLengthRecoveries != 0 {
+			t.Errorf("%s MaxLengthRecoveries = %d, want 0 (default behavior)", name, other.MaxLengthRecoveries)
+		}
+		if other.MaxActualCalls != 0 {
+			t.Errorf("%s MaxActualCalls = %d, want 0 (default behavior)", name, other.MaxActualCalls)
+		}
+	}
+	// architect_long：预算表 65,536 = agentcore 默认，保持 0 不显式设置。
+	archLong, ok := runner.AgentConfig("architect_long")
+	if !ok {
+		t.Fatal("agent architect_long missing")
+	}
+	if archLong.LengthRecoveryPrompt != "" {
+		t.Errorf("architect_long LengthRecoveryPrompt = %q, want empty (default behavior)", archLong.LengthRecoveryPrompt)
+	}
+	if archLong.MaxTokens != 0 {
+		t.Errorf("architect_long MaxTokens = %d, want 0 (agentcore default 65536 = budget table)", archLong.MaxTokens)
+	}
+	if archLong.MaxLengthRecoveries != 0 {
+		t.Errorf("architect_long MaxLengthRecoveries = %d, want 0 (default behavior)", archLong.MaxLengthRecoveries)
+	}
+	if archLong.MaxActualCalls != 0 {
+		t.Errorf("architect_long MaxActualCalls = %d, want 0 (default behavior)", archLong.MaxActualCalls)
 	}
 
 	// polisher 模型 = 配置的 roles.polisher
@@ -895,4 +938,223 @@ func TestBuildWorkers_WrapsModelsWithTrailingReminder(t *testing.T) {
 			t.Errorf("%s model is not wrapped with trailing reminder", name)
 		}
 	}
+}
+
+// TestBuildWorkers_PolisherHighOutputOverride 验证 131,072 override（计划 §6）：
+// 模型名精确命中 polisherHighOutputModels 时 polisher MaxTokens 放宽到 131,072；
+// 未命中时保持预算表默认 65,536。override 按模型名精确匹配，不能全局提升。
+func TestBuildWorkers_PolisherHighOutputOverride(t *testing.T) {
+	build := func(model string) *subagent.Runner {
+		t.Helper()
+		dir := t.TempDir()
+		st := store.NewStore(dir)
+		if err := st.Init(); err != nil {
+			t.Fatal(err)
+		}
+		bundle := assets.Load("default", assets.LoadOptions{})
+		cfg := bootstrap.Config{
+			Provider:  "ollama",
+			ModelName: "dummy-model",
+			Providers: map[string]bootstrap.ProviderConfig{
+				"ollama": {BaseURL: "http://0.0.0.0:0"},
+			},
+			Style:           "default",
+			ChapterPipeline: "ds_mimo_critic",
+			Roles: map[string]bootstrap.RoleConfig{
+				"polisher": {Provider: "ollama", Model: model},
+			},
+		}
+		models, err := bootstrap.NewModelSet(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runner, _, _, _ := BuildWorkers(cfg, st, models, bundle, nil, nil, projectprofile.NewCore4Contract())
+		return runner
+	}
+
+	t.Run("override_model", func(t *testing.T) {
+		runner := build("mimo-v2.5")
+		ac, ok := runner.AgentConfig("polisher")
+		if !ok {
+			t.Fatal("polisher agent missing")
+		}
+		if ac.MaxTokens != 131072 {
+			t.Errorf("polisher MaxTokens = %d, want 131072 (verified override)", ac.MaxTokens)
+		}
+	})
+
+	t.Run("non_override_model", func(t *testing.T) {
+		runner := build("mimo-polisher")
+		ac, ok := runner.AgentConfig("polisher")
+		if !ok {
+			t.Fatal("polisher agent missing")
+		}
+		if ac.MaxTokens != 65536 {
+			t.Errorf("polisher MaxTokens = %d, want 65536 (budget table default)", ac.MaxTokens)
+		}
+	})
+}
+
+// TestBuildWorkers_RoleMaxTokens 验证各角色 MaxTokens 对齐预算表（计划 §6）：
+// architect_short/editor 显式 32,768；architect_long/writer 保持 0（agentcore
+// 默认 65,536 = 预算表值，保持不变）；style_critic 走独立 runner，其 16,384 由
+// budgets_test.go 的预算表断言覆盖。
+func TestBuildWorkers_RoleMaxTokens(t *testing.T) {
+	dir := t.TempDir()
+	st := store.NewStore(dir)
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	bundle := assets.Load("default", assets.LoadOptions{})
+	cfg := bootstrap.Config{
+		Provider:  "ollama",
+		ModelName: "dummy-model",
+		Providers: map[string]bootstrap.ProviderConfig{
+			"ollama": {BaseURL: "http://0.0.0.0:0"},
+		},
+		Style: "default",
+	}
+	models, err := bootstrap.NewModelSet(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, _, _, _ := BuildWorkers(cfg, st, models, bundle, nil, nil, projectprofile.NewCore4Contract())
+
+	for _, name := range []string{"architect_short", "editor"} {
+		ac, ok := runner.AgentConfig(name)
+		if !ok {
+			t.Fatalf("agent %s missing", name)
+		}
+		if ac.MaxTokens != 32768 {
+			t.Errorf("%s MaxTokens = %d, want 32768 (budget table)", name, ac.MaxTokens)
+		}
+	}
+	// architect_long / writer：预算表 65,536 = agentcore 默认，保持 0 不显式设置。
+	for _, name := range []string{"architect_long", "writer"} {
+		ac, ok := runner.AgentConfig(name)
+		if !ok {
+			t.Fatalf("agent %s missing", name)
+		}
+		if ac.MaxTokens != 0 {
+			t.Errorf("%s MaxTokens = %d, want 0 (agentcore default 65536 = budget table)", name, ac.MaxTokens)
+		}
+	}
+}
+
+// polishDraftFromWriter 从 writer 工具集提取 polish_draft 实例（测试辅助）。
+func polishDraftFromWriter(t *testing.T, runner *subagent.Runner) *tools.PolishDraftTool {
+	t.Helper()
+	writerAC, ok := runner.AgentConfig("writer")
+	if !ok {
+		t.Fatal("writer agent missing")
+	}
+	for _, tl := range writerAC.Tools {
+		if pd, ok := tl.(*tools.PolishDraftTool); ok {
+			return pd
+		}
+	}
+	t.Fatal("writer toolset missing polish_draft")
+	return nil
+}
+
+// TestBuildWorkers_FullContextPolisherFlagWiring 验证灰度 flag
+// full_context_polisher_v3（计划 §12）经 BuildWorkers 注入 polish_draft：
+// flag=true → FullContextEnabled()=true；flag=false（默认）→ false（回滚开关）。
+func TestBuildWorkers_FullContextPolisherFlagWiring(t *testing.T) {
+	build := func(flag bool) *subagent.Runner {
+		t.Helper()
+		dir := t.TempDir()
+		st := store.NewStore(dir)
+		if err := st.Init(); err != nil {
+			t.Fatal(err)
+		}
+		bundle := assets.Load("default", assets.LoadOptions{})
+		cfg := bootstrap.Config{
+			Provider:  "ollama",
+			ModelName: "dummy-model",
+			Providers: map[string]bootstrap.ProviderConfig{
+				"ollama": {BaseURL: "http://0.0.0.0:0"},
+			},
+			Style:           "default",
+			ChapterPipeline: "ds_mimo_critic",
+			Roles: map[string]bootstrap.RoleConfig{
+				"polisher": {Provider: "ollama", Model: "mimo-polisher"},
+			},
+			Flags: bootstrap.Flags{FullContextPolisherV3: flag},
+		}
+		models, err := bootstrap.NewModelSet(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runner, _, _, _ := BuildWorkers(cfg, st, models, bundle, nil, nil, projectprofile.NewCore4Contract())
+		return runner
+	}
+
+	t.Run("flag_on", func(t *testing.T) {
+		pd := polishDraftFromWriter(t, build(true))
+		if !pd.FullContextEnabled() {
+			t.Error("full_context_polisher_v3=true must enable multi-turn path")
+		}
+	})
+	t.Run("flag_off_default", func(t *testing.T) {
+		pd := polishDraftFromWriter(t, build(false))
+		if pd.FullContextEnabled() {
+			t.Error("full_context_polisher_v3=false (default) must keep one-shot path")
+		}
+	})
+}
+
+// TestBuildWorkers_LegacyPolisherHighOutputFlag 验证灰度 flag
+// legacy_polisher_high_output（计划 §12）：开启时 polisher MaxTokens 沿用旧
+// 硬编码 131,072（回滚开关），关闭（默认）时走预算表 + 已验证模型 override。
+func TestBuildWorkers_LegacyPolisherHighOutputFlag(t *testing.T) {
+	build := func(flag bool) *subagent.Runner {
+		t.Helper()
+		dir := t.TempDir()
+		st := store.NewStore(dir)
+		if err := st.Init(); err != nil {
+			t.Fatal(err)
+		}
+		bundle := assets.Load("default", assets.LoadOptions{})
+		cfg := bootstrap.Config{
+			Provider:  "ollama",
+			ModelName: "dummy-model",
+			Providers: map[string]bootstrap.ProviderConfig{
+				"ollama": {BaseURL: "http://0.0.0.0:0"},
+			},
+			Style:           "default",
+			ChapterPipeline: "ds_mimo_critic",
+			Roles: map[string]bootstrap.RoleConfig{
+				"polisher": {Provider: "ollama", Model: "mimo-polisher"},
+			},
+			Flags: bootstrap.Flags{LegacyPolisherHighOutput: flag},
+		}
+		models, err := bootstrap.NewModelSet(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runner, _, _, _ := BuildWorkers(cfg, st, models, bundle, nil, nil, projectprofile.NewCore4Contract())
+		return runner
+	}
+
+	t.Run("flag_on_legacy_131072", func(t *testing.T) {
+		runner := build(true)
+		ac, ok := runner.AgentConfig("polisher")
+		if !ok {
+			t.Fatal("polisher agent missing")
+		}
+		if ac.MaxTokens != 131072 {
+			t.Errorf("polisher MaxTokens = %d, want 131072 (legacy high-output flag)", ac.MaxTokens)
+		}
+	})
+	t.Run("flag_off_budget_default", func(t *testing.T) {
+		runner := build(false)
+		ac, ok := runner.AgentConfig("polisher")
+		if !ok {
+			t.Fatal("polisher agent missing")
+		}
+		if ac.MaxTokens != 65536 {
+			t.Errorf("polisher MaxTokens = %d, want 65536 (budget table default)", ac.MaxTokens)
+		}
+	})
 }

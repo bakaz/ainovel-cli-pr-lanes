@@ -82,6 +82,58 @@ func TestRenderEventLine_TOOL_DiscardedShowsOStroke(t *testing.T) {
 	}
 }
 
+func TestRenderEventContent_DispatchTotalsIncludeThinkAndTools(t *testing.T) {
+	now := time.Now()
+	events := []host.Event{
+		{
+			ID:       "d1",
+			Time:     now.Add(-20 * time.Minute),
+			Category: "DISPATCH",
+			Agent:    "writer",
+			Summary:  "写第 845 章",
+		},
+		{
+			ID:         "t1",
+			Time:       now.Add(-8 * time.Minute),
+			FinishedAt: now.Add(-7 * time.Minute),
+			Category:   "TOOL",
+			Agent:      "writer",
+			Summary:    "plan_chapter",
+			Depth:      1,
+			Duration:   time.Minute,
+		},
+		{
+			ID:       "t2",
+			Time:     now.Add(-4 * time.Minute),
+			Category: "TOOL",
+			Agent:    "writer",
+			Summary:  "draft_chapter",
+			Depth:    1,
+		},
+	}
+	out := renderEventContent(events, 160, 0)
+	if !strings.Contains(out, "想") || !strings.Contains(out, "工") || !strings.Contains(out, "=") {
+		t.Fatalf("dispatch should show 总=想+工, got %q", out)
+	}
+	if !strings.Contains(out, "20m") {
+		t.Fatalf("dispatch total should be ~20m: %q", out)
+	}
+	// 工 = 完成的 1m + 进行中的 ~4m
+	if !strings.Contains(out, "工 5m") && !strings.Contains(out, "工 4m") {
+		t.Fatalf("dispatch 工 should include finished+running tools: %q", out)
+	}
+	lines := strings.Split(out, "\n")
+	if len(lines) < 3 {
+		t.Fatalf("expected dispatch + 2 tools, got %d lines: %q", len(lines), out)
+	}
+	if strings.Contains(lines[2], "想") || strings.Contains(lines[2], "started") {
+		t.Fatalf("tool line should only show this call, got %q", lines[2])
+	}
+	if !strings.Contains(lines[2], "4m") {
+		t.Fatalf("current tool line should show this call ~4m: %q", lines[2])
+	}
+}
+
 func TestRenderEventLine_TOOL_FailedShowsCross(t *testing.T) {
 	ev := host.Event{
 		ID:         "e1",

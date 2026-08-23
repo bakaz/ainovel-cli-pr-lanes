@@ -190,7 +190,45 @@ type Config struct {
 
 	// Notify 无人值守告警配置；缺省启用（system 通道兜底）。
 	Notify NotifyConfig `json:"notify,omitzero"`
+
+	// Flags 灰度功能开关（docs/handoff-polisher-style-token-plan.md §12）。
+	// 全部默认关闭（零值=false）；开启前必须完成对应观测/验收。
+	Flags Flags `json:"flags,omitzero"`
 }
+
+// Flags 是 polisher v3 改造的灰度功能开关（计划 §12）。全部默认关闭；
+// 回滚只翻 flag（旧 one-shot 路径保留至少两个正式版本和 30 天）。
+type Flags struct {
+	// FullContextPolisherV3 开启 polisher 多轮候选工具协议路径
+	//（submit_polish_plan → submit_edit_batch×N → finish_polish，包 6）。
+	// 关闭（默认）时走现有 one-shot 路径（edit_list/full_text）——回滚开关。
+	FullContextPolisherV3 bool `json:"full_context_polisher_v3,omitempty"`
+	// PolisherCandidateToolsV3 候选工具协议（包 2）开关。
+	PolisherCandidateToolsV3 bool `json:"polisher_candidate_tools_v3,omitempty"`
+	// AgentOutputBudgetV2 角色级 token/retry 预算（包 4）开关。
+	AgentOutputBudgetV2 bool `json:"agent_output_budget_v2,omitempty"`
+	// StyleContentBudgetV2 风格评审内容/技术预算（包 3）开关。
+	StyleContentBudgetV2 bool `json:"style_content_budget_v2,omitempty"`
+	// LegacyPolisherHighOutput 旧 polisher 高输出（131,072 max output）开关：
+	// 开启时 polisher 沿用旧硬编码 131,072 上限（回滚开关），关闭时走
+	// 预算表默认 65,536 + 已验证模型 override（budgets.go）。
+	LegacyPolisherHighOutput bool `json:"legacy_polisher_high_output,omitempty"`
+}
+
+// FullContextPolisherV3Enabled 报告多轮候选工具协议路径是否开启（计划 §12 灰度 flag）。
+func (c Config) FullContextPolisherV3Enabled() bool { return c.Flags.FullContextPolisherV3 }
+
+// PolisherCandidateToolsV3Enabled 报告候选工具协议（包 2）是否开启。
+func (c Config) PolisherCandidateToolsV3Enabled() bool { return c.Flags.PolisherCandidateToolsV3 }
+
+// AgentOutputBudgetV2Enabled 报告角色级 token/retry 预算（包 4）是否开启。
+func (c Config) AgentOutputBudgetV2Enabled() bool { return c.Flags.AgentOutputBudgetV2 }
+
+// StyleContentBudgetV2Enabled 报告风格评审内容/技术预算（包 3）是否开启。
+func (c Config) StyleContentBudgetV2Enabled() bool { return c.Flags.StyleContentBudgetV2 }
+
+// LegacyPolisherHighOutputEnabled 报告旧 polisher 高输出开关是否开启。
+func (c Config) LegacyPolisherHighOutputEnabled() bool { return c.Flags.LegacyPolisherHighOutput }
 
 // BudgetConfig 是用户对单本书钱包的政策声明。越线停机等同于用户在那一刻
 // 手动 Abort——Host 只代为执行，不评估模型行为（架构 §10 合宪边界）。

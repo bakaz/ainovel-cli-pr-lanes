@@ -27,13 +27,15 @@ import (
 // text so the critic knows which portion it sees.
 const maxCriticRunes = 12000
 
-// maxFinalRevisionsPerEpoch 是同一评审 epoch 内 final revision 轮次上限
-// （ora-1 P1-7，建议 2-3，取 3）：final 评审返回 revise（final_pending →
-// revision_open）的次数达到该值后，critic 再返回 revise 即进入 exhausted。
-// 与同签名停滞（DetectFinalReviewStagnation）叠加：同签名立即 exhausted；
-// 不同 finding 的振荡（ch130：critic revise → edit → polish → check → review
-// 循环）在 3 轮后 exhausted，防止无限消耗 writer 轮次。
-const maxFinalRevisionsPerEpoch = 3
+// ── Style review 内容预算（计划 §9）────────────────────────────────────
+//
+// 同一评审 epoch 内有效内容 revise 上限 = domain.MaxContentRevisionsPerEpoch（3）：
+// final 评审返回内容性 revise（final_pending → revision_open）达到上限后，critic
+// 再返回 revise 即进入 exhausted。与同签名停滞（DetectFinalReviewStagnation）
+// 叠加：同签名立即 exhausted；不同 finding 的振荡（ch130：critic revise → edit →
+// polish → check → review 循环）在 3 轮后 exhausted，防止无限消耗 writer 轮次。
+// 技术失败（length/empty/EOF/network/timeout/malformed JSON/audit 超限）与
+// CAS stale 不消耗内容预算，不得触发 exhausted（核心修复目标）。
 
 // ── Critic empty-output retry ────────────────────────────────────────
 //
@@ -774,11 +776,14 @@ func (t *ReviewStyleTool) mechanicalGateFor(chapter int) func(draft string) erro
 
 func (t *ReviewStyleTool) appendInitialResult(chapter int, attemptID string, request *domain.StyleReviewRequest, result *domain.StyleReviewResult, draftDigest, basisDigest string) (json.RawMessage, error) {
 	var nextStatus domain.StyleReviewStatus
+	// style budget（计划 §9）：pass 不消耗预算；revise 是有效内容 revise。
+	eventKind := domain.ReviewEventPass
 	switch result.Verdict {
 	case domain.ReviewVerdictPass:
 		nextStatus = domain.ReviewStatusAcceptedInitial
 	case domain.ReviewVerdictRevise:
 		nextStatus = domain.ReviewStatusRevisionOpen
+		eventKind = domain.ReviewEventContentRevise
 	default:
 		return t.appendDegraded(chapter, attemptID, draftDigest, basisDigest, request, fmt.Errorf("unexpected verdict %q", result.Verdict))
 	}
@@ -812,6 +817,7 @@ func (t *ReviewStyleTool) appendInitialResult(chapter int, attemptID string, req
 			DraftDigest: draftDigest,
 			BasisDigest: basisDigest,
 			Epoch:       cur.MaxEpoch(),
+			EventKind:   eventKind,
 		})
 		return cur, nil
 	})
@@ -827,11 +833,15 @@ func (t *ReviewStyleTool) appendInitialResult(chapter int, attemptID string, req
 
 func (t *ReviewStyleTool) appendFinalResult(chapter int, attemptID string, request *domain.StyleReviewRequest, result *domain.StyleReviewResult, draftDigest, basisDigest string) (json.RawMessage, error) {
 	var nextStatus domain.StyleReviewStatus
+	// style budget（计划 §9）：pass 不消耗预算；revise 是有效内容 revise
+	// （即使因内容预算耗尽转为 exhausted，事件本身仍是内容 revise）。
+	eventKind := domain.ReviewEventPass
 	switch result.Verdict {
 	case domain.ReviewVerdictPass:
 		nextStatus = domain.ReviewStatusAcceptedRev
 	case domain.ReviewVerdictRevise:
 		nextStatus = domain.ReviewStatusRevisionOpen // V2: loop back to revision_open by default
+		eventKind = domain.ReviewEventContentRevise
 	default:
 		return nil, fmt.Errorf("unexpected verdict %q for final review", result.Verdict)
 	}
@@ -854,13 +864,14 @@ func (t *ReviewStyleTool) appendFinalResult(chapter int, attemptID string, reque
 
 		// V2: detect stagnation — same finding signature as previous
 		// final_revise → revision_open → exhausted to prevent infinite loops.
-		// P1-7: 叠加 final revision 总数上限——同一 epoch 内 final revise 轮次
-		// 达到 maxFinalRevisionsPerEpoch 后，即使 findings 各不相同（oscillation）
-		// 也进入 exhausted，与同签名停滞共用同一收敛路径（/style-override 或
-		// 接受当前候选）。
+		// P1-7 + 计划 §9：叠加内容预算上限——同一 epoch 内有效内容 revise 达到
+		// domain.MaxContentRevisionsPerEpoch 后，即使 findings 各不相同
+		// （oscillation）也进入 exhausted，与同签名停滞共用同一收敛路径
+		// （/style-override 或接受当前候选）。技术失败（degraded）与 CAS stale
+		// 不消耗内容预算，不得触发 exhausted。
 		if nextStatus == domain.ReviewStatusRevisionOpen {
 			if domain.DetectFinalReviewStagnation(cur, result) ||
-				domain.FinalRevisionCount(cur) >= maxFinalRevisionsPerEpoch {
+				domain.ContentBudgetExhausted(cur) {
 				nextStatus = domain.ReviewStatusExhausted
 			}
 		}
@@ -885,6 +896,7 @@ func (t *ReviewStyleTool) appendFinalResult(chapter int, attemptID string, reque
 			DraftDigest: draftDigest,
 			BasisDigest: basisDigest,
 			Epoch:       cur.MaxEpoch(),
+			EventKind:   eventKind,
 		})
 		return cur, nil
 	})
@@ -935,7 +947,12 @@ func (t *ReviewStyleTool) appendDegraded(chapter int, attemptID string, draftDig
 		Request:     req,
 		DraftDigest: draftDigest,
 		BasisDigest: basisDigest,
-		Error:       cause.Error(),
+		// 技术失败（length/empty/EOF/network/timeout/malformed JSON/audit 超限
+		// 等调用故障）记录为 technical（style budget，计划 §9）：技术计数 +1，
+		// 不消耗内容预算，不得触发 exhausted。CAS stale 由 markReviewStale
+		// 单独记录为 stale，不走本函数。
+		EventKind: domain.ReviewEventTechnical,
+		Error:     cause.Error(),
 	}
 
 	if err := t.store.StyleReview.Update(chapter, func(cur *domain.StyleReviewLedger) (*domain.StyleReviewLedger, error) {

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -66,6 +67,26 @@ type PolishDraftTool struct {
 	// ErrorCategory，正文未变）→ FSM 收敛到 post-check，防"精修反复引入机械违规 →
 	// 永久 fail-closed 死循环"（循环 B）。
 	mechRejectStreak map[int]int
+	// fullContextEnabled 是 polisher 多轮候选工具协议路径开关（灰度 flag
+	// full_context_polisher_v3，计划 §12）。关闭（默认）时走现有 one-shot 路径
+	//（edit_list/full_text）——回滚开关。由 BuildWorkers 按配置注入。
+	fullContextEnabled bool
+	// accHolder 是 accumulator 运行时注入桥（agents.PolishAccumulatorHolder 实现）。
+	// 多轮路径每次 run 开始时 Set(acc)、结束时 Set(nil) 清理。
+	accHolder PolishAccumulatorHolder
+	// planTool/batchTool/finishTool 是三个候选工具实例（BuildWorkers 注入）。
+	// 多轮路径每次 run 开始时经 SetAccumulator 注入新 accumulator、结束时清理为
+	// nil（防跨 run 泄漏）。
+	planTool   *SubmitPolishPlanTool
+	batchTool  *SubmitEditBatchTool
+	finishTool *FinishPolishTool
+}
+
+// PolishAccumulatorHolder 是 accumulator 运行时注入桥接口
+//（agents.PolishAccumulatorHolder 实现）。polish_draft 每次 run 开始时
+// Set(acc) 注入、结束时 Set(nil) 清理。
+type PolishAccumulatorHolder interface {
+	Set(acc *PolishAccumulator)
 }
 
 func NewPolishDraftTool(s *store.Store, polisherRunner *subagent.Runner, polisherPromptHash string) *PolishDraftTool {
@@ -94,6 +115,26 @@ func (t *PolishDraftTool) FSMConfig() ChapterFSMConfig { return t.fsmConfig }
 func (t *PolishDraftTool) SetPolisherRunner(runner *subagent.Runner, promptHash string) {
 	t.polisherRunner = runner
 	t.polisherPromptHash = promptHash
+}
+
+// SetFullContextEnabled 设置多轮候选工具协议路径开关（灰度 flag
+// full_context_polisher_v3，计划 §12）。由 BuildWorkers 按配置注入；
+// 关闭（默认）时走现有 one-shot 路径（回滚开关）。
+func (t *PolishDraftTool) SetFullContextEnabled(v bool) { t.fullContextEnabled = v }
+
+// FullContextEnabled 返回多轮候选工具协议路径开关（构建/测试诊断用）。
+func (t *PolishDraftTool) FullContextEnabled() bool { return t.fullContextEnabled }
+
+// SetAccumulatorHolder 注入 accumulator 运行时注入桥（BuildWorkers 调用；
+// agents.PolishAccumulatorHolder 实现本接口）。
+func (t *PolishDraftTool) SetAccumulatorHolder(h PolishAccumulatorHolder) { t.accHolder = h }
+
+// SetCandidateTools 注入三个候选工具实例（BuildWorkers 调用）。多轮路径每次
+// run 开始时经 SetAccumulator 注入新 accumulator、结束时清理为 nil。
+func (t *PolishDraftTool) SetCandidateTools(plan *SubmitPolishPlanTool, batch *SubmitEditBatchTool, finish *FinishPolishTool) {
+	t.planTool = plan
+	t.batchTool = batch
+	t.finishTool = finish
 }
 
 func (t *PolishDraftTool) Name() string { return "polish_draft" }
@@ -191,6 +232,12 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 	inputDigest := baseline.InputDigest
 
 	// ── 4. 构建任务 payload（草稿 + 评审依据 + 已给意见 + 重写 brief）并调用 polisher ──
+	// 多轮候选工具协议路径（灰度 flag full_context_polisher_v3，计划 §12）：
+	// plan → 最多 4 批 batch → finish，产物由 accumulator 累积、统一验证落盘。
+	// 关闭（默认）时走现有 one-shot 路径（edit_list/full_text）——回滚开关。
+	if t.fullContextEnabled {
+		return t.executeFullContext(ctx, a.Chapter, content, wordCount, inputDigest, baseline)
+	}
 	taskText := t.buildPolishTask(a.Chapter, content, wordCount, "")
 
 	// 基线观测（§14 第 2 步）：polisher 调用前后记录耗时与进程 CPU 时间差。
@@ -233,6 +280,401 @@ func (t *PolishDraftTool) Execute(ctx context.Context, args json.RawMessage) (js
 	summary, sErr := t.applyEditPlan(a.Chapter, content, wordCount, inputDigest, plan, baseline)
 	logPolisherRunObs(a.Chapter, wordCount, obs, summary, sErr)
 	return summary, sErr
+}
+
+// ── 多轮候选工具协议路径（灰度 flag full_context_polisher_v3，计划 §12） ──────
+//
+// 流程（schema docs/polisher-candidate-tools-schema.md §11 + 计划 §5）：
+//
+//	生成 operation_id → 创建 accumulator → 注入三个候选工具
+//	→ buildPolishTask 追加协议段 → 调用 polisher runner（多轮）
+//	→ 从 accumulator 取终态 → 统一验证 → 一次 CommitPolishCandidate。
+//
+// 状态语义映射（计划 §5）：
+//   - changed：≥1 候选成功应用（CommitPolishCandidate，Method=candidate_tools）。
+//   - no_op：finish(status=no_op)，changed=false，不保存新正文（与现有 edits=[]
+//     语义一致：仍写一条 Changed=false 的 polish checkpoint 推进 FSM seq）。
+//   - partial：部分应用 + 部分被拒（Partial=true 审计）。
+//   - degraded：技术失败（runner 错误/预算耗尽）或全部候选被拒（复用
+//     handlePolisherFailure / handleEditPlanRejected 的收敛模式）。
+//   - stale：CAS 失败（复用现有 ErrPolishCandidateStale 处理，不落盘）。
+//   - error：协议不变量失败（state != finished / 声明完成但无候选），不落盘、
+//     不写 checkpoint。
+
+// maxPolishRunAPICalls 是单次 polish run 的实际 API 调用硬上限（计划 §7：8 次）。
+const maxPolishRunAPICalls = 8
+
+// polisherBudgetExhausted 是 run 级技术预算耗尽哨兵（计划 §7：总 API 调用硬上限
+// 8）。polish_draft 层在 runner 返回后按 Usage.Turns 计数；命中 → 可降级
+// （classifyPolishDegradableError 分类为 budget_exhausted）。
+var polisherBudgetExhausted = errors.New("polisher run API call budget exhausted")
+
+// executeFullContext 是多轮候选工具协议路径主体（flag 开启时 Execute 的分支）。
+func (t *PolishDraftTool) executeFullContext(ctx context.Context, chapter int, content string, wordCount int, inputDigest string, baseline *store.PolishBaseline) (json.RawMessage, error) {
+	// b. 生成 operation_id：pol-<chapter>-<unixnano>-<4位随机hex>（schema §3.1，
+	//    模型在三个工具调用中必须原样回显）。
+	operationID := newPolishOperationID(chapter)
+
+	// c. 创建 accumulator（operationID/baseline digest/输入快照全文）。
+	acc := NewPolishAccumulator(operationID, baseline.InputDigest, content, chapter)
+
+	// d. 注入三个候选工具（holder 同步 + 工具 SetAccumulator）；run 结束或失败时
+	//    清理为 nil（防跨 run 泄漏）。
+	if t.planTool == nil || t.batchTool == nil || t.finishTool == nil {
+		return nil, fmt.Errorf("polish_draft: 候选工具未注入（BuildWorkers 必须 SetCandidateTools）: %w", errs.ErrToolPrecondition)
+	}
+	if t.accHolder != nil {
+		t.accHolder.Set(acc)
+	}
+	t.planTool.SetAccumulator(acc)
+	t.batchTool.SetAccumulator(acc)
+	t.finishTool.SetAccumulator(acc)
+	defer func() {
+		if t.accHolder != nil {
+			t.accHolder.Set(nil)
+		}
+		t.planTool.SetAccumulator(nil)
+		t.batchTool.SetAccumulator(nil)
+		t.finishTool.SetAccumulator(nil)
+	}()
+
+	// e. buildPolishTask 追加协议段（operation_id/baseline_digest/协议说明）。
+	taskText := appendCandidateProtocol(t.buildPolishTask(chapter, content, wordCount, ""), operationID, baseline.InputDigest)
+
+	// f. 调用 polisher runner（多轮；run 级技术预算在 polish_draft 层计数）。
+	if _, err := t.runPolisherMultiTurn(ctx, chapter, taskText); err != nil {
+		// h. 技术失败（runner 错误/预算耗尽）→ 复用 handlePolisherFailure（degraded）。
+		return t.handlePolisherFailure(chapter, inputDigest, wordCount, baseline, err)
+	}
+
+	// g. 从 accumulator 取终态。
+	return t.finalizeCandidateRun(chapter, content, wordCount, inputDigest, baseline, acc)
+}
+
+// newPolishOperationID 生成 host 侧 operation_id：pol-<chapter>-<unixnano>-<4位随机hex>
+//（schema §3.1）。crypto/rand 失败（不可达）时退化为时间戳派生，保证格式稳定。
+func newPolishOperationID(chapter int) string {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		b[0], b[1] = byte(time.Now().UnixNano()), byte(time.Now().UnixNano()>>8)
+	}
+	return fmt.Sprintf("pol-%d-%d-%04x", chapter, time.Now().UnixNano(), b)
+}
+
+// appendCandidateProtocol 在任务文本末尾追加候选工具协议段（schema §11）：
+// operation_id、baseline_digest 与协议顺序说明（先 plan → 最多 4 批 → 必须
+// finish；每批 ≤8、总 ≤32；全部 old_string 基于同一 baseline）。
+func appendCandidateProtocol(taskText, operationID, baselineDigest string) string {
+	var sb strings.Builder
+	sb.WriteString(taskText)
+	sb.WriteString("\n\n### 候选工具协议\n")
+	fmt.Fprintf(&sb, "- operation_id: %s\n", operationID)
+	fmt.Fprintf(&sb, "- baseline_digest: %s\n", baselineDigest)
+	sb.WriteString("- 必须严格按顺序调用工具：先 submit_polish_plan（恰好一次、最先），然后最多 4 批 submit_edit_batch（每批 ≤8 条、累计 ≤32 条），最后必须调用 finish_polish 结束。\n")
+	sb.WriteString("- 所有 old_string 必须原样来自上述 baseline 草稿全文（不得依赖前一批修改后的文本）。\n")
+	sb.WriteString("- 三个工具调用必须原样回显 operation_id 与 baseline_digest。\n")
+	return sb.String()
+}
+
+// runPolisherMultiTurn 调用 polisher runner（多轮，带三个候选工具）。run 级
+// 技术预算在 polish_draft 层计数（计划 §7）：总 API 调用硬上限 8
+//（Usage.Turns = 实际模型调用数，含 length recovery 等内部恢复）；每个逻辑调用
+// 最多 1 次恢复、整个 run 最多 2 次技术恢复由 agentcore 内部预算（per-call
+// MaxRetries / length recovery budget）执行，本层只做总硬上限兜底。
+func (t *PolishDraftTool) runPolisherMultiTurn(ctx context.Context, chapter int, taskText string) (subagent.RunResult, error) {
+	runResult, err := t.polisherRunner.Run(ctx, "polisher", taskText)
+	if err != nil {
+		return runResult, fmt.Errorf("polisher call failed: %w", err)
+	}
+	if runResult.Usage.Turns > maxPolishRunAPICalls {
+		return runResult, fmt.Errorf("polisher run 实际 API 调用 %d 次超过硬上限 %d（技术预算耗尽）: %w",
+			runResult.Usage.Turns, maxPolishRunAPICalls, polisherBudgetExhausted)
+	}
+	return runResult, nil
+}
+
+// finalizeCandidateRun 从 accumulator 取终态并分派（g 步）。
+func (t *PolishDraftTool) finalizeCandidateRun(chapter int, content string, wordCount int, inputDigest string, baseline *store.PolishBaseline, acc *PolishAccumulator) (json.RawMessage, error) {
+	// g1. 协议不变量：run 必须以 finish_polish 成功结束（state=finished）。
+	if acc.StateName() != "finished" {
+		return nil, fmt.Errorf("polisher 候选协议未完成：accumulator 终态=%s（必须 finish_polish 结束）: %w",
+			acc.StateName(), errs.ErrToolPrecondition)
+	}
+	finish := acc.Finish()
+	if finish == nil {
+		return nil, fmt.Errorf("polisher 候选协议错误：finished 状态但 finish 记录缺失: %w", errs.ErrToolPrecondition)
+	}
+
+	// g2. no_op 终态：合法 no-op（changed=false；与现有 edits=[] 语义一致）。
+	if finish.Status == "no_op" {
+		return t.handleCandidateNoOp(chapter, content, wordCount, inputDigest, baseline, acc)
+	}
+
+	accepted := acc.Accepted()
+
+	// g3. accepted 非空 → 构建 PolishEditPlan 并应用（覆盖/输出/机械检查复用现有）。
+	if len(accepted) > 0 {
+		return t.applyCandidatePlan(chapter, content, wordCount, inputDigest, baseline, acc, accepted)
+	}
+
+	// g4. accepted 为空（rejected 非空，或模型声明完成/转 Writer 但未提交任何候选）
+	//     → 复用 handleEditPlanRejected 的收敛模式（degraded checkpoint，
+	//     category 按拒绝码判定）。
+	return t.handleCandidateRejected(chapter, inputDigest, wordCount, baseline, acc, nil)
+}
+
+// handleCandidateNoOp 处理 finish(status=no_op) 终态：合法 no-op。
+// 与现有 edits=[] 语义一致：changed=false、不保存新正文，但写入一条
+// Changed=false 的 polish checkpoint（digest=当前草稿）推进 FSM seq——
+// validPolish 需要 polish 记录，无记录会永久 needs_polish 死循环（计划 §5：
+// 一次 SaveDraft + 一次逻辑 polish checkpoint）。
+func (t *PolishDraftTool) handleCandidateNoOp(chapter int, content string, wordCount int, inputDigest string, baseline *store.PolishBaseline, acc *PolishAccumulator) (json.RawMessage, error) {
+	polisherModel := t.loadPolisherModelName()
+	stage := polishStageForChapter(t.store, chapter)
+	audit := candidateAuditFromAcc(acc, 0, 0, nil)
+	if _, err := t.store.CommitPolishCandidate(chapter, content, baseline, t.candidateCheckpointMeta(chapter, inputDigest, false, 0, audit, acc)); err != nil {
+		if errors.Is(err, store.ErrPolishCandidateStale) {
+			return nil, fmt.Errorf("polish candidate stale: draft changed during polish, discard and retry: %w: %w",
+				errs.ErrToolPrecondition, store.ErrPolishCandidateStale)
+		}
+		return nil, fmt.Errorf("polish commit: %w: %w", errs.ErrStoreWrite, err)
+	}
+	t.mechRejectStreak[chapter] = 0
+
+	return json.Marshal(PolishDraftOutput{
+		Chapter:       chapter,
+		Polished:      true,
+		Changed:       false,
+		InputDigest:   inputDigest,
+		OutputDigest:  inputDigest,
+		PolisherModel: polisherModel,
+		Stage:         stage,
+		WordCount:     wordCount,
+		NextStep:      "精修完成（no-op）。下一步**必须**调用 check_consistency 重新核验；通过后按返回的 required_next_action 继续（review_style → terminal → commit_chapter）",
+	})
+}
+
+// applyCandidatePlan 是 accepted 非空时的应用路径（g3）：构建
+// PolishEditPlan{Version:1, Edits: accepted 的 OldString/NewString} →
+// ApplyPolishEditPlanDetailed（复用现有覆盖/输出/机械检查）→ salvageMechanical
+//（复用）→ CommitPolishCandidate（Method=candidate_tools + schema §9 审计字段）。
+func (t *PolishDraftTool) applyCandidatePlan(chapter int, content string, wordCount int, inputDigest string, baseline *store.PolishBaseline, acc *PolishAccumulator, accepted []PolishAcceptedEdit) (json.RawMessage, error) {
+	plan := &PolishEditPlan{Version: 1}
+	for _, e := range accepted {
+		plan.Edits = append(plan.Edits, PolishEditItem{OldString: e.OldString, NewString: e.NewString})
+	}
+	res, err := ApplyPolishEditPlanDetailed(content, plan, polishCoverageLimitForChapter(t.store, chapter))
+	if err != nil {
+		// 全无效（accepted 全部被最终验证丢弃）→ degraded 收敛（复用 rejected 路径）。
+		return t.handleCandidateRejected(chapter, inputDigest, wordCount, baseline, acc, res)
+	}
+	res2, summary, mErr := t.salvageMechanical(chapter, content, wordCount, inputDigest, res, baseline, "candidate_tools")
+	if mErr != nil {
+		return nil, mErr
+	}
+	if summary != nil {
+		return summary, nil
+	}
+	return t.applyCandidatePlanCommit(chapter, wordCount, inputDigest, res2, baseline, acc)
+}
+
+// applyCandidatePlanCommit 是候选通过内容校验与机械门禁后的公共收尾：
+// 一次 SaveDraft + draft checkpoint + 一个 polish checkpoint（Method=
+// candidate_tools、EditCount=实际应用数、schema §9 审计字段）→ 成功摘要。
+func (t *PolishDraftTool) applyCandidatePlanCommit(chapter int, wordCount int, inputDigest string, res *PolishEditPlanResult, baseline *store.PolishBaseline, acc *PolishAccumulator) (json.RawMessage, error) {
+	candidate := res.Candidate
+	outputDigest := domain.DigestDraft(candidate)
+	stage := polishStageForChapter(t.store, chapter)
+	changed := outputDigest != inputDigest
+	polisherModel := t.loadPolisherModelName()
+	rejected := acc.Rejected()
+	// schema §9：ProposedEditCount = accepted+rejected 总数；DroppedEditCount =
+	// rejected 数 + 最终验证丢弃数；DropReasons = 预检 per-edit 码 + 最终验证原因。
+	audit := PolishCheckpointAudit{
+		ProposedEditCount:    res.ProposedEditCount + len(rejected),
+		DroppedEditCount:     len(rejected) + len(res.Dropped),
+		DropReasons:          append(rejectedDropReasons(rejected), res.DropReasons()...),
+		NormalizedMatchCount: res.NormalizedMatchCount,
+		Partial:              res.Partial || len(rejected) > 0,
+		MatchModes:           res.AppliedMatchModes(),
+	}
+	audit.OperationID = acc.OperationID()
+	audit.RunRejectionCode = acc.RunRejectionCode()
+	if plan := acc.Plan(); plan != nil {
+		audit.PlanIssueCount = len(plan.Issues)
+		audit.PlanDigest = plan.Digest
+	}
+	if finish := acc.Finish(); finish != nil {
+		audit.FinishStatus = finish.Status
+		audit.UnresolvedCount = len(finish.Unresolved)
+	}
+	audit.BatchCount = acc.BatchCount()
+
+	if _, err := t.store.CommitPolishCandidate(chapter, candidate, baseline, t.candidateCheckpointMeta(chapter, inputDigest, changed, len(res.Applied), audit, acc)); err != nil {
+		if errors.Is(err, store.ErrPolishCandidateStale) {
+			return nil, fmt.Errorf("polish candidate stale: draft changed during polish, discard and retry: %w: %w",
+				errs.ErrToolPrecondition, store.ErrPolishCandidateStale)
+		}
+		return nil, fmt.Errorf("polish commit: %w: %w", errs.ErrStoreWrite, err)
+	}
+	t.mechRejectStreak[chapter] = 0
+
+	return json.Marshal(PolishDraftOutput{
+		Chapter:              chapter,
+		Polished:             true,
+		Changed:              changed,
+		InputDigest:          inputDigest,
+		OutputDigest:         outputDigest,
+		PolisherModel:        polisherModel,
+		Stage:                stage,
+		WordCount:            utf8.RuneCountInString(candidate),
+		ProposedEditCount:    audit.ProposedEditCount,
+		DroppedEditCount:     audit.DroppedEditCount,
+		DropReasons:          audit.DropReasons,
+		NormalizedMatchCount: audit.NormalizedMatchCount,
+		Partial:              audit.Partial,
+		MatchModes:           audit.MatchModes,
+		NextStep:             "精修完成。下一步**必须**调用 check_consistency 重新核验；通过后按返回的 required_next_action 继续（review_style → terminal → commit_chapter）",
+	})
+}
+
+// handleCandidateRejected 处理"accepted 为空"的收敛（g4）：复用
+// handleEditPlanRejected 的收敛模式——category 按拒绝码判定（含 total_limit/
+// batch_limit → coverage_exceeded，其余 → edit_plan_invalid），写审计明确的
+// rejected/degraded polish checkpoint（Method=candidate_tools、正文未变、
+// Changed=false、schema §9 审计字段）→ FSM 收敛到 post-check。
+// finalRes 非 nil 时并入最终验证丢弃（accepted>0 但全部被最终验证丢弃的场景）。
+func (t *PolishDraftTool) handleCandidateRejected(chapter int, inputDigest string, wordCount int, baseline *store.PolishBaseline, acc *PolishAccumulator, finalRes *PolishEditPlanResult) (json.RawMessage, error) {
+	rejected := acc.Rejected()
+	category := "edit_plan_invalid"
+	for _, r := range rejected {
+		if r.Code == PolishErrTotalLimit || r.Code == PolishErrBatchLimit {
+			category = "coverage_exceeded"
+			break
+		}
+	}
+	reasons := rejectedDropReasons(rejected)
+	if finalRes != nil {
+		reasons = append(reasons, finalRes.DropReasons()...)
+	}
+	audit := candidateAuditFromAcc(acc, len(acc.Accepted())+len(rejected), len(rejected)+finalResDropped(finalRes), reasons)
+	reason := fmt.Sprintf("polisher 候选全部被拒（%d 条预检拒绝%s，%s），已写入 rejected/degraded polish checkpoint（正文未变，digest=%s）",
+		len(rejected), finalResDropSuffix(finalRes), category, inputDigest)
+	slog.Warn("polisher 候选全部被拒，已写入 rejected/degraded polish checkpoint",
+		"module", "tools", "chapter", chapter, "category", category, "digest", inputDigest, "drop_reasons", reasons)
+	return t.writeDegradedPolishCheckpoint(chapter, inputDigest, wordCount, category, "candidate_tools", audit, reason, baseline)
+}
+
+// finalResDropped 返回最终验证丢弃条数（finalRes 为 nil 时 0）。
+func finalResDropped(finalRes *PolishEditPlanResult) int {
+	if finalRes == nil {
+		return 0
+	}
+	return len(finalRes.Dropped)
+}
+
+// finalResDropSuffix 构造最终验证丢弃的说明后缀（审计日志用）。
+func finalResDropSuffix(finalRes *PolishEditPlanResult) string {
+	if finalRes == nil || len(finalRes.Dropped) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" + %d 条最终验证丢弃", len(finalRes.Dropped))
+}
+
+// candidateAuditFromAcc 构造候选工具协议路径的审计字段（schema §9）：只含计数
+// 与 digest，绝不含 edit 内容。
+func candidateAuditFromAcc(acc *PolishAccumulator, proposed, dropped int, dropReasons []string) PolishCheckpointAudit {
+	audit := PolishCheckpointAudit{
+		ProposedEditCount: proposed,
+		DroppedEditCount:  dropped,
+		DropReasons:       dropReasons,
+		OperationID:       acc.OperationID(),
+		RunRejectionCode:  acc.RunRejectionCode(),
+		BatchCount:        acc.BatchCount(),
+	}
+	if plan := acc.Plan(); plan != nil {
+		audit.PlanIssueCount = len(plan.Issues)
+		audit.PlanDigest = plan.Digest
+	}
+	if finish := acc.Finish(); finish != nil {
+		audit.FinishStatus = finish.Status
+		audit.UnresolvedCount = len(finish.Unresolved)
+	}
+	return audit
+}
+
+// candidateCheckpointMeta 组装候选工具协议路径的 checkpoint 元数据
+//（Method=candidate_tools + schema §9 审计字段）。
+func (t *PolishDraftTool) candidateCheckpointMeta(chapter int, inputDigest string, changed bool, editCount int, audit PolishCheckpointAudit, acc *PolishAccumulator) domain.PolishCheckpointMeta {
+	return domain.PolishCheckpointMeta{
+		InputDigest:          inputDigest,
+		PolisherModel:        t.loadPolisherModelName(),
+		Stage:                polishStageForChapter(t.store, chapter),
+		Changed:              changed,
+		Method:               "candidate_tools",
+		EditCount:            editCount,
+		ProposedEditCount:    audit.ProposedEditCount,
+		DroppedEditCount:     audit.DroppedEditCount,
+		DropReasons:          audit.DropReasons,
+		NormalizedMatchCount: audit.NormalizedMatchCount,
+		Partial:              audit.Partial,
+		MatchModes:           audit.MatchModes,
+		OperationID:          audit.OperationID,
+		RunRejectionCode:     audit.RunRejectionCode,
+		PlanIssueCount:       audit.PlanIssueCount,
+		BatchCount:           audit.BatchCount,
+		FinishStatus:         audit.FinishStatus,
+		UnresolvedCount:      audit.UnresolvedCount,
+		PlanDigest:           audit.PlanDigest,
+	}
+}
+
+// rejectedDropReasons 把预检 per-edit 拒绝码映射为审计 drop reasons（schema §9）。
+func rejectedDropReasons(rejected []PolishRejectedEdit) []string {
+	out := make([]string, 0, len(rejected))
+	for _, r := range rejected {
+		out = append(out, polishDropReasonForCode(r.Code))
+	}
+	return out
+}
+
+// polishDropReasonForCode 把候选工具错误码映射为 PolishEditDropReason 审计值；
+// 无专属常量的码（field_required 等）原样记录（稳定字符串，审计用）。
+func polishDropReasonForCode(code string) string {
+	switch code {
+	case PolishErrAnchorMissing:
+		return string(PolishEditDropAnchorMissing)
+	case PolishErrAnchorAmbiguous:
+		return string(PolishEditDropAnchorAmbiguous)
+	case PolishErrAnchorOverlap:
+		return string(PolishEditDropAnchorOverlap)
+	case PolishErrNoop:
+		return string(PolishEditDropNoop)
+	case PolishErrEmptyOld:
+		return string(PolishEditDropEmptyOldString)
+	case PolishErrAnchorTooLong:
+		return string(PolishEditDropOldTooLong)
+	case PolishErrFactChanged:
+		return string(PolishEditDropFactChanged)
+	case PolishErrFactCheckInvalid:
+		return string(PolishEditDropFactCheckInvalid)
+	case PolishErrIssueUnknown:
+		return string(PolishEditDropIssueUnknown)
+	case PolishErrIssueNotEditable:
+		return string(PolishEditDropIssueNotEditable)
+	case PolishErrIssueReused:
+		return string(PolishEditDropIssueReused)
+	case PolishErrEmptyNew:
+		return string(PolishEditDropEmptyNewString)
+	case PolishErrNewTooLong:
+		return string(PolishEditDropNewTooLong)
+	case PolishErrTotalLimit:
+		return string(PolishEditDropTotalLimit)
+	case PolishErrBatchLimit:
+		return string(PolishEditDropBatchLimit)
+	default:
+		return code
+	}
 }
 
 // applyFullTextPolish 是整章重输出回退路径（旧协议）：polisher 输出无法解析为
@@ -434,6 +876,14 @@ type PolishCheckpointAudit struct {
 	NormalizedMatchCount int
 	Partial              bool
 	MatchModes           []string
+	// 候选工具协议审计字段（schema §9；旧路径为零值，omitempty 不落盘）。
+	OperationID      string
+	RunRejectionCode string
+	PlanIssueCount   int
+	BatchCount       int
+	FinishStatus     string
+	UnresolvedCount  int
+	PlanDigest       string
 }
 
 // auditFromResult 从部分接受结果导出 checkpoint/摘要审计字段。
@@ -462,7 +912,13 @@ func auditFromResult(res *PolishEditPlanResult) PolishCheckpointAudit {
 //
 // 返回三元组：res2（安全子集结果）、summary（非 nil = 已写 rejected checkpoint
 // 并返回成功摘要）、err（fail-closed 错误）。
-func (t *PolishDraftTool) salvageMechanical(chapter int, content string, wordCount int, inputDigest string, res *PolishEditPlanResult, baseline *store.PolishBaseline) (*PolishEditPlanResult, json.RawMessage, error) {
+// method 是可选变参（默认 "edit_list"）：候选工具协议路径传 "candidate_tools"，
+// 使机械回归收敛的 checkpoint Method 审计正确。
+func (t *PolishDraftTool) salvageMechanical(chapter int, content string, wordCount int, inputDigest string, res *PolishEditPlanResult, baseline *store.PolishBaseline, method ...string) (*PolishEditPlanResult, json.RawMessage, error) {
+	m := "edit_list"
+	if len(method) > 0 && method[0] != "" {
+		m = method[0]
+	}
 	// 门禁前提：polisher 输入无 error 级机械违规（精修不得引入新的机械违规）。
 	if hasErrorViolations(computeMechanicalViolations(t.store, content, wordCount)) {
 		return res, nil, nil
@@ -490,7 +946,7 @@ func (t *PolishDraftTool) salvageMechanical(chapter int, content string, wordCou
 		}
 	}
 	// 仍无法安全（组合违规/剔除后仍违规）→ mechRejectStreak 收敛。
-	return t.mechanicalRegression(chapter, inputDigest, wordCount, "edit_list", res.ProposedEditCount, baseline)
+	return t.mechanicalRegression(chapter, inputDigest, wordCount, m, res.ProposedEditCount, baseline)
 }
 
 // handleMechanicalRegression 处理机械回归拒绝（循环 B 收敛）。edit 路径与
@@ -587,6 +1043,13 @@ func (t *PolishDraftTool) writeDegradedPolishCheckpoint(chapter int, inputDigest
 			NormalizedMatchCount: audit.NormalizedMatchCount,
 			Partial:              audit.Partial,
 			MatchModes:           audit.MatchModes,
+			OperationID:          audit.OperationID,
+			RunRejectionCode:     audit.RunRejectionCode,
+			PlanIssueCount:       audit.PlanIssueCount,
+			BatchCount:           audit.BatchCount,
+			FinishStatus:         audit.FinishStatus,
+			UnresolvedCount:      audit.UnresolvedCount,
+			PlanDigest:           audit.PlanDigest,
 		},
 	); aErr != nil {
 		if errors.Is(aErr, store.ErrPolishCandidateStale) {
@@ -884,6 +1347,8 @@ func polishStageForChapter(st *store.Store, chapter int) string {
 //     agentcore.IsFailoverEligible（含 stream idle，已先单独判定）
 //   - polisher MaxTurns：errors.Is(err, agentcore.ErrMaxTurns)
 //     （长度截断 recovery 预算耗尽——正文从未被接受，降级留痕优于失败重派）
+//   - run 级技术预算耗尽：errors.Is(err, polisherBudgetExhausted)
+//     （多轮路径实际 API 调用超过硬上限 8，计划 §7）
 //
 // 不可降级（必须原样失败，绝不写 degraded）：
 //   - context.Canceled（用户取消 / Host 关闭）
@@ -901,6 +1366,9 @@ func classifyPolishDegradableError(err error) (string, bool) {
 	}
 	if errors.Is(err, agentcore.ErrProviderStreamIdle) {
 		return "stream_idle", true
+	}
+	if errors.Is(err, polisherBudgetExhausted) {
+		return "budget_exhausted", true
 	}
 	if agentcore.IsFailoverEligible(err) {
 		if reason := agentcore.FailoverReason(err); reason != "" {
