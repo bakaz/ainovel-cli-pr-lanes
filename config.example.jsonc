@@ -139,12 +139,12 @@
   // NOTIFY_TITLE / NOTIFY_BODY / NOTIFY_KIND / NOTIFY_LEVEL 通过环境变量传入，完整 JSON 同时写 stdin。
   // Unix shell 用 $NOTIFY_TITLE；Windows PowerShell 用 $env:NOTIFY_TITLE。
   // events 可选过滤：run_end / budget / advance_gate / stop_guard /
-  // plan_start / deadlock / worker_failure；缺省全部开启。
+  // plan_start / deadlock / worker_failure / engine / backup；缺省全部开启。
   // "notify": {
   //   "enabled": true,
   //   // 标题/正文含中文与空格，必须经 --data-urlencode 传参，不可拼进 URL 路径或 HTTP 头。
   //   // Bark (iOS):         "command": "curl -s --data-urlencode \"title=$NOTIFY_TITLE\" --data-urlencode \"body=$NOTIFY_BODY\" https://api.day.app/<key>"
   //   // ntfy (iOS/Android): "command": "curl -s -G --data-urlencode \"title=$NOTIFY_TITLE\" --data-urlencode \"message=$NOTIFY_BODY\" ntfy.sh/<topic>/publish"
-  //   "events": ["run_end", "budget", "advance_gate", "stop_guard", "plan_start", "deadlock", "worker_failure"]
+  //   "events": ["run_end", "budget", "advance_gate", "stop_guard", "plan_start", "deadlock", "worker_failure", "engine", "backup"]
   // }
 }

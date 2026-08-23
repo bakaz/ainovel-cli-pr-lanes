@@ -42,6 +42,25 @@ func TestKindsAreUniqueAndKnown(t *testing.T) {
 	if IsKnownKind("repeat") {
 		t.Fatal("旧 repeat 事件不应继续出现在新契约中")
 	}
+	if !IsKnownKind(KindEngine) || !IsKnownKind(KindBackup) {
+		t.Fatal("engine/backup 必须在通知契约里，预检暂停才进白名单")
+	}
+}
+
+func TestMarkSentDedupesIdenticalNotifications(t *testing.T) {
+	n := New("", nil)
+	nt := Notification{Kind: KindEngine, Title: "ainovel: 引擎暂停", Body: "评审已耗尽"}
+	if !n.markSent(nt) {
+		t.Fatal("first send should be accepted")
+	}
+	if n.markSent(nt) {
+		t.Fatal("identical pause notice must not send again")
+	}
+	other := nt
+	other.Body = "进度读取失败"
+	if !n.markSent(other) {
+		t.Fatal("different body should still send")
+	}
 }
 
 func TestCommandChannelEnvAndStdin(t *testing.T) {

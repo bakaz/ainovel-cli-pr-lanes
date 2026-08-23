@@ -319,6 +319,11 @@ func (e *engine) run(ctx context.Context) {
 			return
 		}
 		if replaced := e.precheck(inst); replaced != nil {
+			if replaced.Agent == "" {
+				// 空指令 = 预检已 pauseWithNotify，必须停机。不能当下一轮任务继续跑，
+				// 否则评审耗尽等硬暂停会空转刷桌面通知。
+				return
+			}
 			inst = replaced
 		}
 		allowed, gateErr := e.gate.Allow(inst)
@@ -349,7 +354,7 @@ func (e *engine) run(ctx context.Context) {
 		// 记录 Worker 启动前的最新已完成章；读错则暂停/停止，不执行 Worker。
 		before, beforeErr := e.latestCompletedChapter()
 		if beforeErr != nil {
-			e.pauseWithNotify("backup", "进度读取失败，已暂停: "+beforeErr.Error())
+			e.pauseWithNotify(notify.KindBackup, "进度读取失败，已暂停: "+beforeErr.Error())
 			return
 		}
 
@@ -486,11 +491,11 @@ func (e *engine) precheck(inst *flow.Instruction) *flow.Instruction {
 	strictTargetAgent := inst.Agent == "writer" || inst.Agent == "architect_short" || inst.Agent == "architect_long"
 	if isV3 && strictTargetAgent {
 		if progressErr != nil {
-			e.pauseWithNotify("engine", "引擎预检: progress 加载失败 ("+progressErr.Error()+")")
+			e.pauseWithNotify(notify.KindEngine, "引擎预检: progress 加载失败 ("+progressErr.Error()+")")
 			return &flow.Instruction{}
 		}
 		if progress == nil {
-			e.pauseWithNotify("engine", "引擎预检: progress 未初始化")
+			e.pauseWithNotify(notify.KindEngine, "引擎预检: progress 未初始化")
 			return &flow.Instruction{}
 		}
 	}
@@ -517,18 +522,18 @@ func (e *engine) precheck(inst *flow.Instruction) *flow.Instruction {
 			// 检查 legacy exhausted：阻止 writer dispatch，避免工具调用风暴
 			exhausted, loadErr := e.isStyleReviewExhausted(ch)
 			if loadErr != nil {
-				e.pauseWithNotify("engine", fmt.Sprintf("引擎预检 Writer: 第 %d 章评审状态检查失败: %v", ch, loadErr))
+				e.pauseWithNotify(notify.KindEngine, fmt.Sprintf("引擎预检 Writer: 第 %d 章评审状态检查失败: %v", ch, loadErr))
 				return &flow.Instruction{}
 			}
 			if exhausted {
-				e.pauseWithNotify("engine", fmt.Sprintf("引擎预检 Writer: 第 %d 章评审已耗尽（exhausted），无法继续创作。请使用 /style-override 覆盖评审结果后重试", ch))
+				e.pauseWithNotify(notify.KindEngine, fmt.Sprintf("引擎预检 Writer: 第 %d 章评审已耗尽（exhausted），无法继续创作。请使用 /style-override 覆盖评审结果后重试", ch))
 				return &flow.Instruction{}
 			}
 			if isV3 {
 				// V3: Writer 必须有一个有效展开的 outline entry。
 				// 缺失、无效或加载错误一律 hard pause，不允许回退到 Architect。
 				if err := tools.ValidateOutlineEntry(e.store, e.contract, ch); err != nil {
-					e.pauseWithNotify("engine", "引擎预检 Writer: "+err.Error())
+					e.pauseWithNotify(notify.KindEngine, "引擎预检 Writer: "+err.Error())
 					return &flow.Instruction{}
 				}
 			} else {
@@ -542,7 +547,7 @@ func (e *engine) precheck(inst *flow.Instruction) *flow.Instruction {
 				}
 				if e.contract != nil {
 					if err := tools.ValidateOutlineEntry(e.store, e.contract, ch); err != nil {
-						e.pauseWithNotify("engine", "引擎预检 Writer: "+err.Error())
+						e.pauseWithNotify(notify.KindEngine, "引擎预检 Writer: "+err.Error())
 						return &flow.Instruction{}
 					}
 				}
@@ -550,7 +555,7 @@ func (e *engine) precheck(inst *flow.Instruction) *flow.Instruction {
 		} else {
 			// 复核缺口 1：无法推导 writer 目标章节 → 显式暂停（返回明确错误、
 			// 停止派发），不静默放行一个未绑定章节、绕过熔断观察的 writer 指令。
-			e.pauseWithNotify("engine", "引擎预检 Writer: 无法确定目标章节，已停止自动派发，等待人工处理")
+			e.pauseWithNotify(notify.KindEngine, "引擎预检 Writer: 无法确定目标章节，已停止自动派发，等待人工处理")
 			return &flow.Instruction{}
 		}
 		e.refresh()
@@ -567,7 +572,7 @@ func (e *engine) precheck(inst *flow.Instruction) *flow.Instruction {
 			// 加载失败或目标已存在但无效 → hard pause。
 			outline, loadErr := e.store.Outline.LoadOutline()
 			if loadErr != nil {
-				e.pauseWithNotify("engine", "引擎预检 Architect: outline 加载失败 ("+loadErr.Error()+")")
+				e.pauseWithNotify(notify.KindEngine, "引擎预检 Architect: outline 加载失败 ("+loadErr.Error()+")")
 				return &flow.Instruction{}
 			}
 			hasChapter := false
@@ -579,13 +584,13 @@ func (e *engine) precheck(inst *flow.Instruction) *flow.Instruction {
 			}
 			if hasChapter {
 				if err := tools.ValidateOutlineEntry(e.store, e.contract, ch); err != nil {
-					e.pauseWithNotify("engine", "引擎预检 Architect: "+err.Error())
+					e.pauseWithNotify(notify.KindEngine, "引擎预检 Architect: "+err.Error())
 					return &flow.Instruction{}
 				}
 			}
 			// hasChapter=false → target absent → 允许通过
 		} else if isV3 {
-			e.pauseWithNotify("engine", "引擎预检 Architect: 无法确定目标章节")
+			e.pauseWithNotify(notify.KindEngine, "引擎预检 Architect: 无法确定目标章节")
 			return &flow.Instruction{}
 		}
 	}
@@ -611,9 +616,12 @@ func writerTargetChapter(st *storepkg.Store) int {
 // 返回 stop=true 表示本轮应结束循环;inst 可能被 Arbiter 改写(reroute)或置 nil(重算)。
 func (e *engine) trackDeadlock(ctx context.Context, inst **flow.Instruction) (stop bool) {
 	in := *inst
-	if in == nil || in.Agent == "" {
+	if in == nil {
 		*inst = nil
 		return false
+	}
+	if in.Agent == "" {
+		return true
 	}
 	key := in.Agent + "\x00" + in.Task
 	if key == e.lastKey {
@@ -1173,9 +1181,9 @@ func pauseCategoryForKind(kind string) domain.StopCategory {
 		return domain.StopCategoryFailureBreaker
 	case notify.KindWorkerFailure, notify.KindPlanStart:
 		return domain.StopCategoryDecisionFailed
-	case "backup":
+	case notify.KindBackup:
 		return domain.StopCategoryDeterministicErr
-	case "engine":
+	case notify.KindEngine:
 		return domain.StopCategoryStateError
 	default:
 		return domain.StopCategoryUnknown
@@ -1221,7 +1229,7 @@ func (e *engine) latestCompletedChapter() (int, error) {
 func (e *engine) handleCompletedChapters(_ context.Context, before int) bool {
 	after, err := e.latestCompletedChapter()
 	if err != nil {
-		e.pauseWithNotify("backup", "进度读取失败，已暂停: "+err.Error())
+		e.pauseWithNotify(notify.KindBackup, "进度读取失败，已暂停: "+err.Error())
 		return true
 	}
 	if after <= before || after == 0 {
@@ -1230,7 +1238,7 @@ func (e *engine) handleCompletedChapters(_ context.Context, before int) bool {
 
 	boundary, berr := e.store.Outline.CheckArcBoundary(after)
 	if berr != nil {
-		e.pauseWithNotify("backup", "弧边界检查失败，已暂停: "+berr.Error())
+		e.pauseWithNotify(notify.KindBackup, "弧边界检查失败，已暂停: "+berr.Error())
 		return true
 	}
 	if boundary == nil {
@@ -1240,7 +1248,7 @@ func (e *engine) handleCompletedChapters(_ context.Context, before int) bool {
 	if boundary.IsVolumeEnd {
 		if e.backupVolume != nil {
 			if berr := e.backupVolume(boundary.Volume); berr != nil {
-				e.pauseWithNotify("backup", "卷边界备份失败，已暂停: "+berr.Error())
+				e.pauseWithNotify(notify.KindBackup, "卷边界备份失败，已暂停: "+berr.Error())
 				return true
 			}
 		}
@@ -1249,7 +1257,7 @@ func (e *engine) handleCompletedChapters(_ context.Context, before int) bool {
 	if boundary.IsArcEnd {
 		if e.backupArc != nil {
 			if berr := e.backupArc(boundary.Volume, boundary.Arc); berr != nil {
-				e.pauseWithNotify("backup", "弧边界备份失败，已暂停: "+berr.Error())
+				e.pauseWithNotify(notify.KindBackup, "弧边界备份失败，已暂停: "+berr.Error())
 				return true
 			}
 		}
