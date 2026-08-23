@@ -106,9 +106,9 @@ func TestPolisherPrompt_LoadedAndOverlay(t *testing.T) {
 	if !contains(t, b.Prompts.Polisher, "仿写画像") {
 		t.Fatal("Polisher 应带 simulation guidance 包装（按 writer 同款）")
 	}
-	// 受限协议：不重规划 / 不评审 / 不提交
-	if !contains(t, b.Prompts.Polisher, "plan_chapter") {
-		t.Fatal("Polisher 应禁止 plan_chapter")
+	// 受限协议：只使用三个候选提交工具，不重规划 / 不评审 / 不提交
+	if !contains(t, b.Prompts.Polisher, "只使用本会话提供的三个工具") {
+		t.Fatal("Polisher 应只使用三个候选提交工具（不重规划）")
 	}
 	if !contains(t, b.Prompts.Polisher, "review_style") || !contains(t, b.Prompts.Polisher, "commit_chapter") {
 		t.Fatal("Polisher 应声明 review_style/commit_chapter 由调用方执行")
