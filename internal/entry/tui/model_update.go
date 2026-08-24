@@ -3,6 +3,7 @@ package tui
 import (
 	"time"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/entry/startup"
@@ -13,6 +14,30 @@ import (
 
 const maxPromptEventCols = 160
 
+// layoutAffecting 报告一条消息是否可能改变面板布局几何（顶栏高度、输入框
+// 行数、viewport 宽高）。updateViewportSize 为量高要完整跑一遍 lipgloss 渲染
+// （renderTopBar + renderBottomBar），是每条消息的固定开销；高频纯视觉 tick
+// （spinner/cursor/stream delta，30FPS 流式下每秒上百条）不会改变几何，
+// 跳过重布局可消除持续 CPU 空转。
+//
+// 保守策略：只对确认纯视觉的消息返回 false；不确定的消息一律返回 true
+// 重布局——宁可多做一次量高，也不冒布局失真的风险。
+func layoutAffecting(msg tea.Msg) bool {
+	switch msg.(type) {
+	case spinnerTickMsg, toolSpinnerTickMsg, cursorTickMsg:
+		// 动画帧推进：只重渲对应 viewport 内容，不改任何几何输入。
+		return false
+	case streamBatchMsg, streamDeltaMsg, streamClearMsg:
+		// 流式增量：只写 streamRounds + refreshStreamViewport，不改几何。
+		return false
+	case cursor.BlinkMsg:
+		// textarea 光标闪烁：内容不变 → refitTextareaHeight 结果不变。
+		return false
+	default:
+		return true
+	}
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	next, cmd := m.update(msg)
 	mm, ok := next.(Model)
@@ -21,7 +46,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	// View 禁止改 Model。textarea 多行、顶栏高度变化都在消息处理之后才稳定，
 	// 所以在 Update 末尾同步 viewport 尺寸，供下一帧 View 使用。
-	if mm.width > 0 {
+	// 纯视觉 tick 消息（见 layoutAffecting）不重算布局。
+	if mm.width > 0 && layoutAffecting(msg) {
 		mm.updateViewportSize()
 	}
 	return mm, cmd
@@ -551,6 +577,10 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		// RunControl/ResumePermit 裁定，TUI 不再根据文案猜测停止原因。
 		m.idleWritingActive = false
 		m.finalizeStaleEngineEvents(time.Now())
+		// 运行边界全量校准计数缓存：finalize 后通常归零；ask 弹窗打开时
+		// 挂起的 DECISION 合法保持 running，不能盲目清零（否则该行 spinner
+		// 停止动画，与逐行扫描的旧行为不一致）。
+		m.recountRunningEvents()
 		m.snapshot.LastStopReason = msg.stopReason
 		m.snapshot.IsRunning = false
 		m.refreshEventViewport()
@@ -667,9 +697,10 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 	case toolSpinnerTickMsg:
 		m.toolSpinnerPending = false
 		m.toolSpinnerIdx = (m.toolSpinnerIdx + 1) % len(toolSpinnerFrames)
-		// 事件流"进行中"行的 spinner 刷新（150ms，独立节奏）。
-		// Arbiter 可在 Engine 停机态处理 Continue/查询，因此不能用 snapshot.IsRunning
-		// 作为动画前提；只要存在调用类 running 事件就刷新。没有时跳过全量重渲。
+		// 事件流"进行中"行的 spinner 刷新（350ms，与主 spinner 同频，见
+		// toolSpinnerTickInterval）。Arbiter 可在 Engine 停机态处理 Continue/查询，
+		// 因此不能用 snapshot.IsRunning 作为动画前提；只要存在调用类 running
+		// 事件就刷新。没有时跳过全量重渲。
 		if m.hasRunningEvent() {
 			m.refreshEventViewport()
 			m.toolSpinnerPending = true
@@ -922,10 +953,14 @@ func (m Model) handleTextareaMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
 // - 带 ID 且已存在 → 原地更新（合并完成态字段，保留首次的 Time / Summary）
 // - 新事件 → 追加，必要时记录到 eventIndex
 // - 超过 maxEvents 时做滑动截断并重建索引
+// 全程同步维护 runningEventCount（hasRunningEvent 的 O(1) 缓存）。
 func (m *Model) applyEvent(ev host.Event) {
 	if ev.ID != "" {
 		if idx, ok := m.eventIndex[ev.ID]; ok && idx >= 0 && idx < len(m.events) {
 			existing := &m.events[idx]
+			// 合并只会把 running 推向终态（FinishedAt/Discarded/Failed 只置位），
+			// 不可能反向复活，因此计数只减不增。
+			wasRunning := existing.Running()
 			if !ev.FinishedAt.IsZero() {
 				existing.FinishedAt = ev.FinishedAt
 			}
@@ -950,6 +985,9 @@ func (m *Model) applyEvent(ev host.Event) {
 			if ev.Category != "" && ev.Category != existing.Category {
 				existing.Category = ev.Category
 			}
+			if wasRunning && !existing.Running() {
+				m.runningEventCount--
+			}
 			return
 		}
 	}
@@ -958,10 +996,23 @@ func (m *Model) applyEvent(ev host.Event) {
 	if ev.ID != "" {
 		m.eventIndex[ev.ID] = len(m.events) - 1
 	}
+	if ev.Running() {
+		m.runningEventCount++
+	}
 	if len(m.events) > maxEvents {
 		drop := len(m.events) - maxEvents
+		// 截断把头部事件挤出窗口：被挤出的 running 行要同步减计数，
+		// 否则孤儿行删除后缓存永远大于实际。
+		for _, dropped := range m.events[:drop] {
+			if dropped.Running() {
+				m.runningEventCount--
+			}
+		}
 		m.events = m.events[drop:]
 		m.rebuildEventIndex()
+	}
+	if m.runningEventCount < 0 {
+		m.runningEventCount = 0
 	}
 }
 
@@ -1016,6 +1067,7 @@ func (m *Model) rebuildEventIndex() {
 func (m *Model) resetOutputPanels() {
 	m.events = nil
 	m.eventIndex = make(map[string]int)
+	m.runningEventCount = 0
 	m.viewport.SetContent("")
 	m.viewport.GotoTop()
 	m.streamRounds = nil

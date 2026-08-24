@@ -257,13 +257,36 @@ func (o *observer) workerProgress(p agentcore.ProgressPayload) {
 	o.handleToolUpdate(agentcore.Event{Type: agentcore.EventToolExecUpdate, Progress: &payload})
 }
 
+// finalize 运行结束（完成/出错停止/abort）时收尾：
+//  1. agents 快照全部置 idle（agentMu 保护）；
+//  2. 整体清空 mapMu 保护的全部 per-run 状态。
+//
+// abort/cancel 路径不会逐 agent 走 dispatchFinish，残留的 lastThinkingByAgent
+// 会持有整章 thinking 全文、toolStarts/dispatchStarts 持有 activeCall、
+// streamExtractors 持有抽取器实例、streamArgPrefixes/Labels 持有参数前缀缓存；
+// 长会话多次 abort 后累积可达 GB 级 —— 这里统一重置为零值。
+// aborting 不在此复位：它由 Host 在 Start/Resume/Continue 入口经 setAborting 显式管理。
 func (o *observer) finalize() {
 	o.agentMu.Lock()
-	defer o.agentMu.Unlock()
 	for _, a := range o.agents {
 		a.state = "idle"
 		a.tool = ""
 	}
+	o.agentMu.Unlock()
+
+	o.mapMu.Lock()
+	o.lastThinkingByAgent = make(map[string]string)
+	o.dispatchStarts = make(map[string]*activeCall)
+	o.toolStarts = make(map[string]*activeCall)
+	o.streamExtractors = make(map[string]*agentExtractor)
+	o.streamArgPrefixes = make(map[string]string)
+	o.streamArgLabels = make(map[string]string)
+	o.retryEvents = make(map[string]string)
+	o.streamOwner = ""
+	o.streamHasContent = false
+	o.streamLastByte = 0
+	o.streamThinking = false
+	o.mapMu.Unlock()
 }
 
 // setAborting 由 Host 在 Abort/Close/Start 等生命周期切换处调用，控制

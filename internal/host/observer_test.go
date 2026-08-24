@@ -1403,3 +1403,71 @@ func TestHandleContextProgressPersistsFullRewrite(t *testing.T) {
 		t.Fatalf("full rewrite should emit a SYSTEM notification, got %+v", events)
 	}
 }
+
+// ── finalize: 全量清理 mapMu 保护的 per-run 状态 ──────────────────────────
+
+// TestObserverFinalizeClearsAllMapState 验证运行结束后 finalize 清空全部
+// mapMu 保护的 map 与 stream 标量。abort/cancel 路径不走 dispatchFinish，
+// 残留的 lastThinkingByAgent（整章 thinking 全文）等只能靠这里兜底回收。
+func TestObserverFinalizeClearsAllMapState(t *testing.T) {
+	var events []Event
+	o := testObserver(&events)
+
+	// 污染全部 mapMu 保护字段
+	o.lastThinkingByAgent["writer"] = strings.Repeat("整章 thinking 全文", 4096)
+	o.dispatchStarts["writer"] = &activeCall{id: "d1", summary: "writer"}
+	o.toolStarts["writer"] = &activeCall{id: "t1", summary: "draft_chapter"}
+	o.streamExtractors["writer"] = &agentExtractor{tool: "draft_chapter"}
+	o.streamArgPrefixes["writer\x00draft_chapter"] = `{"chapter":1`
+	o.streamArgLabels["writer\x00draft_chapter"] = "draft_chapter[chapter]"
+	o.retryEvents["scope"] = "e9"
+	o.streamOwner = "writer"
+	o.streamHasContent = true
+	o.streamLastByte = 'x'
+	o.streamThinking = true
+	o.updateAgent("writer", func(a *agentState) {
+		a.state = "working"
+		a.tool = "draft_chapter"
+	})
+
+	o.finalize()
+
+	for _, s := range o.agentSnapshots() {
+		if s.State != "idle" || s.Tool != "" {
+			t.Errorf("agent %s should be idle after finalize, got state=%q tool=%q", s.Name, s.State, s.Tool)
+		}
+	}
+	if len(o.lastThinkingByAgent) != 0 {
+		t.Errorf("lastThinkingByAgent len = %d, want 0", len(o.lastThinkingByAgent))
+	}
+	if len(o.dispatchStarts) != 0 {
+		t.Errorf("dispatchStarts len = %d, want 0", len(o.dispatchStarts))
+	}
+	if len(o.toolStarts) != 0 {
+		t.Errorf("toolStarts len = %d, want 0", len(o.toolStarts))
+	}
+	if len(o.streamExtractors) != 0 {
+		t.Errorf("streamExtractors len = %d, want 0", len(o.streamExtractors))
+	}
+	if len(o.streamArgPrefixes) != 0 {
+		t.Errorf("streamArgPrefixes len = %d, want 0", len(o.streamArgPrefixes))
+	}
+	if len(o.streamArgLabels) != 0 {
+		t.Errorf("streamArgLabels len = %d, want 0", len(o.streamArgLabels))
+	}
+	if len(o.retryEvents) != 0 {
+		t.Errorf("retryEvents len = %d, want 0", len(o.retryEvents))
+	}
+	if o.streamOwner != "" {
+		t.Errorf("streamOwner = %q, want empty", o.streamOwner)
+	}
+	if o.streamHasContent || o.streamLastByte != 0 || o.streamThinking {
+		t.Errorf("stream scalars should be zeroed, got hasContent=%v lastByte=%q thinking=%v",
+			o.streamHasContent, o.streamLastByte, o.streamThinking)
+	}
+
+	// finalize 后新 run 的 retry 行仍能拿到新 ID（map 已重建可用）
+	if id := o.retryEventID("scope", 1); id == "" {
+		t.Error("retryEvents should be usable after finalize")
+	}
+}

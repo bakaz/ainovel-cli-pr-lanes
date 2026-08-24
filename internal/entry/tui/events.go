@@ -320,9 +320,16 @@ func tickSpinner() tea.Cmd {
 	})
 }
 
-// tickToolSpinner 驱动事件流"进行中"行的 spinner。独立于 tickSpinner，节奏更快（150ms）。
+// toolSpinnerTickInterval 事件流"进行中"行 spinner 的刷新间隔。
+// 与主 spinner 同频（350ms）：每个 tick 都要全量重渲 ≤500 行事件流，
+// 旧的 150ms 节奏在长事件流下是持续 CPU 空转源；8 帧 350ms 转一圈 2.8s，
+// 视觉上仍连贯。
+const toolSpinnerTickInterval = 350 * time.Millisecond
+
+// tickToolSpinner 驱动事件流"进行中"行的 spinner。独立于 tickSpinner 的帧索引，
+// 节奏见 toolSpinnerTickInterval（与主 spinner 同为 350ms）。
 func tickToolSpinner() tea.Cmd {
-	return tea.Tick(150*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(toolSpinnerTickInterval, func(t time.Time) tea.Msg {
 		return toolSpinnerTickMsg(t)
 	})
 }

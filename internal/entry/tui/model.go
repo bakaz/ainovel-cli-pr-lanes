@@ -48,7 +48,7 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 // 事件流"进行中"行专用的 spinner 帧序列（bubbles.Spinner.Dot）。
 // 7 个点 + 1 个缺口沿 3×3 格子顺时针旋转，视觉上像完整的加载圆圈。
-// 用独立帧索引 + 更快 tick，不影响顶栏和星星动画的节奏。
+// 用独立帧索引 + 独立 tick（350ms，见 toolSpinnerTickInterval），不影响顶栏和星星动画的节奏。
 var toolSpinnerFrames = []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"}
 
 // Model 是 TUI 的顶层状态。
@@ -97,13 +97,18 @@ type Model struct {
 	reportSeq          int
 	err                error
 	spinnerIdx         int
-	toolSpinnerIdx     int  // 事件流进行中行的独立帧索引（150ms tick，不影响顶栏/星星）
+	toolSpinnerIdx     int  // 事件流进行中行的独立帧索引（350ms tick，不影响顶栏/星星）
 	cursorIdx          int  // 流式光标帧索引（独立 tick）
 	spinnerPending     bool // 顶栏动画已有待处理 tick
 	toolSpinnerPending bool // 事件流动画已有待处理 tick
 	cursorPending      bool // 流式光标已有待处理 tick
 	quitPending        bool // 双次 Ctrl+C 退出确认
 	abortPending       bool // 等待 Done 回来的手动暂停
+	// runningEventCount 缓存当前 Running() 事件数，让 hasRunningEvent O(1)。
+	// 维护点：applyEvent（增/终态减/截断随删减）、finalizeStaleEngineEvents、
+	// resetOutputPanels 清零、doneMsg 全量校准。下限钳 0 以兼容直接构造的
+	// Model 字面量（计数零值但事件已存在）。
+	runningEventCount int
 	// 以下字段仅兼容旧的 TUI 消息回显；自动恢复资格不由本地缓存决定，统一由 Host.RunControl 裁定。
 	idleWritingActive       bool
 	idleWritingStartPending bool
@@ -226,13 +231,22 @@ func (m *Model) paneHighlighted(pane focusPane) bool {
 // hasRunningEvent 是否存在未完成（spinner 仍在转）的调用类事件。
 // toolSpinnerTick 用此判断是否值得重渲：没有 running 事件时 spinner 帧不影响输出，
 // 整个 refreshEventViewport 是确定的无效工作。
+// O(1)：读 runningEventCount 缓存（维护点见字段注释），不再每 tick 全量扫描
+// ≤500 行事件流。
 func (m *Model) hasRunningEvent() bool {
+	return m.runningEventCount > 0
+}
+
+// recountRunningEvents 全量重扫 m.events 校准 runningEventCount。
+// O(n)，只在运行边界（doneMsg）调用作一致性兜底；热路径不使用。
+func (m *Model) recountRunningEvents() {
+	count := 0
 	for i := range m.events {
 		if m.events[i].Running() {
-			return true
+			count++
 		}
 	}
-	return false
+	m.runningEventCount = count
 }
 
 // finalizeStaleEngineEvents 收束引擎停止时实时事件通道可能遗失的结束态。
@@ -261,6 +275,10 @@ func (m *Model) finalizeStaleEngineEvents(now time.Time) {
 		if !ev.Time.IsZero() && now.After(ev.Time) {
 			ev.Duration = now.Sub(ev.Time)
 		}
+		m.runningEventCount--
+	}
+	if m.runningEventCount < 0 {
+		m.runningEventCount = 0
 	}
 }
 
