@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -17,6 +18,22 @@ import (
 	"github.com/voocel/ainovel-cli/internal/rules"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
+
+// progressLogRe 匹配进度日志式的 status 字段名后缀
+// （"…完成阶段""…完成""…落地""…收束""…第N班"等——历史上被误提交的进度记录均为此形态）。
+var progressLogRe = regexp.MustCompile(`(完成阶段|完成$|落地$|收束$|完结$|首轮|[0-9]+班)`)
+
+// progressLogHint 检测 status.* 新增条目是否为剧情进度日志而非持续生效的当前状态。
+// 返回非空提示 = 疑似进度日志（含原因）；空 = 未命中。
+func progressLogHint(field, value string) string {
+	if progressLogRe.MatchString(field) {
+		return "字段名含进度后缀（完成阶段/落地/第N班等）"
+	}
+	if m := regexp.MustCompile(`^[^，。]{0,12}(完成|落地|收束|完结)[：:]`).FindStringSubmatch(value); m != nil {
+		return "值以「" + m[0] + "」进度叙述开头"
+	}
+	return ""
+}
 
 // CommitChapterTool 提交章节：加载正文 → 保存终稿 → 生成摘要 → 更新状态 → 更新进度。
 type CommitChapterTool struct {
@@ -635,6 +652,15 @@ func (t *CommitChapterTool) preflightCommitArgs(
 		key := u.Entity + "\x00" + u.Field
 		if _, exists := existingKeys[key]; exists {
 			continue
+		}
+		if strings.HasPrefix(u.Field, "status.") {
+			// 进度日志启发式拦截：status.* 应承载持续生效的当前状态；
+			// "XX完成阶段/落地/第N班"式条目是剧情进度，属于 timeline_events。
+			// 拒绝并给出明确指引，模型下一轮会自纠改投 timeline_events。
+			if hint := progressLogHint(u.Field, u.Value); hint != "" {
+				return fmt.Errorf("character_state_updates[%d]: %s.%s 疑似剧情进度记录而非持续状态（%s）。status.* 只承载持续生效的当前状态；章节进程请改用 timeline_events 提交: %w",
+					i, u.Entity, u.Field, hint, errs.ErrToolArgs)
+			}
 		}
 		if fieldCount[u.Entity] >= domain.MaxFieldsPerEntity {
 			return fmt.Errorf("character_state_updates[%d]: %s 字段数已达上限 %d，拒绝新增 %s: %w",
