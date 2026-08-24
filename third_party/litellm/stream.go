@@ -377,8 +377,9 @@ func (c *EventCollector) normalizeToolArguments() {
 		if !ok {
 			continue
 		}
-		if warning := normalizeInvalidToolArguments(&tool); warning != nil {
-			c.blocks[i] = tool
+		warning := normalizeInvalidToolArguments(&tool)
+		c.blocks[i] = tool
+		if warning != nil {
 			c.appendWarning(*warning)
 		}
 	}
@@ -386,6 +387,14 @@ func (c *EventCollector) normalizeToolArguments() {
 
 func normalizeInvalidToolArguments(tool *ToolUseBlock) *Warning {
 	if tool == nil || len(tool.Arguments) == 0 || json.Valid(tool.Arguments) {
+		return nil
+	}
+	// Some OpenAI-compatible relays emit concatenated top-level JSON objects
+	// (e.g. "{}" + "{\"chapter\":40}") when converting upstream native
+	// function calls. Shallow-merge them into one valid object instead of
+	// flagging the call as malformed.
+	if fixed, repaired := repairConcatenatedJSONObjects(tool.Arguments); repaired {
+		tool.Arguments = fixed
 		return nil
 	}
 	var probe any

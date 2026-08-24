@@ -1,6 +1,9 @@
 package litellm
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+)
 
 func IntPtr(v int) *int {
 	return &v
@@ -101,4 +104,38 @@ func MustJSONRaw(v any) json.RawMessage {
 		panic(err)
 	}
 	return b
+}
+
+// repairConcatenatedJSONObjects attempts to repair tool-call arguments that
+// contain two or more concatenated top-level JSON objects (e.g. "{}" followed
+// by "{\"chapter\":40}"), a shape observed from some OpenAI-compatible relays
+// when converting upstream native function calls. All objects are
+// shallow-merged in order of appearance; later keys win. ok is false when the
+// input does not decode into at least two objects — callers should keep their
+// existing malformed-argument handling in that case.
+func repairConcatenatedJSONObjects(raw []byte) ([]byte, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	var merged map[string]any
+	count := 0
+	for {
+		var obj map[string]any
+		if err := dec.Decode(&obj); err != nil {
+			break
+		}
+		count++
+		if merged == nil {
+			merged = make(map[string]any, len(obj))
+		}
+		for k, v := range obj {
+			merged[k] = v
+		}
+	}
+	if count < 2 || merged == nil {
+		return nil, false
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }

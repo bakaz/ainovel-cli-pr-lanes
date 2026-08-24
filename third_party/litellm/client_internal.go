@@ -378,9 +378,16 @@ func appendMalformedToolArgumentWarnings(resp *Response) {
 	if resp == nil {
 		return
 	}
-	for _, block := range resp.Blocks {
+	for i, block := range resp.Blocks {
 		tool, ok := block.(ToolUseBlock)
 		if !ok || len(tool.Arguments) == 0 || json.Valid(tool.Arguments) {
+			continue
+		}
+		// Repair concatenated top-level JSON objects (relay conversion bug:
+		// "{}" + "{\"chapter\":40}") before flagging the call as malformed.
+		if fixed, repaired := repairConcatenatedJSONObjects(tool.Arguments); repaired {
+			tool.Arguments = fixed
+			resp.Blocks[i] = tool
 			continue
 		}
 		var probe any
