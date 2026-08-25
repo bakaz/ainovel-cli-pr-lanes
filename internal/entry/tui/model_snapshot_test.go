@@ -8,6 +8,44 @@ import (
 	"github.com/voocel/ainovel-cli/internal/host"
 )
 
+func TestOneShotSnapshotDoesNotRenewPeriodicTick(t *testing.T) {
+	m := NewModel(nil, nil, "test")
+	m.mode = modeRunning
+
+	next, cmd, handled := m.handleRuntimeMsg(snapshotMsg(host.UISnapshot{
+		RuntimeState: "paused",
+	}))
+	if !handled {
+		t.Fatal("one-shot snapshot should be handled")
+	}
+	if cmd != nil {
+		t.Fatal("one-shot idle snapshot must not schedule a recurring tick")
+	}
+	got := next.(Model)
+	if got.snapshot.RuntimeState != "paused" {
+		t.Fatalf("snapshot was not applied: state=%q", got.snapshot.RuntimeState)
+	}
+}
+
+func TestPeriodicSnapshotRenewsExactlyItsTickChain(t *testing.T) {
+	m := NewModel(&host.Host{}, nil, "test")
+	m.mode = modeRunning
+
+	next, cmd, handled := m.handleRuntimeMsg(snapshotTickMsg(host.UISnapshot{
+		RuntimeState: "paused",
+	}))
+	if !handled {
+		t.Fatal("periodic snapshot should be handled")
+	}
+	if cmd == nil {
+		t.Fatal("periodic snapshot should renew the single tick chain")
+	}
+	got := next.(Model)
+	if got.snapshot.RuntimeState != "paused" {
+		t.Fatalf("snapshot was not applied: state=%q", got.snapshot.RuntimeState)
+	}
+}
+
 func TestIdleSnapshotSkipsUnchangedViewports(t *testing.T) {
 	snap := host.UISnapshot{
 		RuntimeState:   "paused",

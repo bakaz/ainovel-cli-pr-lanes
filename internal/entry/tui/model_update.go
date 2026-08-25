@@ -523,6 +523,14 @@ func (m Model) handleRuntimeMsg(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		return m, listenAskUser(m.askBridge), true
 	case snapshotMsg:
 		m.applySnapshot(host.UISnapshot(msg))
+		// fetchSnapshot is an immediate, one-shot refresh used by lifecycle and
+		// command results. It must not create another recurring timer chain.
+		return m, m.scheduleAnimationTicks(), true
+	case snapshotTickMsg:
+		m.applySnapshot(host.UISnapshot(msg))
+		// Only the periodic tick owns renewal. Init starts exactly one chain;
+		// separating this message from snapshotMsg prevents every one-shot
+		// refresh from permanently multiplying timers.
 		idle := !m.snapshot.IsRunning && !m.starting
 		return m, tea.Batch(tickSnapshot(m.runtime, idle), m.scheduleAnimationTicks()), true
 	case idleWritingTickMsg:

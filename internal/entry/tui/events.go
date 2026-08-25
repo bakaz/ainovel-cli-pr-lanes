@@ -15,9 +15,10 @@ import (
 
 // 消息类型
 type (
-	eventMsg    host.Event
-	snapshotMsg host.UISnapshot
-	doneMsg     struct {
+	eventMsg        host.Event
+	snapshotMsg     host.UISnapshot // one-shot refresh; must not schedule another periodic tick
+	snapshotTickMsg host.UISnapshot // periodic refresh; owns the single recurring tick chain
+	doneMsg         struct {
 		complete   bool
 		stopReason string
 	} // complete=true 全书完成，false 出错停止
@@ -113,7 +114,7 @@ func tickSnapshot(rt *host.Host, idle bool) tea.Cmd {
 		d = snapshotTickIdle
 	}
 	return tea.Tick(d, func(t time.Time) tea.Msg {
-		return snapshotMsg(rt.Snapshot())
+		return snapshotTickMsg(rt.Snapshot())
 	})
 }
 

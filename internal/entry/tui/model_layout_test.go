@@ -40,6 +40,7 @@ func TestLayoutAffectingClassification(t *testing.T) {
 		bootstrapMsg{},
 		startResultMsg{},
 		snapshotMsg{},
+		snapshotTickMsg{},
 		askUserMsg{},
 		quitResetMsg{}, // 改变 inputHints 文案，保守重布局
 		idleWritingTickMsg{},
