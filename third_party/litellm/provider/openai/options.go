@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"encoding/json"
 	"fmt"
 )
 
@@ -29,6 +30,7 @@ const (
 	ProviderOptionWebSearchOptions     = "web_search_options"
 	ProviderOptionParallelToolCalls    = "parallel_tool_calls"
 	ProviderOptionSeed                 = "seed"
+	ProviderOptionProviderOptions      = "providerOptions"
 )
 
 var providerOptionKeys = map[string]struct{}{
@@ -56,6 +58,7 @@ var providerOptionKeys = map[string]struct{}{
 	ProviderOptionWebSearchOptions:     {},
 	ProviderOptionParallelToolCalls:    {},
 	ProviderOptionSeed:                 {},
+	ProviderOptionProviderOptions:      {},
 }
 
 func applyProviderOptions(req *chatRequest, options map[string]any) error {
@@ -204,6 +207,15 @@ func applyProviderOptions(req *chatRequest, options map[string]any) error {
 				return err
 			}
 			req.Seed = &v
+		case ProviderOptionProviderOptions:
+			// 透传 provider 专属选项（如 Vercel AI Gateway 的
+			// providerOptions.gateway.only 路由锁定）：原样 JSON 序列化，
+			// 不做 schema 解释，逐字转发给上游端点。
+			raw, err := json.Marshal(value)
+			if err != nil {
+				return fmt.Errorf("openai: provider option %q must be JSON-serializable", key)
+			}
+			req.ProviderOptions = raw
 		}
 	}
 	return nil

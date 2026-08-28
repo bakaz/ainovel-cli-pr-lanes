@@ -55,6 +55,12 @@ type chatRequest struct {
 
 	ParallelToolCalls *bool `json:"parallel_tool_calls,omitempty"`
 	Seed              *int  `json:"seed,omitempty"`
+
+	// ProviderOptions carries provider-specific options that must be passed
+	// through verbatim to the upstream endpoint (e.g. Vercel AI Gateway's
+	// providerOptions.gateway.only routing lock). Kept as raw JSON so the
+	// value is forwarded byte-for-byte without schema interpretation.
+	ProviderOptions json.RawMessage `json:"providerOptions,omitempty"`
 }
 
 type streamOptions struct {
