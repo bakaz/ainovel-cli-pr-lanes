@@ -42,14 +42,34 @@ func (p *Provider) buildRequest(req *litellm.Request, stream bool) (*chatRequest
 	} else {
 		out.MaxTokens = req.MaxTokens
 		out.Temperature = req.Temperature
-		// Non-reasoning models pass thinking controls through verbatim. The
-		// endpoint (proxy or backend) decides whether the thinking parameter
-		// is accepted; passthrough relays forward it, strict ones reject it.
-		thinking, err := buildThinkingBody(req.Thinking)
-		if err != nil {
-			return nil, err
+		if isDeepSeekV4Flash(req.Model) {
+			// deepseek-v4-flash (Ollama Cloud) documents reasoning_effort but
+			// not the thinking parameter, so map thinking controls to
+			// reasoning_effort instead of emitting a thinking field. Sampling
+			// parameters (temperature/top_p) are config-driven via
+			// extra_body provider options, not hardcoded here.
+			if req.Thinking != nil {
+				switch req.Thinking.Mode {
+				case litellm.ThinkingEnabled:
+					effort := reasoningEffort(req.Thinking)
+					if !isOpenAIReasoningEffort(effort) {
+						return nil, fmt.Errorf("openai: unsupported reasoning_effort %q; use low, medium, high, or xhigh", effort)
+					}
+					out.ReasoningEffort = effort
+				case litellm.ThinkingDisabled:
+					out.ReasoningEffort = "none"
+				}
+			}
+		} else {
+			// Non-reasoning models pass thinking controls through verbatim. The
+			// endpoint (proxy or backend) decides whether the thinking parameter
+			// is accepted; passthrough relays forward it, strict ones reject it.
+			thinking, err := buildThinkingBody(req.Thinking)
+			if err != nil {
+				return nil, err
+			}
+			out.Thinking = thinking
 		}
-		out.Thinking = thinking
 	}
 	if req.ResponseFormat != nil {
 		converted, err := convertResponseFormat(req.ResponseFormat)
@@ -64,7 +84,7 @@ func (p *Provider) buildRequest(req *litellm.Request, stream bool) (*chatRequest
 		}
 	}
 	if len(req.Tools) > 0 {
-		tools, err := convertTools(req.Tools)
+		tools, err := p.convertTools(req.Tools)
 		if err != nil {
 			return nil, err
 		}
@@ -84,6 +104,13 @@ func (p *Provider) isReasoningModel(model string) bool {
 		model = after
 	}
 	return strings.HasPrefix(model, "gpt-5")
+}
+
+// isDeepSeekV4Flash reports whether the model is deepseek-v4-flash (Ollama
+// Cloud). This model documents reasoning_effort but not the thinking
+// parameter, so thinking controls are mapped to reasoning_effort.
+func isDeepSeekV4Flash(model string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(model)), "deepseek-v4-flash")
 }
 
 func reasoningEffort(thinking *litellm.Thinking) string {
@@ -268,8 +295,12 @@ func imageURLValue(block litellm.ImageBlock) (string, error) {
 	}
 }
 
-func convertTools(tools []litellm.Tool) ([]tool, error) {
+func (p *Provider) convertTools(tools []litellm.Tool) ([]tool, error) {
 	out := make([]tool, 0, len(tools))
+	// Ollama Cloud does not document tool-level strict support; strict
+	// normalization would reshape the schema the model sees, so skip it and
+	// keep the schema verbatim without a strict field.
+	skipStrict := strings.Contains(strings.ToLower(p.cfg.BaseURL), "ollama.com")
 	for _, t := range tools {
 		if t.Name == "" {
 			return nil, fmt.Errorf("openai: tool name is required")
@@ -283,7 +314,7 @@ func convertTools(tools []litellm.Tool) ([]tool, error) {
 			params = decoded
 		}
 		var strict *bool
-		if t.Strict == litellm.StrictEnabled {
+		if t.Strict == litellm.StrictEnabled && !skipStrict {
 			normalised, err := normalizeStrictSchema(params)
 			if err != nil {
 				return nil, fmt.Errorf("openai: tool %q strict schema invalid: %w", t.Name, err)

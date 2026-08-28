@@ -700,6 +700,220 @@ func TestStreamPreservesRefusal(t *testing.T) {
 	}
 }
 
+func TestBuildRequestDeepSeekV4FlashNoDefaultSampling(t *testing.T) {
+	// Sampling parameters are config-driven via extra_body provider options,
+	// not hardcoded: without them, no top_p/temperature is emitted.
+	provider := mustProvider(t)
+	wire, err := provider.buildRequest(&litellm.Request{
+		Model:    "deepseek-v4-flash:0731",
+		Messages: []litellm.Message{litellm.UserText("hi")},
+	}, false)
+	if err != nil {
+		t.Fatalf("buildRequest returned error: %v", err)
+	}
+	if wire.TopP != nil {
+		t.Fatalf("top_p = %v, want nil without extra_body", wire.TopP)
+	}
+	if wire.Temperature != nil {
+		t.Fatalf("temperature = %v, want nil without extra_body", wire.Temperature)
+	}
+
+	// Explicit request-level top_p must still be preserved.
+	topP := 0.7
+	wire, err = provider.buildRequest(&litellm.Request{
+		Model:    "deepseek-v4-flash:0731",
+		TopP:     &topP,
+		Messages: []litellm.Message{litellm.UserText("hi")},
+	}, false)
+	if err != nil {
+		t.Fatalf("buildRequest returned error: %v", err)
+	}
+	if wire.TopP == nil || *wire.TopP != 0.7 {
+		t.Fatalf("top_p = %v, want 0.7", wire.TopP)
+	}
+}
+
+func TestBuildRequestExtraBodySamplingOptions(t *testing.T) {
+	// extra_body temperature/top_p flow through ProviderOptions into the
+	// wire request (config-driven sampling, no code hardcoding).
+	provider := mustProvider(t)
+	wire, err := provider.buildRequest(&litellm.Request{
+		Model:    "deepseek-v4-flash:0731",
+		Messages: []litellm.Message{litellm.UserText("hi")},
+		ProviderOptions: litellm.ProviderOptions{
+			"temperature": 1.0,
+			"top_p":       0.95,
+		},
+	}, false)
+	if err != nil {
+		t.Fatalf("buildRequest returned error: %v", err)
+	}
+	if wire.Temperature == nil || *wire.Temperature != 1.0 {
+		t.Fatalf("temperature = %v, want 1.0", wire.Temperature)
+	}
+	if wire.TopP == nil || *wire.TopP != 0.95 {
+		t.Fatalf("top_p = %v, want 0.95", wire.TopP)
+	}
+	data, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal wire: %v", err)
+	}
+	jsonText := string(data)
+	for _, want := range []string{`"temperature":1`, `"top_p":0.95`} {
+		if !strings.Contains(jsonText, want) {
+			t.Fatalf("wire JSON missing %s:\n%s", want, jsonText)
+		}
+	}
+
+	// Non-numeric values must be rejected.
+	_, err = provider.buildRequest(&litellm.Request{
+		Model:    "deepseek-v4-flash:0731",
+		Messages: []litellm.Message{litellm.UserText("hi")},
+		ProviderOptions: litellm.ProviderOptions{
+			"top_p": "high",
+		},
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), `provider option "top_p" must be number`) {
+		t.Fatalf("expected top_p type error, got %v", err)
+	}
+}
+
+func TestBuildRequestDeepSeekV4FlashMapsThinkingToReasoningEffort(t *testing.T) {
+	provider := mustProvider(t)
+	wire, err := provider.buildRequest(&litellm.Request{
+		Model:    "deepseek-v4-flash:0731",
+		Messages: []litellm.Message{litellm.UserText("hi")},
+		Thinking: &litellm.Thinking{Mode: litellm.ThinkingEnabled, Effort: "high"},
+	}, false)
+	if err != nil {
+		t.Fatalf("buildRequest returned error: %v", err)
+	}
+	if wire.ReasoningEffort != "high" {
+		t.Fatalf("reasoning_effort = %q, want high", wire.ReasoningEffort)
+	}
+	if wire.Thinking != nil {
+		t.Fatalf("thinking = %#v, want nil for deepseek-v4-flash", wire.Thinking)
+	}
+
+	wire, err = provider.buildRequest(&litellm.Request{
+		Model:    "deepseek-v4-flash:0731",
+		Messages: []litellm.Message{litellm.UserText("hi")},
+		Thinking: &litellm.Thinking{Mode: litellm.ThinkingDisabled},
+	}, false)
+	if err != nil {
+		t.Fatalf("buildRequest returned error: %v", err)
+	}
+	if wire.ReasoningEffort != "none" {
+		t.Fatalf("reasoning_effort = %q, want none", wire.ReasoningEffort)
+	}
+	if wire.Thinking != nil {
+		t.Fatalf("thinking = %#v, want nil for deepseek-v4-flash", wire.Thinking)
+	}
+
+	_, err = provider.buildRequest(&litellm.Request{
+		Model:    "deepseek-v4-flash:0731",
+		Messages: []litellm.Message{litellm.UserText("hi")},
+		Thinking: &litellm.Thinking{Mode: litellm.ThinkingEnabled, Effort: "minimal"},
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), `unsupported reasoning_effort "minimal"`) {
+		t.Fatalf("expected minimal effort error, got %v", err)
+	}
+}
+
+func TestBuildRequestNonDeepSeekV4FlashUnchanged(t *testing.T) {
+	provider := mustProvider(t)
+	wire, err := provider.buildRequest(&litellm.Request{
+		Model:    "gpt-4.1",
+		Messages: []litellm.Message{litellm.UserText("hi")},
+		Thinking: &litellm.Thinking{Mode: litellm.ThinkingEnabled, Effort: "medium"},
+	}, false)
+	if err != nil {
+		t.Fatalf("buildRequest returned error: %v", err)
+	}
+	if wire.TopP != nil {
+		t.Fatalf("top_p = %v, want nil for non-deepseek-v4-flash", wire.TopP)
+	}
+	if wire.ReasoningEffort != "" {
+		t.Fatalf("reasoning_effort = %q, want empty for non-deepseek-v4-flash", wire.ReasoningEffort)
+	}
+	thinkingJSON, err := json.Marshal(wire.Thinking)
+	if err != nil {
+		t.Fatalf("marshal thinking: %v", err)
+	}
+	if got := string(thinkingJSON); got != `{"effort":"medium","type":"enabled"}` {
+		t.Fatalf("thinking body = %s", got)
+	}
+}
+
+func TestConvertToolsSkipsStrictForOllamaCloud(t *testing.T) {
+	provider, err := New(Config{APIKey: "test-key", BaseURL: "https://ollama.com/v1"})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	tool := mustTool(t, "lookup", "Lookup data.", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"q": map[string]any{"type": "string"},
+		},
+		"required": []string{"q"},
+	})
+	tool.Strict = litellm.StrictEnabled
+
+	wire, err := provider.buildRequest(&litellm.Request{
+		Model:    "deepseek-v4-flash:0731",
+		Messages: []litellm.Message{litellm.UserText("hi")},
+		Tools:    []litellm.Tool{tool},
+	}, false)
+	if err != nil {
+		t.Fatalf("buildRequest returned error: %v", err)
+	}
+	data, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal wire: %v", err)
+	}
+	jsonText := string(data)
+	if strings.Contains(jsonText, `"strict"`) {
+		t.Fatalf("wire JSON must not contain strict for ollama.com:\n%s", jsonText)
+	}
+	if strings.Contains(jsonText, `"additionalProperties"`) {
+		t.Fatalf("wire JSON must keep schema verbatim for ollama.com:\n%s", jsonText)
+	}
+}
+
+func TestConvertToolsKeepsStrictForNonOllamaBaseURL(t *testing.T) {
+	provider, err := New(Config{APIKey: "test-key", BaseURL: "https://example.test"})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	tool := mustTool(t, "lookup", "Lookup data.", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"q": map[string]any{"type": "string"},
+		},
+		"required": []string{"q"},
+	})
+	tool.Strict = litellm.StrictEnabled
+
+	wire, err := provider.buildRequest(&litellm.Request{
+		Model:    "gpt-4.1",
+		Messages: []litellm.Message{litellm.UserText("hi")},
+		Tools:    []litellm.Tool{tool},
+	}, false)
+	if err != nil {
+		t.Fatalf("buildRequest returned error: %v", err)
+	}
+	data, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal wire: %v", err)
+	}
+	jsonText := string(data)
+	for _, want := range []string{`"strict":true`, `"additionalProperties":false`} {
+		if !strings.Contains(jsonText, want) {
+			t.Fatalf("wire JSON missing %s:\n%s", want, jsonText)
+		}
+	}
+}
+
 func jsonResponse(status int, body string) *http.Response {
 	return &http.Response{
 		StatusCode: status,

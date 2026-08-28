@@ -5,6 +5,8 @@ import (
 )
 
 const (
+	ProviderOptionTemperature          = "temperature"
+	ProviderOptionTopP                 = "top_p"
 	ProviderOptionFrequencyPenalty     = "frequency_penalty"
 	ProviderOptionPresencePenalty      = "presence_penalty"
 	ProviderOptionLogitBias            = "logit_bias"
@@ -30,6 +32,8 @@ const (
 )
 
 var providerOptionKeys = map[string]struct{}{
+	ProviderOptionTemperature:          {},
+	ProviderOptionTopP:                 {},
 	ProviderOptionFrequencyPenalty:     {},
 	ProviderOptionPresencePenalty:      {},
 	ProviderOptionLogitBias:            {},
@@ -62,6 +66,18 @@ func applyProviderOptions(req *chatRequest, options map[string]any) error {
 	}
 	for key, value := range options {
 		switch key {
+		case ProviderOptionTemperature:
+			v, err := optionFloat64(key, value)
+			if err != nil {
+				return err
+			}
+			req.Temperature = &v
+		case ProviderOptionTopP:
+			v, err := optionFloat64(key, value)
+			if err != nil {
+				return err
+			}
+			req.TopP = &v
 		case ProviderOptionFrequencyPenalty:
 			v, err := optionFloat64(key, value)
 			if err != nil {
