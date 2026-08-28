@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -513,6 +514,75 @@ func ResolveChapterStage(st *store.Store, chapter int, cfg ChapterFSMConfig) (Ch
 // ── RequireChapterAction：统一强制入口 ────────────────────────────────
 // 六工具在 Execute 入口调用；cfg.Enabled=false 时不拦截（standalone 旧行为）。
 
+// FSM 拒绝审计记录（meta/decisions.jsonl，append-only）：
+// 每次 FSM 拒绝落一条 Kind=chapter_fsm_denied 的记录，Reason 携带
+// "chapter=<n> code=<拒绝码>" 稳定键。拒绝计数升级（DeniedCount）从最近
+// 记录中统计"同一章节同一拒绝码"的连续拒绝次数——持久化在 decisions.jsonl，
+// 重启不丢失；成功（Allows）后计数自然归零（后续记录不再是连续拒绝）。
+const (
+	fsmDeniedDecisionKind    = "chapter_fsm_denied"
+	fsmDeniedDecisionDecider = "fsm"
+	// fsmDeniedRecentWindow 统计窗口：只回看最近 N 条记录（拒绝计数只关心
+	// 紧邻的连续拒绝，窗口足够覆盖"连续 ≥2 次"判定即可，避免长文件全量扫描）。
+	fsmDeniedRecentWindow = 32
+)
+
+// fsmDeniedKey 生成拒绝记录的稳定键：chapter=<n> code=<拒绝码>。
+// 拒绝码 = "chapter_fsm_transition_denied" + 该章节 + required 动作
+// （同一章节同一 required 的连续拒绝才升级；不同 required 视为不同拒绝）。
+func fsmDeniedKey(chapter int, required ChapterAction) string {
+	return fmt.Sprintf("chapter=%d code=chapter_fsm_transition_denied required=%s", chapter, required)
+}
+
+// countConsecutiveFSMDenials 从 decisions.jsonl 最近记录中统计指定章节
+// 指定拒绝码的连续拒绝次数。best-effort：读取失败返回 0（行为退化为现状，
+// 不因审计文件问题阻断工具调用）。
+//
+// 扫描规则：从最新往旧只统计同一章节同一拒绝码的 chapter_fsm_denied 记录；
+// 其它审计记录（worker_failure/plan_start/intervention 等）是引擎在两次拒绝
+// 之间插入的旁路记录（如失败裁定），不打断拒绝链；遇到不同章节或不同拒绝码
+// 的 chapter_fsm_denied 才视为链被打断、停止计数。
+func countConsecutiveFSMDenials(st *store.Store, chapter int, required ChapterAction) int {
+	recs, err := st.Decisions.Recent(fsmDeniedRecentWindow)
+	if err != nil || len(recs) == 0 {
+		return 0
+	}
+	key := fsmDeniedKey(chapter, required)
+	count := 0
+	for i := len(recs) - 1; i >= 0; i-- {
+		rec := recs[i]
+		if rec.Kind != fsmDeniedDecisionKind {
+			continue
+		}
+		if rec.Reason != key {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+// recordFSMDenial 落一条 FSM 拒绝审计记录（best-effort，失败不阻断拒绝本身）。
+func recordFSMDenial(st *store.Store, chapter int, required ChapterAction, attempted ChapterAction, stage ChapterStage) {
+	rec := store.DecisionRecord{
+		Kind:    fsmDeniedDecisionKind,
+		Decider: fsmDeniedDecisionDecider,
+		Reason:  fsmDeniedKey(chapter, required),
+	}
+	if data, err := json.Marshal(map[string]any{
+		"chapter":   chapter,
+		"stage":     string(stage),
+		"attempted": string(attempted),
+		"required":  string(required),
+	}); err == nil {
+		rec.Facts = data
+	}
+	if _, err := st.Decisions.Append(rec); err != nil {
+		// 审计失败不阻断拒绝（错误消息本身已含全部指引信息）。
+		return
+	}
+}
+
 func RequireChapterAction(st *store.Store, chapter int, attempted ChapterAction, cfg ChapterFSMConfig) error {
 	if !cfg.Enabled {
 		return nil
@@ -527,14 +597,19 @@ func RequireChapterAction(st *store.Store, chapter int, attempted ChapterAction,
 	if decision.Allows(attempted) {
 		return nil
 	}
+	// 拒绝计数升级：先落审计记录，再统计连续拒绝次数（含本次）。
+	// 顺序不可颠倒——先 Append 后 Recent 才能把本次拒绝计入连续链。
+	recordFSMDenial(st, chapter, decision.Required, attempted, decision.Stage)
+	deniedCount := countConsecutiveFSMDenials(st, chapter, decision.Required)
 	return &ChapterTransitionError{
-		Chapter:   chapter,
-		Stage:     decision.Stage,
-		Attempted: attempted,
-		Required:  decision.Required,
-		Allowed:   decision.Allowed,
-		Reason:    decision.Reason,
-		Recovery:  decision.Recovery,
+		Chapter:     chapter,
+		Stage:       decision.Stage,
+		Attempted:   attempted,
+		Required:    decision.Required,
+		Allowed:     decision.Allowed,
+		Reason:      decision.Reason,
+		Recovery:    decision.Recovery,
+		DeniedCount: deniedCount,
 	}
 }
 
@@ -550,6 +625,10 @@ type ChapterTransitionError struct {
 	Allowed   []ChapterAction
 	Reason    string
 	Recovery  string
+	// DeniedCount 是该章节该拒绝码（required 动作）的连续拒绝次数（含本次）。
+	// >=2 时 Error() 追加强制指令，直接给出必须调用的工具与参数，并提示
+	// 不要重复获取上下文（模型指令遵循差时的拒绝升级机制）。
+	DeniedCount int
 }
 
 // recoveryHint 按 required action 生成 action-specific 的 recovery 文案。
@@ -589,8 +668,16 @@ func (e *ChapterTransitionError) Error() string {
 	if allowedStr == "" {
 		allowedStr = "none"
 	}
-	return fmt.Sprintf("code=chapter_fsm_transition_denied chapter=%d stage=%s attempted=%s required=%s allowed=[%s] reason=%s 下一步：%s",
+	msg := fmt.Sprintf("code=chapter_fsm_transition_denied chapter=%d stage=%s attempted=%s required=%s allowed=[%s] reason=%s 下一步：%s",
 		e.Chapter, e.Stage, e.Attempted, required, allowedStr, e.Reason, recoveryHint(e.Required, e.Chapter))
+	// 拒绝计数升级：同一章节同一拒绝码连续 ≥2 次时追加强制指令。
+	// 只升级"拒绝"场景，不改变正常流程；code= 前缀保持稳定（测试依赖）。
+	// required 为空（如 complete 阶段无下一步工具）时不升级——没有可强制的工具。
+	if e.DeniedCount >= 2 && e.Required != "" {
+		msg += fmt.Sprintf(" 你已被同一原因连续拒绝 %d 次。必须立即调用 %s（参数见上方 recoveryHint），不要再次调用 novel_context / read_chapter / check_consistency 获取上下文。",
+			e.DeniedCount, required)
+	}
+	return msg
 }
 
 func (e *ChapterTransitionError) Unwrap() error { return errs.ErrToolPrecondition }

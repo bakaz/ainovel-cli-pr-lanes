@@ -116,8 +116,8 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 	if t.fsmConfig.Enabled && a.Mode == "write" {
 		if existing, loadErr := t.store.Drafts.LoadDraft(a.Chapter); loadErr == nil && existing != "" {
 			wordCount := utf8.RuneCountInString(existing)
+			rng := chapterWordRange(t.store)
 			if shouldForceAppendUnderMin(t.store, a.Chapter, existing, wordCount) {
-				rng := chapterWordRange(t.store)
 				deficit := 0
 				if rng != nil && rng.Min > wordCount {
 					deficit = rng.Min - wordCount
@@ -126,6 +126,38 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 					"draft_chapter: 第 %d 章当前草稿 %d 字，唯一 error 是低于最小字数（还差 %d 字）；请使用 mode=append 续写，不要再次 mode=write 整章覆盖: %w",
 					a.Chapter, wordCount, deficit, errs.ErrToolPrecondition,
 				)
+			}
+			// 现有草稿已达标但本次 write 的新内容不达标：拒绝覆盖，防止
+			// 达标草稿被单次输出习惯偏短的整章重写打回不达标（826/850 类循环）。
+			// 豁免条件：
+			//   - 活跃评审 ledger（revision_open 等）：整章覆盖合法
+			//   - 重写队列且现有草稿未达标：重写刚开始，允许整章覆盖
+			//   - FSM 强制 draft（required=draft_chapter）：合法动作（827 死锁修复）
+			// 不豁免：重写队列但现有草稿已达标 → 防倒退（850 循环）
+			if !hasActiveReviewLedger(t.store, a.Chapter) {
+				inRewrite := chapterInRewriteQueue(t.store, a.Chapter)
+				// 进入守卫的条件：非重写队列，或重写队列但现有草稿已达标。
+				// 重写队列 + 未达标草稿 = 重写刚开始，豁免整章覆盖（不得按
+				// 字数误伤）；重写队列 + 已达标草稿 = 防倒退（850 循环）。
+				if !inRewrite || rng == nil || wordCount >= rng.Min {
+					// FSM 强制 draft 时（needs_edit/needs_draft 的 required=draft_chapter，
+					// 如 error 级机械违规待修）write 是 FSM 要求的合法动作，不得按
+					// 字数拒绝——否则 FSM 与守卫互相矛盾，模型无路可走（827 死锁）。
+					// write 后 next_step 会引导 append 补字，不会形成倒退循环。
+					fsmForcesDraft := false
+					if decision, err := ResolveChapterStage(t.store, a.Chapter, t.fsmConfig); err == nil {
+						fsmForcesDraft = decision.Required == ChapterActionDraft
+					}
+					if !fsmForcesDraft {
+						if rng != nil && rng.Min > 0 &&
+							wordCount >= rng.Min && utf8.RuneCountInString(a.Content) < rng.Min {
+							return nil, fmt.Errorf(
+								"draft_chapter: 第 %d 章现有草稿 %d 字已达标，本次 write 内容仅 %d 字（低于下限 %d）；请改用 mode=append 在现有草稿上续写，或先 check_consistency 确认结构问题后再决定是否整章重写: %w",
+								a.Chapter, wordCount, utf8.RuneCountInString(a.Content), rng.Min, errs.ErrToolPrecondition,
+							)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -145,12 +177,13 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 		); err != nil {
 			return nil, fmt.Errorf("checkpoint draft: %w", err)
 		}
+		wc := utf8.RuneCountInString(a.Content)
 		return json.Marshal(map[string]any{
 			"written":    true,
 			"chapter":    a.Chapter,
 			"mode":       "write",
-			"word_count": utf8.RuneCountInString(a.Content),
-			"next_step":  "先 read_chapter(source=draft) 回读草稿，再调用 check_consistency；检查通过后按返回的 required_next_action 依次执行 polish_draft → check_consistency → review_style，最后 commit_chapter",
+			"word_count": wc,
+			"next_step":  draftNextStep(t.store, a.Chapter, wc),
 		})
 	case "append":
 		if err := t.store.Drafts.AppendDraft(a.Chapter, a.Content); err != nil {
@@ -166,14 +199,46 @@ func (t *DraftChapterTool) Execute(_ context.Context, args json.RawMessage) (jso
 		); err != nil {
 			return nil, fmt.Errorf("checkpoint draft: %w", err)
 		}
+		wc := utf8.RuneCountInString(full)
 		return json.Marshal(map[string]any{
 			"written":    true,
 			"chapter":    a.Chapter,
 			"mode":       "append",
-			"word_count": utf8.RuneCountInString(full),
-			"next_step":  "先 read_chapter(source=draft) 回读草稿，再调用 check_consistency；检查通过后按返回的 required_next_action 依次执行 polish_draft → check_consistency → review_style，最后 commit_chapter",
+			"word_count": wc,
+			"next_step":  draftNextStep(t.store, a.Chapter, wc),
 		})
 	default: // 理论不可达（Execute 入口已校验），纵深防御：新增 mode 不得静默降级为 write
 		return nil, fmt.Errorf("draft_chapter: mode 必须是 write 或 append，收到 %q: %w", a.Mode, errs.ErrToolArgs)
 	}
+}
+
+// hasActiveReviewLedger 报告章节是否存在活跃评审账本（CurrentStatus 非空）。
+// 活跃评审周期（revision_open 等）时整章覆盖是合法操作（评审修订需要覆盖
+// 旧草稿），不得被"达标草稿防倒退"守卫误伤。
+func hasActiveReviewLedger(st *store.Store, chapter int) bool {
+	ledger, err := st.StyleReview.Load(chapter)
+	return err == nil && ledger != nil && ledger.CurrentStatus() != ""
+}
+
+// chapterInRewriteQueue 报告章节是否在 PendingRewrites 重写队列中。
+func chapterInRewriteQueue(st *store.Store, chapter int) bool {
+	progress, err := st.Progress.Load()
+	return err == nil && progress != nil && slices.Contains(progress.PendingRewrites, chapter)
+}
+
+// draftNextStep 生成 draft_chapter 返回的 next_step 引导。字数低于下限时
+// 直接提示缺口与 mode=append 续写，避免模型反复 mode=write 整章重写却
+// 始终达不到字数（825 类死循环：模型单次输出习惯低于下限，且不主动
+// check_consistency 就看不到 under_min 引导）。
+func draftNextStep(st *store.Store, chapter, wordCount int) string {
+	if rng := chapterWordRange(st); rng != nil && rng.Min > 0 && wordCount < rng.Min {
+		return fmt.Sprintf(
+			"当前草稿 %d 字，低于下限 %d（还差 %d 字）。请调用 draft_chapter(chapter=%d, mode=\"append\") 追加续写，不要用 mode=\"write\" 整章重写；追加后 read_chapter(source=\"draft\") 回读，再 check_consistency。",
+			wordCount, rng.Min, rng.Min-wordCount, chapter,
+		)
+	}
+	return fmt.Sprintf(
+		"草稿已达标（%d 字）。请调用 check_consistency(chapter=%d) 自审结构/设定；若发现重复段落或结构问题，先看 check 返回的 rule_violations，再用 edit_chapter 定点修改或 draft_chapter(mode=write) 整章重写（整章重写必须一次输出达到字数下限）。禁止在 check_consistency 之前再次 draft_chapter 覆盖。",
+		wordCount, chapter,
+	)
 }

@@ -1315,3 +1315,193 @@ func TestComputeChapterStage_UnderMinSuggestsAppend(t *testing.T) {
 		t.Fatalf("rewrite queue must not receive append-only mode: %+v", next)
 	}
 }
+
+// ── FSM 拒绝计数升级（同一章节同一拒绝码连续 ≥2 次追加强制指令） ────────
+
+// TestRequireChapterAction_DeniedCountEscalation 验证拒绝计数升级机制：
+// 首次拒绝不升级；连续第 2/3 次拒绝升级并携带计数；不同章节的拒绝不打断
+// 本章拒绝链；拒绝码（required）变化打断拒绝链、计数从 1 重新开始；
+// code= 前缀保持稳定。
+func TestRequireChapterAction_DeniedCountEscalation(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	savePermissiveUserRules(t, st)
+	if err := st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, "# 一\nabc她心里骂自己丢人，真不要脸。"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := ChapterFSMConfig{Enabled: true}
+
+	// 第 1 次拒绝：DeniedCount=1，不升级。
+	err := RequireChapterAction(st, 1, ChapterActionCommit, cfg)
+	if err == nil {
+		t.Fatal("commit must be denied in draft_dirty")
+	}
+	var te *ChapterTransitionError
+	if !errors.As(err, &te) || te.DeniedCount != 1 {
+		t.Fatalf("first denial DeniedCount = %+v, want 1", te)
+	}
+	if strings.Contains(err.Error(), "你已被同一原因") {
+		t.Fatalf("first denial must not escalate:\n%s", err.Error())
+	}
+
+	// 第 2 次拒绝：DeniedCount=2，升级。
+	err = RequireChapterAction(st, 1, ChapterActionCommit, cfg)
+	if !errors.As(err, &te) || te.DeniedCount != 2 {
+		t.Fatalf("second denial DeniedCount = %+v, want 2", te)
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"你已被同一原因连续拒绝 2 次",
+		"必须立即调用 check_consistency",
+		"不要再次调用 novel_context / read_chapter / check_consistency 获取上下文",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("escalated message missing %q:\n%s", want, msg)
+		}
+	}
+	if !strings.HasPrefix(msg, "code=chapter_fsm_transition_denied") {
+		t.Fatalf("code prefix must stay stable:\n%s", msg)
+	}
+
+	// 第 3 次拒绝：DeniedCount=3。
+	err = RequireChapterAction(st, 1, ChapterActionCommit, cfg)
+	if !errors.As(err, &te) || te.DeniedCount != 3 {
+		t.Fatalf("third denial DeniedCount = %+v, want 3", te)
+	}
+	if !strings.Contains(err.Error(), "连续拒绝 3 次") {
+		t.Fatalf("third denial must escalate with count 3:\n%s", err.Error())
+	}
+
+	// 不同章节的拒绝（不同 key）打断本章拒绝链：严格"连续"语义——
+	// 中间夹了其它章节的拒绝，本章计数从 1 重新开始。
+	if err := st.Drafts.SaveDraft(2, "# 二\nabc她心里骂自己丢人，真不要脸。"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RequireChapterAction(st, 2, ChapterActionCommit, cfg); err == nil {
+		t.Fatal("chapter 2 commit must be denied")
+	}
+	err = RequireChapterAction(st, 1, ChapterActionCommit, cfg)
+	if !errors.As(err, &te) || te.DeniedCount != 1 {
+		t.Fatalf("denial after other-chapter denial DeniedCount = %+v, want 1 (chain broken)", te)
+	}
+	if strings.Contains(err.Error(), "你已被同一原因") {
+		t.Fatalf("chain-broken denial must not escalate:\n%s", err.Error())
+	}
+
+	// 拒绝码（required）变化打断拒绝链：追加匹配 digest 的 consistency
+	// checkpoint → 阶段推进到 needs_review（required=review_style），
+	// 新拒绝码计数从 1 重新开始、不升级。
+	draft, _ := st.Drafts.LoadDraft(1)
+	digest := domain.DigestDraft(draft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "c1", digest); err != nil {
+		t.Fatal(err)
+	}
+	err = RequireChapterAction(st, 1, ChapterActionCommit, cfg)
+	if !errors.As(err, &te) || te.DeniedCount != 1 {
+		t.Fatalf("denial with new required must restart count, DeniedCount = %+v, want 1", te)
+	}
+	if strings.Contains(err.Error(), "你已被同一原因") {
+		t.Fatalf("new denial code must not escalate:\n%s", err.Error())
+	}
+}
+
+// TestRequireChapterAction_DeniedCountIgnoresOtherRecords 验证引擎旁路记录
+// （worker_failure/plan_start 等非 chapter_fsm_denied 审计）不打断拒绝链——
+// 生产流程中两次 FSM 拒绝之间必然夹着失败裁定等记录，若它们打断链，
+// 升级机制将永远无法触发。
+func TestRequireChapterAction_DeniedCountIgnoresOtherRecords(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	savePermissiveUserRules(t, st)
+	if err := st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, "# 一\nabc她心里骂自己丢人，真不要脸。"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := ChapterFSMConfig{Enabled: true}
+
+	// 第 1 次拒绝。
+	if err := RequireChapterAction(st, 1, ChapterActionCommit, cfg); err == nil {
+		t.Fatal("commit must be denied")
+	}
+	// 引擎在两次拒绝之间插入的旁路审计（worker_failure 裁定等）。
+	if _, err := st.Decisions.Append(store.DecisionRecord{
+		Kind: "worker_failure", Decider: "arbiter", Input: "writer: 写第 1 章", Reason: "重试",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 第 2 次拒绝：旁路记录不打断链 → 升级触发。
+	err := RequireChapterAction(st, 1, ChapterActionCommit, cfg)
+	var te *ChapterTransitionError
+	if !errors.As(err, &te) || te.DeniedCount != 2 {
+		t.Fatalf("DeniedCount = %+v, want 2 (interleaved records must not break chain)", te)
+	}
+	if !strings.Contains(err.Error(), "你已被同一原因连续拒绝 2 次") {
+		t.Fatalf("escalation must trigger despite interleaved records:\n%s", err.Error())
+	}
+}
+
+// TestRequireChapterAction_DeniedCountRewriteQueue 复现生产死循环场景：
+// 重写队列章节（rewrite_not_started，required=edit_chapter）反复调用
+// check_consistency 被拒 → 连续 ≥2 次后错误升级为强制调用 edit_chapter。
+func TestRequireChapterAction_DeniedCountRewriteQueue(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	savePermissiveUserRules(t, st)
+	if err := st.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.Init("重写测试", 10); err != nil {
+		t.Fatal(err)
+	}
+	final := "原终稿。她心里骂自己丢人，真不要脸。"
+	if err := st.Drafts.SaveFinalChapter(1, final); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Drafts.SaveDraft(1, final); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.MarkChapterComplete(1, 100, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Progress.SetPendingRewrites([]int{1}, "重写测试"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := ChapterFSMConfig{Enabled: true}
+
+	// 第 1 次：check_consistency 被拒（required=edit_chapter），不升级。
+	err := RequireChapterAction(st, 1, ChapterActionCheck, cfg)
+	if err == nil {
+		t.Fatal("check_consistency must be denied in rewrite_not_started")
+	}
+	var te *ChapterTransitionError
+	if !errors.As(err, &te) || te.Required != ChapterActionEdit || te.DeniedCount != 1 {
+		t.Fatalf("first denial = %+v, want required=edit_chapter DeniedCount=1", te)
+	}
+	if strings.Contains(err.Error(), "你已被同一原因") {
+		t.Fatalf("first denial must not escalate:\n%s", err.Error())
+	}
+
+	// 第 2 次：升级，强制调用 edit_chapter。
+	err = RequireChapterAction(st, 1, ChapterActionCheck, cfg)
+	if !errors.As(err, &te) || te.DeniedCount != 2 {
+		t.Fatalf("second denial DeniedCount = %+v, want 2", te)
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"你已被同一原因连续拒绝 2 次",
+		"必须立即调用 edit_chapter",
+		"不要再次调用 novel_context / read_chapter / check_consistency 获取上下文",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("escalated message missing %q:\n%s", want, msg)
+		}
+	}
+	if !strings.HasPrefix(msg, "code=chapter_fsm_transition_denied") {
+		t.Fatalf("code prefix must stay stable:\n%s", msg)
+	}
+}
