@@ -274,10 +274,10 @@ func TestDraftChapter_RewriteQueueQualifiedDraftShortWriteRejected(t *testing.T)
 
 // TestDraftChapter_RewriteQueueUnderMinDraftWriteAllowed 重写刚开始豁免：
 // 重写队列 + 现有草稿未达标 → write 放行（整章覆盖合法，不得按字数误伤）。
-// 草稿同时带非字数机械 error（自评口吻不足），确保不被第一道 under-min
+// 草稿同时带非字数机械 error（禁词清零"浑身发抖"），确保不被第一道 under-min
 // 守卫（onlyUnderMinChapterWordsError）拦截，走到"达标防倒退"守卫验证豁免。
 func TestDraftChapter_RewriteQueueUnderMinDraftWriteAllowed(t *testing.T) {
-	st := rewriteQueueDraftStore(t, "重写刚开始的短草稿。")
+	st := rewriteQueueDraftStore(t, "重写刚开始的短草稿。她浑身发抖。")
 	tool := NewDraftChapterTool(st, testContract)
 	tool.SetChapterFSMConfig(fsmEnabledCfg())
 

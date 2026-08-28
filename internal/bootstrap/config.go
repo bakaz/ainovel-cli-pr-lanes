@@ -185,6 +185,11 @@ type Config struct {
 	// 显式配置 roles.polisher 角色同样视为启用（见 ChapterPipelineEnabled）。
 	ChapterPipeline string `json:"chapter_pipeline,omitempty"`
 
+	// ViolationDetail 控制 FSM 拒绝消息是否携带 error 级机械违规明细
+	// （rule/target/actual/limit 紧凑摘要）。缺省 true（未配置时默认开启——
+	// 见 ViolationDetailEnabled）；显式配置 false 可关闭，恢复旧版拒绝消息。
+	ViolationDetail *bool `json:"violation_detail,omitempty"`
+
 	// Budget 单本书的成本预算政策；book_usd > 0 才启用。
 	Budget BudgetConfig `json:"budget,omitzero"`
 
@@ -460,6 +465,13 @@ func (c Config) ChapterPipelineEnabled() bool {
 		return true
 	}
 	return false
+}
+
+// ViolationDetailEnabled 报告 FSM 拒绝消息的机械违规明细开关是否启用。
+// 缺省 true（未配置时默认开启——ch43 死循环修复的默认行为）；显式配置
+// violation_detail=false 时关闭，拒绝消息恢复旧版（不含 violations=[...]）。
+func (c Config) ViolationDetailEnabled() bool {
+	return c.ViolationDetail == nil || *c.ViolationDetail
 }
 
 // ResolveReasoningEffort 返回某角色生效的推理强度原始串（off/low/medium/high/xhigh/max 或空）。

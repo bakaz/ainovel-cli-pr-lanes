@@ -93,8 +93,8 @@ func setupCriticStore(t *testing.T, chapter int, draft string) *store.Store {
 		t.Fatalf("SetStyleReviewMode: %v", err)
 	}
 	// C2 机械规则前置闸：被评审的草稿必须机械干净，否则评审在 accepted 落盘前
-	// 被拒（自评口吻不足 / 章节字数不足 3000 等 error 级违例）。测试草稿统一经
-	// mechCleanDraft 包装，避免与闸门语义纠缠。
+	// 被拒（章节字数不足 3000 等 error 级违例；自评口吻不足已降为 warning 不
+	// 阻断）。测试草稿统一经 mechCleanDraft 包装，避免与闸门语义纠缠。
 	draft = mechCleanDraft(draft)
 	if draft != "" {
 		if err := st.Drafts.SaveDraft(chapter, draft); err != nil {
@@ -112,7 +112,8 @@ func setupCriticStore(t *testing.T, chapter int, draft string) *store.Store {
 }
 
 // mechCleanDraft 返回满足 review_style 机械规则前置闸（C2）的测试草稿：
-// 12 类文学腔硬闸中"自评口吻 ≥2"这一条（其余 11 类测试草稿天然不触发）。
+// 12 类文学腔硬闸中"自评口吻 ≥1"这一条（其余 11 类测试草稿天然不触发；
+// 自评口吻现为 warning 不阻断，追加关键词仍保持草稿机械干净的口径）。
 // 追加自评关键词"她心里骂自己丢人，真不要脸。"（含 心里骂/丢人/真不要脸
 // 三个命中词，且不匹配任何其它文学腔模式）。空串原样返回（表示无草稿）。
 func mechCleanDraft(draft string) string {

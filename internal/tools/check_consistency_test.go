@@ -129,3 +129,58 @@ func TestCheckConsistencyReportsDuplicateCharacterStateKey(t *testing.T) {
 		t.Fatalf("expected 1 duplicate key issue, got %+v", got["character_state_issues"])
 	}
 }
+
+// ── FSM-enabled：相同 digest 再次 check 被拒时携带违规明细（ch43 修复） ──
+// 43 章死循环根因：模型在 needs_edit 阶段反复 draft_chapter，但拒绝消息不含
+// 违规明细（rule/target/actual/limit）。以下测试验证：FSM 开启 + 草稿含 error
+// 级违规时，首次 check 通过（追加 checkpoint），相同 digest 再次 check 被拒，
+// 错误消息包含紧凑违规摘要（开关开）；开关关时不包含（消息与旧版一致）。
+
+func TestCheckConsistency_FSMRejectCarriesViolationDetail(t *testing.T) {
+	// 草稿含 error 级违规：forbidden_phrases "某种程度上"（SystemDefaults 保留）。
+	const draft = "# 一\nabc她心里骂自己丢人，真不要脸。某种程度上，他看见了。"
+
+	run := func(t *testing.T, cfg ChapterFSMConfig) (string, error) {
+		t.Helper()
+		st := store.NewStore(t.TempDir())
+		savePermissiveUserRules(t, st)
+		if err := st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Drafts.SaveDraft(1, draft); err != nil {
+			t.Fatal(err)
+		}
+		tool := NewCheckConsistencyTool(st)
+		tool.SetChapterFSMConfig(cfg)
+		// 首次 check：draft_dirty 允许，追加匹配 digest 的 checkpoint。
+		if _, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`)); err != nil {
+			t.Fatalf("first check must pass: %v", err)
+		}
+		// 相同 digest 再次 check：needs_edit 拒绝（allowed 只有 draft_chapter）。
+		_, err := tool.Execute(t.Context(), json.RawMessage(`{"chapter":1}`))
+		return err.Error(), err
+	}
+
+	// 开关开：拒绝消息含 violations=[...] 紧凑摘要（rule/target/actual）。
+	msg, err := run(t, ChapterFSMConfig{Enabled: true, ViolationDetailEnabled: true})
+	if err == nil {
+		t.Fatal("相同 digest 再次 check 必须被 FSM 拒绝")
+	}
+	for _, want := range []string{
+		"code=chapter_fsm_transition_denied", "stage=needs_edit",
+		"violations=[", "rule=forbidden_phrases", "severity=error",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("拒绝消息缺少 %q：\n%s", want, msg)
+		}
+	}
+
+	// 开关关：拒绝消息不含 violations=（与旧版一致）。
+	omsg, oerr := run(t, ChapterFSMConfig{Enabled: true, ViolationDetailEnabled: false})
+	if oerr == nil {
+		t.Fatal("相同 digest 再次 check 必须被 FSM 拒绝（开关关）")
+	}
+	if strings.Contains(omsg, "violations=") {
+		t.Fatalf("开关关时拒绝消息不得含 violations=：\n%s", omsg)
+	}
+}

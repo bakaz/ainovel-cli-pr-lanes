@@ -901,15 +901,16 @@ func TestBuildWorkers_ChapterFSMWiring(t *testing.T) {
 			"polisher": {Provider: "ollama", Model: "mimo-polisher"},
 		})
 		checkInjected(t, runner, tools.ChapterFSMConfig{
-			Enabled:               true,
-			PipelineEnabled:       true,
-			ExpectedPolisherModel: "mimo-polisher",
+			Enabled:                true,
+			PipelineEnabled:        true,
+			ExpectedPolisherModel:  "mimo-polisher",
+			ViolationDetailEnabled: true, // 缺省 true（未配置 violation_detail 默认开启）
 		})
 	})
 
 	t.Run("pipeline_disabled", func(t *testing.T) {
 		runner := newRunner("", nil)
-		checkInjected(t, runner, tools.ChapterFSMConfig{Enabled: true})
+		checkInjected(t, runner, tools.ChapterFSMConfig{Enabled: true, ViolationDetailEnabled: true})
 	})
 }
 

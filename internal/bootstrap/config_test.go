@@ -50,6 +50,44 @@ func TestMergeConfigFlags(t *testing.T) {
 	}
 }
 
+// TestConfigViolationDetailEnabled 验证 FSM 违规明细开关：缺省 true（未配置时
+// 默认开启——ch43 死循环修复的默认行为）；显式 false 关闭；显式 true 保持开启。
+func TestConfigViolationDetailEnabled(t *testing.T) {
+	if !(Config{}).ViolationDetailEnabled() {
+		t.Fatal("未配置 violation_detail 时默认应开启（缺省 true）")
+	}
+	f := false
+	if (Config{ViolationDetail: &f}).ViolationDetailEnabled() {
+		t.Fatal("显式 violation_detail=false 应关闭")
+	}
+	tr := true
+	if !(Config{ViolationDetail: &tr}).ViolationDetailEnabled() {
+		t.Fatal("显式 violation_detail=true 应保持开启")
+	}
+}
+
+// TestMergeConfigViolationDetail 验证指针开关的合并语义：显式配置（true/false）
+// 覆盖低层值；未配置（nil）保持低层值。
+func TestMergeConfigViolationDetail(t *testing.T) {
+	f := false
+	tr := true
+	// 低层未配置 + 高层显式 false → false（项目级可关闭全局默认开启）。
+	merged := mergeConfig(Config{}, Config{ViolationDetail: &f})
+	if merged.ViolationDetailEnabled() {
+		t.Fatal("overlay violation_detail=false 应覆盖缺省 true")
+	}
+	// 低层显式 false + 高层未配置 → 保持 false。
+	merged = mergeConfig(Config{ViolationDetail: &f}, Config{})
+	if merged.ViolationDetailEnabled() {
+		t.Fatal("未配置的 overlay 不得把低层 false 改回 true")
+	}
+	// 低层显式 false + 高层显式 true → true（高层覆盖）。
+	merged = mergeConfig(Config{ViolationDetail: &f}, Config{ViolationDetail: &tr})
+	if !merged.ViolationDetailEnabled() {
+		t.Fatal("overlay violation_detail=true 应覆盖低层 false")
+	}
+}
+
 func TestConfigResolveReasoningEffort(t *testing.T) {
 	cfg := Config{
 		ReasoningEffort: "low", // 顶层默认

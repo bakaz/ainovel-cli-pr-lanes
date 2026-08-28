@@ -145,6 +145,11 @@ func mergeConfig(base, overlay Config) Config {
 	if overlay.ContextWindow > 0 {
 		base.ContextWindow = overlay.ContextWindow
 	}
+	// ViolationDetail 是指针开关：显式配置（true/false）即覆盖低层值；
+	// 未配置（nil）保持低层值（缺省 true 由 ViolationDetailEnabled 兜底）。
+	if overlay.ViolationDetail != nil {
+		base.ViolationDetail = overlay.ViolationDetail
+	}
 
 	// Providers: overlay 的 key 覆盖 base 同名 key
 	if len(overlay.Providers) > 0 {

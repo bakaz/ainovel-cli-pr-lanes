@@ -14,7 +14,9 @@ import (
 // 素材口吻不足、节拍账本（身体节奏被写成抽象计数系统）、禁词清零（成熟
 // 质检体系的硬性禁词出现即打回）。纯正则机械计数，不经 LLM judge；
 // 超阈值即 error 级违例，由 commit_chapter 的前置硬闸（tools.CheckLiteraryProseGate）
-// 阻止提交。
+// 阻止提交。例外：自评口吻不足（第 10 类）是文学偏好而非硬底线，降为
+// warning 级，不阻断 commit/review（模型重写时自评词随机丢失，error 级会
+// 造成 needs_edit 死循环）。
 //
 // 契约：
 //   - 只返事实（Violation 列表），是否阻断由调用方（commit gate）裁定
@@ -53,8 +55,10 @@ const (
 	// 整段只析出 1 个句子的段落）计数 ≥6 触发 error（规则要求 ≤5）。
 	LitGateSingleSentenceLimit = 6
 	// LitGateSelfReviewMin 第 10 类：自评/素材口吻不足——自评关键词命中
-	// <2 触发 error（规则要求 ≥2）。
-	LitGateSelfReviewMin = 2
+	// <1 触发 warning（规则要求 ≥1：章内至少 1 处明确自评）。这是文学偏好
+	// 而非硬底线：模型重写时自评词随机丢失，error 级会造成 needs_edit
+	// 死循环（43 章循环 30 分钟实测），故降为 warning 不阻断任何流程。
+	LitGateSelfReviewMin = 1
 
 	// LitGateBeatLedgerALimit 第 11 类组合 A：计数单位+账本关系词结构
 	// ≥2 触发 error（"维持器转一圈也是六拍"这类单句即含多个关系结构）。
@@ -82,7 +86,7 @@ var literaryProseRules = []LiteraryProseRule{
 	{
 		Name:    "abstract_emotion",
 		Label:   "抽象情绪概括",
-		Pattern: `一种.{0,8}?的|无尽|难以言喻|说不出的`,
+		Pattern: `无尽|难以言喻|说不出的`,
 		Limit:   LitGateAbstractEmoLimit,
 	},
 	{
@@ -224,9 +228,9 @@ func countSentences(p string) int {
 
 // ── 第 10 类：自评/素材口吻不足 ────────────────────────────────────────
 //
-// 统计 litGateSelfReviewRe 关键词命中数，命中 < LitGateSelfReviewMin(2)
-// 触发 error（规则要求 ≥2）。Target 附带去重命中词明细，供 editor 核对
-// 装置/对白语境的误计。
+// 统计 litGateSelfReviewRe 关键词命中数，命中 < LitGateSelfReviewMin(1)
+// 触发 warning（规则要求 ≥1）。文学偏好而非硬底线，不阻断 commit/review。
+// Target 附带去重命中词明细，供 editor 核对装置/对白语境的误计。
 func checkSelfReviewTone(text string) *Violation {
 	matches := litGateSelfReviewRe.FindAllString(text, -1)
 	if len(matches) >= LitGateSelfReviewMin {
@@ -242,7 +246,7 @@ func checkSelfReviewTone(text string) *Violation {
 			len(matches), LitGateSelfReviewMin, detail),
 		Limit:    LitGateSelfReviewMin,
 		Actual:   len(matches),
-		Severity: SeverityError,
+		Severity: SeverityWarning,
 	}
 }
 
@@ -264,7 +268,9 @@ func checkSelfReviewTone(text string) *Violation {
 //
 // 豁免（宁漏勿滥）：命中起点前 10 字内出现测量动词（数着/她数/数到/心里数/
 // 咬着指节/数了）时剔除该命中——"数到第六十遍"是计数行为本身，不是账本化
-// 表达。"跳了一拍/漏跳了一拍"类成语化表达缺账本关系词，天然不匹配。
+// 表达；命中片段（含其后 1 字）含"维持器"装置名时同样剔除——"把维持器裹得
+// 更紧"是装置动作，不是账本关系（"维持"作为账本关系词保留，仅排除装置名
+// 场景）。"跳了一拍/漏跳了一拍"类成语化表达缺账本关系词，天然不匹配。
 var (
 	// litGateBeatLedgerAFwd 组合 A 正向：计数单位 + 账本关系词。
 	litGateBeatLedgerAFwd = regexp.MustCompile(
@@ -280,16 +286,27 @@ var (
 )
 
 // litGateBeatLedgerExempt 豁免判定：命中起点（byte 偏移）前 10 个 rune 内
-// 出现测量动词即豁免该命中（宁漏勿滥）。
-func litGateBeatLedgerExempt(text string, start int) bool {
-	if start <= 0 {
-		return false
+// 出现测量动词即豁免该命中（宁漏勿滥）；命中片段（含其后 1 个 rune）含
+// "维持器"装置名时同样豁免——"把维持器裹得更紧"是装置动作，不是账本关系
+// （"维持"作为账本关系词保留，仅排除"维持器"装置名场景）。
+func litGateBeatLedgerExempt(text string, start, end int) bool {
+	if start > 0 {
+		rs := []rune(text[:start])
+		if len(rs) > 10 {
+			rs = rs[len(rs)-10:]
+		}
+		if litGateMeasureVerb.MatchString(string(rs)) {
+			return true
+		}
 	}
-	rs := []rune(text[:start])
-	if len(rs) > 10 {
-		rs = rs[len(rs)-10:]
+	// 命中片段 + 其后 1 个 rune：覆盖"维持"后紧跟"器"的装置名形态
+	// （AFwd 匹配止于"维持"，"器"在匹配之外）。
+	ctx := text[start:end]
+	if end < len(text) {
+		_, size := utf8.DecodeRuneInString(text[end:])
+		ctx += text[end : end+size]
 	}
-	return litGateMeasureVerb.MatchString(string(rs))
+	return strings.Contains(ctx, "维持器")
 }
 
 // checkBeatLedger 第 11 类检查：组合 A 命中 ≥2 或组合 B 命中 ≥3 时产出
@@ -298,14 +315,14 @@ func checkBeatLedger(text string) *Violation {
 	var aHits, bHits []string
 	for _, re := range []*regexp.Regexp{litGateBeatLedgerAFwd, litGateBeatLedgerARev} {
 		for _, loc := range re.FindAllStringIndex(text, -1) {
-			if litGateBeatLedgerExempt(text, loc[0]) {
+			if litGateBeatLedgerExempt(text, loc[0], loc[1]) {
 				continue
 			}
 			aHits = append(aHits, text[loc[0]:loc[1]])
 		}
 	}
 	for _, loc := range litGateBeatLedgerB.FindAllStringIndex(text, -1) {
-		if litGateBeatLedgerExempt(text, loc[0]) {
+		if litGateBeatLedgerExempt(text, loc[0], loc[1]) {
 			continue
 		}
 		bHits = append(bHits, text[loc[0]:loc[1]])
@@ -436,14 +453,14 @@ const maxSnippetSamples = 5
 
 // CheckLiteraryProse 统计正文中 8 类文学腔句式命中数 + 4 类形态检查
 // （段落碎片化 / 自评口吻不足 / 节拍账本 / 禁词清零），超阈值即产生
-// error 级违例。
+// error 级违例（自评口吻不足除外：warning 级，文学偏好不阻断）。
 //
 // 每类超阈值规则产出一条 Violation：
 //   - Rule    = "literary_prose"
 //   - Target  = "模式名：命中片段1 / 命中片段2 …"（每片段 ≤40 runes，去重，最多 5 条）
 //   - Limit   = 阈值
 //   - Actual  = 命中总数
-//   - Severity= error
+//   - Severity= error（自评口吻不足为 warning）
 //
 // 不阻断任何流程；是否阻断由 commit 硬闸（tools.CheckLiteraryProseGate）决定。
 func CheckLiteraryProse(text string) []Violation {
@@ -473,7 +490,7 @@ func CheckLiteraryProse(text string) []Violation {
 	if v := checkParagraphShape(text); v != nil {
 		vs = append(vs, *v)
 	}
-	// 第 10 类：自评/素材口吻不足（命中 < 2 触发）
+	// 第 10 类：自评/素材口吻不足（命中 < 1 触发）
 	if v := checkSelfReviewTone(text); v != nil {
 		vs = append(vs, *v)
 	}

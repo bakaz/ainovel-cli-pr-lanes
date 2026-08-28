@@ -10,6 +10,7 @@ import (
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/errs"
+	"github.com/voocel/ainovel-cli/internal/rules"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -54,6 +55,10 @@ type ChapterFSMConfig struct {
 	Enabled               bool   // 生产 Writer 工具集 true；standalone 旧测试默认 false
 	PipelineEnabled       bool   // 精修流水线开关（与 polish_draft/review_style/commit 的既有开关同源）
 	ExpectedPolisherModel string // roles.polisher 显式配置时使用；空表示不检查
+	// ViolationDetailEnabled 控制 FSM 拒绝消息是否携带 error 级机械违规明细
+	// （rule/target/actual/limit 紧凑摘要）。默认开启（bootstrap.Config
+	// ViolationDetailEnabled() 缺省 true）；关闭时错误消息与旧版逐字节一致。
+	ViolationDetailEnabled bool
 }
 
 // ChapterFSMConfigurable 是六工具实现 FSM 配置注入的接口。
@@ -79,6 +84,11 @@ type ChapterStageInput struct {
 	LatestConsistency     *domain.Checkpoint
 	LatestPolish          *domain.Checkpoint
 	ReviewLedger          *domain.StyleReviewLedger
+	// MechanicalViolations 是 error 级机械违规明细（ResolveChapterStage 重跑
+	// computeMechanicalViolations 后按 hasErrorViolations 过滤的实际条目）。
+	// 供 FSM 拒绝消息携带"修什么"的确定性事实（rule/target/actual/limit），
+	// 避免模型在 needs_edit 阶段盲目重写（ch43 死循环根因）。
+	MechanicalViolations []rules.Violation
 }
 
 // ChapterStageDecision 是一次 FSM 判定的完整结果。
@@ -89,6 +99,9 @@ type ChapterStageDecision struct {
 	Reason    string
 	Recovery  string
 	DraftMode string
+	// Violations 是 error 级机械违规明细（与 ChapterStageInput.MechanicalViolations
+	// 同源，由 ResolveChapterStage 填充；纯函数 ComputeChapterStage 不产生）。
+	Violations []rules.Violation
 }
 
 // Allows 报告动作是否被当前阶段允许。
@@ -484,11 +497,19 @@ func ResolveChapterStage(st *store.Store, chapter int, cfg ChapterFSMConfig) (Ch
 	//    重跑确定性且无需模型），只取 hasErrorViolations。
 	hasErrors := false
 	onlyUnderMinError := false
+	var errorViolations []rules.Violation
 	if draftExists {
 		wordCount := utf8.RuneCountInString(draft)
 		violations := computeMechanicalViolations(st, draft, wordCount)
 		hasErrors = hasErrorViolations(violations)
 		onlyUnderMinError = onlyUnderMinChapterWordsError(st, draft, wordCount)
+		// 只保留 error 级条目：FSM 拒绝只关心"必须修什么"，warning 由模型
+		// 按文风自主裁定，不进入拒绝明细（保持消息紧凑）。
+		for _, v := range violations {
+			if v.Severity == rules.SeverityError {
+				errorViolations = append(errorViolations, v)
+			}
+		}
 	}
 
 	in := ChapterStageInput{
@@ -507,8 +528,11 @@ func ResolveChapterStage(st *store.Store, chapter int, cfg ChapterFSMConfig) (Ch
 		LatestConsistency:     latestConsistency,
 		LatestPolish:          latestPolish,
 		ReviewLedger:          ledger,
+		MechanicalViolations:  errorViolations,
 	}
-	return ComputeChapterStage(in), nil
+	decision := ComputeChapterStage(in)
+	decision.Violations = errorViolations
+	return decision, nil
 }
 
 // ── RequireChapterAction：统一强制入口 ────────────────────────────────
@@ -601,7 +625,7 @@ func RequireChapterAction(st *store.Store, chapter int, attempted ChapterAction,
 	// 顺序不可颠倒——先 Append 后 Recent 才能把本次拒绝计入连续链。
 	recordFSMDenial(st, chapter, decision.Required, attempted, decision.Stage)
 	deniedCount := countConsecutiveFSMDenials(st, chapter, decision.Required)
-	return &ChapterTransitionError{
+	te := &ChapterTransitionError{
 		Chapter:     chapter,
 		Stage:       decision.Stage,
 		Attempted:   attempted,
@@ -611,6 +635,12 @@ func RequireChapterAction(st *store.Store, chapter int, attempted ChapterAction,
 		Recovery:    decision.Recovery,
 		DeniedCount: deniedCount,
 	}
+	// 违规明细开关：开启时把 error 级机械违规复制进拒绝错误，Error() 据此
+	// 追加 violations=[...] 紧凑摘要（模型可见"修什么"）。关闭时保持旧消息。
+	if cfg.ViolationDetailEnabled && len(decision.Violations) > 0 {
+		te.Violations = append([]rules.Violation(nil), decision.Violations...)
+	}
+	return te
 }
 
 // ── ChapterTransitionError：FSM 拦截错误 ─────────────────────────────
@@ -629,6 +659,66 @@ type ChapterTransitionError struct {
 	// >=2 时 Error() 追加强制指令，直接给出必须调用的工具与参数，并提示
 	// 不要重复获取上下文（模型指令遵循差时的拒绝升级机制）。
 	DeniedCount int
+	// Violations 是 error 级机械违规明细（仅 ViolationDetailEnabled 时由
+	// RequireChapterAction 填充）。非空时 Error() 追加 violations=[...] 紧凑
+	// 摘要，让模型看到"修什么"（rule/target/actual/limit），避免 needs_edit
+	// 阶段盲目重写（ch43 死循环根因）。
+	Violations []rules.Violation
+}
+
+// ── 违规明细紧凑摘要（FSM 拒绝消息的确定性输出） ──────────────────────
+// 43 章死循环根因：模型在 needs_edit 阶段反复 draft_chapter，但拒绝消息只有
+// "一致性检查仍有 error 级机械违规"，不含 rule/target/actual/limit——模型看不到
+// "修什么"只能盲目重写。本摘要把 error 级违规逐条压缩进拒绝消息：
+//
+//	violations=[rule=literary_prose target="禁词清零：浑身发抖 1处：她浑身发抖" actual=1 limit=1 severity=error; ...]
+//
+// 约束：最多 5 条；每条 target 截断到 60 runes（超长加 …）；只含 error 级
+// （防御性过滤，不依赖上游）；仅在 ViolationDetailEnabled 时输出（保持旧消息兼容）。
+
+// maxViolationSummaryEntries 拒绝消息中违规摘要的最大条数。
+const maxViolationSummaryEntries = 5
+
+// maxViolationTargetRunes 每条违规 target 在摘要中的最大长度（rune 计数）。
+const maxViolationTargetRunes = 60
+
+// violationSummary 把一条违规压缩为 "rule=... target=... actual=... limit=... severity=..." 片段。
+// target 超长截断到 maxViolationTargetRunes runes（加 …），绝不按 byte 切坏 UTF-8。
+// limit 为 nil/空时省略（forbidden_chars/forbidden_phrases 无阈值概念）。
+func violationSummary(v rules.Violation) string {
+	target := v.Target
+	if utf8.RuneCountInString(target) > maxViolationTargetRunes {
+		target = string([]rune(target)[:maxViolationTargetRunes]) + "…"
+	}
+	limit := ""
+	if v.Limit != nil && fmt.Sprintf("%v", v.Limit) != "" {
+		limit = fmt.Sprintf(" limit=%v", v.Limit)
+	}
+	return fmt.Sprintf("rule=%s target=%q actual=%v%s severity=%s", v.Rule, target, v.Actual, limit, v.Severity)
+}
+
+// violationsSummary 把 error 级违规列表压缩为 "violations=[...]" 摘要串。
+// 空列表返回空串；最多 maxViolationSummaryEntries 条，超出截断；防御性
+// 只取 error 级条目（不依赖上游过滤——ChapterTransitionError.Violations 是
+// 公开字段，调用方可能直接构造含 warning 的列表）。
+func violationsSummary(vs []rules.Violation) string {
+	if len(vs) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, min(len(vs), maxViolationSummaryEntries))
+	for _, v := range vs {
+		if v.Severity != rules.SeverityError {
+			continue
+		}
+		parts = append(parts, violationSummary(v))
+		if len(parts) >= maxViolationSummaryEntries {
+			break
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " violations=[" + strings.Join(parts, "; ") + "]"
 }
 
 // recoveryHint 按 required action 生成 action-specific 的 recovery 文案。
@@ -670,6 +760,10 @@ func (e *ChapterTransitionError) Error() string {
 	}
 	msg := fmt.Sprintf("code=chapter_fsm_transition_denied chapter=%d stage=%s attempted=%s required=%s allowed=[%s] reason=%s 下一步：%s",
 		e.Chapter, e.Stage, e.Attempted, required, allowedStr, e.Reason, recoveryHint(e.Required, e.Chapter))
+	// 违规明细（ViolationDetailEnabled 时由 RequireChapterAction 填充）：
+	// 追加紧凑摘要，让模型看到"修什么"（rule/target/actual/limit）。
+	// 只含 error 级、最多 5 条、target 截断 60 runes；空列表不追加（旧消息兼容）。
+	msg += violationsSummary(e.Violations)
 	// 拒绝计数升级：同一章节同一拒绝码连续 ≥2 次时追加强制指令。
 	// 只升级"拒绝"场景，不改变正常流程；code= 前缀保持稳定（测试依赖）。
 	// required 为空（如 complete 阶段无下一步工具）时不升级——没有可强制的工具。

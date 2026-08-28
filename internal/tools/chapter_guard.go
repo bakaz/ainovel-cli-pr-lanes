@@ -269,8 +269,12 @@ func CheckCommitStyleGate(st *store.Store, chapter int) error {
 // 对将要提交的新正文统计 8 类文学腔句式 + 4 类形态检查（见
 // rules.CheckLiteraryProse：否定修正句/抽象情绪概括/明喻滥用/升华收尾/伪停顿/
 // 物化句式/抽象主语+状态动词/破折号伪深刻，以及段落碎片化单句段超标、
-// 自评口吻不足、节拍账本、禁词清零），任一触发 → error 级违例，直接阻止
+// 自评口吻不足、节拍账本、禁词清零），任一 error 级违例 → 直接阻止
 // commit。纯正则机械判定，不经 LLM judge。
+//
+// 严重度口径：只拦 SeverityError 的违例。自评口吻不足（第 10 类）是文学
+// 偏好而非硬底线（模型重写时自评词随机丢失，error 级会造成 needs_edit
+// 死循环），已降为 warning——warning 级违例照常落盘审计，但不阻断 commit。
 //
 // 行为：
 //   - 命中句（原文片段 ≤40 字）随违例写入 meta/rule_violations.jsonl 供审计——
@@ -294,8 +298,18 @@ func CheckLiteraryProseGate(st *store.Store, chapter int) error {
 	if err := st.World.SaveRuleViolations(chapter, violations); err != nil {
 		slog.Warn("文学腔硬闸违规落盘失败", "module", "tools", "chapter", chapter, "err", err)
 	}
-	parts := make([]string, 0, len(violations))
+	// 只拦 error 级违例；warning（自评口吻不足等文学偏好）不阻断 commit。
+	var errors []rules.Violation
 	for _, v := range violations {
+		if v.Severity == rules.SeverityError {
+			errors = append(errors, v)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(errors))
+	for _, v := range errors {
 		parts = append(parts, fmt.Sprintf("%s（命中 %v 处，阈值 %v）", v.Target, v.Actual, v.Limit))
 	}
 	return fmt.Errorf("文学腔句式硬闸拦截：%s。请修改正文后重新 check_consistency，再 commit_chapter: %w",

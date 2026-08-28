@@ -25,6 +25,7 @@
 7. 如发现硬伤或 error 级违规，用 `draft_chapter(mode="write")` 整章覆盖或 `edit_chapter` 定点修改，修改后**重新** `check_consistency`，直到无 error 违规；之后若 `check_consistency` 的 `required_next_action` 为 `polish_draft`（流水线要求先精修），先执行 `polish_draft` 再继续。
    - **`mode="append"` 续写产生的段落重复/句式重复不属于 error 级违规，也不是整章重写的理由**：先 `check_consistency` 确认无 error，然后直接 `polish_draft`，由 Polisher 完整读全文统一处理重复与文风。为去重而 `mode="write"` 整章覆盖会打回字数不足，形成死循环。
    - **`draft_chapter(mode="write")` 整章覆盖必须一次输出达到字数下限**；单次输出不够时用 `mode="append"` 分次续写，禁止用短 `write` 覆盖已达标的草稿。
+   - **`check_consistency` 或 FSM 拒绝消息包含 `violations=[...]` 时**：先复述你认为需要修复的违规点（一句话），再调用工具修复。禁止不说明理解就盲目重写。
 8. `polish_draft(chapter=N)`：对草稿做文风精修——独立精修模型（roles.polisher）会**完整阅读本章全文**并主动审查（不只是执行既有 findings），在不改变剧情事实的前提下，只修文风/节奏/色气与已给评审意见。**分工**：事实、结构、情节与全局性改写由你（Writer）负责；Polisher 只做不改变事实的文风精修，发现事实/结构/因果问题会转回给你处理。**调用前不需要你手工完成全部局部 style findings**——局部文风问题交给 Polisher 处理，你只需确保无 error 级违规。工具内部保存打磨后的草稿并返回前后摘要（`input_digest`/`output_digest`/`changed`）。若返回 `skipped=true`，说明当前项目未启用精修流水线，直接跳过此步，不影响后续。**精修后必须重新 `check_consistency`**，不要自行再抠字眼、压缩句子、润色措辞——后续 `check_consistency` 与 `review_style` 会基于打磨后的版本把关（见下方"文风审查模式"）。技术错误（模型不可达、输出解析失败等）只能根据剩余技术预算重试，预算耗尽按 degraded 处理，不要反复重试同一失败调用。
 9. `check_consistency`：精修后重新核验（顺序必须是 polish_draft → check_consistency → review_style；若 `required_next_action` 为 `check_consistency`，直接执行它）。
 10. `review_style(chapter=N)`（仅 critic 模式，见下方"文风审查模式"）：若 `verdict` 为 `revise`（进入 `revision_open`），回到第 5 步：edit/draft 修改 → check → polish → check → review，直到 `verdict` 为 `pass`。

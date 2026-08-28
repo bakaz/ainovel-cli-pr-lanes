@@ -9,6 +9,7 @@ import (
 
 	"github.com/voocel/ainovel-cli/internal/domain"
 	"github.com/voocel/ainovel-cli/internal/errs"
+	"github.com/voocel/ainovel-cli/internal/rules"
 	"github.com/voocel/ainovel-cli/internal/store"
 )
 
@@ -1503,5 +1504,213 @@ func TestRequireChapterAction_DeniedCountRewriteQueue(t *testing.T) {
 	}
 	if !strings.HasPrefix(msg, "code=chapter_fsm_transition_denied") {
 		t.Fatalf("code prefix must stay stable:\n%s", msg)
+	}
+}
+
+// ── 改动：FSM 拒绝时输出机械违规明细（ch43 死循环修复） ────────────────
+// 模型在 needs_edit 阶段反复 draft_chapter 的根因是拒绝消息不含违规明细
+// （rule/target/actual/limit）——模型看不到"修什么"只能盲目重写。以下测试
+// 验证：needs_edit decision 保留 error 级违规；Error() 输出紧凑摘要；
+// 开关关闭时消息与旧版一致；摘要条数与 target 长度有上限；FSM 不变量未放宽。
+
+// TestResolveChapterStage_NeedsEditCarriesViolations 验证 needs_edit 判定携带
+// error 级机械违规明细（ResolveChapterStage 重跑 computeMechanicalViolations
+// 后过滤 error 级条目），且 Allowed/Required 不变量未放宽。
+func TestResolveChapterStage_NeedsEditCarriesViolations(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	savePermissiveUserRules(t, st)
+	if err := st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}); err != nil {
+		t.Fatal(err)
+	}
+	// 草稿含 error 级违规：forbidden_phrases（某种程度上）+ 字数不足（permissive
+	// 规则 Min=0 不触发字数，但 SystemDefaults 的禁语在 permissive 快照中保留）。
+	if err := st.Drafts.SaveDraft(1, "# 一\nabc她心里骂自己丢人，真不要脸。某种程度上，他看见了。"); err != nil {
+		t.Fatal(err)
+	}
+	draft, _ := st.Drafts.LoadDraft(1)
+	digest := domain.DigestDraft(draft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "c1", digest); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := ChapterFSMConfig{Enabled: true}
+	decision, err := ResolveChapterStage(st, 1, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Stage != ChapterStageNeedsEdit {
+		t.Fatalf("stage = %s, want needs_edit", decision.Stage)
+	}
+	// 违规明细：至少一条 error 级（forbidden_phrases 或 literary_prose）。
+	if len(decision.Violations) == 0 {
+		t.Fatal("needs_edit decision 必须携带 error 级违规明细")
+	}
+	for _, v := range decision.Violations {
+		if v.Severity != rules.SeverityError {
+			t.Fatalf("decision.Violations 只应含 error 级，got %s", v.Severity)
+		}
+	}
+	// FSM 不变量未放宽：needs_edit 的 Allowed/Required 与纯函数判定一致。
+	want := ComputeChapterStage(ChapterStageInput{
+		StyleReviewMode: domain.StyleQualityCritic, DraftExists: true, DraftDigest: digest,
+		HasMechanicalErrors: true, LatestConsistency: consistencyCP(1, digest),
+	})
+	if !assertSameAllowed(decision.Allowed, want.Allowed) || decision.Required != want.Required {
+		t.Fatalf("FSM 不变量被放宽：allowed=%v required=%s，纯函数判定 allowed=%v required=%s",
+			decision.Allowed, decision.Required, want.Allowed, want.Required)
+	}
+}
+
+// assertSameAllowed 断言两个 allowed 集合逐元素一致（顺序无关）。
+func assertSameAllowed(a, b []ChapterAction) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, x := range a {
+		found := false
+		for _, y := range b {
+			if x == y {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// TestChapterTransitionError_ViolationSummary 验证 Error() 在 Violations 非空时
+// 追加紧凑摘要：含 rule/target/actual/limit/severity；开关关闭（Violations 空）时
+// 消息与旧版一致（不含 violations=）。
+func TestChapterTransitionError_ViolationSummary(t *testing.T) {
+	base := &ChapterTransitionError{
+		Chapter:   56,
+		Stage:     ChapterStageNeedsEdit,
+		Attempted: ChapterActionCheck,
+		Required:  ChapterActionDraft,
+		Allowed:   []ChapterAction{ChapterActionDraft},
+		Reason:    "一致性检查仍有 error 级机械违规",
+		Violations: []rules.Violation{
+			{Rule: "literary_prose", Target: "禁词清零：浑身发抖 1处：她浑身发抖", Limit: 1, Actual: 1, Severity: rules.SeverityError},
+			{Rule: "forbidden_phrases", Target: "某种程度上", Actual: 1, Severity: rules.SeverityError},
+		},
+	}
+	msg := base.Error()
+	for _, want := range []string{
+		"violations=[",
+		`rule=literary_prose target="禁词清零：浑身发抖 1处：她浑身发抖" actual=1 limit=1 severity=error`,
+		`rule=forbidden_phrases target="某种程度上" actual=1 severity=error`,
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error message missing %q:\n%s", want, msg)
+		}
+	}
+	// 旧消息字段保持稳定。
+	for _, want := range []string{
+		"code=chapter_fsm_transition_denied", "chapter=56", "stage=needs_edit",
+		"attempted=check_consistency", "required=draft_chapter", "allowed=[draft_chapter]",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error message missing %q:\n%s", want, msg)
+		}
+	}
+
+	// 开关关闭（Violations 空）：消息与旧版一致，不含 violations=。
+	off := *base
+	off.Violations = nil
+	omsg := off.Error()
+	if strings.Contains(omsg, "violations=") {
+		t.Fatalf("开关关闭时不得输出 violations=：\n%s", omsg)
+	}
+	if omsg != strings.Replace(msg, violationsSummary(base.Violations), "", 1) {
+		t.Fatalf("开关关闭时消息应与旧版逐字节一致：\n--- on:\n%s\n--- off:\n%s", msg, omsg)
+	}
+}
+
+// TestChapterTransitionError_ViolationSummaryLimits 验证摘要上限：最多 5 条；
+// 每条 target 截断到 60 runes（超长加 …）；只含 error 级（防御性过滤——
+// warning 排在最前也不得进入摘要）。
+func TestChapterTransitionError_ViolationSummaryLimits(t *testing.T) {
+	longTarget := strings.Repeat("长", 100)
+	vs := make([]rules.Violation, 0, 9)
+	// warning 排在最前：若 violationsSummary 不防御性过滤，会先占掉摘要名额。
+	vs = append(vs, rules.Violation{Rule: "fatigue_words", Target: "不禁", Actual: 3, Severity: rules.SeverityWarning})
+	for i := 0; i < 8; i++ {
+		vs = append(vs, rules.Violation{
+			Rule: "literary_prose", Target: longTarget, Actual: i, Severity: rules.SeverityError,
+		})
+	}
+
+	err := &ChapterTransitionError{
+		Chapter: 1, Stage: ChapterStageNeedsEdit, Attempted: ChapterActionCheck,
+		Required: ChapterActionDraft, Allowed: []ChapterAction{ChapterActionDraft},
+		Reason: "r", Violations: vs,
+	}
+	msg := err.Error()
+	// 最多 5 条：摘要内 rule= 出现 5 次（不含 warning 的 fatigue_words）。
+	if n := strings.Count(msg, "rule=literary_prose"); n != maxViolationSummaryEntries {
+		t.Fatalf("摘要条数 = %d, want %d:\n%s", n, maxViolationSummaryEntries, msg)
+	}
+	if strings.Contains(msg, "rule=fatigue_words") {
+		t.Fatalf("warning 级违规不得进入摘要：\n%s", msg)
+	}
+	// target 截断到 60 runes + …。
+	truncated := strings.Repeat("长", maxViolationTargetRunes) + "…"
+	if !strings.Contains(msg, `target="`+truncated+`"`) {
+		t.Fatalf("target 应截断到 %d runes 加 …：\n%s", maxViolationTargetRunes, msg)
+	}
+	if strings.Contains(msg, strings.Repeat("长", maxViolationTargetRunes+1)) {
+		t.Fatalf("target 不得超过 %d runes：\n%s", maxViolationTargetRunes, msg)
+	}
+}
+
+// TestRequireChapterAction_NeedsEditDenialCarriesViolations 端到端验证：
+// needs_edit 阶段 check_consistency 被拒时，错误消息包含紧凑违规摘要
+// （开关开）；开关关时不包含（消息与旧版一致）。
+func TestRequireChapterAction_NeedsEditDenialCarriesViolations(t *testing.T) {
+	st := store.NewStore(t.TempDir())
+	savePermissiveUserRules(t, st)
+	if err := st.RunMeta.Save(domain.RunMeta{StyleReviewMode: domain.StyleQualityCritic}); err != nil {
+		t.Fatal(err)
+	}
+	// 草稿含 error 级违规（forbidden_phrases "某种程度上"）。
+	if err := st.Drafts.SaveDraft(1, "# 一\nabc她心里骂自己丢人，真不要脸。某种程度上，他看见了。"); err != nil {
+		t.Fatal(err)
+	}
+	draft, _ := st.Drafts.LoadDraft(1)
+	digest := domain.DigestDraft(draft)
+	if _, err := st.Checkpoints.Append(domain.ChapterScope(1), "consistency_check", "c1", digest); err != nil {
+		t.Fatal(err)
+	}
+
+	// 开关开：拒绝消息含 violations=[...] 摘要。
+	on := ChapterFSMConfig{Enabled: true, ViolationDetailEnabled: true}
+	err := RequireChapterAction(st, 1, ChapterActionCheck, on)
+	if err == nil {
+		t.Fatal("needs_edit 阶段 check_consistency 必须被拒")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "violations=[") || !strings.Contains(msg, "rule=") {
+		t.Fatalf("开关开时拒绝消息必须含违规摘要：\n%s", msg)
+	}
+	var te *ChapterTransitionError
+	if !errors.As(err, &te) || len(te.Violations) == 0 {
+		t.Fatalf("ChapterTransitionError 必须携带 Violations，got %+v", te)
+	}
+
+	// 开关关：消息与旧版一致（不含 violations=）。
+	off := ChapterFSMConfig{Enabled: true, ViolationDetailEnabled: false}
+	oerr := RequireChapterAction(st, 1, ChapterActionCheck, off)
+	if oerr == nil {
+		t.Fatal("needs_edit 阶段 check_consistency 必须被拒（开关关）")
+	}
+	omsg := oerr.Error()
+	if strings.Contains(omsg, "violations=") {
+		t.Fatalf("开关关时拒绝消息不得含 violations=：\n%s", omsg)
+	}
+	if !errors.As(oerr, &te) || len(te.Violations) != 0 {
+		t.Fatalf("开关关时 ChapterTransitionError.Violations 必须为空，got %+v", te)
 	}
 }

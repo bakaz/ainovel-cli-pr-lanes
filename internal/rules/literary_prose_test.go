@@ -68,7 +68,9 @@ func TestLiteraryProseAllPatternsThresholds(t *testing.T) {
 			label: "抽象情绪概括",
 			limit: LitGateAbstractEmoLimit,
 			over:  "一种说不出的快感。一种难以言喻的战栗。一种无尽的渴望。",
-			under: "他拿出一种药丸，仔细看了看。",
+			// "一种X的"是正常中文表达（916 误报修复后不再命中），
+			// 仅 无尽/难以言喻/说不出的 计入。
+			under: "转化成了一种酸胀，发出一种低呜。",
 		},
 		{
 			label: "明喻滥用",
@@ -391,7 +393,7 @@ func TestLiteraryProseParagraphShape(t *testing.T) {
 // ── 第 10 类：自评/素材口吻不足 ────────────────────────────────────────
 
 func TestLiteraryProseSelfReviewTone(t *testing.T) {
-	// 正例：自评关键词 ≥2 → 不触发
+	// 正例：自评关键词 ≥1 → 不触发
 	positives := []string{
 		"她心里骂自己丢人，真不要脸。",
 		"她恨自己软弱，算了吧。",
@@ -400,11 +402,11 @@ func TestLiteraryProseSelfReviewTone(t *testing.T) {
 	}
 	for _, s := range positives {
 		if v := findLiteraryViolation(CheckLiteraryProse(s), "自评口吻不足"); v != nil {
-			t.Errorf("自评 ≥2 不应触发违例: %q, got %+v", s, v)
+			t.Errorf("自评 ≥1 不应触发违例: %q, got %+v", s, v)
 		}
 	}
 
-	// 反例：0 命中 → error 违例
+	// 反例：0 命中 → warning 违例（文学偏好，非硬底线）
 	vs := CheckLiteraryProse("他站在窗前，看着远处的灯火。")
 	v := findLiteraryViolation(vs, "自评口吻不足")
 	if v == nil {
@@ -416,34 +418,21 @@ func TestLiteraryProseSelfReviewTone(t *testing.T) {
 	if v.Actual != 0 {
 		t.Errorf("Actual = %v, want 0", v.Actual)
 	}
-	if v.Severity != SeverityError {
-		t.Errorf("应为 error 级，got %s", v.Severity)
+	if v.Severity != SeverityWarning {
+		t.Errorf("应为 warning 级，got %s", v.Severity)
 	}
 
-	// 反例：恰好 1 命中 → error 违例（阈值 <2）
+	// 边界：恰好 1 命中 → 通过（阈值 <1，916 误报修复：1 处"她骂自己贱"即达标）
 	vs = CheckLiteraryProse("装置发出指令：别走，任务尚未完成。")
-	v = findLiteraryViolation(vs, "自评口吻不足")
-	if v == nil {
-		t.Fatal("自评 1 命中应触发违例")
-	}
-	if v.Actual != 1 {
-		t.Errorf("Actual = %v, want 1（别走 按保守词表如实计数）", v.Actual)
-	}
-	if !strings.Contains(v.Target, "命中词：别走") {
-		t.Errorf("Target 应附带命中词明细供 editor 核对: %q", v.Target)
+	if v := findLiteraryViolation(vs, "自评口吻不足"); v != nil {
+		t.Fatalf("自评 1 命中应通过（阈值 <1）: %+v", v)
 	}
 
-	// 含"别走"的装置语境不误报：单处装置指令"别走"只计 1 命中，不足 2，
-	// 不会让缺自评的章被误判为达标——仍触发 error（保守词表只收词表词，
-	// 不做语境消歧；漏判代价是两处装置"别走"会被如实计 2 放行，editor
-	// 可凭命中词明细核对）。
+	// 含"别走"的装置语境：单处装置指令"别走"计 1 命中，≥1 即满足最低
+	// 自评要求（保守词表只收词表词、不做语境消歧；1 处命中即达标）。
 	vs = CheckLiteraryProse("装置显示屏亮起：别走，任务尚未完成。")
-	v = findLiteraryViolation(vs, "自评口吻不足")
-	if v == nil {
-		t.Fatal("仅单处装置语境 别走（1 命中）不应让检查放行")
-	}
-	if v.Actual != 1 {
-		t.Errorf("Actual = %v, want 1", v.Actual)
+	if v := findLiteraryViolation(vs, "自评口吻不足"); v != nil {
+		t.Fatalf("单处装置语境 别走（1 命中）应通过: %+v", v)
 	}
 }
 
@@ -503,6 +492,30 @@ func TestLiteraryProseBeatLedger(t *testing.T) {
 	exempt := "她数着呼吸，一，二，三。数到第六十遍门锁响了。"
 	if v := findLiteraryViolation(CheckLiteraryProse(exempt), "节拍账本"); v != nil {
 		t.Fatalf("测量动词豁免不应触发: %q, got %+v", exempt, v)
+	}
+
+	// 反例："维持器"装置名豁免（916 误报修复）："把维持器裹得更紧"是装置
+	// 动作，不是账本关系——AFwd 匹配止于"维持"（"器"在匹配之外），豁免
+	// 判定覆盖命中片段 + 其后 1 字。两处装置动作合段也不触发。
+	device := "把维持器裹得更紧。把维持器绞得死紧。"
+	if v := findLiteraryViolation(CheckLiteraryProse(device), "节拍账本"); v != nil {
+		t.Fatalf("维持器装置名应豁免: %q, got %+v", device, v)
+	}
+	deviceOnce := "她听着那声音，听一声，那口就缩一下，把维持器裹得更紧。"
+	if v := findLiteraryViolation(CheckLiteraryProse(deviceOnce), "节拍账本"); v != nil {
+		t.Fatalf("维持器装置名单处应豁免: %q, got %+v", deviceOnce, v)
+	}
+
+	// 正例："维持"作为账本关系词仍生效（非装置名场景）：计数单位 + 维持
+	// 结构照常命中，≥2 触发。
+	keep := "六拍维持着节奏。七拍维持着节拍。"
+	vs = CheckLiteraryProse(keep)
+	v = findLiteraryViolation(vs, "节拍账本")
+	if v == nil {
+		t.Fatalf("维持 作为账本关系词应触发: %q", keep)
+	}
+	if v.Actual != 2 {
+		t.Errorf("Actual = %v, want 2（六拍维持/七拍维持）", v.Actual)
 	}
 
 	// 反例：成语化表达"跳了一拍"天然不匹配（缺账本关系词）

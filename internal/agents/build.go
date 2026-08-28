@@ -286,9 +286,12 @@ func ChapterFSMConfigFor(cfg bootstrap.Config, models *bootstrap.ModelSet) tools
 		}
 	}
 	return tools.ChapterFSMConfig{
-		Enabled:               true,
+		Enabled:                true,
 		PipelineEnabled:       pipelineEnabled,
 		ExpectedPolisherModel: expectedPolisherModel,
+		// 违规明细开关：缺省 true（未配置时默认开启），显式 violation_detail=false
+		// 时关闭——FSM 拒绝消息恢复旧版（不含 violations=[...] 摘要）。
+		ViolationDetailEnabled: cfg.ViolationDetailEnabled(),
 	}
 }
 
