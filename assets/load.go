@@ -31,6 +31,9 @@ type Prompts struct {
 	Writer           string // 协议模板,含 {{VOICE}} 占位符;终稿经 BuildWriterPrompt 组装
 	Editor           string
 	Polisher         string // 文风精修师（独立 Runner，仅精修已有草稿，不评审不提交）
+	// PolisherOneShot 是 flag full_context_polisher_v3 关闭（默认）时的回滚 prompt：
+	// 旧 one-shot 路径（本会话不提供任何工具，直接输出 edit 列表 JSON）。
+	PolisherOneShot string
 	ImportSegment    string // 语义切分：识别章节/卷/附属文本边界
 	ImportAnalyze    string // 连续批次逐章事实提取
 	ImportSynthesize string // 分层综合与卷弧划分
@@ -226,6 +229,7 @@ func loadPrompts() Prompts {
 		Writer:           WithSimulationGuidance(mustRead(promptsFS, "prompts/writer.md"), "writer"),
 		Editor:           WithSimulationGuidance(mustRead(promptsFS, "prompts/editor.md"), "editor"),
 		Polisher:         WithSimulationGuidance(mustRead(promptsFS, "prompts/polisher.md"), "polisher"),
+		PolisherOneShot:  WithSimulationGuidance(mustRead(promptsFS, "prompts/polisher-oneshot.md"), "polisher"),
 		ImportSegment:    mustRead(promptsFS, "prompts/import-segment.md"),
 		ImportAnalyze:    analyzer,
 		ImportSynthesize: foundation,

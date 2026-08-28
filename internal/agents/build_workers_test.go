@@ -56,12 +56,12 @@ func TestBuildWorkers_ToolComposition(t *testing.T) {
 		"edit_chapter", "check_consistency", "commit_chapter",
 	})
 
-	// ── polisher 工具集：三个候选提交工具（schema docs/polisher-candidate-tools-schema.md §2）──
-	expectTools(t, "polisher", ts.Polisher, []string{
-		"submit_polish_plan", "submit_edit_batch", "finish_polish",
-	})
-	if len(ts.Polisher) != 3 {
-		t.Errorf("polisher toolset must have exactly 3 candidate tools, got %v", toolNames(ts.Polisher))
+	// ── polisher 工具集：默认（flag=false）为空——旧 one-shot 纯文本转换路径，
+	// 候选提交工具只在 full_context_polisher_v3 开启时注册（回归：9f66a8b6 后
+	// flag=false 时 polisher 仍可见三个候选工具，任何调用报
+	// "polish accumulator not initialized"）。 ──
+	if len(ts.Polisher) != 0 {
+		t.Errorf("polisher toolset must be empty by default (one-shot path), got %v", toolNames(ts.Polisher))
 	}
 
 	// ── editor 工具 ──
@@ -121,7 +121,7 @@ func TestBuildWorkerToolsetsWiresTUILongApprovalIntoArchitect(t *testing.T) {
 	ask.SetHandler(func(_ context.Context, questions []tools.Question) (*tools.AskUserResponse, error) {
 		return &tools.AskUserResponse{Answers: map[string]string{questions[0].Question: "批准"}}, nil
 	})
-	ts := buildWorkerToolsetsWithApproval(st, assets.Bundle{}, "default", projectprofile.NewCore4Contract(), ask)
+	ts := buildWorkerToolsetsWithApproval(st, assets.Bundle{}, "default", projectprofile.NewCore4Contract(), ask, true)
 	var save agentcore.Tool
 	for _, candidate := range ts.ArchitectLong {
 		if candidate.Name() == "save_foundation" {
@@ -516,10 +516,10 @@ func TestBuildWorkers_V3GuidanceProductionWiring(t *testing.T) {
 	})
 }
 
-// TestBuildWorkers_PolisherAgentWiring 验证 pipeline 开启时 BuildWorkers 组装
-// 独立的 polisher 子代理（独立 system prompt / cache key / 工具集）并把 polish_draft
-// 注入 writer 工具集；pipeline 关闭时 polisher 子代理仍注册（工具自身 skipped），
-// 但 commit 门控与工具强制不生效。
+// TestBuildWorkers_PolisherAgentWiring 验证 pipeline + full_context_polisher_v3
+// 开启时 BuildWorkers 组装独立的 polisher 子代理（独立 system prompt / cache
+// key / 三工具集）并把 polish_draft 注入 writer 工具集；pipeline 关闭时
+// polisher 子代理仍注册（工具自身 skipped），但 commit 门控与工具强制不生效。
 func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 	dir := t.TempDir()
 	st := store.NewStore(dir)
@@ -539,6 +539,10 @@ func TestBuildWorkers_PolisherAgentWiring(t *testing.T) {
 		Roles: map[string]bootstrap.RoleConfig{
 			"polisher": {Provider: "ollama", Model: "mimo-polisher"},
 		},
+		// 三工具候选协议路径：候选提交工具只在 flag 开启时装配（回归：
+		// 9f66a8b6 后 flag=false 时 polisher 仍可见三个候选工具，任何调用
+		// 报 "polish accumulator not initialized"——默认 one-shot 回滚）。
+		Flags: bootstrap.Flags{FullContextPolisherV3: true},
 	}
 	models, err := bootstrap.NewModelSet(cfg)
 	if err != nil {
@@ -1060,7 +1064,10 @@ func polishDraftFromWriter(t *testing.T, runner *subagent.Runner) *tools.PolishD
 
 // TestBuildWorkers_FullContextPolisherFlagWiring 验证灰度 flag
 // full_context_polisher_v3（计划 §12）经 BuildWorkers 注入 polish_draft：
-// flag=true → FullContextEnabled()=true；flag=false（默认）→ false（回滚开关）。
+// flag=true → FullContextEnabled()=true 且 polisher 工具集=三个候选工具、
+// system prompt=三工具协议版；flag=false（默认）→ false、polisher 工具集=空、
+// system prompt=one-shot 回滚版（回归：9f66a8b6 后 flag=false 时 polisher 仍
+// 可见三个候选工具，任何调用报 "polish accumulator not initialized"）。
 func TestBuildWorkers_FullContextPolisherFlagWiring(t *testing.T) {
 	build := func(flag bool) *subagent.Runner {
 		t.Helper()
@@ -1092,15 +1099,41 @@ func TestBuildWorkers_FullContextPolisherFlagWiring(t *testing.T) {
 	}
 
 	t.Run("flag_on", func(t *testing.T) {
-		pd := polishDraftFromWriter(t, build(true))
+		runner := build(true)
+		pd := polishDraftFromWriter(t, runner)
 		if !pd.FullContextEnabled() {
 			t.Error("full_context_polisher_v3=true must enable multi-turn path")
 		}
+		ac, ok := runner.AgentConfig("polisher")
+		if !ok {
+			t.Fatal("polisher agent missing")
+		}
+		expectTools(t, "polisher", ac.Tools, []string{
+			"submit_polish_plan", "submit_edit_batch", "finish_polish",
+		})
+		if !strings.Contains(ac.SystemPrompt, "submit_polish_plan") {
+			t.Error("flag on: polisher prompt must be the three-tool protocol version")
+		}
 	})
 	t.Run("flag_off_default", func(t *testing.T) {
-		pd := polishDraftFromWriter(t, build(false))
+		runner := build(false)
+		pd := polishDraftFromWriter(t, runner)
 		if pd.FullContextEnabled() {
 			t.Error("full_context_polisher_v3=false (default) must keep one-shot path")
+		}
+		ac, ok := runner.AgentConfig("polisher")
+		if !ok {
+			t.Fatal("polisher agent missing")
+		}
+		if len(ac.Tools) != 0 {
+			t.Errorf("flag off: polisher toolset must be empty (one-shot), got %v", toolNames(ac.Tools))
+		}
+		// one-shot prompt 声明不提供任何工具，且不引导调用候选工具
+		if !strings.Contains(ac.SystemPrompt, "不提供任何工具") {
+			t.Error("flag off: polisher prompt must be the one-shot version (no tools)")
+		}
+		if strings.Contains(ac.SystemPrompt, "submit_polish_plan") {
+			t.Error("flag off: one-shot polisher prompt must not mention candidate tools")
 		}
 	})
 }

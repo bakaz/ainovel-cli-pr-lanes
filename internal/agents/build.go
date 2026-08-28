@@ -210,10 +210,15 @@ type workerToolsets struct {
 }
 
 func buildWorkerToolsets(store *store.Store, bundle assets.Bundle, style string, contract *projectprofile.SceneBeatContract) workerToolsets {
-	return buildWorkerToolsetsWithApproval(store, bundle, style, contract, nil)
+	// 合约/契约测试入口：polisher 候选工具默认关闭（旧 one-shot 行为）。
+	return buildWorkerToolsetsWithApproval(store, bundle, style, contract, nil, false)
 }
 
-func buildWorkerToolsetsWithApproval(store *store.Store, bundle assets.Bundle, style string, contract *projectprofile.SceneBeatContract, askUser *tools.AskUserTool) workerToolsets {
+// buildWorkerToolsetsWithApproval 组装生产工具集。polisherCandidateTools 是
+// 灰度 flag full_context_polisher_v3 的投影（BuildWorkers 传入）：开启时
+// polisher 工具集 = 三个候选提交工具（多轮协议路径）；关闭（默认）时 = 空
+// 工具集（旧 one-shot 纯文本转换路径）。
+func buildWorkerToolsetsWithApproval(store *store.Store, bundle assets.Bundle, style string, contract *projectprofile.SceneBeatContract, askUser *tools.AskUserTool, polisherCandidateTools bool) workerToolsets {
 	readChapter := tools.NewReadChapterTool(store)
 	architectCtx := tools.NewContextToolForRole(store, bundle.References, style, "architect")
 	writerCtx := tools.NewContextToolForRole(store, bundle.References, style, "writer")
@@ -251,16 +256,30 @@ func buildWorkerToolsetsWithApproval(store *store.Store, bundle assets.Bundle, s
 			tools.NewSaveArcSummaryTool(store),
 			tools.NewSaveVolumeSummaryTool(store),
 		},
-		// Polisher 工具集 = 三个候选提交工具（schema docs/polisher-candidate-tools-schema.md §2）：
-		// submit_polish_plan / submit_edit_batch / finish_polish。accumulator 是 per-run 的
-		//（polish_draft 每次 run 创建，包 6 接线），工具在构建时以 nil accumulator 注册，
-		// 运行时经 SetAccumulator 注入（见 BuildWorkers 的 holder 接线）。
-		Polisher: []agentcore.Tool{
-			tools.NewSubmitPolishPlanTool(),
-			tools.NewSubmitEditBatchTool(),
-			tools.NewFinishPolishTool(),
-		},
+		// Polisher 工具集：灰度 flag full_context_polisher_v3 开启（多轮候选工具
+		// 协议路径）时 = 三个候选提交工具（schema docs/polisher-candidate-tools-schema.md
+		// §2：submit_polish_plan / submit_edit_batch / finish_polish）。accumulator 是
+		// per-run 的（polish_draft 每次 run 创建，包 6 接线），工具在构建时以 nil
+		// accumulator 注册，运行时经 SetAccumulator 注入（见 BuildWorkers 的 holder 接线）。
+		// 关闭（默认）时 = 空工具集（旧 one-shot 纯文本转换路径：polisher 全部
+		// 上下文已由 polish_draft 塞进任务文本）——回滚开关，防模型调用候选工具
+		// 但 accumulator 未注入（回归：9f66a8b6 后 flag=false 时 polisher 仍可见
+		// 三个候选工具，任何调用报 "polish accumulator not initialized"）。
+		Polisher: candidateToolset(polisherCandidateTools),
 		commitTool: commitTool,
+	}
+}
+
+// candidateToolset 按灰度 flag 投影 polisher 工具集：开启 = 三个候选提交工具，
+// 关闭（默认） = 空（旧 one-shot 路径）。
+func candidateToolset(enabled bool) []agentcore.Tool {
+	if !enabled {
+		return []agentcore.Tool{}
+	}
+	return []agentcore.Tool{
+		tools.NewSubmitPolishPlanTool(),
+		tools.NewSubmitEditBatchTool(),
+		tools.NewFinishPolishTool(),
 	}
 }
 
@@ -311,7 +330,11 @@ func BuildWorkers(
 	contract *projectprofile.SceneBeatContract,
 ) (*subagent.Runner, *tools.AskUserTool, *ctxpack.WriterRestorePack, ApplyThinking) {
 	askUser := tools.NewAskUserTool()
-	ts := buildWorkerToolsetsWithApproval(store, bundle, cfg.Style, contract, askUser)
+	// 灰度 flag full_context_polisher_v3 投影：开启时 polisher 携带三个候选
+	// 提交工具（多轮协议路径）；关闭（默认）时为空工具集（旧 one-shot 路径，
+	// 回滚开关——flag=false 时 polisher 不可见任何工具，杜绝调用未注入
+	// accumulator 的候选工具报错）。
+	ts := buildWorkerToolsetsWithApproval(store, bundle, cfg.Style, contract, askUser, cfg.FullContextPolisherV3Enabled())
 	architectShortTools := ts.ArchitectShort
 	architectLongTools := ts.ArchitectLong
 	writerTools := ts.Writer
@@ -614,15 +637,22 @@ func BuildWorkers(
 	polisherContextWindow, polisherSource := cfg.ResolveContextWindow(polisherModelName)
 	bootstrap.LogContextWindowChoice("polisher", polisherModelName, polisherContextWindow, polisherSource)
 
-	// 精修者提示词身份：实际 prompt 内容的 sha256 前缀（可溯源，随 checkpoint 落盘）
-	polisherHash := sha256.Sum256([]byte(bundle.Prompts.Polisher))
+	// 精修者提示词身份：实际 prompt 内容的 sha256 前缀（可溯源，随 checkpoint 落盘）。
+	// 灰度 flag full_context_polisher_v3 关闭（默认）时用回滚版 one-shot prompt
+	//（PolisherOneShot：不提供任何工具，直接输出 edit 列表 JSON）；开启时用
+	// 三工具候选协议版（Polisher）。hash 随所选 prompt 变化，checkpoint 可溯源。
+	polisherSystemPrompt := bundle.Prompts.Polisher
+	if !cfg.FullContextPolisherV3Enabled() {
+		polisherSystemPrompt = bundle.Prompts.PolisherOneShot
+	}
+	polisherHash := sha256.Sum256([]byte(polisherSystemPrompt))
 	polisherPromptHash := "prompt:" + hex.EncodeToString(polisherHash[:8])
 
 	polisher := subagent.Config{
 		Name:             "polisher",
 		Description:      "文风精修师：在不改变剧情事实的前提下打磨草稿文风/节奏/色气",
 		Model:            polisherModel,
-		SystemPrompt:     bundle.Prompts.Polisher,
+		SystemPrompt:     polisherSystemPrompt,
 		Tools:            polisherTools,
 		MaxTurns:         6,
 		MaxRetries:       subagentMaxRetries,
