@@ -273,6 +273,12 @@ JSON 数组，每条含：category、rule、boundary。
    - 每章需要：title、core_event、hook、scenes
    - scenes 为结构对象数组：Core4 下每对象含 goal/action/conflict/outcome 四字段必填；V3 按运行时注入契约填齐七字段（goal/action/conflict/outcome/body_reaction/emotion_reaction/erotic_charge 必填）；sensory_anchor 可选
    - scenes 的节拍密度参考 style_rules 中的 outline 规划规则（若有）
+   - **scene 字段多样化（治模板）**：
+     1. 同一弧内，各 scene 的 body_reaction/emotion_reaction/erotic_charge 必须侧重**不同部位/不同反应**：穴口、乳尖、断口、深口、阀、喉、眼皮、腕——轮着分配，禁止整弧复用同一组合短语。
+     2. 同一短语组合（"断口法兰绷紧幻肢蜷""四阀各应""穴壁绞维持器"等）在**同一弧内出现 ≤2 次**；第 3 次起必须换写法（具体动作或具体液体）。
+     3. 每个 scene 的 body_reaction 只写 1-2 处反应（不是全身清单）；emotion_reaction 与 erotic_charge 各写一句具体的话（不是模板句）。
+   - **对话人味（治没人味）**：scene 的 action 里若有人物说话，按角色身份写腔调——接货人带家常气（说粥、说盏、说蜡），守灯人短促命令式，来人低而近；禁止全员同一种"低短玄"腔。对话允许日常冗余（半句废话、重复、犹豫），并带具体物件（粥、盏、蜡、绑带、灯），抽象禅机句每章最多 1-2 句。
+   - **methods 素材转写（治源头同构）**：planning_archive 的 methods 是**素材库不是逐字清单**——每条都是"动作→部位→液体→短反应"的紧凑链，整弧照搬会让正文变成同构段落清单。展开 scenes 时：每个 scene 从 methods 里挑 1-2 个素材**换写法**重新组织（不同句式、不同侧重、不同顺序），禁止把 methods 原句或原组合直接搬进 body_reaction/emotion_reaction/erotic_charge；methods 里没覆盖的节拍，用场景自身的逻辑补（对话、环境、心理、他人动作），不要硬凑身体反应链。
 
 **title 格式硬约束**（违反即是整本书风格断裂）：
 - **长度必须有起伏，禁止机械对齐**：同一弧内各章标题长短自然交错（如 借炉 / 同行的牙 / 夜里翻旧册），切忌"全弧 4 字"或"全弧 2 字"这种整齐划一——读者一眼扫过目录应感到节奏，而不是排版
